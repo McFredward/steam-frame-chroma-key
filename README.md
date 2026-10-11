@@ -74,6 +74,22 @@ The username is `steamos`. Check that it works from the PC:
 ssh steamos@<headset-ip>
 ```
 
+If SSH stops working after a reboot, check the Frame's current IP first. With
+the default device name and working local hostname discovery, you can also use
+`ssh steamos@frame.local` so an IP change does not break the connection.
+Keep Developer Mode enabled. In the Frame's desktop terminal, this command
+starts SSH immediately and enables it for future boots:
+
+```bash
+sudo systemctl enable --now sshd.service
+```
+
+After a reboot, `systemctl is-enabled sshd.service` should report `enabled` and
+`systemctl is-active sshd.service` should report `active`. These are the native
+service controls; no separate SSH startup script is required.
+See [Valve's developer setup](https://partner.steamgames.com/doc/steamhardware/steamframe/setup)
+and [systemd's service controls](https://github.com/systemd/systemd/blob/main/man/systemctl.xml).
+
 ### 2. Set up a `frame` SSH alias with a key (on the PC)
 
 The PC tools reach the headset through an SSH alias named `frame`, using key login so they never prompt for a

@@ -1,8 +1,11 @@
 # Steam Link mask bridge investigation
 
-Status: source investigation, 2026-10-11. No Steam Frame runtime capture has yet
-validated a decoded-frame identity or the complete sampling transform. This
-document separates the working upstream chroma hook from the genuine-mask work.
+Status: source and read-only installed-runtime investigation, 2026-10-11.
+The actual Frame shader has now been inspected on SteamOS 0.3.0, build
+20260922.6101926. Its interface and source-coordinate dependencies provide
+concrete integration constraints. A decoded-frame identity and the complete
+live sampling transform remain unproven. This document separates the working
+upstream chroma hook from the genuine-mask work.
 
 ## What the source establishes
 
@@ -91,6 +94,38 @@ must never accidentally make dashboards or unrelated applications transparent.
 The camera image remains local in either approach. It need not be sent to the PC.
 The current fork's mask transport/CPU tests can verify packet and matching logic;
 they cannot establish the Steam Link bridge or headset visual correctness.
+
+## Read-only Frame investigation, 2026-10-11
+
+The installed native shader and decoder executable were read over SSH and
+inspected privately on the development host. No layer, shader, runtime setting,
+or diagnostic process was installed or activated on the headset. The only
+authorized headset write was confirming native SSH service boot enablement.
+The device was already running SSH from its most recent boot; the initially
+refused connection used an obsolete IP address.
+
+Observed installed-runtime metadata:
+
+| Component | Observed identity |
+|---|---|
+| SteamOS | 0.3.0, build 20260922.6101926, variant `vr` |
+| Distortion shader | 6,620 bytes; SHA-256 `f28dd5d22a570cbee64057da03d0418b80aee88a8eeed988b2f776e8d9a513f2` |
+| `vrcompositor` | ELF build ID `ba0d798c2694e05985421e848b67ced8984fe2d3` |
+| `vrserver` | ELF build ID `5aa95363d05998027c870b98e01281f46d2b3ab5` |
+| `vrlink` | 2,412,336 bytes; ELF build ID `0a51addb6a9ef05dc52c055b1076947908f20acc` |
+
+The shader's existing opaque-store anchors match the upstream patcher, but
+that does not establish mask-coordinate compatibility. It uses an image array
+at set 0/binding 9 and a separate sampler at binding 25. The candidate `%883`
+coordinate belongs to edge normalization, rather than either native color
+sample. A logical full-eye mask at this coordinate requires a separately
+verified eye/rectangle transform; a packed decoded-video mask cannot simply
+use it.
+
+The installed decoder contains frame metadata handling and explicit missing-
+metadata cases. This is a useful interception lead, not proof that an external
+application frame ID survives encoding, decoding and compositor surface reuse.
+Static strings alone do not establish an ABI or a reliable pairing contract.
 
 ## Local diagnostics collector
 
