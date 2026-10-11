@@ -17,3 +17,7 @@
   a headset test. Never describe this foundation as working Steam Link passthrough.
 - Keep allocations, queued frames, reassembly and logging bounded. No file I/O,
   socket waits or shader compilation on a compositor rendering thread.
+- Clean completed temporary test artifacts after every run (maintainer request,
+  2026-10-11). Retain small validation records and only the build outputs still
+  needed for review/deployment. Protect active workers, hardware logs, source
+  checkouts and private reference captures; never purge `/tmp` wholesale.
