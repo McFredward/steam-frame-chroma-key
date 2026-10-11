@@ -60,6 +60,13 @@ class Session:
                   f'Environment="FRAME_MASK_TRACE_OUTPUT={self.folder}/capture.jsonl"\n')
         return {self.manifest: manifest.encode(), self.dropin: dropin.encode()}
 
+    def recovery_event(self, name, **fields):
+        # A full/damaged home filesystem must not prevent disabling the layer.
+        try:
+            self.event(name, **fields)
+        except OSError:
+            pass
+
     def start(self, expected_hash):
         for path in (self.manifest, self.dropin, self.folder / "armed.json",
                      self.folder / "capture.jsonl", self.folder / "rollback-complete.json",
@@ -133,11 +140,11 @@ class Session:
             if not path.exists() and not path.is_symlink():
                 continue
             if path.is_symlink() or str(path) not in expected or path.read_bytes() != bytes.fromhex(expected[str(path)]):
-                self.event("rollback_refused_changed_file", path=str(path))
+                self.recovery_event("rollback_refused_changed_file", path=str(path))
                 refused.append(str(path))
                 continue
             path.unlink()
-            self.event("removed_activation_file", path=str(path))
+            self.recovery_event("removed_activation_file", path=str(path))
         if expected:
             try:
                 self.command("systemctl", "--user", "daemon-reload")
@@ -145,15 +152,15 @@ class Session:
                 # The absent manifest already prevents loading. Still attempt
                 # the native restart even if refreshing systemd failed.
                 refused.append("daemon-reload failed")
-                self.event("rollback_reload_failed", detail=str(error))
-            self.event("restart_requested", phase="native_restore")
+                self.recovery_event("rollback_reload_failed", detail=str(error))
+            self.recovery_event("restart_requested", phase="native_restore")
             self.command("systemctl", "--user", "restart", UNIT)
             self.command("systemctl", "--user", "is-active", UNIT)
         if refused:
             raise RuntimeError(f"Native restart attempted; changed files need manual review: {refused}")
         exclusive(complete, json.dumps({"restored": True, "time": time.time(),
                   "capture_unverified": True}).encode())
-        self.event("rollback_complete")
+        self.recovery_event("rollback_complete")
         # Keep tiny capture/ledger/library until the operator copies evidence and
         # confirms the new compositor is native; cleanup then removes this folder.
         try:

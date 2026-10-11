@@ -113,6 +113,46 @@ class SessionTests(unittest.TestCase):
             self.session.start(self.sha)
         self.assertFalse(self.calls)
 
+    def test_rollback_finishes_before_delayed_activation(self):
+        def completed(arguments, **options):
+            result = self.run_command(arguments, **options)
+            if arguments[0] == "systemd-run":
+                (self.session.folder / "rollback-complete.json").write_text("{}")
+            return result
+        self.session.run = completed
+        with self.assertRaises(RuntimeError):
+            self.session.start(self.sha)
+        self.assertFalse(self.session.manifest.exists())
+        self.assertFalse(self.session.dropin.exists())
+        self.assertFalse(any("restart" in command for command in self.calls))
+
+    def test_reload_failure_still_attempts_native_restart(self):
+        self.session.start(self.sha)
+        def failure(arguments, **options):
+            result = self.run_command(arguments, **options)
+            if "daemon-reload" in arguments:
+                raise subprocess.CalledProcessError(1, arguments)
+            if "restart" in arguments:
+                self.assertFalse(self.session.manifest.exists())
+                self.assertFalse(self.session.dropin.exists())
+            return result
+        self.session.run = failure
+        with self.assertRaises(RuntimeError):
+            self.session.rollback()
+        self.assertFalse(self.session.manifest.exists())
+        self.assertEqual(sum("restart" in command for command in self.calls), 2)
+        self.assertFalse((self.session.folder / "rollback-complete.json").exists())
+
+    def test_full_ledger_cannot_block_recovery(self):
+        self.session.start(self.sha)
+        def full(*arguments, **options):
+            raise OSError(28, "No space left on device")
+        self.session.event = full
+        self.session.rollback()
+        self.assertFalse(self.session.manifest.exists())
+        self.assertFalse(self.session.dropin.exists())
+        self.assertEqual(sum("restart" in command for command in self.calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
