@@ -133,3 +133,9 @@ green eight-suite CI checkpoint `f702142`; the two-suite focused pass is not a n
 complete foundation gate. Build and test outputs are local, ignored and cleaned
 after recording evidence; only the small staged diagnostic library is retained
 while needed for a possible authorized hardware capture.
+
+The pushed checkpoint `8fe0088` subsequently passed the complete
+[ten-suite CI run](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38131947911),
+including the real Vulkan layer/pixel checks, Windows diagnostic-sender
+cross-build and protocol sanitizers. This is software evidence; no Frame
+installation or genuine-mask hardware result is implied.
