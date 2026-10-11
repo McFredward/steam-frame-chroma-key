@@ -10,6 +10,9 @@ import unittest
 SPEC = importlib.util.spec_from_file_location("session", Path(__file__).resolve().parents[1] / "tools/frame_trace_session.py")
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+PROBE_SPEC = importlib.util.spec_from_file_location("probe", SPEC.origin.replace("frame_trace_session.py", "probe_trace_loader.py"))
+PROBE = importlib.util.module_from_spec(PROBE_SPEC)
+PROBE_SPEC.loader.exec_module(PROBE)
 
 
 class SessionTests(unittest.TestCase):
@@ -164,6 +167,45 @@ class SessionTests(unittest.TestCase):
         self.session.rollback()
         self.assertFalse(self.session.dropin.exists())
         self.assertFalse(self.session.manifest.exists())
+
+    def test_deployed_manifest_version_is_a_string(self):
+        manifest = json.loads(self.session.contents()[self.session.manifest])
+        self.assertEqual(manifest["layer"]["implementation_version"], "1")
+        self.assertEqual(manifest["layer"]["api_version"], "1.3.0")
+        PROBE.validate_manifest(manifest)
+
+    def test_numeric_manifest_is_rejected_before_loader_discovery(self):
+        manifest = json.loads(self.session.contents()[self.session.manifest])
+        for value in (1, True, 1.0, None):
+            with self.subTest(value=value):
+                manifest["layer"]["implementation_version"] = value
+                with self.assertRaises(RuntimeError):
+                    PROBE.validate_manifest(manifest)
+
+    def test_probe_requires_complete_properties_not_a_partial_name(self):
+        manifest = json.loads(self.session.contents()[self.session.manifest])
+        complete = PROBE.Layer()
+        complete.name = manifest["layer"]["name"].encode()
+        complete.spec = (1 << 22) | (3 << 12)
+        complete.implementation = 1
+        complete.description = manifest["layer"]["description"].encode()
+        PROBE.validate_properties([complete], manifest)
+        partial = PROBE.Layer()
+        partial.name = complete.name
+        partial.spec = complete.spec
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_properties([partial], manifest)
+        for field, value in (("spec", 0), ("implementation", 0), ("description", b"")):
+            with self.subTest(field=field):
+                wrong = PROBE.Layer()
+                wrong.name, wrong.spec = complete.name, complete.spec
+                wrong.implementation, wrong.description = complete.implementation, complete.description
+                setattr(wrong, field, value)
+                with self.assertRaises(RuntimeError):
+                    PROBE.validate_properties([wrong], manifest)
+        for properties in ([], [complete, complete]):
+            with self.assertRaises(RuntimeError):
+                PROBE.validate_properties(properties, manifest)
 
 
 if __name__ == "__main__":
