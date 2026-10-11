@@ -253,6 +253,10 @@ void startupBenchmark(std::uint32_t idleUs) {
     const auto counters = journal->transportCounters();
     require(journal->finished() && counters.published == counters.replayed && callbacks == 1,
             "startup closure omitted accepted metadata");
+    if (counters.registry || counters.orderGap || counters.batch || counters.closedCalls)
+        std::cerr << "startup transport: registry=" << counters.registry << " orderGap=" << counters.orderGap
+                  << " batch=" << counters.batch << " closedCalls=" << counters.closedCalls
+                  << " published=" << counters.published << " replayed=" << counters.replayed << '\n';
     require(counters.registry == 0 && counters.orderGap == 0 && counters.batch == 0 && counters.closedCalls == 0,
             "startup produced unrelated journal transport failures");
     require(!journal->lostState() || !complete, "startup erased pre-arm loss");
