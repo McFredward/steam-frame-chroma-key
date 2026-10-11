@@ -52,6 +52,49 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(before, self.calls)
         self.assertEqual(sum("restart" in command for command in self.calls), 2)
 
+    def test_manual_mode_has_no_timer_and_retains_exact_idempotent_recovery(self):
+        self.session.manual_rollback = True
+        self.session.start(self.sha)
+        self.assertFalse(any(command[0] == "systemd-run" or
+                             MODULE.WATCHDOG + ".service" in command for command in self.calls))
+        self.assertFalse((self.session.folder / "watchdog-ready").exists())
+        self.assertTrue(self.session.manifest.exists())
+        self.assertTrue(self.session.dropin.exists())
+        first = json.loads((self.session.folder / "session.jsonl").read_text().splitlines()[0])
+        self.assertEqual(first["rollback_mode"], "manual")
+        self.assertIsNone(first["limit_seconds"])
+        self.assertNotIn(b"FRAME_MASK_TRACE_OUTPUT", self.session.manifest.read_bytes())
+        self.assertEqual(sum("restart" in command for command in self.calls), 1)
+        self.session.rollback()
+        self.assertFalse(self.session.manifest.exists())
+        self.assertFalse(self.session.dropin.exists())
+        self.assertTrue((self.session.folder / "rollback-complete.json").exists())
+        before = list(self.calls)
+        self.session.rollback()
+        self.assertEqual(before, self.calls)
+        self.assertEqual(sum("restart" in command for command in self.calls), 2)
+
+    def test_manual_start_failure_still_removes_activation_before_native_restart(self):
+        self.session.manual_rollback = True
+        restarts = 0
+        def failing(arguments, **options):
+            nonlocal restarts
+            result = self.run_command(arguments, **options)
+            if "restart" in arguments:
+                restarts += 1
+                if restarts == 1:
+                    raise subprocess.TimeoutExpired(arguments, 45)
+                self.assertFalse(self.session.manifest.exists())
+                self.assertFalse(self.session.dropin.exists())
+            return result
+        self.session.run = failing
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.session.start(self.sha)
+        self.assertFalse(self.session.manifest.exists())
+        self.assertFalse(self.session.dropin.exists())
+        self.assertTrue((self.session.folder / "rollback-complete.json").exists())
+        self.assertFalse(any(command[0] == "systemd-run" for command in self.calls))
+
     def test_preexisting_manifest_and_symlink_preserved(self):
         self.session.manifest.parent.mkdir(parents=True)
         self.session.manifest.write_text("unrelated")

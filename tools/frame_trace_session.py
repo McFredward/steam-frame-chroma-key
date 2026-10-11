@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Temporary, user-only SteamVR trace session with independent timed rollback.
+"""Temporary, user-only SteamVR trace session with recorded exact rollback.
 
 Run only after explicit headset authorization. No system files, sudo, boot
 configuration or persistent service settings are changed.
@@ -29,7 +29,8 @@ def exclusive(path, contents):
 
 
 class Session:
-    def __init__(self, home, runtime, run=subprocess.run, loader_debug=False):
+    def __init__(self, home, runtime, run=subprocess.run, loader_debug=False,
+                 manual_rollback=False):
         self.folder = home / ".local/share/frame-mask-trace"
         self.manifest_dir = home / ".local/share/vulkan/implicit_layer.d"
         self.manifest = self.manifest_dir / "frame_mask_trace.json"
@@ -37,6 +38,7 @@ class Session:
         self.dropin = self.dropin_dir / "90-frame-mask-trace.conf"
         self.run = run
         self.loader_debug = loader_debug
+        self.manual_rollback = manual_rollback
 
     def command(self, *arguments, timeout=45, check=True):
         return self.run(arguments, check=check, timeout=timeout,
@@ -86,26 +88,30 @@ class Session:
         exclusive(self.folder / "session.jsonl", b"")
         self.event("approved_preflight", library_sha256=expected_hash,
                    manifest=str(self.manifest), runtime_dropin=str(self.dropin),
-                   limit_seconds=180, limit_trace_bytes=1048576,
+                   limit_seconds=None if self.manual_rollback else 180,
+                   rollback_mode="manual" if self.manual_rollback else "watchdog",
+                   limit_trace_bytes=1048576,
                    loader_debug=self.loader_debug)
-        # Separate user service, never PartOf=steamvr or in its cgroup.
-        self.command("systemd-run", "--user", "--unit=" + WATCHDOG, "--collect",
-                     "--property=Restart=no", "/usr/bin/python3",
-                     str(self.folder / "frame_trace_session.py"), "watchdog")
-        for _ in range(30):
-            if (self.folder / "watchdog-ready").exists():
-                break
-            time.sleep(0.1)
-        else:
-            raise RuntimeError("Rollback watchdog did not acknowledge readiness; activation refused")
-        self.command("systemctl", "--user", "is-active", WATCHDOG + ".service")
+        if not self.manual_rollback:
+            # Separate user service, never PartOf=steamvr or in its cgroup.
+            self.command("systemd-run", "--user", "--unit=" + WATCHDOG, "--collect",
+                         "--property=Restart=no", "/usr/bin/python3",
+                         str(self.folder / "frame_trace_session.py"), "watchdog")
+            for _ in range(30):
+                if (self.folder / "watchdog-ready").exists():
+                    break
+                time.sleep(0.1)
+            else:
+                raise RuntimeError("Rollback watchdog did not acknowledge readiness; activation refused")
+            self.command("systemctl", "--user", "is-active", WATCHDOG + ".service")
         try:
             descriptor = os.open(self.folder / "rollback.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             with os.fdopen(descriptor, "wb") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 if (self.folder / "rollback-complete.json").exists():
                     raise RuntimeError("Rollback already completed; refusing delayed activation")
-                self.command("systemctl", "--user", "is-active", WATCHDOG + ".service")
+                if not self.manual_rollback:
+                    self.command("systemctl", "--user", "is-active", WATCHDOG + ".service")
                 values = self.contents()
                 # Preserve exact owned file bytes for recovery after crashes.
                 exclusive(self.folder / "armed.json", json.dumps({str(path): content.hex()
@@ -192,7 +198,11 @@ def main():
     parser.add_argument("--sha256")
     parser.add_argument("--loader-debug", action="store_true",
                         help="Record native loader startup decisions; never force-enable a layer")
+    parser.add_argument("--manual-rollback", action="store_true",
+                        help="Start without a timed SteamVR restart; keep explicit rollback and reboot recovery")
     args = parser.parse_args()
+    if args.manual_rollback and args.mode != "start":
+        parser.error("--manual-rollback applies only to start")
     if os.getuid() == 0 or platform.machine() != "aarch64":
         raise RuntimeError("Only an authorized non-root AArch64 headset session is allowed")
     home = Path.home()
@@ -204,7 +214,8 @@ def main():
             or folder.stat().st_mode & 0o777 != 0o700 or runtime.stat().st_uid != os.getuid()):
         raise RuntimeError("Private session/runtime ownership check failed")
     os.umask(0o077)
-    session = Session(home, runtime, loader_debug=args.loader_debug)
+    session = Session(home, runtime, loader_debug=args.loader_debug,
+                      manual_rollback=args.manual_rollback)
     if args.mode == "start":
         for parent in (session.manifest_dir, session.dropin_dir):
             for path in (parent, *parent.parents):
