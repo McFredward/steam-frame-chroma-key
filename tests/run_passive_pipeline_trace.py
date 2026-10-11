@@ -129,6 +129,7 @@ def main():
             records = [json.loads(line) for line in output.read_text().splitlines()]
             assert len(records) <= 2050, "Trace escaped its event cap"
             assert records[0]["event"] == "header"
+            assert records[0]["deadline_seconds"] == (120 if mode.startswith("filtered-") else 30), records[0]
             assert records[-1]["event"] == "footer"
             footer = records[-1]
             assert footer["io_ok"] and not footer["byte_cap_reached"], footer

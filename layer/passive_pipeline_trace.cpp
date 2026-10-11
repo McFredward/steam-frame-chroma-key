@@ -154,17 +154,29 @@ struct Capture {
         // symlink. The trace contains no binary shader payload or private image.
         const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd < 0) { core.enable(false); return; }
+        // Leave time for the independently armed 180-second rollback watchdog
+        // to restore SteamVR after this writer has closed a complete capture.
+        const unsigned deadlineSeconds = fragmentFilter ? 120 : 30;
         char header[1024];
         const auto headerLength = std::snprintf(header, sizeof(header),
             "{\"event\":\"header\",\"version\":1,\"layer\":\"VK_LAYER_FRAME_MASK_trace\","
             "\"scope\":\"passive_pipeline_metadata\",\"hash\":\"fnv1a64_standard\","
             "\"limit_events\":2048,\"limit_bytes\":1048576,\"gpu_completion_proven\":false,"
             "\"descriptor_uv_frame_binding_proven\":false,\"fragment_filter\":\"%016llx\","
-            "\"deadline_seconds\":%u}\n", static_cast<unsigned long long>(fragmentFilter), fragmentFilter ? 180 : 30);
+            "\"deadline_seconds\":%u}\n", static_cast<unsigned long long>(fragmentFilter), deadlineSeconds);
         std::size_t total = static_cast<std::size_t>(headerLength);
         bool ioGood = writeAll(fd, header, total), capped = false;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(fragmentFilter ? 180 : 30);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(deadlineSeconds);
+        bool draining = false;
         for (;;) {
+            // Check even while records arrive continuously. Disabling producers
+            // leaves only the fixed-capacity ring and bounded in-flight records
+            // to drain before the footer; queue traffic cannot defer expiration.
+            if (!draining && (stop.load() || events.finished() ||
+                              std::chrono::steady_clock::now() >= deadline)) {
+                core.enable(false);
+                draining = true;
+            }
             Event event;
             if (events.pop(event)) {
                 char line[8192];
@@ -177,10 +189,7 @@ struct Capture {
                 if (!writeAll(fd, line, bytes)) { ioGood = false; break; }
                 total += bytes;
             } else {
-                if (stop.load() || events.finished() || std::chrono::steady_clock::now() >= deadline) {
-                    core.enable(false);
-                    if (events.empty()) break;
-                }
+                if (draining && events.empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
