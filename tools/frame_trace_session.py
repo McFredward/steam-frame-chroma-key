@@ -29,13 +29,14 @@ def exclusive(path, contents):
 
 
 class Session:
-    def __init__(self, home, runtime, run=subprocess.run):
+    def __init__(self, home, runtime, run=subprocess.run, loader_debug=False):
         self.folder = home / ".local/share/frame-mask-trace"
         self.manifest_dir = home / ".local/share/vulkan/implicit_layer.d"
         self.manifest = self.manifest_dir / "frame_mask_trace.json"
         self.dropin_dir = runtime / "systemd/user/steamvr.service.d"
         self.dropin = self.dropin_dir / "90-frame-mask-trace.conf"
         self.run = run
+        self.loader_debug = loader_debug
 
     def command(self, *arguments, timeout=45, check=True):
         return self.run(arguments, check=check, timeout=timeout,
@@ -58,6 +59,9 @@ class Session:
         dropin = ("[Service]\nEnvironment=FRAME_MASK_TRACE=1\n"
                   f"Environment=FRAME_MASK_TRACE_FRAGMENT_HASH={FRAGMENT}\n"
                   f'Environment="FRAME_MASK_TRACE_OUTPUT={self.folder}/capture.jsonl"\n')
+        if self.loader_debug:
+            # Startup decisions only; no forced layer enable or call/API trace.
+            dropin += "Environment=VK_LOADER_DEBUG=error,warn,layer\n"
         return {self.manifest: manifest.encode(), self.dropin: dropin.encode()}
 
     def recovery_event(self, name, **fields):
@@ -82,7 +86,8 @@ class Session:
         exclusive(self.folder / "session.jsonl", b"")
         self.event("approved_preflight", library_sha256=expected_hash,
                    manifest=str(self.manifest), runtime_dropin=str(self.dropin),
-                   limit_seconds=180, limit_trace_bytes=1048576)
+                   limit_seconds=180, limit_trace_bytes=1048576,
+                   loader_debug=self.loader_debug)
         # Separate user service, never PartOf=steamvr or in its cgroup.
         self.command("systemd-run", "--user", "--unit=" + WATCHDOG, "--collect",
                      "--property=Restart=no", "/usr/bin/python3",
@@ -114,7 +119,10 @@ class Session:
                 self.event("restart_requested", phase="capture")
                 self.command("systemctl", "--user", "restart", UNIT)
                 self.command("systemctl", "--user", "is-active", UNIT)
-                self.event("capture_runtime_active")
+                # The native unit tracks vrcmd. This is not proof that the
+                # compositor loaded our layer or rendered a submitted draw.
+                self.event("capture_runtime_active", launcher_only=True,
+                           capture_accepted=False)
         except BaseException:
             self.rollback()
             raise
@@ -182,6 +190,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("start", "watchdog", "rollback"))
     parser.add_argument("--sha256")
+    parser.add_argument("--loader-debug", action="store_true",
+                        help="Record native loader startup decisions; never force-enable a layer")
     args = parser.parse_args()
     if os.getuid() == 0 or platform.machine() != "aarch64":
         raise RuntimeError("Only an authorized non-root AArch64 headset session is allowed")
@@ -194,7 +204,7 @@ def main():
             or folder.stat().st_mode & 0o777 != 0o700 or runtime.stat().st_uid != os.getuid()):
         raise RuntimeError("Private session/runtime ownership check failed")
     os.umask(0o077)
-    session = Session(home, runtime)
+    session = Session(home, runtime, loader_debug=args.loader_debug)
     if args.mode == "start":
         for parent in (session.manifest_dir, session.dropin_dir):
             for path in (parent, *parent.parents):

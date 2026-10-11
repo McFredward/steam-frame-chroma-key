@@ -153,6 +153,18 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(self.session.dropin.exists())
         self.assertEqual(sum("restart" in command for command in self.calls), 2)
 
+    def test_default_never_changes_native_loader_logging(self):
+        self.assertNotIn(b"VK_LOADER_DEBUG", self.session.contents()[self.session.dropin])
+
+    def test_opt_in_loader_debug_uses_same_exact_rollback(self):
+        self.session.loader_debug = True
+        self.session.start(self.sha)
+        self.assertIn(b"Environment=VK_LOADER_DEBUG=error,warn,layer\n", self.session.dropin.read_bytes())
+        self.assertNotIn(b"VK_LOADER_LAYERS_ENABLE", self.session.dropin.read_bytes())
+        self.session.rollback()
+        self.assertFalse(self.session.dropin.exists())
+        self.assertFalse(self.session.manifest.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -123,3 +123,27 @@ including implicit-loader/GPU validation and the ten-case recovery suite,
 Windows cross-build and protocol sanitizers. Completed local build/test outputs
 were removed; only small private evidence and the still-reviewed staged library
 were retained. The SSH credential environment was cleared when the session ended.
+
+## Prepared next capture
+
+The bounded helper now has an opt-in `start --loader-debug` variant. This adds
+only `VK_LOADER_DEBUG=error,warn,layer` to the same temporary user-service
+drop-in. It does not force-enable a layer, disable another layer or replace the
+loader. It has not been installed/run on the Frame. Twelve focused recovery
+checks pass, including default logging preservation and exact removal of the
+debug variant. The native trace library is unchanged, so its previous compiled
+and GPU evidence remains applicable without rebuilding it.
+
+The next run must collect the real startup journal, bounded to at most 1 MiB
+and 2,048 copied lines, together with actual compositor PID/executable, loader
+mapping and trace header. This bounds the evidence copy; it is not a promise
+that the native SteamVR journal producer itself obeys our trace file cap.
+No full function-call loader tracing is enabled. Abort and restore on a warning,
+missing capture or missing compositor mapping instead of retrying indefinitely.
+`systemctl is-active` measures the launcher (`vrcmd`) only; it must never be
+accepted as compositor readiness or a successful pipeline capture.
+
+The [startup review](FRAME-TRACE-STARTUP-REVIEW.md) records why a blind repeat,
+privilege change or forced layer enable is unjustified. All new writes/restarts
+still use the approved temporary scope and require the maintainer to be ready
+for the stream interruption.
