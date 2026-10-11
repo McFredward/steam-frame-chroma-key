@@ -7,7 +7,10 @@ descriptor, copies an image, reads mapped GPU memory or enables passthrough.
 
 The maintainer authorized temporary sessions on 2026-10-11. Initial loading
 failed because the manifest version had the wrong JSON type. Corrected attempts
-loaded the diagnostic, but no capture has yet met the healthy-footer rule.
+loaded the diagnostic. The fifth attempt supplies 39 complete recorded/submitted
+pairings with a healthy footer; later state-capacity reports make its remaining
+records incomplete. Neither the footer nor these positive pairs establish an
+exhaustive capture or working masks.
 The exact procedure, changed paths and verified rollback are recorded
 in [the session ledger summary](FRAME-TRACE-SESSION.md). Headset access otherwise
 remains read-only, apart from the previously authorized SSH-service setup.
@@ -96,6 +99,14 @@ leaves the evidence incomplete. A later event's `complete: true` does not repair
 an earlier missing draw or secondary-buffer link. This diagnostic observes the
 six standard direct/indexed/indirect draw calls in its source; other draw families
 are not certified by absence of records.
+
+A healthy footer is necessary, not sufficient. Each certified draw needs its
+own complete stage/pipeline/module generations and a complete accepted-submit
+record with the same device, command and command generation, or a fully observed
+secondary-command execution chain leading to one. State-capacity reports can
+taint later events without incrementing the footer's contention counter. Accept
+an explicit complete positive pairing before such a gap only within that scope;
+never describe later incomplete pairs or the entire capture as established.
 
 ## Local build and focused validation
 

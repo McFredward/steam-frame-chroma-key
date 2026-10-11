@@ -6,6 +6,14 @@ mask activation remains blocked. Private process/journal evidence is retained
 outside Git under `build/private-frame-trace-20261011` and
 `build/private-frame-startup-20261011` in the integration checkout.
 
+This report preserves the initial failed startup and its targeted repeat.
+Subsequent corrected sessions and the fifth attempt's 39 complete positive
+pipeline pairings are recorded in [the current session record](FRAME-TRACE-SESSION.md).
+The maintainer explicitly removed timed rollback for that fifth attempt;
+the earlier mandatory-watchdog procedure below is historical, not an instruction
+to override that later authorization. Manual rollback and verified native
+restoration were retained.
+
 ## What the evidence establishes
 
 - The capture restart at 12:36:28 CEST created compositor PID 222054. Its initial

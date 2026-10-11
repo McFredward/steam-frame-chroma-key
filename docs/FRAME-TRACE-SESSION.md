@@ -249,9 +249,71 @@ exact deployed implicit manifest, healthy footer and unchanged fixture pixels.
 These are focused checks, not a repeated complete foundation gate or a headset
 outcome.
 
-The new library and helper have been staged in the private headset directory.
+Before the fifth attempt, the new library and helper were staged in the private
+headset directory.
 The dependency/discovery-only native probe reports complete matching manifest
 properties and successful `RTLD_NOW` loading. It creates no Vulkan instance or
 device and cannot prove the compositor instance chain. Both activation files
-remain absent, SteamVR remains native and no timer is active. The maintainer
-asked to wait before activation; no further restart or capture has been started.
+were absent, SteamVR remained native and no timer was active. The maintainer
+asked to wait; activation began only after the subsequent explicit start signal.
+
+## Fifth attempt: bounded positive pipeline evidence
+
+At 13:42:46 CEST the helper recorded the approved manual-mode preflight with
+`rollback_mode: manual`, no rollback deadline and loader-debug disabled. It
+requested the initial restart at 13:42:47; the launcher became active at
+13:42:53. Compositor PID 359674 actually mapped the reviewed library and wrote
+the expected header. The operator signalled readiness for the PC VR stream.
+At 13:45:00 a read-only process snapshot found the native `vrlink` executable
+(PID 364298, comm `vrlinkrunthread`) beside the same compositor. Process argv
+was not collected because it can contain streaming credentials.
+
+The 120-second recording closed without a restart. Its 792,956-byte file has
+one header, 1,670 consecutively numbered events and one intact footer. The
+footer reports `dropped_events: 0`, `lost_state: 0`, no byte-cap hit and
+successful I/O. SHA-256:
+`269c03b54bb40cfbfd787fa46ddc11a933e9d4cd44a16e02b360cba626c68666`.
+
+Root and an independent read-only reviewer verified **39 complete direct
+draw/accepted-submit generation pairs** on device 1. Each has matching complete
+command, pipeline and shader records; pipeline generations 19399 and 19422
+account for 20 and 19 pairs respectively. All have these exact stages:
+
+| Stage | Bytes | Standard FNV-1a 64 | Entry |
+| --- | ---: | --- | --- |
+| Vertex | 9,460 | `9cc04d186b9c8fe5` | `VS_DISTORT` |
+| Fragment | 6,620 | `f333a137b4e79ced` | `PS_DISTORT` |
+
+This is the first accepted **positive recorded/submitted pairing**. It is not
+an exhaustive or wholly complete capture. Event 478 reports state capacity;
+26 such reports taint later observations. Of 616 draw records and 616 accepted
+submission records, 577 draws cannot be certified as complete pairs. The event
+sequence strongly suggests exhaustion of the 256-entry shader table: pipeline
+479 references an untracked fragment immediately after the first capacity
+report. The shared reason code does not identify the table, so this attribution
+remains inferred. A clean footer does not override `complete: false` events.
+
+The capture establishes neither GPU completion, resource/descriptor binding,
+UV/eye coherence nor a particular streamed video's source identity. It has no
+per-event timestamp or video-frame key. Observing the stream process in the
+same session is context, not a draw-to-video-frame association. The installed
+shader fingerprints and the explicit matching records establish only the
+narrow positive pairing above. Time-ended writer closure in this binary also
+does not synchronize all in-flight producers; no absence or exhaustive-window
+claim is made from its footer.
+
+There was no timed rollback service. SteamVR continued after recording ended.
+After announcing manual restoration, the operator invoked rollback at 13:46:28.
+Both activation files were removed at 13:46:28, native restart was requested at
+13:46:29 and completed at 13:46:34. The new native compositor PID 368833 had
+neither diagnostic mappings nor diagnostic environment variables. The service
+was active, the watchdog inactive and both activation paths absent. The private
+headset directory was removed by 13:47:45. No persistent configuration, native
+binary, shader or camera setting was changed.
+
+The tiny ledgers, capture and selected validation remain private and ignored in
+`build/private-frame-manual-run-20261011/`. The SSH credential environment was
+cleared and the terminal closed. Local software checkpoint `9e3fa41` also
+passed the complete eleven-suite CI; that software result is separate from the
+limited live evidence above. Subsequent closure/fixture repairs need only their
+focused core and loader/GPU checks; they cannot retroactively broaden this run.

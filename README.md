@@ -23,8 +23,9 @@ The supplied PC driver now has a concrete
 [encoder/transmitter dataflow](docs/PC-DRIVER-20261011.md), and the native shader
 inspection identifies a [conditional full-eye UV route](docs/FRAME-UV-BINDING-20261011.md).
 A separate [bounded passive pipeline diagnostic](docs/PASSIVE-PIPELINE-TRACE.md)
-can verify the actual stage tuple. It changes no rendered pixels and remains
-opt-in; it does not establish the remaining mask/video association or enable
+has verified 39 complete recorded/submitted stage pairings on the inspected Frame
+build. It changes no rendered pixels and remains opt-in; it does not establish
+the remaining descriptor/UV/mask/video association or enable
 genuine-mask passthrough.
 
 The original upstream chroma-key implementation and instructions below remain

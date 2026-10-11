@@ -8,10 +8,12 @@ an eye rectangle, and the inspected fragment's `%883` reverses that rectangle
 mapping. Native distortion and reprojection can therefore remain untouched.
 
 This is a conditional, static dataflow result, **not a live binding proof**.
-The active graphics-pipeline stages, vertex/fragment uniform coherence and source
-frame/eye association have not been captured. Genuine-mask activation remains
-blocked. Inspection used privately supplied files only; no headset process was
-attached, installed, reconfigured or modified.
+A subsequent [authorized passive session](FRAME-TRACE-SESSION.md#fifth-attempt-bounded-positive-pipeline-evidence)
+established 39 complete recorded/submitted pairings of the layered vertex and
+inspected fragment. Vertex/fragment uniform coherence and source frame/eye
+association remain unobserved. Genuine-mask activation stays blocked. This
+static inspection used privately supplied files only; the separately authorized
+passive deployment and its verified removal are documented in that session.
 
 The OS/compositor identity is recorded in
 [the installed shader report](FRAME-SHADER-20261011.md). This document contains
