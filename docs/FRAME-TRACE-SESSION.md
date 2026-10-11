@@ -540,3 +540,30 @@ mask activation or change to native rendering occurred. The next source work
 must address nonblocking metadata tracking and explicit bounded extension
 interpretation, rather than repeating the same lossy capture and hoping for
 different timing.
+
+### Verified manual recovery and cleanup
+
+After the maintainer approved manual rollback, the helper removed both exact
+activation files at 16:38:33 CEST, requested the native SteamVR restart at
+16:38:34 and recorded completion at 16:38:40. Read-only verification found
+SteamVR active with compositor PID 543270, no diagnostic library mapped, no
+diagnostic environment variables and no active rollback watchdog. The capture
+and complete recovery ledger were retained privately on the development machine.
+
+SSH became unavailable when the maintainer put the headset into standby; this
+did not undo or interrupt the completed native recovery. After the maintainer
+woke it, native state was verified again. At 16:46:43, the exact owned current
+and rejected-session directories were removed after verifying their inventories,
+library hashes, closed-writer locks and copied-evidence hashes. A final check
+confirmed both directories, the staged directory and both activation files were
+absent while SteamVR remained active. Cleanup did not restart SteamVR. The
+maintainer was told that standby was safe and no more headset access was needed.
+
+The private cleanup and recovery validation are retained beside the capture in
+`build/private-frame-armed-resource-run-20261011/`. No active or residual
+diagnostic installation remains on the headset. The next implementation is
+described in [the passive binding loss audit](PASSIVE-BINDING-LOSS-AUDIT.md):
+replace lossy hook-time bookkeeping with bounded ordered metadata replay and
+interpret explicitly supported import/sampler extension metadata. These are
+source work to complete before another resource capture; no native passthrough
+or resource/frame/UV proof is claimed by this diagnostic result.
