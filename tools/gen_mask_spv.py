@@ -6,6 +6,9 @@ with opaque sampler borders, at the selected combined-image-sampler binding.
 This tool neither changes Vulkan pipeline layouts nor associates video frames.
 The meaning of the native %883 source coordinates must be checked against the
 actual SteamVR shader before enabling a replacement on a headset.
+On the privately inspected 2026-10-11 build, %883 is rectangle-normalized edge
+coverage, not either packed/foveated color sample coordinate. Using it for an
+unpacked full-eye mask remains an unproven adapter assumption.
 
 Only the final opaque store is replaced. Native color conversion, source
 reprojection, tinting and distortion remain unchanged. There is no color key,
@@ -163,15 +166,34 @@ def patch_assembly(assembly, descriptor_set=0, binding=31, rgb_convention="strai
         "OpDecorate %smask_texture DescriptorSet {}".format(descriptor_set),
         "OpDecorate %smask_texture Binding {}".format(binding),
     ]
-    declarations = [
-        "%smask_image_type = OpTypeImage %float 2D 0 0 0 1 Unknown",
-        "%smask_sampled_type = OpTypeSampledImage %smask_image_type",
-        "%smask_pointer_type = OpTypePointer UniformConstant %smask_sampled_type",
-        "%smask_texture = OpVariable %smask_pointer_type UniformConstant",
+    declarations = []
+
+    def reusable_type(expected, fallback, reject_other_images=False):
+        matches = [ident for ident, (_, instruction) in definitions.items()
+                   if instruction == expected]
+        _require(len(matches) <= 1, "ambiguous native " + expected[0] + " declarations")
+        if matches:
+            return matches[0]
+        if reject_other_images:
+            _require(not any(instruction[0] == "OpTypeImage"
+                             for _, instruction in definitions.values()),
+                     "native image declarations are incompatible with the required sampled float 2D type")
+        declarations.append(fallback + " = " + " ".join(expected))
+        return fallback
+
+    # SPIR-V forbids duplicate non-aggregate types. Native video shaders already
+    # have these image/sample types even when their descriptors use separate
+    # images and samplers. Reuse exact types; never guess at a compatible shape.
+    image_type = reusable_type(["OpTypeImage", "%float", "2D", "0", "0", "0", "1", "Unknown"],
+                               "%smask_image_type", reject_other_images=True)
+    sampled_type = reusable_type(["OpTypeSampledImage", image_type], "%smask_sampled_type")
+    pointer_type = reusable_type(["OpTypePointer", "UniformConstant", sampled_type], "%smask_pointer_type")
+    declarations += [
+        "%smask_texture = OpVariable {} UniformConstant".format(pointer_type),
         "%smask_lod_zero = OpConstant %float 0",
     ]
     code = [
-        "%smask_sampler = OpLoad %smask_sampled_type %smask_texture",
+        "%smask_sampler = OpLoad {} %smask_texture".format(sampled_type),
         "%smask_sample = OpImageSampleExplicitLod %v4float %smask_sampler %883 Lod %smask_lod_zero",
         "%smask_alpha = OpCompositeExtract %float %smask_sample 0",
     ]
@@ -183,11 +205,7 @@ def patch_assembly(assembly, descriptor_set=0, binding=31, rgb_convention="strai
             "%smask_b = OpCompositeExtract %float %smask_rgb 2",
         ]
     else:
-        existing_bool = next((ident for ident, (_, instruction) in definitions.items()
-                              if instruction == ["OpTypeBool"]), None)
-        bool_type = existing_bool or "%smask_bool_type"
-        if existing_bool is None:
-            declarations.append("%smask_bool_type = OpTypeBool")
+        bool_type = reusable_type(["OpTypeBool"], "%smask_bool_type")
         code += [
             "%smask_visible = OpFOrdGreaterThan {} %smask_alpha %smask_lod_zero".format(bool_type),
             "%smask_native_r = OpCompositeExtract %float %911 0",

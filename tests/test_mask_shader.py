@@ -18,6 +18,7 @@ SPEC = importlib.util.spec_from_file_location("gen_mask_spv", ROOT / "tools/gen_
 PATCHER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PATCHER)
 FIXTURE = ROOT / "tests/fixtures/mask_scene.spvasm"
+SEPARATE_SAMPLER_FIXTURE = ROOT / "tests/fixtures/mask_scene_separate_sampler.spvasm"
 
 
 def evaluate_mask_store(assembly, color, alpha):
@@ -217,6 +218,50 @@ class MaskLayoutTests(unittest.TestCase):
                 with self.assertRaisesRegex(PATCHER.ShaderLayoutError, "unsigned 32-bit"):
                     PATCHER.patch_assembly(self.original, 0, value)
 
+    def test_separate_native_sampler_types_are_reused_exactly(self):
+        source = SEPARATE_SAMPLER_FIXTURE.read_text(encoding="utf-8")
+        for convention in ("straight", "premultiplied"):
+            with self.subTest(convention=convention):
+                result = PATCHER.patch_assembly(source, rgb_convention=convention)
+                self.assertEqual(result.count(" = OpTypeImage "), 1)
+                self.assertEqual(result.count(" = OpTypeSampledImage "), 1)
+                self.assertEqual(result.count(" = OpTypePointer UniformConstant %native_combined_type"), 1)
+                self.assertIn("%smask_texture = OpVariable %native_pointer_combined UniformConstant", result)
+                self.assertIn("%smask_sampler = OpLoad %native_combined_type %smask_texture", result)
+
+    def test_separate_native_sampler_without_combined_pointer_gets_one(self):
+        source = SEPARATE_SAMPLER_FIXTURE.read_text(encoding="utf-8").replace(
+            "%native_pointer_combined = OpTypePointer UniformConstant %native_combined_type\n", "")
+        result = PATCHER.patch_assembly(source)
+        self.assertEqual(result.count(" = OpTypeImage "), 1)
+        self.assertEqual(result.count(" = OpTypeSampledImage "), 1)
+        self.assertIn("%smask_pointer_type = OpTypePointer UniformConstant %native_combined_type", result)
+
+    def test_incompatible_existing_image_type_rejected(self):
+        source = SEPARATE_SAMPLER_FIXTURE.read_text(encoding="utf-8").replace(
+            "%native_image_type = OpTypeImage %float 2D 0 0 0 1 Unknown",
+            "%native_image_type = OpTypeImage %float Cube 0 0 0 1 Unknown")
+        source = source.replace("%scene_sample = OpImageSampleImplicitLod %v4float %scene_combined %883\n", "")
+        self.rejected(source, "image declarations are incompatible")
+
+    def test_ambiguous_native_image_type_rejected(self):
+        source = SEPARATE_SAMPLER_FIXTURE.read_text(encoding="utf-8").replace(
+            "%4 = OpFunction %void None %3",
+            "%duplicate_image = OpTypeImage %float 2D 0 0 0 1 Unknown\n%4 = OpFunction %void None %3")
+        self.rejected(source, "ambiguous native OpTypeImage")
+
+    def test_ambiguous_native_combined_type_rejected(self):
+        source = SEPARATE_SAMPLER_FIXTURE.read_text(encoding="utf-8").replace(
+            "%4 = OpFunction %void None %3",
+            "%duplicate_combined = OpTypeSampledImage %native_image_type\n%4 = OpFunction %void None %3")
+        self.rejected(source, "ambiguous native OpTypeSampledImage")
+
+    def test_ambiguous_native_combined_pointer_type_rejected(self):
+        source = SEPARATE_SAMPLER_FIXTURE.read_text(encoding="utf-8").replace(
+            "%4 = OpFunction %void None %3",
+            "%duplicate_pointer = OpTypePointer UniformConstant %native_combined_type\n%4 = OpFunction %void None %3")
+        self.rejected(source, "ambiguous native OpTypePointer")
+
     def test_semicolon_in_debug_string_is_not_comment(self):
         source = self.original.replace("OpDecorate %source_uv Location 0", 'OpName %source_uv "uv;native"\nOpDecorate %source_uv Location 0')
         self.assertIn('"uv;native"', PATCHER.patch_assembly(source))
@@ -262,6 +307,39 @@ class MaskBinaryTests(unittest.TestCase):
             PATCHER.write_shader(source, binary, rgb_convention="premultiplied")
             result = subprocess.run(["spirv-dis", str(binary)], check=True, capture_output=True, text=True)
             self.assertEqual(result.stdout.count("OpTypeBool"), 1)
+
+    def test_separate_sampler_fixture_and_both_mask_modes_validate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_binary = Path(directory) / "native-separate.spv"
+            subprocess.run(["spirv-as", "--target-env", "vulkan1.1", str(SEPARATE_SAMPLER_FIXTURE),
+                            "-o", str(original_binary)], check=True, capture_output=True)
+            subprocess.run(["spirv-val", "--target-env", "vulkan1.1", str(original_binary)],
+                           check=True, capture_output=True)
+            for convention in ("straight", "premultiplied"):
+                with self.subTest(convention=convention):
+                    binary = Path(directory) / (convention + ".spv")
+                    PATCHER.write_shader(SEPARATE_SAMPLER_FIXTURE, binary, rgb_convention=convention)
+                    result = subprocess.run(["spirv-dis", str(binary)], check=True, capture_output=True, text=True)
+                    self.assertEqual(result.stdout.count(" = OpTypeImage "), 1)
+                    self.assertEqual(result.stdout.count(" = OpTypeSampledImage "), 1)
+
+    def test_incompatible_native_type_failure_preserves_known_good_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "native-incompatible.spvasm"
+            source.write_text(SEPARATE_SAMPLER_FIXTURE.read_text().replace(
+                "%native_image_type = OpTypeImage %float 2D 0 0 0 1 Unknown",
+                "%native_image_type = OpTypeImage %float Cube 0 0 0 1 Unknown").replace(
+                    "%scene_sample = OpImageSampleImplicitLod %v4float %scene_combined %883\n", ""))
+            unmodified_binary = Path(directory) / "valid-native-cube.spv"
+            subprocess.run(["spirv-as", "--target-env", "vulkan1.1", str(source),
+                            "-o", str(unmodified_binary)], check=True, capture_output=True)
+            subprocess.run(["spirv-val", "--target-env", "vulkan1.1", str(unmodified_binary)],
+                           check=True, capture_output=True)
+            binary = Path(directory) / "keep.spv"
+            binary.write_bytes(b"previous known-good shader")
+            with self.assertRaisesRegex(PATCHER.ShaderLayoutError, "image declarations are incompatible"):
+                PATCHER.write_shader(source, binary)
+            self.assertEqual(binary.read_bytes(), b"previous known-good shader")
 
     def test_cli_default_straight_and_premultiplied_choices(self):
         with tempfile.TemporaryDirectory() as directory:

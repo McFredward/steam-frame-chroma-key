@@ -1,0 +1,50 @@
+; Original synthetic regression fixture. No Valve shader code or disassembly.
+; Models native separate image/sampler resources without their scene algorithm.
+OpCapability Shader
+%1 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %4 "main" %source_uv %source_rgb %504
+OpExecutionMode %4 OriginUpperLeft
+OpDecorate %source_uv Location 0
+OpDecorate %source_rgb Location 1
+OpDecorate %504 Location 0
+OpDecorate %scene_image DescriptorSet 0
+OpDecorate %scene_image Binding 9
+OpDecorate %scene_sampler DescriptorSet 0
+OpDecorate %scene_sampler Binding 25
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%v3float = OpTypeVector %float 3
+%v4float = OpTypeVector %float 4
+%pointer_uv = OpTypePointer Input %v2float
+%pointer_rgb = OpTypePointer Input %v3float
+%pointer_output = OpTypePointer Output %v4float
+%native_image_type = OpTypeImage %float 2D 0 0 0 1 Unknown
+%native_sampler_type = OpTypeSampler
+%native_combined_type = OpTypeSampledImage %native_image_type
+%native_pointer_image = OpTypePointer UniformConstant %native_image_type
+%native_pointer_sampler = OpTypePointer UniformConstant %native_sampler_type
+%native_pointer_combined = OpTypePointer UniformConstant %native_combined_type
+%scene_image = OpVariable %native_pointer_image UniformConstant
+%scene_sampler = OpVariable %native_pointer_sampler UniformConstant
+%source_uv = OpVariable %pointer_uv Input
+%source_rgb = OpVariable %pointer_rgb Input
+%504 = OpVariable %pointer_output Output
+%opaque_alpha = OpConstant %float 1
+%4 = OpFunction %void None %3
+%entry = OpLabel
+%883 = OpLoad %v2float %source_uv
+%911 = OpLoad %v3float %source_rgb
+%scene_loaded_image = OpLoad %native_image_type %scene_image
+%scene_loaded_sampler = OpLoad %native_sampler_type %scene_sampler
+%scene_combined = OpSampledImage %native_combined_type %scene_loaded_image %scene_loaded_sampler
+%scene_sample = OpImageSampleImplicitLod %v4float %scene_combined %883
+%native_r = OpCompositeExtract %float %911 0
+%native_g = OpCompositeExtract %float %911 1
+%native_b = OpCompositeExtract %float %911 2
+%994 = OpCompositeConstruct %v4float %native_r %native_g %native_b %opaque_alpha
+OpStore %504 %994
+OpReturn
+OpFunctionEnd
