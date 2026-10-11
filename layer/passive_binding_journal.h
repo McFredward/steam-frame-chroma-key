@@ -123,6 +123,16 @@ public:
                 if (!aborted_ && closed_.load(std::memory_order_acquire) &&
                     !active_.load(std::memory_order_acquire) &&
                     expected_ != tickets_.load(std::memory_order_acquire)) {
+                    // The earlier scan may precede the final publication and
+                    // close. Recheck after acquiring producer quiescence before
+                    // declaring a missing ticket; cached empty boundaries are
+                    // refreshed by head() on this authoritative second scan.
+                    bool precedingPublished = false;
+                    for (auto& lane : lanes_) {
+                        const auto* candidate = head(lane);
+                        if (candidate && candidate->ticket == expected_) { precedingPublished = true; break; }
+                    }
+                    if (precedingPublished) continue;
                     lose(Reason::Unknown, Transport::OrderGap); aborted_ = true; continue;
                 }
                 break;
