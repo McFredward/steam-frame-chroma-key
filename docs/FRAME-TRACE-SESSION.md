@@ -450,7 +450,7 @@ unarmed fixture must remain empty of those records. Every rendered pixel is
 still checked. Focused validation and the replacement artifact are recorded
 below once complete; a local pass cannot repair this rejected hardware run.
 
-### Reviewed repair artifact, awaiting operator readiness
+### Reviewed repair artifact and authorized live deployment
 
 The replacement AArch64 library is 154,088 bytes, SHA-256
 `e0f976e4f42ab0fbf03383dc97e928401a8760bce7a1a8277d6ced3255653473`.
@@ -480,3 +480,63 @@ If a rotation cannot be verified, stop and use the documented native recovery;
 do not delete unknown files or bypass loader policy. No automatic restart at
 capture expiry is reinstated. The rejected archive/staged files have no loader
 manifest of their own and must be removed after retained evidence and recovery.
+
+### Armed resource capture result
+
+The maintainer confirmed restart readiness. At 16:28:07 CEST the exact old
+activation files were verified and removed, its private directory was renamed
+to the rejected-run archive, and the staged replacement directory was renamed
+into place. The mapped old library inode was never overwritten or truncated.
+At 16:28:15 the replacement helper activated the reviewed 154,088-byte hash
+above and requested one SteamVR restart. The service was active at 16:28:22;
+read-only verification found compositor PID 522854 with the diagnostic mapped,
+the expected five service-local diagnostic variables and no active watchdog.
+The passive loader probe had separately loaded the same hash and matched the
+entire serialized manifest without creating an instance/device.
+
+The maintainer then confirmed the PC-VR game was visible. Read-only inspection
+also found `vrlinkrunthread` PID 525191 running the actual native `vrlink`
+executable. The helper requested arming at 16:29:42; the writer emitted one
+`bindings_armed` event, followed by all **32 resource snapshots**. The earlier
+control-budget defect is validated as repaired in this live run: before arming,
+only shader/pipeline inventory consumed capture space. No automatic restart
+occurred when recording closed.
+
+The 1,046,498-byte capture closed at its byte bound and retained 210 shaders,
+108 pipelines, 772 recorded draws, 32 resources and 772 accepted submissions.
+The footer reports zero event drops and zero pipeline-state losses. Two trailing
+emitted records do not appear in the bounded file once its byte cap is reached;
+the cap is explicit, so this is not a complete event transcript. All 32 resource
+records and the arm event are retained. Evidence, byte-cap semantics and derived
+validation are private in `build/private-frame-armed-resource-run-20261011/`.
+
+**Complete resource/UV/frame proof is still rejected.** The footer reports six
+binding-state losses: five try-lock contention losses and one unknown-state
+operation, with zero capacity/unsupported-command/stale/bounds losses. The exact
+API operations that lost state were not recorded by this version. Every populated
+snapshot is marked incomplete by the historical loss guard; its reason 2 does
+not mean its own snapshot lock failed. No loss is cleared or treated as harmless.
+The imported image/view and sampler are also locally incomplete: the observer
+does not interpret their extension chains. A zero `unsupported` loss counter
+does not certify supported `pNext` chains; those object-level rejections use
+their completeness flags rather than that global counter.
+
+The following scalar observations are retained for the next diagnostic design,
+not certified GPU-consumed values or an activation decision:
+
+| Set 0 binding | Observed scalar data | Limit |
+| --- | --- | --- |
+| 0 and 4 | Same 524,288-byte buffer, alternating effective offsets 320/960 and range 272. | Two slices are visible; physical-eye identity and contents remain unread. |
+| 2 and 6 | Same 2,800-byte buffer, effective offset 0/range 2,800. | Shader interpretation cannot substitute for live coherent values. |
+| 3 | 400-byte buffers, effective offset 0/range 400. | No constant contents were read. |
+| 9 | 30 snapshots retain a 1,152 × 4,608 × 1 image in `VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16`, with DRM modifier tiling. | Two snapshots lack image metadata; extension interpretation and resource/frame bridge remain incomplete. |
+| 25 | A separate sampler is observed, including a custom border-color enum. | Its actual extension-chain parameters are not captured. |
+| 31 | Target entries say absent for the observed layout. | Global `layout_has_binding31` remains unknown after loss; adding a mask binding is not authorized. |
+
+The sampled native shader tuple again matches the earlier verified layered VS
+and achromatic fragment shader. Neither that tuple nor allocation identity
+proves selected content generation. No memory/image readback, shader mutation,
+mask activation or change to native rendering occurred. The next source work
+must address nonblocking metadata tracking and explicit bounded extension
+interpretation, rather than repeating the same lossy capture and hoping for
+different timing.
