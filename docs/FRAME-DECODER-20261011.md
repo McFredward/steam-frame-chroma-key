@@ -9,10 +9,12 @@ working bridge. Neither the PC encoder frame identity nor the private compositor
 resource ABI has been verified. Do not enable mask composition from these
 findings alone.
 
-This was local, read-only static analysis. No stream was active during this
-investigation, no process was attached, and no runtime or headset test was
-performed. Addresses below are ELF virtual addresses for the one identified
-build, not portable hook locations. The repository contains no proprietary
+The initial static inspection preceded the
+[read-only live stream inspection](FRAME-LIVE-20261011.md). No process was
+attached, and no mask runtime or passthrough headset test was performed.
+Follow-up static analysis corrected the timestamp origin below. Addresses are
+ELF virtual addresses for the one identified build, not portable hook locations.
+The repository contains no proprietary
 binary, instruction listing, extracted shader source, or private runtime data.
 
 ## Inspected build
@@ -36,13 +38,19 @@ symbols are stripped, so these are not recovered Valve API names.
 
 ### Decoder input and capture retain an association token
 
-The decoder input function at `0x31118` searches a pointer table for a matching
-input pointer. The resulting table index is written to
-`v4l2_buffer.timestamp.tv_sec` before its buffer-queue ioctl at `0x31260`.
-The instruction dataflow establishes this table-index origin. The table's
-logical meaning is not established: interpreting it as a decoder buffer slot
-is a hypothesis, and it could represent a frame sequence mapped into a pool.
-The value is not a wall-clock reading or a proven PC video-frame identifier.
+**Correction:** the first report confused the input-buffer index with a separate
+frame token. The decoder input function at `0x31118` preserves its fourth
+argument, copies it to the timestamp source at `0x31200`, and writes that value
+to `v4l2_buffer.timestamp.tv_sec` at `0x3124c` before its queue ioctl at `0x31260`.
+Its pointer-table lookup supplies the separate `QBUF.index` field. The timestamp
+does **not** originate in that buffer-table index.
+
+Further dataflow traces this token to a received 16-bit packet sequence, through
+completed-frame bookkeeping and decoder submission. The metadata lookup uses
+a small indexed table but also checks the complete native sequence key. This
+is an explicit receiver-side association, not a guessed equality of arbitrary
+counters. See [the corrected dataflow report](FRAME-ASSOCIATION-DATAFLOW.md).
+It does not prove that the sequence equals the PC's public `PresentInfo_t.nFrameId`.
 
 The capture/media function at `0x31cd0` dequeues into a `v4l2_buffer`. It reads
 the returned timestamp field at `0x31ec4`, retains its low 32 bits, and calls
@@ -53,13 +61,14 @@ not establish the protocol meaning of its value.
 
 The standard V4L2 stateful decoder interface preserves the input timestamp on
 the matching output, including reordered decode results. That makes this a
-potential exact local association mechanism, rather than approximate timestamp
-matching. It does not prove how Steam Link associates that token with PC frame
-metadata. [Linux V4L2 decoder documentation](https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dev-decoder.html)
+an exact native receiver-side association mechanism, rather than approximate
+timestamp matching. It does not establish how the PC encoder assigns the
+received key or associates it with source coverage.
+[Linux V4L2 decoder documentation](https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dev-decoder.html)
 
-The remaining table-entry lifetime, potential slot reuse and metadata lookup
-must be established before using this token. A reused buffer index by itself
-cannot be an external mask frame key.
+Sequence wrap, stream/codec restart epochs, surface generation and resource
+lifetime must still be established before using this token as an external mask
+key. A native 16-bit sequence or reused buffer index alone is insufficient.
 
 ### Presentation uses a private compositor path
 

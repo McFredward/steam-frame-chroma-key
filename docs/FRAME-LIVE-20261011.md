@@ -34,6 +34,11 @@ The October 4 `vrlink.txt` available before the stream was stale. During the
 new stream the log was recreated and grew with current decoder and FEC events.
 Its old allocation/reset failures must not be reported as current failures.
 
+Follow-up [static dataflow analysis](FRAME-ASSOCIATION-DATAFLOW.md) distinguishes
+the actual received packet sequence from the decoder buffer index and follows
+it into metadata lookup. This is stronger receiver-side evidence than a log
+label, but still does not establish the PC encoder's source identity.
+
 The final bounded observer run read 291,129 bytes in 27 ms. It scanned 3,857
 complete tail lines, retained four decoder-configuration records and sampled
 16 of 50 FEC retry lines. The expected `fec_record_limit` warning means the
@@ -82,3 +87,9 @@ fixtures. The observer was also run through `python3 -B -` on the real Frame.
 Transport, shader generation and Vulkan rendering did not change. Their earlier
 passing evidence remains applicable; this is a focused integration check, not
 a new complete gate or a headset passthrough test.
+
+Code checkpoint `f702142` also passed
+[CI run 38129068756](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38129068756):
+all eight CTest suites, the Windows endpoint cross-build and protocol
+ASan/UBSan checks. The later static-analysis corrections change documentation
+only and reuse that code validation; no headset mask activation is implied.
