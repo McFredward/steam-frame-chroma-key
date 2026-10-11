@@ -56,13 +56,19 @@ void checked(int result,int expected=0) {if(result!=expected || errno!=91) std::
 int main(int argc,char** argv) {
     Native native;
     const char* mode=argc>1?argv[1]:"valid";
+    const bool liveness=!std::strcmp(mode,"liveness");
+    if (liveness) {
+        // Keep the actual process alive before arm and after writer closure so
+        // the harness can verify writer liveness independently of process life.
+        if (std::getchar()!='b') return 2;
+    }
     // Allow the background writer to observe a precreated arm marker.
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     errno=91;
     checked(pthread_mutex_lock(native.m())); checked(pthread_mutex_lock(native.m()),EDEADLK);
     checked(pthread_mutex_unlock(native.m())); checked(pthread_mutex_unlock(native.m()),EPERM);
     checked(fixture_metadata_lock(native.n())); checked(fixture_metadata_unlock(native.n()));
-    const unsigned samples=!std::strcmp(mode,"cap")?33:1;
+    const unsigned samples=(!std::strcmp(mode,"cap") || liveness)?33:1;
     for(unsigned i=0;i<samples;++i) {
         checked(fixture_selected_lock(native.m()));
         if (!std::strcmp(mode,"incomplete")) {
@@ -84,4 +90,8 @@ int main(int argc,char** argv) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     std::puts("PLT forwarding preserved results and errno; synthetic native records only");
+    if (liveness) {
+        std::fflush(stdout);
+        if (std::getchar()!='e') return 2;
+    }
 }

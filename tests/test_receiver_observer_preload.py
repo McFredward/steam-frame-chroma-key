@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise real host PLT forwarding; never deploy or claim native frame proof."""
+import fcntl
 import hashlib
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def main():
@@ -111,6 +113,62 @@ extern "C" int pthread_create(pthread_t*,const pthread_attr_t*,void*(*)(void*),v
         refusal = [json.loads(line) for line in output.read_text().splitlines()]
         assert refusal[0]["supported"] is False and refusal[0]["reason"] == "writer_start_failed"
         assert refusal[-1]["serialized"] == 0
+
+        # A real background writer holds the lock before arming and releases it
+        # after its footer, independently of the receiver process lifetime.
+        runs += 1
+        folder = private / str(runs)
+        folder.mkdir(mode=0o700)
+        output, marker = folder/"capture.jsonl", folder/"arm"
+        env = os.environ.copy()
+        env.update(LD_PRELOAD=str(testing), FRAME_RECEIVER_TRACE_OUTPUT=str(output),
+                   FRAME_RECEIVER_TRACE_ARM=str(marker), FRAME_RECEIVER_TEST_SHA256=digest)
+        process = subprocess.Popen([str(fixture), "liveness"], env=env,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        def records_until(predicate):
+            expires = time.monotonic() + 2
+            while time.monotonic() < expires:
+                if output.exists():
+                    lines = output.read_bytes().split(b"\n")[:-1]
+                    rows = [json.loads(line) for line in lines]
+                    if predicate(rows):
+                        return rows
+                assert process.poll() is None, "fixture exited before writer liveness check"
+                time.sleep(0.005)
+            raise AssertionError("writer liveness check timed out")
+        try:
+            before = records_until(lambda rows: rows and rows[0]["kind"] == "header")
+            assert before[0]["writer_liveness"] == "exclusive_flock_v1"
+            with output.open("rb") as reader:
+                try:
+                    fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise AssertionError("active writer did not own its exclusive lock")
+                marker.touch(mode=0o600)
+                process.stdin.write(b"b")
+                process.stdin.flush()
+                rows = records_until(lambda rows: rows and rows[-1]["kind"] == "footer")
+                assert rows[-1]["selection_evidence_complete"] is True
+                # Header/footer and lock must agree while process still lives.
+                expires = time.monotonic() + 1
+                while True:
+                    try:
+                        fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        assert time.monotonic() < expires, "closed writer retained liveness lock"
+                        time.sleep(0.005)
+                assert process.poll() is None
+                process.stdin.write(b"e")
+                process.stdin.flush()
+                process.communicate(timeout=2)
+                assert process.returncode == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=2)
     print(f"receiver preload: {runs} isolated cases passed; actual host PLT forwarding, no hardware proof")
 
 

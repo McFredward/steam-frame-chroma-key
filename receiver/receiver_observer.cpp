@@ -12,6 +12,7 @@
 #include <link.h>
 #include <pthread.h>
 #include <sys/auxv.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -239,11 +240,18 @@ bool write_line(const char* data, std::size_t length, std::size_t& output_bytes)
 }
 
 void* record_loop(void*) noexcept {
+    // Only this background writer owns the liveness lock. An open descriptor
+    // or a live receiver does not prove the bounded recorder is still running.
+    if (flock(output_fd, LOCK_EX | LOCK_NB) != 0) {
+        observer.armed.store(false,std::memory_order_seq_cst);
+        return nullptr;
+    }
     std::size_t bytes = 0;
     char line[2048]{};
     auto count = std::snprintf(line,sizeof(line),
         "{\"kind\":\"header\",\"supported\":true,\"executable_sha256\":\"%s\","
         "\"sample_limit\":32,\"byte_limit\":1048576,\"deadline_seconds\":120,"
+        "\"writer_liveness\":\"exclusive_flock_v1\","
         "\"evidence\":\"protected_selection_attempt\",\"accepted_submit\":false,"
         "\"source_frame_associated\":false,\"gpu_consumed_coherent\":false}\n",executable_hash);
     bool io_ok = count > 0 && write_line(line,static_cast<std::size_t>(count),bytes);
@@ -322,6 +330,7 @@ void* record_loop(void*) noexcept {
         static_cast<unsigned long long>(observer.counters.pointer_rejections.load()),
         closed_quiescent?"true":"false",complete?"true":"false",io_ok?"true":"false");
     if (count>0) write_line(line,static_cast<std::size_t>(count),bytes);
+    flock(output_fd, LOCK_UN);
     return nullptr;
 }
 

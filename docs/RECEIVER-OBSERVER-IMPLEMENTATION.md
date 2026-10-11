@@ -37,11 +37,39 @@ exclusively with mode 0600. Existing output, symlinks and relative paths fail
 closed. An arm marker must be empty, user-owned and private; a symlink never arms
 the capture. These paths do not authorize a different native executable.
 
+The background writer holds a nonblocking exclusive `flock` on its output for
+its complete lifetime, including the final drain and footer, then releases it.
+The header declares `writer_liveness: exclusive_flock_v1`. An open descriptor,
+a running receiver, or a header without this writer lock cannot authorize a
+late arm request. The liveness check never runs in a receiver callback.
+
 This library does not restart SteamVR, install itself, delete capture files, or
 schedule rollback. Exact deployment paths, preload removal and the subsequent
 native restart are the session tooling's responsibility. It must verify that the
 native libc provider exports the required aliases before activation. An absent
 versioned alias is a loader failure, not something a constructor can repair.
+
+`tools/prepare_receiver_observer.py` checks local input fingerprints, AArch64
+ELF headers and versioned imports, then writes an exclusive private **proposal**.
+It requires both libc and the dynamic loader: legitimate libc exports can be
+weak, and the AArch64 stack guard is supplied by the loader. This preparation
+does not install files, restart a service, read process memory or grant runtime
+permission. For example, with privately obtained native references:
+
+```bash
+python3 tools/prepare_receiver_observer.py \
+  --receiver /private/native/vrlink \
+  --provider-libc /private/native/libc.so.6 \
+  --provider-loader /private/native/ld-linux-aarch64.so.1 \
+  --observer /private/build/libframe_receiver_observer.so \
+  --observer-sha256 <reviewed-library-sha256> \
+  --output-plan /private/review/receiver-proposal.json
+```
+
+Preflight input files must come from the receiver's actual native provider
+namespace before deployment. Passing against a cross-compiler sysroot only
+establishes local packaging compatibility; it does not establish compatibility
+with the Frame's SteamVR runtime.
 
 ## Forwarding and capture contract
 
@@ -103,12 +131,23 @@ Focused validation on 2026-10-11:
   concurrent producer publication, closure of an admitted scope after disarm,
   and a sticky incomplete quiescence latch despite late completion;
 - the same 173 assertions under AddressSanitizer and UndefinedBehaviorSanitizer;
-- 16 isolated real host PLT/preload cases covering native result/errno forwarding,
+- 17 isolated real host PLT/preload cases covering native result/errno forwarding,
   wrong executable/hash, private path refusal, valid and invalid record branches,
   unarmed/no-evidence state, the sample limit, incomplete scope at process exit,
-  and a forced writer-start failure with real constructor-time mutex reentry;
+  a forced writer-start failure with real constructor-time mutex reentry, and
+  writer-lock acquisition/release while the fixture process stays alive;
+- nine Python preparation tests covering pinned fingerprints, required provider
+  aliases, libc/loader version imports, wrong ABI, unsafe or pre-existing output,
+  FIFOs, and refusal of dynamic callback TLS;
 - AArch64 ELF inspection confirmed only the two public exports, versioned libc
-  alias imports, 80-byte static TLS, and no `__tls_get_addr` or `dlsym` import.
+  alias imports, 80-byte static TLS, and no `__tls_get_addr` or `dlsym` import;
+- focused CMake integration passed the core, real preload and preparation suites.
+  After the bounded writer-liveness repair, only the two affected suites were
+  repeated; the unchanged core and its sanitizer evidence were inherited.
+
+The local production preflight also passed against the pinned private receiver
+and cross-sysroot libc/loader. Native Frame providers have **not** been verified
+for this new observer, and no deployment is authorized by that local result.
 
 The real host PLT test uses an explicitly compile-separated host-only testing
 library with exact fixture executable hash and assembly return labels. That

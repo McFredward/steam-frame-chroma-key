@@ -5,6 +5,42 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 include(CTest)
 option(FRAME_MASK_BUILD_TRACE "Build the opt-in passive compositor diagnostic layer" OFF)
+option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
+    "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
+
+if(FRAME_MASK_BUILD_RECEIVER_OBSERVER)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "The receiver observer supports Linux/glibc only")
+    endif()
+    find_package(Threads REQUIRED)
+    add_library(frame_receiver_observer SHARED
+        receiver/receiver_observer.cpp receiver/receiver_observer_core.cpp)
+    target_include_directories(frame_receiver_observer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(frame_receiver_observer PRIVATE
+        -Wall -Wextra -Wpedantic -fvisibility=hidden -ftls-model=initial-exec
+        -fno-exceptions -fno-rtti)
+    target_link_libraries(frame_receiver_observer PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    if(BUILD_TESTING)
+        add_executable(test_receiver_observer
+            tests/test_receiver_observer.cpp receiver/receiver_observer_core.cpp)
+        target_include_directories(test_receiver_observer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_receiver_observer PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(test_receiver_observer PRIVATE Threads::Threads)
+        if(NOT CMAKE_CROSSCOMPILING)
+            add_test(NAME receiver_observer COMMAND test_receiver_observer)
+            if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+                add_executable(test_receiver_observer_plt tests/test_receiver_observer_plt.cpp)
+                target_compile_options(test_receiver_observer_plt PRIVATE -Wall -Wextra -Wpedantic)
+                target_link_options(test_receiver_observer_plt PRIVATE -rdynamic)
+                target_link_libraries(test_receiver_observer_plt PRIVATE Threads::Threads)
+                find_package(Python3 REQUIRED COMPONENTS Interpreter)
+                add_test(NAME receiver_observer_preload COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_receiver_observer_preload.py
+                    $<TARGET_FILE:frame_receiver_observer> $<TARGET_FILE:test_receiver_observer_plt>)
+            endif()
+        endif()
+    endif()
+endif()
 
 if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE))
     find_package(Vulkan REQUIRED)
@@ -47,6 +83,9 @@ if(BUILD_TESTING)
     target_include_directories(test_mask_module_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME mask_module_guard COMMAND test_mask_module_guard)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME receiver_observer_preparation COMMAND ${Python3_EXECUTABLE}
+        -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        -p test_prepare_receiver_observer.py)
     if(UNIX)
         add_test(NAME frame_trace_session_recovery COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_frame_trace_session.py)
