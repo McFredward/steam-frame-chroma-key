@@ -483,33 +483,38 @@ VKAPI_ATTR void VKAPI_CALL traceCmdExecuteCommands(VkCommandBuffer command, std:
 VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit(VkQueue queue, std::uint32_t count,
     const VkSubmitInfo* info, VkFence fence) {
     auto* d = deviceFor(queue);
+    if (!capture().core.enabled()) return d->QueueSubmit(queue, count, info, fence);
+    std::array<SubmitTicket, CallRecordLimit> tickets{};
+    std::uint32_t ticketCount = 0;
+    for (std::uint32_t i = 0; i < limited(d, count); ++i) {
+        const auto tracked = std::min(CallRecordLimit - ticketCount, info[i].commandBufferCount);
+        for (std::uint32_t j = 0; j < tracked; ++j)
+            tickets[ticketCount++] = capture().core.prepareSubmit(d->id, number(info[i].pCommandBuffers[j]));
+        if (tracked != info[i].commandBufferCount) capture().core.report(d->id, Core::Capacity);
+    }
     const auto result = d->QueueSubmit(queue, count, info, fence);
     if (result == VK_SUCCESS) {
         const auto serial = ++nextSubmission;
-        std::uint32_t budget = CallRecordLimit;
-        for (std::uint32_t i = 0; i < limited(d, count); ++i) {
-            const auto tracked = std::min(budget, info[i].commandBufferCount);
-            for (std::uint32_t j = 0; j < tracked; ++j) capture().core.submitted(d->id, number(info[i].pCommandBuffers[j]), serial);
-            budget -= tracked;
-            if (tracked != info[i].commandBufferCount) capture().core.report(d->id, Core::Capacity);
-        }
+        for (std::uint32_t i = 0; i < ticketCount; ++i) capture().core.commitSubmit(tickets[i], serial, true);
     }
     return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit2(VkQueue queue, std::uint32_t count,
     const VkSubmitInfo2* info, VkFence fence) {
     auto* d = deviceFor(queue);
+    if (!capture().core.enabled()) return d->QueueSubmit2(queue, count, info, fence);
+    std::array<SubmitTicket, CallRecordLimit> tickets{};
+    std::uint32_t ticketCount = 0;
+    for (std::uint32_t i = 0; i < limited(d, count); ++i) {
+        const auto tracked = std::min(CallRecordLimit - ticketCount, info[i].commandBufferInfoCount);
+        for (std::uint32_t j = 0; j < tracked; ++j)
+            tickets[ticketCount++] = capture().core.prepareSubmit(d->id, number(info[i].pCommandBufferInfos[j].commandBuffer));
+        if (tracked != info[i].commandBufferInfoCount) capture().core.report(d->id, Core::Capacity);
+    }
     const auto result = d->QueueSubmit2(queue, count, info, fence);
     if (result == VK_SUCCESS) {
         const auto serial = ++nextSubmission;
-        std::uint32_t budget = CallRecordLimit;
-        for (std::uint32_t i = 0; i < limited(d, count); ++i) {
-            const auto tracked = std::min(budget, info[i].commandBufferInfoCount);
-            for (std::uint32_t j = 0; j < tracked; ++j)
-                capture().core.submitted(d->id, number(info[i].pCommandBufferInfos[j].commandBuffer), serial);
-            budget -= tracked;
-            if (tracked != info[i].commandBufferInfoCount) capture().core.report(d->id, Core::Capacity);
-        }
+        for (std::uint32_t i = 0; i < ticketCount; ++i) capture().core.commitSubmit(tickets[i], serial, true);
     }
     return result;
 }

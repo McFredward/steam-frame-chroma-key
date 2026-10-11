@@ -78,6 +78,19 @@ struct Event {
     std::array<Stage, StageCapacity> stages{};
 };
 
+// Captured before the native queue call. A completed fence may allow another
+// thread to reset/re-record the CB before that native call returns, so its
+// generation must never be inferred retrospectively from current tracking state.
+struct SubmitTicket {
+    std::uint64_t device = 0;
+    std::uint64_t command = 0;
+    std::uint64_t generation = 0;
+    bool eligible = false;
+    bool known = false;
+    bool executable = false;
+    bool stateComplete = false;
+};
+
 // try_lock deliberately drops diagnostics rather than delaying a render thread.
 // Producers share one bounded ring; the writer is its only consumer.
 class EventRing {
@@ -130,7 +143,7 @@ class Core {
         std::array<Stage, StageCapacity> stages{};
     };
     struct Command {
-        bool used = false, recording = false;
+        bool used = false, recording = false, executable = false;
         bool matchingDraw = false, submitReported = false;
         std::uint64_t device = 0, handle = 0, pool = 0, generation = 0;
         std::uint64_t pipeline = 0, pipelineGeneration = 0;
@@ -141,7 +154,7 @@ public:
         Capacity = 1, UnknownShader = 2, UnknownPipeline = 3,
         UnknownCommand = 4, Contention = 5, StageLimit = 6,
         PartialCreation = 7, UnsupportedCommand = 8,
-        UnknownSecondary = 9, OversizeShader = 10
+        UnknownSecondary = 9, OversizeShader = 10, ChangedGeneration = 11
     };
     explicit Core(EventRing& events, bool enabled = false) noexcept
         : events_(events), enabled_(enabled) {}
@@ -254,12 +267,16 @@ public:
         command->matchingDraw = command->submitReported = false;
         command->recordedPipelines.fill(0);
         command->recording = true;
+        command->executable = false;
     }
     void commandEnd(std::uint64_t device, std::uint64_t handle) noexcept {
         if (!enabled()) return;
         auto lock = acquire();
         if (!lock.owns_lock()) return;
-        if (auto* command = find(commands_, device, handle)) command->recording = false;
+        if (auto* command = find(commands_, device, handle)) {
+            command->executable = command->recording;
+            command->recording = false;
+        }
     }
     void commandReset(std::uint64_t device, std::uint64_t handle, bool removed) noexcept {
         if (!enabled()) return;
@@ -343,7 +360,7 @@ public:
         event.relatedCommand = child;
         auto* a = find(commands_, device, parent);
         auto* b = find(commands_, device, child);
-        event.complete = a && a->recording && b && !b->recording;
+        event.complete = a && a->recording && b && b->executable && !b->recording;
         if (a && b && b->matchingDraw) a->matchingDraw = true;
         if (fragmentHash_ && event.complete && !b->matchingDraw) return;
         event.complete = event.complete && !tainted_ && stateDrops_.load() == 0;
@@ -352,22 +369,40 @@ public:
         if (!event.complete) event.reason = UnknownSecondary;
         events_.push(event);
     }
-    void submitted(std::uint64_t device, std::uint64_t commandHandle,
-                   std::uint64_t submission) noexcept {
-        if (!enabled()) return;
+    SubmitTicket prepareSubmit(std::uint64_t device, std::uint64_t commandHandle) noexcept {
+        SubmitTicket ticket;
+        ticket.device = device;
+        ticket.command = commandHandle;
+        if (!enabled()) return ticket;
+        ticket.eligible = true;
+        auto lock = acquire();
+        if (!lock.owns_lock()) return ticket;
+        auto* command = find(commands_, device, commandHandle);
+        if (!command) return ticket;
+        ticket.known = true;
+        ticket.generation = command->generation;
+        ticket.executable = command->executable && !command->recording;
+        ticket.stateComplete = !tainted_ && stateDrops_.load() == 0;
+        ticket.eligible = !command->submitReported && (!fragmentHash_ || command->matchingDraw);
+        return ticket;
+    }
+    void commitSubmit(const SubmitTicket& ticket, std::uint64_t submission, bool accepted) noexcept {
+        if (!accepted || !ticket.eligible || !enabled()) return;
         auto lock = acquire();
         if (!lock.owns_lock()) return;
         Event event;
         event.kind = Kind::Submit;
-        event.device = device;
-        event.command = commandHandle;
+        event.device = ticket.device;
+        event.command = ticket.command;
+        event.commandGeneration = ticket.generation;
         event.submission = submission;
-        auto* command = find(commands_, device, commandHandle);
-        if (command && (command->submitReported || (fragmentHash_ && !command->matchingDraw))) return;
-        if (command) command->submitReported = true;
-        event.commandGeneration = command ? command->generation : 0;
-        event.complete = command && !command->recording && !tainted_ && stateDrops_.load() == 0;
-        if (!event.complete) event.reason = UnknownCommand;
+        auto* command = find(commands_, ticket.device, ticket.command);
+        const bool sameGeneration = command && ticket.known && command->generation == ticket.generation;
+        if (sameGeneration && command->submitReported) return;
+        if (sameGeneration) command->submitReported = true;
+        event.complete = sameGeneration && ticket.executable && ticket.stateComplete &&
+            command->executable && !command->recording && !tainted_ && stateDrops_.load() == 0;
+        if (!event.complete) event.reason = !sameGeneration && ticket.known ? ChangedGeneration : UnknownCommand;
         events_.push(event);
     }
     void report(std::uint64_t device, Reason reason) noexcept {
@@ -411,6 +446,7 @@ private:
         command.matchingDraw = command.submitReported = false;
         command.recordedPipelines.fill(0);
         command.recording = false;
+        command.executable = false;
         if (removed) command.used = false;
     }
     void incomplete(std::uint64_t device, Reason reason) noexcept {

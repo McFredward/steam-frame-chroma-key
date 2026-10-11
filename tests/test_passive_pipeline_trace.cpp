@@ -52,6 +52,10 @@ void begin(Core& core, std::uint64_t command = 30) {
     core.commandBegin(1, command);
     core.bind(1, command, 20);
 }
+void submit(Core& core, std::uint64_t device, std::uint64_t command, std::uint64_t serial) {
+    const auto ticket = core.prepareSubmit(device, command);
+    core.commitSubmit(ticket, serial, true);
+}
 void disabledAndFingerprint() {
     EventRing ring;
     Core core(ring);
@@ -60,7 +64,7 @@ void disabledAndFingerprint() {
     seed(core);
     begin(core);
     core.draw(1, 30, 1);
-    core.submitted(1, 30, 1);
+    submit(core, 1, 30, 1);
     require(drain(ring).empty(), "disabled state emitted events");
     require(fingerprint("hello", 5) == 0xa430d84680aabd0bULL, "standard FNV-1a fingerprint changed");
 }
@@ -81,8 +85,8 @@ void stageLifecycleAndActualDraw() {
     core.draw(1, 30, 1);
     core.draw(1, 30, 1);
     core.commandEnd(1, 30);
-    core.submitted(1, 30, 7);
-    core.submitted(1, 30, 8);
+    submit(core, 1, 30, 7);
+    submit(core, 1, 30, 8);
     auto events = drain(ring);
     auto draws = kind(events, Kind::Draw);
     auto submissions = kind(events, Kind::Submit);
@@ -115,7 +119,7 @@ void resetAndSecondary() {
     core.commandBegin(1, 30);
     core.execute(1, 30, 31);
     core.commandEnd(1, 30);
-    core.submitted(1, 30, 5);
+    submit(core, 1, 30, 5);
     auto events = drain(ring);
     auto draws = kind(events, Kind::Draw);
     auto execute = kind(events, Kind::Execute);
@@ -211,7 +215,7 @@ void fragmentFilter() {
     core.commandBegin(1, 30);
     core.execute(1, 30, 31);
     core.commandEnd(1, 30);
-    core.submitted(1, 30, 1);
+    submit(core, 1, 30, 1);
     auto events = drain(ring);
     require(kind(events, Kind::Draw).size() == 1 && kind(events, Kind::Submit).size() == 1,
             "matching filter lost draw/secondary submission");
@@ -221,9 +225,44 @@ void fragmentFilter() {
     core.bind(1, 31, 21);
     core.draw(1, 31, 1);
     core.commandEnd(1, 31);
-    core.submitted(1, 31, 2);
+    submit(core, 1, 31, 2);
     events = drain(ring);
     require(kind(events, Kind::Draw).empty() && kind(events, Kind::Submit).empty(), "non-matching shader consumed filtered draw budget");
+}
+void submitRaceKeepsPreCallGeneration() {
+    EventRing ring;
+    Core core(ring, true);
+    seed(core);
+    core.commandAllocated(1, 32, 40);
+    submit(core, 1, 32, 99);
+    require(!kind(drain(ring), Kind::Submit)[0].complete, "allocated initial CB falsely marked executable");
+    begin(core);
+    core.draw(1, 30, 1);
+    core.commandEnd(1, 30);
+    const auto original = kind(drain(ring), Kind::Draw)[0];
+    const auto failedTicket = core.prepareSubmit(1, 30);
+    core.commitSubmit(failedTicket, 100, false);
+    require(kind(drain(ring), Kind::Submit).empty(), "failed native submission produced accepted evidence");
+    const auto raceTicket = core.prepareSubmit(1, 30);
+    core.commandReset(1, 30, false);
+    core.commandBegin(1, 30);
+    core.bind(1, 30, 20);
+    core.draw(1, 30, 1);
+    core.commandEnd(1, 30);
+    const auto replacement = kind(drain(ring), Kind::Draw)[0];
+    require(replacement.commandGeneration != original.commandGeneration, "race setup did not change generation");
+    core.commitSubmit(raceTicket, 101, true);
+    const auto accepted = kind(drain(ring), Kind::Submit);
+    require(accepted.size() == 1 && !accepted[0].complete && accepted[0].reason == Core::ChangedGeneration,
+            "post-submit reset was incorrectly certified");
+    require(accepted[0].commandGeneration == original.commandGeneration,
+            "submit race attributed accepted work to a new command-buffer generation");
+    // The previous ticket must not mark the replacement recording as reported.
+    submit(core, 1, 30, 102);
+    const auto current = kind(drain(ring), Kind::Submit);
+    require(current.size() == 1 && current[0].complete &&
+            current[0].commandGeneration == replacement.commandGeneration,
+            "old submit ticket consumed replacement-generation evidence");
 }
 }
 
@@ -234,5 +273,6 @@ int main() {
     failuresAndBounds();
     contentionCannotCertifyStaleState();
     fragmentFilter();
+    submitRaceKeepsPreCallGeneration();
     std::cout << "passive pipeline trace: lifecycle, exact stage metadata, submit links, bounds, contention and disabled paths passed\n";
 }
