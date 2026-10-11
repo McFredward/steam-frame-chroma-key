@@ -98,6 +98,21 @@ VKAPI_ATTR void VKAPI_CALL traceDestroySampler(VkDevice device, VkSampler object
     d->DestroySampler(device, object, allocator);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL traceCreateSamplerYcbcrConversion(VkDevice device,
+    const VkSamplerYcbcrConversionCreateInfo* info, const VkAllocationCallbacks* allocator,
+    VkSamplerYcbcrConversion* output) {
+    auto* d = deviceFor(device);
+    const auto result = d->CreateSamplerYcbcrConversion(device, info, allocator, output);
+    if (result == VK_SUCCESS) observeBindings([&](auto& b) { b.createConversion(d->id, *output, *info); });
+    return result;
+}
+VKAPI_ATTR void VKAPI_CALL traceDestroySamplerYcbcrConversion(VkDevice device,
+    VkSamplerYcbcrConversion object, const VkAllocationCallbacks* allocator) {
+    auto* d = deviceFor(device);
+    observeBindings([&](auto& b) { b.destroyConversion(d->id, object); });
+    d->DestroySamplerYcbcrConversion(device, object, allocator);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL traceAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
     const VkAllocationCallbacks* allocator, VkDeviceMemory* output) {
     auto* d = deviceFor(device);
@@ -122,11 +137,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceBindBufferMemory2(VkDevice device, std::uint
     const VkBindBufferMemoryInfo* info) {
     auto* d = deviceFor(device);
     const auto result = d->BindBufferMemory2(device, count, info);
-    if (result == VK_SUCCESS) observeBindings([&](auto& b) {
-        if (count > CallRecordLimit) b.reportUnsupported(d->id);
-        for (std::uint32_t i = 0; i < std::min(count, CallRecordLimit); ++i)
-            b.bindBufferMemory(d->id, info[i].buffer, info[i].memory, info[i].memoryOffset, !info[i].pNext);
-    });
+    if (result == VK_SUCCESS) observeBindings([&](auto& b) { b.bindBufferMemory2(d->id, count, info); });
     return result;
 }
 
@@ -141,11 +152,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceBindImageMemory2(VkDevice device, std::uint3
     const VkBindImageMemoryInfo* info) {
     auto* d = deviceFor(device);
     const auto result = d->BindImageMemory2(device, count, info);
-    if (result == VK_SUCCESS) observeBindings([&](auto& b) {
-        if (count > CallRecordLimit) b.reportUnsupported(d->id);
-        for (std::uint32_t i = 0; i < std::min(count, CallRecordLimit); ++i)
-            b.bindImageMemory(d->id, info[i].image, info[i].memory, info[i].memoryOffset, !info[i].pNext);
-    });
+    if (result == VK_SUCCESS) observeBindings([&](auto& b) { b.bindImageMemory2(d->id, count, info); });
     return result;
 }
 

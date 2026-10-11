@@ -7,3 +7,6 @@ BINDING_ALIAS("vkCmdPushDescriptorSetWithTemplate", CmdPushDescriptorSetWithTemp
 BINDING_ALIAS("vkCmdBindDescriptorSets2", CmdBindDescriptorSets2KHR)
 BINDING_ALIAS("vkCmdPushDescriptorSet2", CmdPushDescriptorSet2KHR)
 BINDING_ALIAS("vkCmdPushDescriptorSetWithTemplate2", CmdPushDescriptorSetWithTemplate2KHR)
+
+BINDING_ALIAS("vkCreateSamplerYcbcrConversionKHR", CreateSamplerYcbcrConversion)
+BINDING_ALIAS("vkDestroySamplerYcbcrConversionKHR", DestroySamplerYcbcrConversion)

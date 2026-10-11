@@ -2,6 +2,7 @@
 // Queue-idle waits and synchronous readback are test-only, never compositor code.
 #include <vulkan/vulkan.h>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cmath>
@@ -183,6 +184,32 @@ struct Gpu {
         VkShaderModule out{};
         check(vkCreateShaderModule(device, &info, nullptr, &out));
         return out;
+    }
+
+    void concurrentMetadata() {
+        // Test-only independent native resource calls. The observed metadata
+        // must not contend on one hook-time object-table mutex. No GPU queue
+        // is accessed by these producers, and all native results are checked.
+        std::atomic<unsigned> ready{0};
+        std::atomic<bool> go{false}, failed{false};
+        std::array<std::thread, 8> producers;
+        for (auto& producer : producers) producer = std::thread([&] {
+            std::array<VkBuffer, 16> objects{};
+            ++ready;
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            VkBufferCreateInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            info.size = 64;
+            info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            for (auto& object : objects)
+                if (vkCreateBuffer(device, &info, nullptr, &object) != VK_SUCCESS) failed = true;
+            for (auto object : objects) if (object) vkDestroyBuffer(device, object, nullptr);
+        });
+        while (ready.load(std::memory_order_acquire) != producers.size()) std::this_thread::yield();
+        go.store(true, std::memory_order_release);
+        for (auto& producer : producers) producer.join();
+        if (failed) throw std::runtime_error("Concurrent native metadata fixture failed");
     }
 
     void init(const char *vertexPath, const char *fragmentPath, bool premultiplied, unsigned cycles = 1,
@@ -383,6 +410,7 @@ struct Gpu {
         VkCommandBuffer command{};
         check(vkAllocateCommandBuffers(device, &commandInfo, &command));
         bool initialized = false;
+        if (std::getenv("FRAME_MASK_TEST_CONCURRENT_METADATA")) concurrentMetadata();
         if (waitForTraceArm) {
             waitForTrace("\"binding_ready_at_header\":true");
         }

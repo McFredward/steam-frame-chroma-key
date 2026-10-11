@@ -26,7 +26,9 @@ class Journal {
     friend struct JournalTestAccess;
 public:
     static constexpr std::size_t ProducerCapacity = 32;
-    static constexpr std::size_t LaneCapacity = 64;
+    // Accommodate the selected 32-snapshot burst while the background owner
+    // serializes results. Saturation still invalidates proof without blocking.
+    static constexpr std::size_t LaneCapacity = 128;
     static constexpr std::uint32_t CallCapacity = 32;
     struct TransportCounters {
         std::uint64_t registry = 0, queue = 0, orderGap = 0, batch = 0;

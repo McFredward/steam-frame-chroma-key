@@ -52,7 +52,8 @@ have been established. No mask guard is removed.
   creation and freed at destruction. This lifecycle storage is separate from
   the fixed-capacity observation tables; no per-frame allocation occurs.
   Dispatch lookup has a short mutex critical section for native context lifetime;
-  observation uses try-lock/drop. This is not a universally lock-free layer.
+  pipeline/event observation uses try-lock/drop. Optional binding observations
+  use the bounded journal described below. This is not a universally lock-free layer.
 - Filtered capture lasts at most 120 seconds; unfiltered capture at most 30.
   It ends at its event/byte/time bound or process teardown. Native
   Vulkan calls/results are forwarded regardless of diagnostic capacity.
@@ -188,8 +189,8 @@ input order. Incompatible descriptor rebinding cannot retain a certified old
 set. See the [Khronos descriptor-set specification](https://docs.vulkan.org/spec/latest/chapters/descriptorsets.html).
 This conservative implementation requires the exact observed pipeline-layout
 identity; it does not infer structural compatibility between different handles.
-Unsupported descriptor arrays/extensions, import `pNext` chains, missing
-lifecycles, resource reuse, capacity loss and contention remain incomplete.
+Unsupported descriptor arrays/extensions, unknown import `pNext` chains, missing
+lifecycles, resource reuse and observation loss remain incomplete.
 Known scalar identities are retained for investigation even when an extension
 prevents complete interpretation. `layout_has_binding31` is independently
 `unknown`, `absent` or `present`; unknown never authorizes adding a mask slot.
@@ -205,9 +206,13 @@ video frame. There is no post-hoc host read of eye or foveation constants.
 The live shader inventory is fixed at 1,024 entries, raised from 256 after the
 first successful Frame capture exhausted that original table. Pipeline/command
 storage, event count, 1 MiB output cap and capture deadlines remain bounded.
-The writer performs all serialization; rendering only observes bounded scalars
-with try-lock/drop. This diagnostic has bounded CPU overhead; it does not claim
-that native rendering is cost-free while observation is enabled.
+The writer performs all serialization. Pipeline/event observation retains
+try-lock/drop; optional binding hooks publish owned API scalars to fixed queues
+for ordered background replay, avoiding the binding-table observer mutex on
+rendering threads. This diagnostic has bounded CPU overhead; it does not claim
+that native rendering is cost-free while observation is enabled. See
+[the journal implementation and validation](PASSIVE-BINDING-JOURNAL.md) for its
+capacities, supported import/YCbCr metadata and remaining proof gaps.
 
 On the Frame, the helper configures a private arm marker so initial Home draws
 do not consume the event or 32-snapshot budget before a PC-VR stream is connected. Lifecycle

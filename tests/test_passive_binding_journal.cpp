@@ -136,6 +136,30 @@ void ownershipAndOrdering() {
     journal->close(); require(journal->finished(), "drained closed journal did not finish");
     require(hookAllocations.load() == 0, "hook publication allocated heap memory");
 }
+void selectedSnapshotBurst() {
+    auto journal = std::make_unique<Journal>();
+    monitorHookAllocations = true;
+    seed(*journal);
+    // No consumer or test backpressure: represent all 32 selected draws plus
+    // adjacent descriptor mutations before the background owner is scheduled.
+    for (std::uint32_t i = 0; i < 32; ++i) {
+        writeBuffer(*journal, 32 * i);
+        require(journal->requestSnapshot(1, cb, pl, i), "selected burst exceeded journal capacity");
+        writeBuffer(*journal, 32 * i + 16);
+    }
+    monitorHookAllocations = false;
+    std::uint32_t received = 0;
+    journal->drain([&](std::uint32_t cookie, const Snapshot& value) noexcept {
+        require(cookie == received++, "selected burst reordered snapshots");
+        require(value.sourceComplete && at(value, 0).effectiveOffset == 32 * cookie,
+                "selected burst lost recording-time metadata");
+    });
+    require(received == 32 && journal->lostState() == 0,
+            "unthrottled selected burst lost metadata");
+    require(hookAllocations.load() == 0, "selected burst allocated on a hook");
+    journal->close();
+    require(journal->finished(), "selected burst did not finish after closure");
+}
 void writeBeforeCopyBatch() {
     auto journal = std::make_unique<Journal>(); seed(*journal);
     const auto second = h<VkDescriptorSet>(41);
@@ -367,7 +391,7 @@ void extensionOwnership() {
 }
 }
 int main() {
-    ownershipAndOrdering(); writeBeforeCopyBatch(); delayedPredecessorAndClosure(); concurrentProducers();
+    ownershipAndOrdering(); selectedSnapshotBurst(); writeBeforeCopyBatch(); delayedPredecessorAndClosure(); concurrentProducers();
     registryQueueBatchAndWrap(); laneWrapAndDependencies(); extensionOwnership();
     std::cout << checks << " journal checks passed; " << sizeof(Journal) << " bytes fixed state; no hook allocations\n";
 }

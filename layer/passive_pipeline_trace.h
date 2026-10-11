@@ -21,7 +21,7 @@ constexpr std::size_t ShaderCapacity = 1024;
 constexpr std::size_t PipelineCapacity = 256;
 constexpr std::size_t CommandCapacity = 512;
 constexpr std::size_t StageCapacity = 8;
-constexpr std::size_t EventCapacity = 128;
+constexpr std::size_t EventCapacity = 256;
 constexpr std::size_t EventLimit = 2048;
 constexpr std::size_t MaxShaderBytes = 1024 * 1024;
 constexpr std::size_t EntryCapacity = 48;
@@ -81,8 +81,11 @@ struct Event {
     std::uint32_t reason = 0;
     bool complete = false;
     std::array<Stage, StageCapacity> stages{};
-    frame_bindings::Snapshot bindings{};
+    // Internal writer correlation only; never serialized or a video-frame identity.
+    std::uint32_t bindingCookie = std::numeric_limits<std::uint32_t>::max();
+    frame_bindings::Reason bindingFailure = frame_bindings::Reason::Unknown;
 };
+static_assert(sizeof(Event) <= 1024, "Render events must not carry background snapshots");
 
 // Captured before the native queue call. A completed fence may allow another
 // thread to reset/re-record the CB before that native call returns, so its

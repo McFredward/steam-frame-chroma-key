@@ -1,6 +1,7 @@
 // Opt-in passive Vulkan metadata layer. No shader replacement, descriptor
 // mutation, image/memory readback, GPU work, or render-thread log I/O.
 #include "passive_pipeline_trace.h"
+#include "passive_binding_journal.h"
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 
@@ -24,13 +25,13 @@
 namespace {
 using namespace frame_trace;
 constexpr std::size_t OutputLimit = 1024 * 1024;
-constexpr std::size_t FooterReserve = 2048;
+constexpr std::size_t FooterReserve = 3072;
 constexpr std::uint32_t CallRecordLimit = 512;
 
 struct Capture {
     EventRing events;
     Core core{events};
-    frame_bindings::Core bindings;
+    frame_bindings::Journal bindings;
     std::atomic<bool> stop{false};
     std::thread writer;
     std::once_flag once;
@@ -40,6 +41,19 @@ struct Capture {
     std::atomic<bool> bindingsArmed{false};
     std::atomic<std::uint32_t> bindingSnapshots{0};
     static constexpr std::uint32_t BindingSnapshotLimit = 32;
+    // Writer-owned results; a request is published before its placeholder event.
+    // Keep the event's draw-time serial, even when background replay is delayed.
+    std::array<frame_bindings::Snapshot, BindingSnapshotLimit> bindingResults{};
+    std::array<bool, BindingSnapshotLimit> bindingReady{};
+    std::size_t drainBindings() {
+        if (!bindingsEnabled) return 0;
+        return bindings.drain([this](std::uint32_t cookie, const frame_bindings::Snapshot& result) {
+            if (cookie < BindingSnapshotLimit) {
+                bindingResults[cookie] = result;
+                bindingReady[cookie] = true;
+            }
+        });
+    }
 
     bool drawsReady() const noexcept {
         // Keep lifecycle metadata before arming, but reserve draw/submit event
@@ -128,7 +142,8 @@ struct Capture {
         }
         target[used] = 0;
     }
-    static std::size_t serialize(const Event& e, char (&out)[16384]) {
+    static std::size_t serialize(const Event& e, char (&out)[32768],
+                                 const frame_bindings::Snapshot* binding = nullptr) {
         std::size_t used = 0;
         const char* names[] = {"shader", "pipeline", "draw_recorded", "execute_recorded",
                                "submit_accepted", "incomplete", "bindings_recorded", "bindings_armed"};
@@ -159,7 +174,8 @@ struct Capture {
                 stage.bytes, entry, stage.complete ? "true" : "false");
         }
         valid = valid && append(out, sizeof(out), used, "]");
-        if (e.kind == Kind::Bindings) valid = valid && serializeBindings(e.bindings, out, sizeof(out), used);
+        if (e.kind == Kind::Bindings)
+            valid = valid && binding && serializeBindings(*binding, out, sizeof(out), used);
         valid = valid && append(out, sizeof(out), used, "}\n");
         return valid ? used : 0;
     }
@@ -219,7 +235,10 @@ struct Capture {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(deadlineSeconds);
         auto armCheck = std::chrono::steady_clock::now();
         bool draining = false;
+        Event event;
+        bool pending = false;
         for (;;) {
+            const auto metadataRecords = drainBindings();
             const auto now = std::chrono::steady_clock::now();
             if (!draining && bindingsEnabled && !bindingsArmed.load() && !armPath.empty() && now >= armCheck) {
                 if (now < deadline && armRequested(armPath)) {
@@ -237,12 +256,33 @@ struct Capture {
                               std::chrono::steady_clock::now() >= deadline)) {
                 core.enable(false);
                 events.close();
+                bindings.close();
                 draining = true;
             }
-            Event event;
-            if (events.pop(event)) {
-                char line[16384];
-                const auto bytes = serialize(event, line);
+            if (!pending) pending = events.pop(event);
+            if (pending) {
+                frame_bindings::Snapshot failure;
+                const frame_bindings::Snapshot* binding = nullptr;
+                if (event.kind == Kind::Bindings && event.bindingCookie < BindingSnapshotLimit) {
+                    if (!bindingReady[event.bindingCookie]) {
+                        // Only the writer defers an unresolved predecessor; the
+                        // rendering thread forwards immediately. A closed gap
+                        // must produce incomplete evidence, never guessed state.
+                        if (!bindings.finished()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            continue;
+                        }
+                        failure.device = event.device;
+                        binding = &failure;
+                    } else binding = &bindingResults[event.bindingCookie];
+                } else if (event.kind == Kind::Bindings) {
+                    failure.device = event.device;
+                    failure.reason = event.bindingFailure;
+                    binding = &failure;
+                }
+                if (binding) event.complete = event.complete && binding->sourceComplete;
+                char line[32768];
+                const auto bytes = serialize(event, line, binding);
                 if (!bytes || total + bytes > OutputLimit - FooterReserve) {
                     capped = true;
                     core.enable(false);
@@ -250,14 +290,23 @@ struct Capture {
                 }
                 if (!writeAll(fd, line, bytes)) { ioGood = false; break; }
                 total += bytes;
+                pending = false;
             } else {
-                if (draining && events.empty()) break;
+                if (draining && events.empty() && (!bindingsEnabled || bindings.finished())) break;
+                // Continue existing background work without an idle delay. A
+                // missing predecessor makes zero progress and still yields.
+                if (metadataRecords && !bindings.empty()) continue;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
         core.enable(false);
         events.close();
+        bindings.close();
+        // Byte/time/event closure must include admitted metadata in the stable
+        // footer, even when trailing output records no longer fit the file.
+        while (bindingsEnabled && !bindings.finished()) drainBindings();
         char footer[FooterReserve];
+        const auto journal = bindings.transportCounters();
         const auto count = std::snprintf(footer, sizeof(footer),
             "{\"event\":\"footer\",\"emitted\":%llu,\"dropped_events\":%llu,"
             "\"lost_state\":%llu,\"lost_binding_state\":%llu,\"binding_capture_armed\":%s,"
@@ -266,7 +315,9 @@ struct Capture {
             "\"unsupported\":%llu,\"stale\":%llu,\"bounds\":%llu,\"layout_mismatch\":%llu},"
             "\"binding_capacity_tables\":{\"set_layout\":%llu,\"pipeline_layout\":%llu,\"pool\":%llu,"
             "\"set\":%llu,\"buffer\":%llu,\"image\":%llu,\"view\":%llu,\"sampler\":%llu,"
-            "\"memory\":%llu,\"command\":%llu}}\n",
+            "\"memory\":%llu,\"command\":%llu,\"conversion\":%llu},"
+            "\"binding_journal\":{\"registry\":%llu,\"queue\":%llu,\"order_gap\":%llu,"
+            "\"batch\":%llu,\"order_wrap\":%llu,\"closed_calls\":%llu,\"published\":%llu,\"replayed\":%llu}}\n",
             static_cast<unsigned long long>(events.emitted()), static_cast<unsigned long long>(events.dropped()),
             static_cast<unsigned long long>(core.lostState()), static_cast<unsigned long long>(bindings.lostState()),
             bindingsArmed.load() ? "true" : "false", std::min(bindingSnapshots.load(), BindingSnapshotLimit),
@@ -276,7 +327,11 @@ struct Capture {
 #undef LOSS
 #define TABLE(name) static_cast<unsigned long long>(bindings.capacityLossCount(frame_bindings::Table::name))
             TABLE(SetLayout), TABLE(PipelineLayout), TABLE(Pool), TABLE(Set), TABLE(Buffer), TABLE(Image),
-            TABLE(View), TABLE(Sampler), TABLE(Memory), TABLE(Command));
+            TABLE(View), TABLE(Sampler), TABLE(Memory), TABLE(Command), TABLE(Conversion),
+            static_cast<unsigned long long>(journal.registry), static_cast<unsigned long long>(journal.queue),
+            static_cast<unsigned long long>(journal.orderGap), static_cast<unsigned long long>(journal.batch),
+            static_cast<unsigned long long>(journal.orderWrap), static_cast<unsigned long long>(journal.closedCalls),
+            static_cast<unsigned long long>(journal.published), static_cast<unsigned long long>(journal.replayed));
 #undef TABLE
         if (ioGood && count > 0 && static_cast<std::size_t>(count) < sizeof(footer))
             writeAll(fd, footer, static_cast<std::size_t>(count));
@@ -293,8 +348,9 @@ template <typename T> void* dispatchKey(T handle) { return *reinterpret_cast<voi
 template <typename Observer> void observeBindings(Observer observer) {
     auto& c = capture();
     if (!c.bindingsEnabled || !c.core.enabled()) return;
-    // Admission includes source-table updates in the stable writer footer.
-    // This scope never spans a driver call and never waits for the writer.
+    // Admission includes owned scalar journal publications in the stable footer.
+    // Object-table lookup/mutation is exclusively replayed by the writer. This
+    // scope never spans a driver call or waits for the writer.
     const auto admission = c.events.admit();
     if (admission && c.core.enabled()) observer(c.bindings);
 }
@@ -307,11 +363,16 @@ void recordedDraw(std::uint64_t device, VkCommandBuffer command, std::uint32_t k
         c.bindingSnapshots.load(std::memory_order_relaxed) >= Capture::BindingSnapshotLimit) return;
     Event event;
     if (!c.core.describeDraw(device, number(command), event)) return;
-    if (c.bindingSnapshots.fetch_add(1, std::memory_order_relaxed) >= Capture::BindingSnapshotLimit) return;
+    const auto cookie = c.bindingSnapshots.fetch_add(1, std::memory_order_relaxed);
+    if (cookie >= Capture::BindingSnapshotLimit) return;
     event.kind = Kind::Bindings;
     event.drawKind = kind;
-    event.bindings = c.bindings.snapshot(device, command, (VkPipelineLayout)(std::uintptr_t)event.layout);
-    event.complete = event.complete && event.bindings.sourceComplete;
+    event.bindingCookie = cookie;
+    if (!c.bindings.requestSnapshot(device, command, (VkPipelineLayout)(std::uintptr_t)event.layout, cookie)) {
+        event.bindingCookie = std::numeric_limits<std::uint32_t>::max();
+        event.bindingFailure = frame_bindings::Reason::Capacity;
+        event.complete = false;
+    }
     c.events.push(event);
 }
 

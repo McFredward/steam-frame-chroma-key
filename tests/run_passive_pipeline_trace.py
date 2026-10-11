@@ -68,7 +68,7 @@ def main():
                         str(session.folder / "libVkLayer_frame_mask_trace.so"), "--sha256",
                         hashlib.sha256((session.folder / "libVkLayer_frame_mask_trace.so").read_bytes()).hexdigest()],
                        check=True, timeout=10)
-        for name in ("FRAME_MASK_TRACE_FRAGMENT_HASH", "FRAME_MASK_TRACE_DISABLE", "FRAME_MASK_TRACE_BINDINGS",
+        for name in ("FRAME_MASK_TEST_CONCURRENT_METADATA", "FRAME_MASK_TRACE_FRAGMENT_HASH", "FRAME_MASK_TRACE_DISABLE", "FRAME_MASK_TRACE_BINDINGS",
                      "FRAME_MASK_TRACE_BINDINGS_ARM_FILE"):
             base.pop(name, None)
         for name in ("lvp_icd.x86_64.json", "lvp_icd.json"):
@@ -83,6 +83,7 @@ def main():
                                        ("filtered-miss", compositor, "1"),
                                        ("filtered-match", compositor, "1"),
                                        ("bindings-enabled", compositor, "1"),
+                                       ("bindings-concurrent", compositor, "1"),
                                        ("bindings-limit", compositor, "1"),
                                        ("bindings-unarmed", compositor, "1"),
                                        ("bindings-unarmed-stress", compositor, "1"),
@@ -96,6 +97,8 @@ def main():
             env = base.copy()
             env["FRAME_MASK_TRACE"] = enabled
             env["FRAME_MASK_TRACE_OUTPUT"] = str(output)
+            if mode == "bindings-concurrent":
+                env["FRAME_MASK_TEST_CONCURRENT_METADATA"] = "1"
             if mode.startswith("bindings-"):
                 env["FRAME_MASK_TRACE_BINDINGS"] = "1"
                 env["FRAME_MASK_TRACE_FRAGMENT_HASH"] = f"{fingerprint(fragment):016x}"
@@ -153,10 +156,15 @@ def main():
             assert records[-1]["event"] == "footer"
             footer = records[-1]
             assert footer["io_ok"] and not footer["byte_cap_reached"], footer
-            assert footer["dropped_events"] == 0 and footer["lost_state"] == 0, footer
-            assert footer["lost_binding_state"] == 0, footer
+            assert footer["dropped_events"] == 0 and footer["lost_state"] == 0, (mode, footer)
+            assert footer["lost_binding_state"] == 0, (mode, footer)
             assert sum(footer["binding_loss_reasons"].values()) == footer["lost_binding_state"], footer
             assert sum(footer["binding_capacity_tables"].values()) == 0, footer
+            assert all(value == 0 for name, value in footer["binding_journal"].items()
+                       if name not in ("published", "replayed")), footer
+            assert footer["binding_journal"]["published"] == footer["binding_journal"]["replayed"], footer
+            if mode == "bindings-concurrent":
+                assert footer["binding_journal"]["replayed"] >= 256, "Concurrent native resource calls did not traverse the journal"
             events = records[1:-1]
             assert [event["serial"] for event in events] == list(range(1, footer["emitted"] + 1)), \
                 "Footer count or event serials do not match the complete writer drain"
