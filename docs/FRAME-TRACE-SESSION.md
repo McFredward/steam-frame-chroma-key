@@ -317,3 +317,39 @@ cleared and the terminal closed. Local software checkpoint `9e3fa41` also
 passed the complete eleven-suite CI; that software result is separate from the
 limited live evidence above. Subsequent closure/fixture repairs need only their
 focused core and loader/GPU checks; they cannot retroactively broaden this run.
+
+## Post-run diagnostic repairs and validation
+
+The review found that the deployed binary's time-ended writer did not wait for
+in-flight bookkeeping before serializing the footer. Source now closes an atomic
+admission gate and waits only on the background writer for admitted observers.
+Render hooks keep their try-lock behavior; no admission scope spans a forwarded
+native Vulkan call. Queued records and loss counters are stable before the final
+drain/footer. Tests exercise admitted observers during closure, post-close
+counter stability and concurrent producers. The real-loader fixture also now
+requires complete accepted-submit records, the same device/command/generation,
+later event serial and a footer matching all emitted serials.
+
+The primary integration's first focused run passed the core but rejected the GPU
+fixture because its footer reported one dropped event. Source review established
+that the single render producer shared the event mutex with the background
+reader: fewer than 128 attempted events could not overflow the ring, and a
+reader `pop`/`empty` could make the producer's try-lock fail. This queue behavior
+predated the closure repair. The reader now uses release/acquire published and
+consumed positions; only producers use the try-lock mutex. Actual producer
+contention and capacity loss remain reported and rejected. Deterministic tests
+cover reader independence and a concurrent 2,048-record sequence with unchanged
+payloads, order and counts. No assertion was weakened and no retry-until-green
+was used. This identified fixture cause does not reclassify the earlier rejected
+headset capture's unknown one-event loss.
+
+After this bounded repair, the integrated core and real Vulkan loader/GPU suites
+both pass (2/2, 1.93 seconds), with unchanged fixture pixels. Unchanged suites
+retain checkpoint `9e3fa41`'s complete green CI evidence; this focused pass is not
+a repeated complete local gate. Strict-warning AArch64 compilation also passes.
+The new local-only library is 68,064 bytes, SHA-256
+`ff50e29c5de359b2dab6625fe61cdfea6dfedcd0379cfb9ca232427130ac79d5`.
+It was **not installed or tested on the Frame**. The fifth attempt still uses
+the previously recorded 68,056-byte library identity and its narrower evidence.
+Generated build caches and the completed worker worktree are removed after
+retaining small validation records; private hardware evidence stays intact.

@@ -43,6 +43,11 @@ have been established. No mask guard is removed.
 - Metadata has a 128-event ring, a 2,048-event lifetime limit and a 1 MiB file
   limit. A background worker performs all file output. There is no shader-file
   scan, image readback, socket I/O or GPU work in a render hook.
+  The single reader uses release/acquire publication/consumption positions and
+  never takes the producer mutex. Producer contention and overflow remain
+  diagnostic losses. The writer closes admission and waits for admitted
+  bookkeeping before draining and serializing its stable footer; rendering
+  threads never wait for writer shutdown or hold a scope across driver calls.
 - One small forwarding record per live Vulkan instance/device is allocated at
   creation and freed at destruction. This lifecycle storage is separate from
   the fixed-capacity observation tables; no per-frame allocation occurs.
