@@ -4,6 +4,7 @@
 // allocations, logging or I/O occur here. Snapshots describe observed CPU API
 // state; neither a draw nor validation certifies GPU-consumed uniform values.
 #include <vulkan/vulkan.h>
+#include "passive_binding_extensions.h"
 
 #include <array>
 #include <atomic>
@@ -21,6 +22,7 @@ constexpr std::size_t BufferCapacity = 512;
 constexpr std::size_t ImageCapacity = 512;
 constexpr std::size_t ViewCapacity = 512;
 constexpr std::size_t SamplerCapacity = 256;
+constexpr std::size_t ConversionCapacity = 256;
 constexpr std::size_t MemoryCapacity = 1024;
 constexpr std::size_t CommandCapacity = 512;
 constexpr std::size_t BindingCapacity = 32;
@@ -43,12 +45,14 @@ inline bool same(Identity a, Identity b) noexcept {
 enum class Presence : std::uint8_t { Unknown, Absent, Present };
 enum class BindingState : std::uint8_t { Unknown, Absent, Unwritten, Written };
 enum class Reason : std::uint8_t { None, Capacity, Contention, Unknown, Unsupported, Stale, Bounds, LayoutMismatch };
-enum class Table : std::uint8_t { SetLayout, PipelineLayout, Pool, Set, Buffer, Image, View, Sampler, Memory, Command, Count };
+enum class Table : std::uint8_t { SetLayout, PipelineLayout, Pool, Set, Buffer, Image, View, Sampler, Memory, Command, Conversion, Count };
 
 struct MemoryMetadata {
     Identity identity{};
     VkDeviceSize allocationSize = 0;
     std::uint32_t memoryTypeIndex = 0;
+    extensions::MemoryExtensions extensions{};
+    Identity dedicatedImage{}, dedicatedBuffer{};
     bool complete = false;
 };
 struct BufferMetadata {
@@ -70,9 +74,23 @@ struct ImageMetadata {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
     VkImageUsageFlags usage = 0;
+    extensions::ImageExtensions extensions{};
     Identity memory{};
     VkDeviceSize memoryOffset = 0;
     MemoryMetadata allocation{};
+    bool complete = false;
+};
+struct ConversionMetadata {
+    Identity identity{};
+    extensions::ConversionExtensions extensions{};
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkSamplerYcbcrModelConversion model = VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
+    VkSamplerYcbcrRange range = VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
+    VkComponentMapping components{};
+    VkChromaLocation xChromaOffset = VK_CHROMA_LOCATION_COSITED_EVEN;
+    VkChromaLocation yChromaOffset = VK_CHROMA_LOCATION_COSITED_EVEN;
+    VkFilter chromaFilter = VK_FILTER_NEAREST;
+    VkBool32 forceExplicitReconstruction = VK_FALSE;
     bool complete = false;
 };
 struct ViewMetadata {
@@ -82,6 +100,8 @@ struct ViewMetadata {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkComponentMapping components{};
     VkImageSubresourceRange subresource{};
+    extensions::ViewExtensions extensions{};
+    ConversionMetadata conversion{};
     bool complete = false;
 };
 struct SamplerMetadata {
@@ -101,6 +121,8 @@ struct SamplerMetadata {
     VkCompareOp compareOp = VK_COMPARE_OP_NEVER;
     VkBorderColor borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     VkBool32 unnormalizedCoordinates = VK_FALSE;
+    extensions::SamplerExtensions extensions{};
+    ConversionMetadata conversion{};
     bool complete = false;
 };
 struct Binding {
@@ -139,7 +161,7 @@ struct Snapshot {
     std::array<Binding, TargetBindings.size()> bindings{};
 };
 static_assert(std::is_trivially_copyable_v<Snapshot>, "Snapshots must be safe bounded event payloads");
-static_assert(sizeof(Snapshot) <= 4096, "Snapshot exceeds the bounded trace event budget");
+static_assert(sizeof(Snapshot) <= 16384, "Snapshot exceeds the bounded trace event budget");
 
 class Core {
     friend struct TestAccess;
@@ -177,6 +199,7 @@ class Core {
     struct View : Base { ViewMetadata metadata{}; };
     struct Sampler : Base { SamplerMetadata metadata{}; };
     struct Memory : Base { MemoryMetadata metadata{}; };
+    struct Conversion : Base { ConversionMetadata metadata{}; };
     struct BoundSet {
         Identity set{};
         std::array<std::uint32_t, BindingCapacity> offsets{};
@@ -203,6 +226,9 @@ public:
         return index < capacityLosses_.size() ? capacityLosses_[index].load(std::memory_order_relaxed) : 0;
     }
     void reportUnsupported(std::uint64_t /*device*/) noexcept { lose(Reason::Unsupported); }
+    void reportLoss(Reason reason) noexcept {
+        if (reason != Reason::None && static_cast<std::size_t>(reason) < losses_.size()) lose(reason);
+    }
 
     void createSetLayout(std::uint64_t device, VkDescriptorSetLayout value, const VkDescriptorSetLayoutCreateInfo& info) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
@@ -300,10 +326,26 @@ public:
     }
 
     void allocateMemory(std::uint64_t device, VkDeviceMemory value, const VkMemoryAllocateInfo& info) noexcept {
+        allocateMemory(device, value, info, extensions::parseMemory(info.pNext));
+    }
+    void allocateMemory(std::uint64_t device, VkDeviceMemory value, const VkMemoryAllocateInfo& info,
+                        const extensions::MemoryExtensions& extension) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         auto* out = insert(memories_, device, handle(value)); if (!out) return;
-        out->complete = info.sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO && !info.pNext;
-        out->metadata = {out->id, info.allocationSize, info.memoryTypeIndex, out->complete};
+        out->complete = info.sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO && extension.chain.complete;
+        auto& m = out->metadata;
+        m.identity = out->id; m.allocationSize = info.allocationSize; m.memoryTypeIndex = info.memoryTypeIndex; m.extensions = extension;
+        if (extension.dedicatedImageHandle) {
+            const auto* image = find(images_, device, extension.dedicatedImageHandle);
+            if (image) m.dedicatedImage = image->id;
+            if (!image || !image->complete) out->complete = false;
+        }
+        if (extension.dedicatedBufferHandle) {
+            const auto* buffer = find(buffers_, device, extension.dedicatedBufferHandle);
+            if (buffer) m.dedicatedBuffer = buffer->id;
+            if (!buffer || !buffer->complete) out->complete = false;
+        }
+        m.complete = out->complete;
     }
     void freeMemory(std::uint64_t device, VkDeviceMemory value) noexcept { eraseGuarded(memories_, device, handle(value)); }
     void createBuffer(std::uint64_t device, VkBuffer value, const VkBufferCreateInfo& info) noexcept {
@@ -314,42 +356,85 @@ public:
     }
     void destroyBuffer(std::uint64_t device, VkBuffer value) noexcept { eraseGuarded(buffers_, device, handle(value)); }
     void createImage(std::uint64_t device, VkImage value, const VkImageCreateInfo& info) noexcept {
+        createImage(device, value, info, extensions::parseImage(info.pNext));
+    }
+    void createImage(std::uint64_t device, VkImage value, const VkImageCreateInfo& info,
+                     const extensions::ImageExtensions& extension) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         auto* out = insert(images_, device, handle(value)); if (!out) return;
-        out->complete = info.sType == VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO && !info.pNext &&
+        // A modifier list describes candidates, not the implementation's selected
+        // modifier. Retain the input but reject full resource proof until queried.
+        out->complete = info.sType == VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO && extension.chain.complete && !extension.hasDrmList &&
             (info.flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_DISJOINT_BIT)) == 0;
         auto& m = out->metadata;
         m.identity = out->id; m.type = info.imageType; m.format = info.format; m.extent = info.extent; m.mipLevels = info.mipLevels;
-        m.arrayLayers = info.arrayLayers; m.samples = info.samples; m.tiling = info.tiling; m.usage = info.usage;
+        m.arrayLayers = info.arrayLayers; m.samples = info.samples; m.tiling = info.tiling; m.usage = info.usage; m.extensions = extension;
     }
     void destroyImage(std::uint64_t device, VkImage value) noexcept { eraseGuarded(images_, device, handle(value)); }
     void createView(std::uint64_t device, VkImageView value, const VkImageViewCreateInfo& info) noexcept {
+        createView(device, value, info, extensions::parseView(info.pNext));
+    }
+    void createView(std::uint64_t device, VkImageView value, const VkImageViewCreateInfo& info,
+                    const extensions::ViewExtensions& extension) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         auto* out = insert(views_, device, handle(value)); if (!out) return;
         const auto* image = find(images_, device, handle(info.image));
-        out->complete = info.sType == VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO && !info.pNext && info.flags == 0 && image && image->complete;
+        out->complete = info.sType == VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO && extension.chain.complete && info.flags == 0 && image && image->complete;
         auto& m = out->metadata;
         m.identity = out->id; if (image) m.image = image->id;
-        m.type = info.viewType; m.format = info.format; m.components = info.components; m.subresource = info.subresourceRange;
+        m.type = info.viewType; m.format = info.format; m.components = info.components; m.subresource = info.subresourceRange; m.extensions = extension;
+        if (extension.hasConversion) {
+            const auto* conversion = find(conversions_, device, extension.conversionHandle);
+            if (conversion) m.conversion = conversion->metadata;
+            if (!conversion || !conversion->complete) out->complete = false;
+        }
     }
     void destroyView(std::uint64_t device, VkImageView value) noexcept { eraseGuarded(views_, device, handle(value)); }
     void createSampler(std::uint64_t device, VkSampler value, const VkSamplerCreateInfo& info) noexcept {
+        createSampler(device, value, info, extensions::parseSampler(info.pNext));
+    }
+    void createSampler(std::uint64_t device, VkSampler value, const VkSamplerCreateInfo& info,
+                       const extensions::SamplerExtensions& extension) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         auto* out = insert(samplers_, device, handle(value)); if (!out) return;
-        out->complete = info.sType == VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO && !info.pNext && info.flags == 0;
+        out->complete = info.sType == VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO && extension.chain.complete && info.flags == 0;
+        if ((info.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || info.borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT) &&
+            !extension.hasCustomBorder) out->complete = false;
         auto& m = out->metadata;
         m.identity = out->id; m.magFilter = info.magFilter; m.minFilter = info.minFilter; m.mipmapMode = info.mipmapMode;
         m.addressModeU = info.addressModeU; m.addressModeV = info.addressModeV; m.addressModeW = info.addressModeW;
         m.mipLodBias = info.mipLodBias; m.minLod = info.minLod; m.maxLod = info.maxLod; m.maxAnisotropy = info.maxAnisotropy;
         m.anisotropyEnable = info.anisotropyEnable; m.compareEnable = info.compareEnable; m.compareOp = info.compareOp;
-        m.borderColor = info.borderColor; m.unnormalizedCoordinates = info.unnormalizedCoordinates; m.complete = out->complete;
+        m.borderColor = info.borderColor; m.unnormalizedCoordinates = info.unnormalizedCoordinates; m.extensions = extension;
+        if (extension.hasConversion) {
+            const auto* conversion = find(conversions_, device, extension.conversionHandle);
+            if (conversion) m.conversion = conversion->metadata;
+            if (!conversion || !conversion->complete) out->complete = false;
+        }
+        m.complete = out->complete;
     }
     void destroySampler(std::uint64_t device, VkSampler value) noexcept { eraseGuarded(samplers_, device, handle(value)); }
+    void createConversion(std::uint64_t device, VkSamplerYcbcrConversion value, const VkSamplerYcbcrConversionCreateInfo& info) noexcept {
+        createConversion(device, value, info, extensions::parseConversion(info.pNext));
+    }
+    void createConversion(std::uint64_t device, VkSamplerYcbcrConversion value, const VkSamplerYcbcrConversionCreateInfo& info,
+                          const extensions::ConversionExtensions& extension) noexcept {
+        auto lock = acquire(); if (!lock.owns_lock()) return;
+        auto* out = insert(conversions_, device, handle(value)); if (!out) return;
+        out->complete = info.sType == VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO && extension.chain.complete;
+        auto& m = out->metadata;
+        m.identity = out->id; m.extensions = extension; m.format = info.format; m.model = info.ycbcrModel; m.range = info.ycbcrRange;
+        m.components = info.components; m.xChromaOffset = info.xChromaOffset; m.yChromaOffset = info.yChromaOffset;
+        m.chromaFilter = info.chromaFilter; m.forceExplicitReconstruction = info.forceExplicitReconstruction; m.complete = out->complete;
+    }
+    void destroyConversion(std::uint64_t device, VkSamplerYcbcrConversion value) noexcept { eraseGuarded(conversions_, device, handle(value)); }
     void bindBufferMemory(std::uint64_t device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset, bool supportedInfo = true) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         auto* out = find(buffers_, device, handle(buffer)); const auto* allocation = find(memories_, device, handle(memory));
         if (!out) { lose(Reason::Unknown); return; }
         if (!allocation || !supportedInfo || out->metadata.memory.generation) out->complete = false;
+        if (allocation && (allocation->metadata.dedicatedImage.generation ||
+                           (allocation->metadata.dedicatedBuffer.generation && !same(allocation->metadata.dedicatedBuffer, out->id)))) out->complete = false;
         if (allocation) out->metadata.memory = allocation->id;
         out->metadata.memoryOffset = offset;
     }
@@ -358,6 +443,8 @@ public:
         auto* out = find(images_, device, handle(image)); const auto* allocation = find(memories_, device, handle(memory));
         if (!out) { lose(Reason::Unknown); return; }
         if (!allocation || !supportedInfo || out->metadata.memory.generation) out->complete = false;
+        if (allocation && (allocation->metadata.dedicatedBuffer.generation ||
+                           (allocation->metadata.dedicatedImage.generation && !same(allocation->metadata.dedicatedImage, out->id)))) out->complete = false;
         if (allocation) out->metadata.memory = allocation->id;
         out->metadata.memoryOffset = offset;
     }
@@ -466,7 +553,7 @@ public:
         auto lock = acquire(); if (!lock.owns_lock()) return;
         eraseDevice(layouts_, device); eraseDevice(pipelineLayouts_, device); eraseDevice(pools_, device); eraseDevice(sets_, device);
         eraseDevice(buffers_, device); eraseDevice(images_, device); eraseDevice(views_, device); eraseDevice(samplers_, device);
-        eraseDevice(memories_, device); eraseDevice(commands_, device);
+        eraseDevice(memories_, device); eraseDevice(commands_, device); eraseDevice(conversions_, device);
     }
 private:
     static bool dynamic(VkDescriptorType type) noexcept { return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; }
@@ -509,7 +596,8 @@ private:
             std::is_same_v<T, PipelineLayout> ? Table::PipelineLayout : std::is_same_v<T, Pool> ? Table::Pool :
             std::is_same_v<T, Set> ? Table::Set : std::is_same_v<T, Buffer> ? Table::Buffer :
             std::is_same_v<T, Image> ? Table::Image : std::is_same_v<T, View> ? Table::View :
-            std::is_same_v<T, Sampler> ? Table::Sampler : std::is_same_v<T, Memory> ? Table::Memory : Table::Command;
+            std::is_same_v<T, Sampler> ? Table::Sampler : std::is_same_v<T, Memory> ? Table::Memory :
+            std::is_same_v<T, Conversion> ? Table::Conversion : Table::Command;
         capacityLosses_[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
         lose(Reason::Capacity); return nullptr;
     }
@@ -581,7 +669,11 @@ private:
     }
     MemoryMetadata allocation(std::uint64_t device, Identity id) noexcept {
         const auto* memory = lookup(memories_, device, id);
-        return memory ? memory->metadata : MemoryMetadata{};
+        if (!memory) return {};
+        auto out = memory->metadata;
+        if (out.dedicatedImage.generation && !lookup(images_, device, out.dedicatedImage)) out.complete = false;
+        if (out.dedicatedBuffer.generation && !lookup(buffers_, device, out.dedicatedBuffer)) out.complete = false;
+        return out;
     }
     Binding binding(std::uint64_t device, const Set& set, const SetLayout& layout, const BoundSet& bound, std::uint32_t value) noexcept {
         Binding out; out.binding = value;
@@ -614,7 +706,14 @@ private:
         if (imageType(definition.type)) {
             const auto* view = lookup(views_, device, source.view);
             const auto* image = view ? lookup(images_, device, view->metadata.image) : nullptr;
-            if (view) { out.view = view->metadata; out.view.complete = view->complete; }
+            if (view) {
+                out.view = view->metadata; out.view.complete = view->complete;
+                if (out.view.extensions.hasConversion) {
+                    const auto* conversion = lookup(conversions_, device, out.view.conversion.identity);
+                    out.view.conversion.complete = conversion && conversion->complete;
+                    out.view.complete = out.view.complete && out.view.conversion.complete;
+                }
+            }
             if (image) {
                 out.image = image->metadata;
                 out.image.allocation = allocation(device, out.image.memory); out.image.complete = out.image.allocation.complete &&
@@ -625,9 +724,19 @@ private:
         if (samplerType(definition.type)) {
             const auto identity = definition.immutableSampler.generation ? definition.immutableSampler : source.sampler;
             const auto* sampler = lookup(samplers_, device, identity);
-            if (sampler) out.sampler = sampler->metadata;
-            if (!sampler || !sampler->complete) out.complete = false;
+            if (sampler) {
+                out.sampler = sampler->metadata;
+                if (out.sampler.extensions.hasConversion) {
+                    const auto* conversion = lookup(conversions_, device, out.sampler.conversion.identity);
+                    out.sampler.conversion.complete = conversion && conversion->complete;
+                    out.sampler.complete = out.sampler.complete && out.sampler.conversion.complete;
+                }
+            }
+            if (!sampler || !sampler->complete || !out.sampler.complete) out.complete = false;
         }
+        if (definition.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+            (out.view.extensions.hasConversion || out.sampler.extensions.hasConversion) &&
+            !same(out.view.conversion.identity, out.sampler.conversion.identity)) out.complete = false;
         return out;
     }
     Snapshot snapshotLocked(std::uint64_t device, std::uint64_t commandValue, std::uint64_t layoutValue) noexcept {
@@ -674,6 +783,7 @@ private:
     std::array<Sampler, SamplerCapacity> samplers_{};
     std::array<Memory, MemoryCapacity> memories_{};
     std::array<Command, CommandCapacity> commands_{};
+    std::array<Conversion, ConversionCapacity> conversions_{};
 };
 
 } // namespace frame_bindings
