@@ -567,3 +567,17 @@ replace lossy hook-time bookkeeping with bounded ordered metadata replay and
 interpret explicitly supported import/sampler extension metadata. These are
 source work to complete before another resource capture; no native passthrough
 or resource/frame/UV proof is claimed by this diagnostic result.
+
+## Ordered-journal run and completed recovery
+
+The subsequent authorized run loaded checkpoint `a822f2c`, captured all 32
+selected snapshots and retained the newly supported import/sampler metadata.
+Binding-lock contention was zero, but substantial journal queue overflow still
+invalidated every global resource proof. The Frame was manually restored and
+the exact owned diagnostic directory removed after verifying local evidence
+copies. No diagnostic files or activation remain on the headset.
+
+The [ordered-journal run report](FRAME-BINDING-JOURNAL-RUN-20261011.md) records
+the actual counts, limitations, native recovery and next source-level approach.
+Further headset activation requires a reviewed repair and renewed restart
+readiness; this recording does not authorize a replacement shader or mask.

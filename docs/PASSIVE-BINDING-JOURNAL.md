@@ -3,8 +3,10 @@
 The 2026-10-11 [loss audit](PASSIVE-BINDING-LOSS-AUDIT.md) found five lost
 binding observations and unsupported imported-resource metadata in the armed
 Frame recording. This implementation addresses those two source-level causes.
-It has not yet been loaded in the Frame compositor. The earlier hardware
-recording remains incomplete; no replacement shader or mask is activated.
+The subsequent [native Frame run](FRAME-BINDING-JOURNAL-RUN-20261011.md) loaded
+this implementation and retained the supported import/sampler fields. It also
+exposed substantial journal queue overflow. Both hardware recordings remain
+incomplete; no replacement shader or mask is activated.
 
 ## Hook and writer responsibilities
 
@@ -122,10 +124,13 @@ separate complete CI result; the local limited-repair scope above is unchanged.
 
 ## Remaining acceptance gates
 
-A fresh, authorized passive recording must determine whether the native
-workload fits these bounds and whether its actual import/sampler chains now
-produce complete scalar records. Increasing capacity is not evidence that
-every hardware burst will fit; any overflow still rejects the recording.
+The authorized native run recorded all 32 selected snapshots with locally
+complete supported import/sampler metadata and zero binding-lock contention.
+It also recorded 201,483 journal queue losses and 9,222 unknown-state losses;
+none of its snapshots is globally complete. Queue capacity is therefore
+insufficient for the observed producer/replay balance. Background lookup and
+replay cost must be measured and reduced before another headset trial; merely
+enlarging queues or clearing pre-arm losses cannot establish completeness.
 The frame/eye/source association, GPU-consumed uniform coherence, selected
 decoded resource generation and submit-time binding validation remain open.
 `gpu_consumed_coherent` and `video_frame_associated` stay false.
