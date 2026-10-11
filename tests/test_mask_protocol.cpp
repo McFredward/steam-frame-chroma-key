@@ -225,6 +225,20 @@ void resourceLimitsAndClock() {
     Receiver clock; clock.beginSession(id.session); ingestAll(clock, one, 100);
     require(!clock.takeExact(id, 99) && clock.bufferedBytes() == 0,
             "clock regression discards possible stale masks");
+    for (const auto& packet : one)
+        require(clock.ingest(packet, 100) == IngestResult::WrongSession,
+                "clock regression cannot resurrect buffered frames by replay");
+    require(!clock.takeExact(id, 101), "replayed discarded frame stays opaque");
+    auto fresh = id; fresh.session[0] ^= 0x80;
+    clock.beginSession(fresh.session);
+    ingestAll(clock, encode(fresh, bytes), 102);
+    require(*clock.takeExact(fresh, 103) == bytes,
+            "fresh explicit handshake recovers after clock regression");
+    clock.expire(102);
+    for (const auto& packet : encode(fresh, bytes))
+        require(clock.ingest(packet, 103) == IngestResult::WrongSession,
+                "clock regression cannot resurrect consumed frames by replay");
+    require(!clock.takeExact(fresh, 104), "replayed consumed frame stays opaque");
     limits.maxBufferedBytes = 50000; limits.maxAssemblies = 1;
     Receiver count(limits); count.beginSession(id.session);
     count.ingest(one[0], 0); count.ingest(two[0], 1);

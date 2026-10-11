@@ -184,7 +184,10 @@ struct Receiver::Impl {
     }
 
     void tick(std::uint64_t now) {
-        if (clockSet && now < lastMs) clear();
+        if (clockSet && now < lastMs) {
+            clear();
+            bound = false;
+        }
         clockSet = true;
         lastMs = now;
         for (auto it = assemblies.begin(); it != assemblies.end();) {

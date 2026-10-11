@@ -74,7 +74,9 @@ struct Stats {
 };
 
 // This class performs no networking and creates no threads. Call it serially,
-// passing monotonic milliseconds. A clock regression clears buffered masks.
+// passing monotonic milliseconds. A clock regression clears buffered masks and
+// unbinds the receiver: packets stay rejected until an explicit beginSession
+// handshake with a fresh session ID. Never reuse a session ID after a restart.
 // Session binding is explicit: a packet cannot switch sessions. Transport
 // discovery/authentication is the application's responsibility.
 // Frame counters must increase within each session (start a new session before
@@ -89,6 +91,8 @@ public:
     Receiver(const Receiver&) = delete;
     Receiver& operator=(const Receiver&) = delete;
 
+    // The caller must provide a fresh, unique ID for each transport handshake.
+    // This is an explicit trust boundary, not a packet-driven reset operation.
     void beginSession(const SessionId& session);
     IngestResult ingest(const std::uint8_t* packet, std::size_t size,
                         std::uint64_t nowMs);
