@@ -7,6 +7,7 @@
 namespace frame_bindings {
 struct TestAccess {
     static std::unique_lock<std::mutex> hold(Core& core) { return std::unique_lock<std::mutex>(core.mutex_); }
+    static void exhaustGeneration(Core& core) { core.serial_ = UINT64_MAX; }
 };
 }
 
@@ -79,6 +80,113 @@ void seed(Core& core, std::uint64_t device = 1) {
 const Binding& at(const Snapshot& snapshot, std::uint32_t value) {
     for (const auto& entry : snapshot.bindings) if (entry.binding == value) return entry;
     std::abort();
+}
+
+void indexedCollisionsAndChurn() {
+    struct Entry { std::uint64_t device = 0; Identity id{}; std::uint64_t payload = 0; };
+    ObjectTable<Entry, 8> table;
+    std::array<std::uint64_t, 8> keys{};
+    std::array<Entry*, 8> pointers{};
+    // A cluster starting at the final index bucket must wrap around; remove its
+    // first/middle/last entries without severing the search path of survivors.
+    for (std::uint64_t key = 1, count = 0; count < keys.size(); ++key) {
+        if (ObjectTable<Entry, 8>::bucketFor(1, key) != 15) continue;
+        keys[count] = key; pointers[count] = table.insert(1, key, count + 1);
+        require(pointers[count] != nullptr, "collision cluster could not fill fixed capacity");
+        pointers[count]->payload = 100 + count; ++count;
+    }
+    require(!table.hasRoom() && !table.insert(1, 999, 100), "full index accepted an extra object");
+    require(!table.insert(1, keys[0], 100), "duplicate key replaced its live identity");
+    require(!table.insert(1, 0, 100) && !table.insert(1, 999, 0), "invalid key/generation entered index");
+    for (const auto removed : {0u, 4u, 7u}) {
+        require(table.erase(1, keys[removed]), "collision erase lost its exact keyed object");
+        pointers[removed] = nullptr;
+        require(!table.find(1, keys[removed]), "deleted collision key remained reachable");
+        for (unsigned i = 0; i < keys.size(); ++i) if (pointers[i]) {
+            require(table.find(1, keys[i]) == pointers[i] && pointers[i]->payload == 100 + i,
+                    "backward shifting moved payload or hid collision survivor");
+        }
+    }
+    auto* reused = table.insert(1, keys[4], 1000);
+    require(reused && reused->id.generation == 1000 && reused->payload == 0, "freed slot revived stale metadata");
+    auto* otherDevice = table.insert(2, keys[4], 1001);
+    require(otherDevice && otherDevice != reused && table.find(1, keys[4]) == reused && table.find(2, keys[4]) == otherDevice,
+            "same handle on another device aliased the indexed object");
+    table.eraseIf([](const Entry& entry) { return entry.device == 1; });
+    require(table.find(2, keys[4]) == otherDevice && !table.find(1, keys[4]), "device erase removed another device or retained stale keys");
+    table.eraseEntry(*otherDevice);
+    require(table.hasRoom() && !table.find(2, keys[4]), "entry erasure left a hidden occupied key");
+
+    // Deterministic model comparison deliberately churns both full and sparse
+    // collision chains. No tombstone or historical occupancy can accumulate.
+    ObjectTable<Entry, 32> churn;
+    struct Expected { std::uint64_t device = 0, key = 0, generation = 0; Entry* entry = nullptr; };
+    std::array<Expected, 32> expected{};
+    std::uint32_t state = 0x51b9u;
+    std::uint64_t generation = 1;
+    for (unsigned iteration = 0; iteration < 20000; ++iteration) {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        auto& slot = expected[state % expected.size()];
+        if (slot.entry) {
+            require(churn.erase(slot.device, slot.key), "churn failed to erase an observed key");
+            require(!churn.find(slot.device, slot.key), "churn retained an erased key");
+            slot = {};
+        } else {
+            slot.device = (state >> 16) % 4 + 1;
+            slot.key = (iteration + 1) * UINT64_C(4096);
+            slot.generation = generation++;
+            slot.entry = churn.insert(slot.device, slot.key, slot.generation);
+            require(slot.entry != nullptr, "churn exhausted capacity before live-object limit");
+            slot.entry->payload = iteration;
+        }
+        for (const auto& current : expected) if (current.entry) {
+            require(churn.find(current.device, current.key) == current.entry && current.entry->id.generation == current.generation,
+                    "churn lookup moved object or revived another generation");
+            require(!churn.find(current.device + 10, current.key), "missing device key matched existing handle");
+        }
+    }
+}
+void indexedLifecycleCapacityRecovery() {
+    auto core = std::make_unique<Core>();
+    const auto pool = h<VkDescriptorPool>(0x8100);
+    auto poolInfo = info<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
+    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; poolInfo.maxSets = SetCapacity;
+    core->createPool(1, pool, poolInfo);
+    VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    makeLayout(*core, &binding, 1);
+    auto allocation = info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+    allocation.descriptorPool = pool; allocation.descriptorSetCount = 1; allocation.pSetLayouts = &sl;
+    std::array<VkDescriptorSet, SetCapacity> sets{};
+    std::array<VkCommandBuffer, CommandCapacity> commands{};
+    for (unsigned i = 0; i < SetCapacity; ++i) {
+        sets[i] = h<VkDescriptorSet>(0x100000 + i * 4096);
+        commands[i] = h<VkCommandBuffer>(0x200000 + i * 4096);
+        core->allocateSets(1, allocation, &sets[i]); core->allocateCommands(1, cp, 1, &commands[i]);
+    }
+    core->resetPool(1, pool);
+    for (auto& set : sets) core->allocateSets(1, allocation, &set);
+    core->freeSets(1, pool, sets.size(), sets.data());
+    for (auto& set : sets) core->allocateSets(1, allocation, &set);
+    core->destroyPool(1, pool); core->createPool(1, pool, poolInfo);
+    for (auto& set : sets) core->allocateSets(1, allocation, &set);
+    core->freeCommands(1, cp, commands.size(), commands.data());
+    core->allocateCommands(1, cp, commands.size(), commands.data());
+    core->destroyCommandPool(1, cp); core->allocateCommands(1, cp, commands.size(), commands.data());
+    require(core->lostState() == 0, "pool/free lifecycle failed to return indexed capacity");
+    core->deviceDestroyed(1);
+    core->createPool(1, pool, poolInfo); makeLayout(*core, &binding, 1);
+    for (auto& set : sets) core->allocateSets(1, allocation, &set);
+    core->allocateCommands(1, cp, commands.size(), commands.data());
+    require(core->lostState() == 0, "device destruction retained occupied index entries");
+
+    TestAccess::exhaustGeneration(*core);
+    auto samplerInfo = info<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
+    core->createSampler(1, h<VkSampler>(0xdead), samplerInfo);
+    require(core->lossCount(Reason::Capacity) == 1 && core->capacityLossCount(Table::Sampler) == 0,
+            "generation exhaustion was confused with object-table capacity");
+    core->createSampler(1, h<VkSampler>(0xbeef), samplerInfo);
+    require(core->lossCount(Reason::Capacity) == 2 && core->lossCount(Reason::Stale) == 0,
+            "generation exhaustion inserted a ghost or cleared sticky failure");
 }
 
 void metadataAndRevision() {
@@ -388,8 +496,9 @@ void unsupportedAndCapacity() {
 }
 
 int main() {
+    indexedCollisionsAndChurn(); indexedLifecycleCapacityRecovery();
     metadataAndRevision(); devicesAndHandleReuse(); descriptorCopiesAndPoolReuse(); dynamicOrderingAndBounds();
     incompatibleLayoutAndSecondaryExecution(); dynamicOrderAcrossSets(); imageAndSamplerProvenance(); incompleteResourceKeepsLayoutAndIdentity();
     immutableSampler(); unsupportedAndCapacity();
-    std::cout << "passive binding metadata: 10 focused groups passed; Snapshot=" << sizeof(Snapshot) << " bytes, Core=" << sizeof(Core) << " bytes\n";
+    std::cout << "passive binding metadata: 12 focused groups passed; Snapshot=" << sizeof(Snapshot) << " bytes, Core=" << sizeof(Core) << " bytes\n";
 }

@@ -5,6 +5,7 @@
 // state; neither a draw nor validation certifies GPU-consumed uniform values.
 #include <vulkan/vulkan.h>
 #include "passive_binding_extensions.h"
+#include "passive_binding_table.h"
 
 #include <array>
 #include <atomic>
@@ -284,13 +285,13 @@ public:
         auto lock = acquire(); if (!lock.owns_lock()) return;
         const auto* pool = find(pools_, device, handle(value));
         if (!pool) { lose(Reason::Unknown); return; }
-        for (auto& set : sets_) if (set.device == device && same(set.pool, pool->id)) set = {};
+        sets_.eraseIf([&](const Set& set) { return set.device == device && same(set.pool, pool->id); });
     }
     void destroyPool(std::uint64_t device, VkDescriptorPool value) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         const auto* pool = find(pools_, device, handle(value));
         if (!pool) { if (handle(value)) lose(Reason::Unknown); return; }
-        for (auto& set : sets_) if (set.device == device && same(set.pool, pool->id)) set = {};
+        sets_.eraseIf([&](const Set& set) { return set.device == device && same(set.pool, pool->id); });
         erase(pools_, device, handle(value));
     }
     void allocateSets(std::uint64_t device, const VkDescriptorSetAllocateInfo& info, const VkDescriptorSet* values) noexcept {
@@ -313,7 +314,7 @@ public:
         for (std::uint32_t i = 0; i < count; ++i) {
             auto* set = find(sets_, device, handle(values[i]));
             if (!pool || !set || !same(set->pool, pool->id)) { lose(Reason::Unknown); continue; }
-            *set = {};
+            sets_.eraseEntry(*set);
         }
     }
     void updateSets(std::uint64_t device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes,
@@ -463,7 +464,7 @@ public:
         for (std::uint32_t i = 0; i < count; ++i) {
             auto* out = find(commands_, device, handle(values[i]));
             if (!out || out->pool != handle(pool)) { lose(Reason::Unknown); continue; }
-            *out = {};
+            commands_.eraseEntry(*out);
         }
     }
     void beginCommand(std::uint64_t device, VkCommandBuffer value) noexcept {
@@ -489,7 +490,7 @@ public:
     }
     void destroyCommandPool(std::uint64_t device, VkCommandPool pool) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
-        for (auto& command : commands_) if (command.device == device && command.id.generation && command.pool == handle(pool)) command = {};
+        commands_.eraseIf([&](const Command& command) { return command.device == device && command.pool == handle(pool); });
     }
     void executeCommands(std::uint64_t device, VkCommandBuffer primary) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
@@ -578,19 +579,21 @@ private:
         if (serial_ == std::numeric_limits<std::uint64_t>::max()) { lose(Reason::Capacity); return 0; }
         return ++serial_;
     }
-    template<class T, std::size_t N> static T* find(std::array<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
-        if (!value) return nullptr;
-        for (auto& entry : table) if (entry.device == device && entry.id.handle == value && entry.id.generation) return &entry;
-        return nullptr;
+    template<class T, std::size_t N> static T* find(ObjectTable<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
+        return table.find(device, value);
     }
-    template<class T, std::size_t N> static const T* lookup(std::array<T, N>& table, std::uint64_t device, Identity id) noexcept {
+    template<class T, std::size_t N> static const T* lookup(ObjectTable<T, N>& table, std::uint64_t device, Identity id) noexcept {
         const auto* entry = find(table, device, id.handle); return entry && same(entry->id, id) ? entry : nullptr;
     }
-    template<class T, std::size_t N> T* insert(std::array<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
+    template<class T, std::size_t N> T* insert(ObjectTable<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
         if (!value) { lose(Reason::Unknown); return nullptr; }
         if (find(table, device, value)) { lose(Reason::Stale); return nullptr; }
-        for (auto& entry : table) if (!entry.id.generation) {
-            entry = {}; entry.device = device; entry.id = {value, next()}; return &entry;
+        if (table.hasRoom()) {
+            const auto generation = next();
+            if (!generation) return nullptr;
+            auto* entry = table.insert(device, value, generation);
+            if (!entry) lose(Reason::Unknown);
+            return entry;
         }
         constexpr auto kind = std::is_same_v<T, SetLayout> ? Table::SetLayout :
             std::is_same_v<T, PipelineLayout> ? Table::PipelineLayout : std::is_same_v<T, Pool> ? Table::Pool :
@@ -601,14 +604,15 @@ private:
         capacityLosses_[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
         lose(Reason::Capacity); return nullptr;
     }
-    template<class T, std::size_t N> void erase(std::array<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
-        auto* entry = find(table, device, value); if (entry) *entry = {}; else if (value) lose(Reason::Unknown);
+    template<class T, std::size_t N> void erase(ObjectTable<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
+        auto* entry = find(table, device, value);
+        if (entry) table.eraseEntry(*entry); else if (value) lose(Reason::Unknown);
     }
-    template<class T, std::size_t N> void eraseGuarded(std::array<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
+    template<class T, std::size_t N> void eraseGuarded(ObjectTable<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
         auto lock = acquire(); if (lock.owns_lock()) erase(table, device, value);
     }
-    template<class T, std::size_t N> static void eraseDevice(std::array<T, N>& table, std::uint64_t device) noexcept {
-        for (auto& entry : table) if (entry.device == device) entry = {};
+    template<class T, std::size_t N> static void eraseDevice(ObjectTable<T, N>& table, std::uint64_t device) noexcept {
+        table.eraseIf([&](const T& entry) { return entry.device == device; });
     }
     void clearCommand(Command& out) noexcept {
         const auto device = out.device; const auto pool = out.pool; const auto value = out.id.handle;
@@ -773,17 +777,17 @@ private:
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Table::Count)> capacityLosses_{};
     std::atomic<Reason> lastLoss_{Reason::None};
     std::uint64_t serial_ = 0;
-    std::array<SetLayout, LayoutCapacity> layouts_{};
-    std::array<PipelineLayout, LayoutCapacity> pipelineLayouts_{};
-    std::array<Pool, PoolCapacity> pools_{};
-    std::array<Set, SetCapacity> sets_{};
-    std::array<Buffer, BufferCapacity> buffers_{};
-    std::array<Image, ImageCapacity> images_{};
-    std::array<View, ViewCapacity> views_{};
-    std::array<Sampler, SamplerCapacity> samplers_{};
-    std::array<Memory, MemoryCapacity> memories_{};
-    std::array<Command, CommandCapacity> commands_{};
-    std::array<Conversion, ConversionCapacity> conversions_{};
+    ObjectTable<SetLayout, LayoutCapacity> layouts_{};
+    ObjectTable<PipelineLayout, LayoutCapacity> pipelineLayouts_{};
+    ObjectTable<Pool, PoolCapacity> pools_{};
+    ObjectTable<Set, SetCapacity> sets_{};
+    ObjectTable<Buffer, BufferCapacity> buffers_{};
+    ObjectTable<Image, ImageCapacity> images_{};
+    ObjectTable<View, ViewCapacity> views_{};
+    ObjectTable<Sampler, SamplerCapacity> samplers_{};
+    ObjectTable<Memory, MemoryCapacity> memories_{};
+    ObjectTable<Command, CommandCapacity> commands_{};
+    ObjectTable<Conversion, ConversionCapacity> conversions_{};
 };
 
 } // namespace frame_bindings
