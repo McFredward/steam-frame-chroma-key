@@ -115,6 +115,11 @@ Private validation/artifact hashes are retained under
 `build/journal-validation-20261011/` and `build/journal-trace-staged/`.
 Completed test builds and worker checkouts are removed after integration.
 
+The integrated checkpoint `a822f2c` subsequently passed the
+[complete 15-suite CI run](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38150625034),
+the Windows diagnostic-sender cross-build and protocol sanitizer. This is a
+separate complete CI result; the local limited-repair scope above is unchanged.
+
 ## Remaining acceptance gates
 
 A fresh, authorized passive recording must determine whether the native
