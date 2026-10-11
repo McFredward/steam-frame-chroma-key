@@ -85,6 +85,13 @@ replay-cost reduction. Keep ordering, handle-generation invalidation and sticky
 loss rejection intact. Do not repeat the same headset trial with only a larger
 queue, erase pre-arm losses or activate a mask based on incomplete snapshots.
 
+The later [bounded throughput repair](PASSIVE-BINDING-THROUGHPUT.md) completes
+that local investigation: indexed tables and compact owned storage make the
+tested scheduled bursts lossless within the former fixed memory budget. Its
+extreme asynchronous startup remains incomplete. The additional writer and
+per-operation counters are prepared for a fresh native capture; this run's
+historical failures and acceptance status are unchanged.
+
 ## Verified recovery
 
 After the maintainer explicitly approved manual rollback, both activation files

@@ -15,7 +15,12 @@ never enter the binding object's table mutex, retain borrowed API arrays, read
 image/buffer contents, inspect an imported FD, or perform logging. Successful
 native creation/binding results and destruction calls are forwarded unchanged.
 
-There are 32 producer lanes, each with 128 slots. Thread registration has a
+There are 32 producer lanes, each with 2,048 small headers and a 256-KiB owned
+byte ring. A scalar operation copies only its scalar payload; bounded arrays
+copy their validated used prefix. Maximum-size calls still have a separate byte
+bound. Each lane occupies less fixed memory than the former 128 full-size slots.
+Typed payloads are restored on the background owner with their active C++17
+union members initialized before copying. Thread registration has a
 fixed scan; cold identity reservation has at most 64 changed-value CAS attempts
 and never waits for an owner. Cached publication uses lock-free scalar atomics.
 The AArch64 build statically verifies the relevant atomic types. Linux uses
@@ -47,12 +52,17 @@ Writer closure first quiesces existing event admissions, then closes and drains
 the journal before emitting its stable footer. Rendering threads never wait for
 the writer. The existing native-context dispatch mutex and pipeline/event
 try-lock path remain; this is not a claim that the entire layer is lock-free.
-Binding-table lookups still use bounded linear scans in the background owner.
-Indexing those tables remains a possible replay-cost improvement if live
-measurements show insufficient throughput.
+Binding-table lookups now use fixed-capacity indexes and stable object slots.
+Destruction removes the index entry; device/handle generations and dependency
+invalidation remain intact. The writer reuses a lane only for the exact expected
+ticket, and caches its acquired publication boundary. A closed, quiescent journal
+rescans published heads before declaring a missing predecessor. Productive
+snapshot replay does not add an idle delay after each 256-record batch.
 
-The journal uses 13,956,240 bytes on AArch64 (13,956,232 on x86-64), including its
-fixed object tables. This is diagnostic memory, not per-frame allocation. The
+The final compact journal uses 13,827,056 bytes in the x86-64 validation build,
+including its indexed object tables; the original unindexed checkpoint used
+13,956,232 bytes. Compile-time checks enforce the per-lane memory bound on the
+AArch64 build too. This is diagnostic memory, not per-frame allocation. The
 file still stops at 1 MiB, 32 selected binding snapshots, the event limit or the
 existing 120-second filtered/30-second unfiltered deadline. Recording completion
 does not restart SteamVR in the maintainer's manual-rollback mode.
@@ -75,7 +85,7 @@ selected modifier. Conversion/resource destruction or handle reuse invalidates
 dependent records. Retained scalar observations are not decoded pixels or
 cross-process resource identities.
 
-## Local validation and review
+## Initial local validation and review
 
 The initial merged gate passed 14 of 15 suites. The real-loader GPU test exposed
 a 64-slot journal overflow during selected draw bursts; a rerun also exposed
@@ -128,9 +138,16 @@ The authorized native run recorded all 32 selected snapshots with locally
 complete supported import/sampler metadata and zero binding-lock contention.
 It also recorded 201,483 journal queue losses and 9,222 unknown-state losses;
 none of its snapshots is globally complete. Queue capacity is therefore
-insufficient for the observed producer/replay balance. Background lookup and
-replay cost must be measured and reduced before another headset trial; merely
-enlarging queues or clearing pre-arm losses cannot establish completeness.
+insufficient for that observed producer/replay balance. The subsequent
+[throughput repair](PASSIVE-BINDING-THROUGHPUT.md) measures background lookup,
+replay and burst limits, then indexes tables and compacts owned storage within
+the previous memory budget. Its six scheduled burst cases retain every snapshot,
+but extreme asynchronous startup still overflows. This is not a complete native
+Frame result; pre-arm losses remain sticky and cannot be cleared to accept it.
+The footer now separates header and byte pressure, attributes publication/replay
+losses to API operations, and reports background replay, serialization, output,
+wall and thread CPU time. Clocks and serialization run only on the background
+writer; render hooks do not sample clocks or write logs.
 The frame/eye/source association, GPU-consumed uniform coherence, selected
 decoded resource generation and submit-time binding validation remain open.
 `gpu_consumed_coherent` and `video_frame_associated` stay false.

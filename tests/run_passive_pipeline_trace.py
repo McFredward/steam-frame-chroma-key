@@ -168,7 +168,12 @@ def main():
             assert writer["replayed"] == footer["binding_journal"]["replayed"], footer
             assert writer["replay_ns"] >= writer["max_replay_batch_ns"], writer
             assert writer["output_ns"] >= writer["max_output_ns"], writer
+            assert writer["elapsed_ns"] > 0 and writer["cpu_ns"] >= 0, writer
+            assert writer["cpu_clock_valid"] or writer["cpu_ns"] == 0, writer
             assert 0 <= writer["max_lane_occupancy"] <= records[0]["binding_lane_capacity"], writer
+            assert 0 <= writer["max_lane_bytes"] <= records[0]["binding_lane_byte_capacity"], writer
+            assert footer["binding_journal"]["queue"] == (footer["binding_journal"]["header_queue"] +
+                                                         footer["binding_journal"]["byte_queue"]), footer
             operations = footer["binding_operation_losses"]
             assert len(operations) == 37 and "unknown" not in operations, operations
             assert all(loss == 0 for counter in operations.values() for loss in counter.values()), operations

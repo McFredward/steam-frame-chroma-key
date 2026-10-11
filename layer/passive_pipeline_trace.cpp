@@ -11,6 +11,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <fcntl.h>
 #include <memory>
 #include <string>
@@ -206,6 +207,16 @@ struct Capture {
         close(fd);
         return valid;
     }
+    static bool threadCpuNanos(std::uint64_t& result) {
+        // Background writer only, once at each end of the measurement window.
+        // Separate actual writer CPU use from wall time and scheduler stalls.
+        timespec stamp{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &stamp) || stamp.tv_sec < 0 ||
+            stamp.tv_nsec < 0 || stamp.tv_nsec >= 1000000000) return false;
+        result = static_cast<std::uint64_t>(stamp.tv_sec) * UINT64_C(1000000000) +
+                 static_cast<std::uint64_t>(stamp.tv_nsec);
+        return true;
+    }
     void write(const std::string& path, const std::string& armPath) {
         // O_EXCL/O_NOFOLLOW prevents replacing an existing file or following a
         // symlink. The trace contains no binary shader payload or private image.
@@ -227,17 +238,22 @@ struct Capture {
             "\"descriptor_uv_frame_binding_proven\":false,\"fragment_filter\":\"%016llx\","
             "\"binding_metadata_version\":%u,\"limit_binding_snapshots\":%u,"
             "\"binding_lane_capacity\":%zu,"
+            "\"binding_lane_byte_capacity\":%zu,"
             "\"binding_arm_required\":%s,"
             "\"pre_arm_draws_recorded\":false,"
             "\"binding_ready_at_header\":%s,"
             "\"deadline_seconds\":%u}\n", static_cast<unsigned long long>(fragmentFilter),
             bindingsEnabled ? 1 : 0, bindingsEnabled ? BindingSnapshotLimit : 0,
             frame_bindings::Journal::LaneCapacity,
+            frame_bindings::Journal::ByteCapacity,
             armPath.empty() ? "false" : "true", bindingsArmed.load() ? "true" : "false", deadlineSeconds);
         std::size_t total = static_cast<std::size_t>(headerLength);
         bool ioGood = writeAll(fd, header, total), capped = false;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(deadlineSeconds);
         auto armCheck = std::chrono::steady_clock::now();
+        const auto writerStart = armCheck;
+        std::uint64_t cpuStart = 0;
+        const bool cpuStartValid = threadCpuNanos(cpuStart);
         bool draining = false;
         Event event;
         bool pending = false;
@@ -350,6 +366,10 @@ struct Capture {
         }
         char footer[FooterReserve];
         const auto journal = bindings.transportCounters();
+        std::uint64_t cpuEnd = 0;
+        const bool cpuValid = threadCpuNanos(cpuEnd) && cpuStartValid && cpuEnd >= cpuStart;
+        const auto cpuElapsed = cpuValid ? cpuEnd - cpuStart : 0;
+        const auto writerElapsed = elapsedNanos(writerStart);
         const auto count = std::snprintf(footer, sizeof(footer),
             "{\"event\":\"footer\",\"emitted\":%llu,\"dropped_events\":%llu,"
             "\"lost_state\":%llu,\"lost_binding_state\":%llu,\"binding_capture_armed\":%s,"
@@ -360,7 +380,8 @@ struct Capture {
             "\"set\":%llu,\"buffer\":%llu,\"image\":%llu,\"view\":%llu,\"sampler\":%llu,"
             "\"memory\":%llu,\"command\":%llu,\"conversion\":%llu},"
             "\"binding_journal\":{\"registry\":%llu,\"queue\":%llu,\"order_gap\":%llu,"
-            "\"batch\":%llu,\"order_wrap\":%llu,\"closed_calls\":%llu,\"published\":%llu,\"replayed\":%llu}",
+            "\"batch\":%llu,\"order_wrap\":%llu,\"closed_calls\":%llu,\"published\":%llu,\"replayed\":%llu,"
+            "\"header_queue\":%llu,\"byte_queue\":%llu}",
             static_cast<unsigned long long>(events.emitted()), static_cast<unsigned long long>(events.dropped()),
             static_cast<unsigned long long>(core.lostState()), static_cast<unsigned long long>(bindings.lostState()),
             bindingsArmed.load() ? "true" : "false", std::min(bindingSnapshots.load(), BindingSnapshotLimit),
@@ -374,20 +395,25 @@ struct Capture {
             static_cast<unsigned long long>(journal.registry), static_cast<unsigned long long>(journal.queue),
             static_cast<unsigned long long>(journal.orderGap), static_cast<unsigned long long>(journal.batch),
             static_cast<unsigned long long>(journal.orderWrap), static_cast<unsigned long long>(journal.closedCalls),
-            static_cast<unsigned long long>(journal.published), static_cast<unsigned long long>(journal.replayed));
+            static_cast<unsigned long long>(journal.published), static_cast<unsigned long long>(journal.replayed),
+            static_cast<unsigned long long>(journal.headerQueue), static_cast<unsigned long long>(journal.byteQueue));
 #undef TABLE
         std::size_t footerBytes = count > 0 ? static_cast<std::size_t>(count) : sizeof(footer);
         bool footerValid = append(footer, sizeof(footer), footerBytes,
             ",\"binding_writer\":{\"iterations\":%llu,\"replayed\":%llu,\"replay_ns\":%llu,"
             "\"max_replay_batch_ns\":%llu,\"snapshot_waits\":%llu,\"idle_waits\":%llu,"
-            "\"serialization_ns\":%llu,\"output_ns\":%llu,\"max_output_ns\":%llu,\"max_lane_occupancy\":%llu},"
+            "\"serialization_ns\":%llu,\"output_ns\":%llu,\"max_output_ns\":%llu,\"max_lane_occupancy\":%llu,"
+            "\"max_lane_bytes\":%llu,\"elapsed_ns\":%llu,\"cpu_clock_valid\":%s,\"cpu_ns\":%llu},"
             "\"binding_operation_losses\":{",
             static_cast<unsigned long long>(writerIterations), static_cast<unsigned long long>(replayRecords),
             static_cast<unsigned long long>(replayNanos), static_cast<unsigned long long>(maxReplayNanos),
             static_cast<unsigned long long>(snapshotWaits), static_cast<unsigned long long>(idleWaits),
             static_cast<unsigned long long>(serializationNanos), static_cast<unsigned long long>(outputNanos),
             static_cast<unsigned long long>(maxOutputNanos),
-            static_cast<unsigned long long>(journal.maxLaneOccupancy));
+            static_cast<unsigned long long>(journal.maxLaneOccupancy),
+            static_cast<unsigned long long>(journal.maxLaneBytes),
+            static_cast<unsigned long long>(writerElapsed), cpuValid ? "true" : "false",
+            static_cast<unsigned long long>(cpuElapsed));
         const auto operations = bindings.operationCounters();
         for (std::size_t i = 0; footerValid && i < operations.size(); ++i) {
             footerValid = append(footer, sizeof(footer), footerBytes,
