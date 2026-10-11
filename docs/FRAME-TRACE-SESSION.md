@@ -116,3 +116,10 @@ pixels. The recovery helper has ten focused checks, including concurrent/delayed
 recovery, restart/reload failures, preexisting files and a full ledger filesystem.
 These bounded changes reuse the unchanged foundation's complete green CI result;
 they do not imply a successful headset capture.
+
+Checkpoint `b0007c5` subsequently passed the complete
+[eleven-suite CI gate](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38132993045),
+including implicit-loader/GPU validation and the ten-case recovery suite,
+Windows cross-build and protocol sanitizers. Completed local build/test outputs
+were removed; only small private evidence and the still-reviewed staged library
+were retained. The SSH credential environment was cleared when the session ended.
