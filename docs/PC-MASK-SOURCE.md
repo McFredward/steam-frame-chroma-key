@@ -1,7 +1,9 @@
 # PC source for a real Steam Link mask
 
-Investigation: 2026-10-11. No PC SteamVR installation or active stream was
-available. No headset file, setting or process was modified. This document selects
+Investigation: 2026-10-11. No PC SteamVR installation was available for local
+inspection. A subsequent live Frame inspection is recorded separately in
+[the runtime report](FRAME-LIVE-20261011.md). No headset file, setting or process
+was modified by these investigations. This document selects
 the next source investigation; it does not describe an installable bridge.
 
 ## Decision

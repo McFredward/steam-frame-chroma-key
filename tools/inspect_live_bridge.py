@@ -28,6 +28,7 @@ MAX_READ_BYTES = 1024 * 1024
 MAX_TAIL_BYTES = 128 * 1024
 MAX_LINE_BYTES = 2048
 MAX_RECORDS = 128
+MAX_FEC_RECORDS = 16
 MAX_PROCESSES = 16
 MAX_PROC_ENTRIES = 4096
 MAX_PROGRAM_HEADERS = 128
@@ -289,6 +290,12 @@ def inspect_log(path, budget, report):
             record = numeric_record(line)
             if record is None:
                 continue
+            if record["event"] == "fec_substantive_retry":
+                report["counters"]["fec_retry_lines"] += 1
+                if report["counters"]["fec_retry_records"] >= MAX_FEC_RECORDS:
+                    # Network retry noise must not hide later association fields.
+                    budget.warnings.add("fec_record_limit")
+                    continue
             if report["counters"]["numeric_records"] >= MAX_RECORDS:
                 budget.warnings.add("record_limit")
                 break
@@ -316,9 +323,11 @@ def inspect(*, proc_root=Path("/proc"), logs_root=DEFAULT_LOGS,
         "stream_active": "unverified",
         "counters": {"complete_tail_lines_scanned": 0, "numeric_records": 0,
                      "missing_metadata_records": 0, "oversized_lines_omitted": 0,
-                     "decoder_allocation_failure_lines": 0, "fec_retry_records": 0},
+                     "decoder_allocation_failure_lines": 0, "fec_retry_records": 0,
+                     "fec_retry_lines": 0},
         "limits": {"read_bytes": MAX_READ_BYTES, "log_tail_bytes_each": MAX_TAIL_BYTES,
-                   "records_total": MAX_RECORDS, "processes": MAX_PROCESSES,
+                   "records_total": MAX_RECORDS, "fec_records": MAX_FEC_RECORDS,
+                   "processes": MAX_PROCESSES,
                    "process_directory_entries": MAX_PROC_ENTRIES,
                    "runtime_seconds": MAX_RUNTIME_SECONDS},
     }

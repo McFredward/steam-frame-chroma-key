@@ -32,6 +32,10 @@ if(BUILD_TESTING)
         -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_mask_shader.py)
     add_test(NAME mask_bridge_collector COMMAND ${Python3_EXECUTABLE}
         -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_collect_mask_bridge.py)
+    add_test(NAME mask_pc_bridge_collector COMMAND ${Python3_EXECUTABLE}
+        -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_collect_pc_bridge.py)
+    add_test(NAME mask_live_bridge_inspection COMMAND ${Python3_EXECUTABLE}
+        -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_inspect_live_bridge.py)
     find_package(Vulkan QUIET)
     find_program(GLSLC glslc)
     find_program(SPIRV_AS spirv-as)

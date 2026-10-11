@@ -163,6 +163,20 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(report["counters"]["numeric_records"], 1)
         self.assertFalse(report["association_proven"])
 
+    def test_fec_noise_does_not_hide_later_association_or_other_log_records(self):
+        retry = ("SVLFEC: substantive retry (6 packets) due to frame skip "
+                 "(skipped 7, last sub 6, group 1, expected size 1024)\n")
+        (self.logs / "vrlink.txt").write_text(
+            retry * (observer.MAX_RECORDS + 1) + "unFrameId=42\n")
+        (self.logs / "vrcompositor.txt").write_text("present_frame_id=9\n")
+        report = self.inspect()
+        self.assertEqual(report["counters"]["fec_retry_lines"], observer.MAX_RECORDS + 1)
+        self.assertEqual(report["counters"]["fec_retry_records"], observer.MAX_FEC_RECORDS)
+        self.assertIn("fec_record_limit", report["warnings"])
+        records = [r for log in report["logs"] for r in log["records"]]
+        self.assertIn({"event": "numeric_frame_fields", "fields": {"unFrameId": 42}}, records)
+        self.assertIn({"event": "numeric_frame_fields", "fields": {"present_frame_id": 9}}, records)
+
     def test_future_log_clock_is_metadata_not_a_new_frame_association(self):
         path = self.logs / "vrlink.txt"
         path.write_text("frame_id=1\n")

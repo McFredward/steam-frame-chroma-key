@@ -40,6 +40,7 @@ is required. Save stdout on the operator's computer if needed.
 | Total bytes read | 1 MiB |
 | Individual log line | 2 KiB; longer lines omitted |
 | Numeric records | 128 across all logs |
+| FEC retry records | At most 16 of those records; further retry lines only increment a count |
 | Runtime | 5 seconds; CLI alarm interrupts stalled reads |
 
 Known logs must be regular files. Final symlinks and special files are rejected.
@@ -74,6 +75,8 @@ same count, without exposing its message body.
 The existing `SVLFEC` substantive-retry diagnostic contributes its five numeric
 values in a separate `fec_reassembly` namespace. Its packet, skipped, last-sub,
 group and size numbers are **not** decoded, presented or source frame IDs.
+The separate FEC sample limit prevents a busy retry log from consuming the
+entire record budget before later association diagnostics are reached.
 An exact existing `SVLCodecV4L2::CaptureSetup` diagnostic can also emit decoded
 width and height (1–32,768) and an explicitly allowlisted format (`C01Q`, `NV12`,
 `P010`). Arbitrary format strings are omitted. `uCaptureBufferCount` can emit its

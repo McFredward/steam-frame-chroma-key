@@ -137,6 +137,14 @@ unbound. Transport, endpoint and collector evidence remains
 the earlier complete foundation gate; those unchanged areas were not rerun for
 this repair.
 
+The subsequent [live PC-stream inspection](FRAME-LIVE-20261011.md) confirms these
+executable build IDs, the actual `vrlinkrunthread` process name and the decoded
+1152 × 4608 capture extent. Its existing logs do not establish frame association.
+Use the [stdin-only read-only observer](LIVE-BRIDGE-INSPECTION.md) when no
+installation or headset output files are permitted. The
+[PC source collector](PC-MASK-SOURCE.md) supplies the other endpoint's static
+driver evidence without changing SteamVR.
+
 ## Local diagnostics collector
 
 Run on the Frame, from a checkout of this fork:

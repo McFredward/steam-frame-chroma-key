@@ -14,6 +14,11 @@ Development branch: [`dev`](https://github.com/McFredward/steam-frame-chroma-key
 See [mask implementation and tests](docs/MASK-TRANSPORT.md) and
 [remaining Steam Link integration](docs/MASK-BRIDGE-INVESTIGATION.md).
 
+The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
+existing Frame diagnostics without installing anything or starting another VR
+client. The [PC source collector](docs/PC-MASK-SOURCE.md) inspects the installed
+Steam Link driver separately. Neither tool enables masks or changes SteamVR.
+
 The original upstream chroma-key implementation and instructions below remain
 available as a separate path. They do not enable the new explicit-mask path.
 
