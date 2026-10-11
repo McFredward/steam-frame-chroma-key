@@ -48,6 +48,9 @@ schedule rollback. Exact deployment paths, preload removal and the subsequent
 native restart are the session tooling's responsibility. It must verify that the
 native libc provider exports the required aliases before activation. An absent
 versioned alias is a loader failure, not something a constructor can repair.
+The separately reviewed [manual session helper](RECEIVER-OBSERVER-SESSION.md)
+records exact owned activation files and original native configuration; it is
+also offline preparation and grants no runtime permission.
 
 `tools/prepare_receiver_observer.py` checks local input fingerprints, AArch64
 ELF headers and versioned imports, then writes an exclusive private **proposal**.

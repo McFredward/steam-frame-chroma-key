@@ -83,10 +83,13 @@ if(BUILD_TESTING)
     target_include_directories(test_mask_module_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME mask_module_guard COMMAND test_mask_module_guard)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    add_test(NAME receiver_observer_preparation COMMAND ${Python3_EXECUTABLE}
-        -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
-        -p test_prepare_receiver_observer.py)
     if(UNIX)
+        add_test(NAME receiver_observer_preparation COMMAND ${Python3_EXECUTABLE}
+            -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            -p test_prepare_receiver_observer.py)
+        add_test(NAME receiver_observer_session_recovery COMMAND ${Python3_EXECUTABLE}
+            -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            -p test_receiver_observer_session.py)
         add_test(NAME frame_trace_session_recovery COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_frame_trace_session.py)
     endif()

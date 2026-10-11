@@ -145,15 +145,17 @@ Unsupported build, wrong argument shape, unexpected nesting, reused generation,
 partial lookup, lost record or unknown fence makes the record incomplete. Never
 continue with an inferred signature or reset loss counters to manufacture proof.
 
-The existing public Vulkan layer cannot invoke these private boundaries by
-itself. A public `VR_GetGenericInterface` preload wrapper alone also cannot expose
-the selected helper's key/content generation. Private-function observation is
-required for the proposed receiver tuple unless a supported native diagnostic
-supplies it. The instrumentation mechanism must be separately reviewed: a
-version-pinned function probe that copies selected scalar arguments/records is
-different from today's public API metadata observation, even if it leaves output
-unchanged. Kernel probes can also alter executable instructions temporarily;
-they are not automatically covered by a permission for read-only attachment.
+The existing public Vulkan layer cannot expose these private records by itself.
+A public `VR_GetGenericInterface` preload wrapper alone also cannot expose the
+selected helper's key/content generation. The later
+[public mutex interposition audit](FRAME-RECEIVER-OBSERVER.md) and
+[offline observer implementation](RECEIVER-OBSERVER-IMPLEMENTATION.md) now provide
+a narrower receiver path: copy protected scalar fields at pinned caller sites
+of ordinary imported locks, without a private method probe or executable patch.
+This still reads private records and changes the launch environment, so it
+requires the separate runtime scope below. Other private import, GPU and PC
+boundaries remain unresolved. Kernel probes are not part of this implementation
+or authorized by the prior passive Vulkan capture.
 
 The following operations **exceed the currently approved passive scope** and
 need explicit agreement before runtime use:
