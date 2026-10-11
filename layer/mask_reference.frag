@@ -2,6 +2,8 @@
 // Reference for the explicit-mask math, not an active compositor replacement.
 // The caller supplies a same-frame R8_UNORM mask and opaque sampler borders.
 // Actual SteamVR source UVs require validation on the supported headset build.
+// The adapter must prove the RGB convention. Define MASK_RGB_PREMULTIPLIED
+// when native RGB already contains opacity; do not apply opacity twice.
 layout(set = 0, binding = 31) uniform sampler2D opacityMask;
 layout(location = 0) in vec2 sourceUv;
 layout(location = 1) in vec3 tintedRgb;
@@ -9,5 +11,9 @@ layout(location = 0) out vec4 outColor;
 
 void main() {
     float alpha = textureLod(opacityMask, sourceUv, 0.0).r;
+#ifdef MASK_RGB_PREMULTIPLIED
+    outColor = vec4(alpha > 0.0 ? tintedRgb : vec3(0.0), alpha);
+#else
     outColor = vec4(tintedRgb * alpha, alpha);
+#endif
 }

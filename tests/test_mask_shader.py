@@ -8,6 +8,7 @@ import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -17,6 +18,42 @@ SPEC = importlib.util.spec_from_file_location("gen_mask_spv", ROOT / "tools/gen_
 PATCHER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PATCHER)
 FIXTURE = ROOT / "tests/fixtures/mask_scene.spvasm"
+
+
+def evaluate_mask_store(assembly, color, alpha):
+    """Execute only the inserted arithmetic to check its declared convention.
+
+    This bounded CPU instruction check supplements, rather than replaces, the
+    actual SPIR-V validator and headless Vulkan regression.
+    """
+    values = {"%911": color, "%883": (0.5, 0.5), "%smask_lod_zero": 0.0,
+              "%smask_texture": "same-frame-sampler"}
+    active = False
+    for _, tokens in PATCHER._instructions(assembly):
+        if tokens[:2] == ["%smask_sampler", "="]:
+            active = True
+        if not active:
+            continue
+        if tokens[:2] == ["OpStore", "%504"]:
+            return values[tokens[2]]
+        target, _, operation, _result_type, *operands = tokens
+        if operation == "OpLoad":
+            values[target] = values[operands[0]]
+        elif operation == "OpImageSampleExplicitLod":
+            values[target] = (alpha, 0.0, 0.0, 1.0)
+        elif operation == "OpCompositeExtract":
+            values[target] = values[operands[0]][int(operands[1])]
+        elif operation == "OpVectorTimesScalar":
+            values[target] = tuple(channel * values[operands[1]] for channel in values[operands[0]])
+        elif operation == "OpFOrdGreaterThan":
+            values[target] = values[operands[0]] > values[operands[1]]
+        elif operation == "OpSelect":
+            values[target] = values[operands[1] if values[operands[0]] else operands[2]]
+        elif operation == "OpCompositeConstruct":
+            values[target] = tuple(values[operand] for operand in operands)
+        else:
+            raise AssertionError("unexpected inserted arithmetic instruction " + operation)
+    raise AssertionError("mask output store absent")
 
 
 class MaskLayoutTests(unittest.TestCase):
@@ -55,6 +92,39 @@ class MaskLayoutTests(unittest.TestCase):
         result = PATCHER.patch_assembly(self.original, 2, 7)
         self.assertIn("OpDecorate %smask_texture DescriptorSet 2", result)
         self.assertIn("OpDecorate %smask_texture Binding 7", result)
+
+    def test_explicit_straight_mode_is_unchanged_default(self):
+        self.assertEqual(PATCHER.patch_assembly(self.original),
+                         PATCHER.patch_assembly(self.original, rgb_convention="straight"))
+
+    def test_unknown_rgb_convention_rejected(self):
+        with self.assertRaisesRegex(PATCHER.ShaderLayoutError, "RGB convention"):
+            PATCHER.patch_assembly(self.original, rgb_convention="infer")
+
+    def test_premultiplied_rgb_is_not_multiplied_twice(self):
+        result = PATCHER.patch_assembly(self.original, rgb_convention="premultiplied")
+        self.assertNotIn("OpVectorTimesScalar", result)
+        self.assertEqual(result.count("OpSelect %float %smask_visible"), 3)
+        self.assertIn("OpFOrdGreaterThan %smask_bool_type %smask_alpha %smask_lod_zero", result)
+        self.assertIn('OpModuleProcessed "MRMASK/1 source-frame-binding-required"', result)
+
+    def test_straight_partial_alpha_and_color_independence(self):
+        result = PATCHER.patch_assembly(self.original)
+        for color in ((0.0, 1.0, 0.0), (1.0, 0.0, 1.0), (0.2, 0.4, 0.8)):
+            for alpha in (0.0, 0.25, 0.5, 1.0):
+                with self.subTest(color=color, alpha=alpha):
+                    self.assertEqual(evaluate_mask_store(result, color, alpha),
+                                     tuple(channel * alpha for channel in color) + (alpha,))
+
+    def test_premultiplied_partial_alpha_and_background_noise_clear(self):
+        result = PATCHER.patch_assembly(self.original, rgb_convention="premultiplied")
+        for alpha, native_color, expected in (
+                (0.0, (0.8, 0.1, 0.6), (0.0, 0.0, 0.0, 0.0)),
+                (0.25, (0.1, 0.2, 0.05), (0.1, 0.2, 0.05, 0.25)),
+                (0.5, (0.2, 0.4, 0.1), (0.2, 0.4, 0.1, 0.5)),
+                (1.0, (0.4, 0.8, 0.2), (0.4, 0.8, 0.2, 1.0))):
+            with self.subTest(alpha=alpha):
+                self.assertEqual(evaluate_mask_store(result, native_color, alpha), expected)
 
     def test_frame_binding_marker_precedes_annotations(self):
         result = PATCHER.patch_assembly(self.original)
@@ -176,6 +246,37 @@ class MaskBinaryTests(unittest.TestCase):
             self.assertEqual(result.stdout.count("OpVectorTimesScalar"), 1)
             self.assertFalse(list(Path(directory).glob(".mask-shader-*")))
 
+    def test_premultiplied_shader_is_assembled_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "premultiplied.spv"
+            PATCHER.write_shader(FIXTURE, binary, rgb_convention="premultiplied")
+            result = subprocess.run(["spirv-dis", str(binary)], check=True, capture_output=True, text=True)
+            self.assertNotIn("OpVectorTimesScalar", result.stdout)
+            self.assertEqual(result.stdout.count("OpSelect"), 3)
+
+    def test_premultiplied_shader_reuses_native_bool_type(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "native-bool.spvasm"
+            source.write_text(FIXTURE.read_text().replace("%float = OpTypeFloat 32", "%bool = OpTypeBool\n%float = OpTypeFloat 32"))
+            binary = Path(directory) / "premultiplied.spv"
+            PATCHER.write_shader(source, binary, rgb_convention="premultiplied")
+            result = subprocess.run(["spirv-dis", str(binary)], check=True, capture_output=True, text=True)
+            self.assertEqual(result.stdout.count("OpTypeBool"), 1)
+
+    def test_cli_default_straight_and_premultiplied_choices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            binaries = {}
+            for convention in (None, "straight", "premultiplied"):
+                binary = directory / ((convention or "default") + ".spv")
+                command = [sys.executable, str(ROOT / "tools/gen_mask_spv.py"), str(FIXTURE), str(binary)]
+                if convention:
+                    command += ["--rgb-convention", convention]
+                subprocess.run(command, check=True, capture_output=True, text=True)
+                binaries[convention] = binary.read_bytes()
+            self.assertEqual(binaries[None], binaries["straight"])
+            self.assertNotEqual(binaries[None], binaries["premultiplied"])
+
     def test_layout_failure_does_not_replace_output(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input.spvasm"
@@ -201,10 +302,12 @@ class MaskBinaryTests(unittest.TestCase):
         if not shutil.which("glslc"):
             self.skipTest("glslc is not installed")
         with tempfile.TemporaryDirectory() as directory:
-            binary = Path(directory) / "reference.spv"
-            subprocess.run(["glslc", "--target-env=vulkan1.1", str(ROOT / "layer/mask_reference.frag"), "-o", str(binary)],
-                           check=True, capture_output=True)
-            subprocess.run(["spirv-val", "--target-env", "vulkan1.1", str(binary)], check=True, capture_output=True)
+            for define in ([], ["-DMASK_RGB_PREMULTIPLIED=1"]):
+                binary = Path(directory) / "reference.spv"
+                subprocess.run(["glslc", "--target-env=vulkan1.1"] + define
+                               + [str(ROOT / "layer/mask_reference.frag"), "-o", str(binary)],
+                               check=True, capture_output=True)
+                subprocess.run(["spirv-val", "--target-env", "vulkan1.1", str(binary)], check=True, capture_output=True)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,11 @@ actual SteamVR shader before enabling a replacement on a headset.
 Only the final opaque store is replaced. Native color conversion, source
 reprojection, tinting and distortion remain unchanged. There is no color key,
 spill suppression, threshold or opacity inference from RGB.
+
+An adapter must prove and declare whether native RGB is straight or already
+premultiplied. Straight RGB is multiplied by opacity once. Already premultiplied
+RGB is preserved at nonzero opacity and cleared at zero opacity; multiplying
+again would darken antialiased edges. Never infer this convention from pixels.
 """
 
 import argparse
@@ -57,11 +62,13 @@ def _require(condition, detail):
         raise ShaderLayoutError("unsupported shader layout: " + detail)
 
 
-def patch_assembly(assembly, descriptor_set=0, binding=31):
+def patch_assembly(assembly, descriptor_set=0, binding=31, rgb_convention="straight"):
     """Return patched assembly, refusing unknown anchors or binding collisions."""
     for value, label in ((descriptor_set, "descriptor set"), (binding, "binding")):
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0xFFFFFFFF:
             raise ShaderLayoutError(label + " must be an unsigned 32-bit integer")
+    _require(rgb_convention in ("straight", "premultiplied"),
+             "RGB convention must be straight or premultiplied")
 
     instructions = _instructions(assembly)
     _require(not any(tokens == ["OpModuleProcessed", '"' + MODULE_MARKER + '"']
@@ -167,10 +174,30 @@ def patch_assembly(assembly, descriptor_set=0, binding=31):
         "%smask_sampler = OpLoad %smask_sampled_type %smask_texture",
         "%smask_sample = OpImageSampleExplicitLod %v4float %smask_sampler %883 Lod %smask_lod_zero",
         "%smask_alpha = OpCompositeExtract %float %smask_sample 0",
-        "%smask_rgb = OpVectorTimesScalar %v3float %911 %smask_alpha",
-        "%smask_r = OpCompositeExtract %float %smask_rgb 0",
-        "%smask_g = OpCompositeExtract %float %smask_rgb 1",
-        "%smask_b = OpCompositeExtract %float %smask_rgb 2",
+    ]
+    if rgb_convention == "straight":
+        code += [
+            "%smask_rgb = OpVectorTimesScalar %v3float %911 %smask_alpha",
+            "%smask_r = OpCompositeExtract %float %smask_rgb 0",
+            "%smask_g = OpCompositeExtract %float %smask_rgb 1",
+            "%smask_b = OpCompositeExtract %float %smask_rgb 2",
+        ]
+    else:
+        existing_bool = next((ident for ident, (_, instruction) in definitions.items()
+                              if instruction == ["OpTypeBool"]), None)
+        bool_type = existing_bool or "%smask_bool_type"
+        if existing_bool is None:
+            declarations.append("%smask_bool_type = OpTypeBool")
+        code += [
+            "%smask_visible = OpFOrdGreaterThan {} %smask_alpha %smask_lod_zero".format(bool_type),
+            "%smask_native_r = OpCompositeExtract %float %911 0",
+            "%smask_native_g = OpCompositeExtract %float %911 1",
+            "%smask_native_b = OpCompositeExtract %float %911 2",
+            "%smask_r = OpSelect %float %smask_visible %smask_native_r %smask_lod_zero",
+            "%smask_g = OpSelect %float %smask_visible %smask_native_g %smask_lod_zero",
+            "%smask_b = OpSelect %float %smask_visible %smask_native_b %smask_lod_zero",
+        ]
+    code += [
         "%smask_output = OpCompositeConstruct %v4float %smask_r %smask_g %smask_b %smask_alpha",
         "OpStore %504 %smask_output",
     ]
@@ -192,9 +219,9 @@ def patch_assembly(assembly, descriptor_set=0, binding=31):
     return "\n".join(result) + "\n"
 
 
-def write_shader(source, destination, descriptor_set=0, binding=31):
+def write_shader(source, destination, descriptor_set=0, binding=31, rgb_convention="straight"):
     """Assemble and validate in isolation before atomically replacing output."""
-    assembly = patch_assembly(Path(source).read_text(encoding="utf-8"), descriptor_set, binding)
+    assembly = patch_assembly(Path(source).read_text(encoding="utf-8"), descriptor_set, binding, rgb_convention)
     destination = Path(destination)
     with tempfile.TemporaryDirectory(prefix=".mask-shader-", dir=destination.parent) as directory:
         assembly_path = Path(directory) / "mask.spvasm"
@@ -225,9 +252,11 @@ def main(argv=None):
     parser.add_argument("output", help="validated output SPIR-V module")
     parser.add_argument("--set", type=_uint32, default=0, dest="descriptor_set")
     parser.add_argument("--binding", type=_uint32, default=31)
+    parser.add_argument("--rgb-convention", choices=("straight", "premultiplied"), default="straight",
+                        help="proven native RGB convention; never infer from pixels (default: straight)")
     args = parser.parse_args(argv)
     try:
-        write_shader(args.source, args.output, args.descriptor_set, args.binding)
+        write_shader(args.source, args.output, args.descriptor_set, args.binding, args.rgb_convention)
     except (ShaderLayoutError, OSError) as error:
         print("mask shader: {}".format(error), file=sys.stderr)
         return 1
