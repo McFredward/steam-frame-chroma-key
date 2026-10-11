@@ -272,7 +272,7 @@ struct Configuration {
     bool sleepWhileSnapshotPending = false;
     std::uint32_t scheduledBatchCycles = 16;
 };
-void journalBenchmark(Configuration config) {
+void journalBenchmark(Configuration config, bool requireLossless = false) {
     auto journal = std::make_unique<Journal>();
     const auto initialDrain = [&] { while (journal->drain([](std::uint32_t, const Snapshot&) noexcept {})) {} };
     seed(*journal, config.producers, config.objects, initialDrain);
@@ -364,6 +364,8 @@ void journalBenchmark(Configuration config) {
             "valid stress triggered unrelated journal transport failure");
     if (!journal->lostState()) require(complete == callbacks && !finalInvalid, "lossless stress produced incomplete snapshots");
     else require(finalInvalid, "stress silently erased prior loss before its final snapshot");
+    if (requireLossless) require(journal->lostState() == 0 && complete == Selected + 1,
+                                "bounded concurrent semantic check unexpectedly lost metadata");
     for (std::size_t i = 0; i < static_cast<std::size_t>(Table::Count); ++i)
         require(journal->capacityLossCount(static_cast<Table>(i)) == 0, "stress exceeded fixed object-table capacity");
     require(attempts.load() == published + queue, "accepted and rejected publication accounting diverged");
@@ -401,7 +403,7 @@ int main(int argc, char** argv) {
     invariants();
     // Semantics-only concurrent publication. Each lane's finite complete batch
     // fits without a consumer, so losslessness is independent of machine speed.
-    journalBenchmark({8, 32, 4, 100, 0, 0, false});
+    journalBenchmark({8, 32, 4, 100, 0, 0, false}, true);
     if (!benchmark) return 0;
     coreBaseline(32, iterations); coreBaseline(384, iterations);
     startupBenchmark(1000); startupBenchmark(100);
