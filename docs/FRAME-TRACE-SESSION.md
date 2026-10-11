@@ -68,5 +68,51 @@ Do not interpret capture data until a healthy trace footer, unchanged output
 bounds and matching recorded/submitted generations have been verified. A timeout
 or incomplete capture never authorizes enabling a mask.
 
-This page describes the approved procedure. The actual installation, capture
-result and verified removal will be appended after the run.
+## Actual run, 2026-10-11
+
+The authorized session was staged in a new mode-0700 user directory. The reviewed
+AArch64 library hash matched. Both activation paths were absent and the native
+`steamvr.service` was active before staging. The independent rollback service
+acknowledged readiness before any activation file was written.
+
+At 12:36:28 CEST the helper requested the capture restart; SteamVR reported active
+at 12:36:33. The new compositor inherited the three intended `FRAME_MASK_TRACE*`
+variables, but no capture file was created and its process mappings did not
+contain the diagnostic library. The journal included Gamescope's non-hooked
+swapchain warning. This warning describes missing Gamescope hook bookkeeping;
+it does not establish that the apparently unloaded diagnostic caused it. The
+run was aborted rather than accepting missing data or forcing a shader.
+
+Manual recovery removed the manifest and runtime drop-in at 12:38:07, then
+restarted the native service. Recovery completed at 12:38:14. The new compositor
+was active, had no diagnostic mapping and had no diagnostic service drop-in.
+The watchdog had exited and its transient unit was collected. The small session
+ledger was copied to the ignored developer evidence directory and the entire
+temporary headset session directory was removed by 12:39:15.
+
+A separate dependency/discovery-only probe completed at 12:42 without restarting
+SteamVR. It loaded the reviewed library with `RTLD_NOW` to check dependencies and
+enumerated the isolated temporary manifest with the native Vulkan loader. Both
+checks passed. It created **no Vulkan instance or device**, touched no existing
+process and removed its temporary manifests automatically. Its private copied
+library/helper directory was removed at 12:42:57; SteamVR remained active.
+
+Read-only checks also found `AT_SECURE=0`, user UID/GID, no effective/ambient
+capabilities, ordinary executable permissions and a shared mount namespace for
+the native compositor. No relevant loader settings file was present at the
+standard checked locations. These eliminate several obvious installation and
+dependency failures, but do not prove the compositor's runtime layer-selection
+policy. `/proc/environ` represents the initial environment; absence there does
+not exclude later application-side changes.
+
+No capture was accepted. The exact remaining native-compositor non-loading cause
+is unresolved. Stage/descriptor/frame proof and genuine mask passthrough remain
+blocked. Further live retries must first address this startup behavior; there is
+no installed diagnostic left on the Frame.
+
+Local validation was expanded to exercise implicit `XDG_DATA_HOME` discovery
+through the real loader, in addition to explicit loading and unchanged GPU
+pixels. The recovery helper has ten focused checks, including concurrent/delayed
+recovery, restart/reload failures, preexisting files and a full ledger filesystem.
+These bounded changes reuse the unchanged foundation's complete green CI result;
+they do not imply a successful headset capture.

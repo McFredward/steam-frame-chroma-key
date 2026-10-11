@@ -38,6 +38,11 @@ def main():
         base = os.environ.copy()
         base["VK_LAYER_PATH"] = str(manifest_dir)
         base["VK_INSTANCE_LAYERS"] = "VK_LAYER_FRAME_MASK_trace"
+        implicit_home = folder / "implicit-home"
+        implicit_folder = implicit_home / "vulkan/implicit_layer.d"
+        implicit_folder.mkdir(parents=True)
+        manifest = json.loads((manifest_dir / "VkLayer_frame_mask_trace.json").read_text())
+        (implicit_folder / "frame_mask_trace.json").write_text(json.dumps(manifest))
         for name in ("FRAME_MASK_TRACE_FRAGMENT_HASH", "FRAME_MASK_TRACE_DISABLE"):
             base.pop(name, None)
         for name in ("lvp_icd.x86_64.json", "lvp_icd.json"):
@@ -51,11 +56,16 @@ def main():
                                        ("invalid-filter", compositor, "1"),
                                        ("filtered-miss", compositor, "1"),
                                        ("filtered-match", compositor, "1"),
+                                       ("implicit-enabled", compositor, "1"),
                                        ("enabled", compositor, "1")):
             output = folder / (mode + ".jsonl")
             env = base.copy()
             env["FRAME_MASK_TRACE"] = enabled
             env["FRAME_MASK_TRACE_OUTPUT"] = str(output)
+            if mode == "implicit-enabled":
+                env.pop("VK_INSTANCE_LAYERS", None)
+                env.pop("VK_LAYER_PATH", None)
+                env["XDG_DATA_HOME"] = str(implicit_home)
             if mode == "explicit-disable":
                 env["FRAME_MASK_TRACE_DISABLE"] = "1"
             elif mode == "invalid-filter":

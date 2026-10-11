@@ -5,9 +5,11 @@ It observes shader-module fingerprints, graphics-pipeline stage tuples, recorded
 draws and successful queue submission. It never replaces a shader, changes a
 descriptor, copies an image, reads mapped GPU memory or enables passthrough.
 
-It has not been installed on the maintainer's Frame. Headset installation and
-SteamVR restart require the maintainer's authorization: current headset access
-is read-only, apart from the previously authorized SSH-service setup.
+The maintainer authorized a temporary session on 2026-10-11. It was attempted,
+then fully removed after the native compositor did not load it; no capture was
+accepted. The exact procedure, changed paths and verified rollback are recorded
+in [the session ledger summary](FRAME-TRACE-SESSION.md). Headset access otherwise
+remains read-only, apart from the previously authorized SSH-service setup.
 
 ## What this closes
 
@@ -126,7 +128,9 @@ loader/GPU suites. Deterministic tests cover reset/re-record between capture and
 submit return, failed submissions, handle reuse, secondary links, contention,
 capacity bounds and disabled paths. The worker also passed the core under
 AddressSanitizer/UndefinedBehaviorSanitizer. The layer cross-compiles with strict
-warnings for AArch64; the ARM binary has not been loaded on a headset.
+warnings for AArch64. A subsequent standalone dependency-only Frame probe loaded
+the library without creating a Vulkan instance/device; the native compositor did
+not load it in the attempted capture session.
 
 Unchanged transport, shader-generator and collector checks inherit the earlier
 green eight-suite CI checkpoint `f702142`; the two-suite focused pass is not a new
@@ -138,4 +142,4 @@ The pushed checkpoint `8fe0088` subsequently passed the complete
 [ten-suite CI run](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38131947911),
 including the real Vulkan layer/pixel checks, Windows diagnostic-sender
 cross-build and protocol sanitizers. This is software evidence; no Frame
-installation or genuine-mask hardware result is implied.
+capture or genuine-mask hardware result is implied.
