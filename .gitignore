@@ -1,0 +1,7 @@
+build/
+spv/
+__pycache__/
+*.pyc
+*.pc-backup
+*.vrsettings
+*.ppm

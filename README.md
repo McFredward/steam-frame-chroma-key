@@ -1,0 +1,224 @@
+# mr-chroma-frame: chroma-key passthrough for Steam Frame streaming
+
+Mixed reality on the Steam Frame over Valve's normal PC streaming, with no ALVR and no Virtual Desktop.
+
+Paint your SteamVR game's background a solid colour (for example pure green) and the Steam Frame
+replaces that colour with its own passthrough camera. Valve's native streaming (vrlink, hardware decode) is unchanged.
+No second video stream is added, the camera image never leaves the headset, and the cost is about 0.3 ms of GPU time
+with no extra frame of latency.
+
+![In-headset Chroma Key panel](toggle/panel_preview.png)
+
+What you get:
+
+- **In-headset panel** in the SteamVR dashboard: keying ON/OFF, key colour presets and hue bar, Similarity, Edge
+  softness and Spill sliders.
+- **Desktop background switch** (*Key colour* / *Mountains*): with no game running, it makes the PC SteamVR home
+  backdrop the key colour, so you see your room around the SteamVR desktop view. Switch back to the default
+  mountains with one click.
+- **PC control panel** (optional): eyedropper to sample the background colour straight off your monitor, a colour
+  picker and the same sliders.
+- Everything is user-scope. Nothing under `/usr` or `/opt` is modified, and `uninstall.sh` rolls it all back.
+
+> **Warning**
+> This is an unofficial hack that hooks SteamVR's compositor through internal, undocumented details. It was built and
+> tested on **SteamOS holo 0.4.5 (build 20261007)** with the SteamVR version shipped on the headset at that time.
+> A SteamVR update can break it. When that happens the shader generator refuses to run rather than produce a broken
+> shader, and the layer falls back to the stock shader. See [Fragility](#fragility). Use at your own risk.
+
+---
+
+## Requirements
+
+- A Steam Frame streaming from a Windows PC with SteamVR.
+- **Developer Mode** on the headset, for SSH access.
+- On the PC: an SSH client (built into Windows 10/11) and, for the optional PC tools, **Python 3** from
+  [python.org](https://www.python.org/) (includes tkinter).
+
+The headset already ships with the build tools this needs: `g++`, `glslc`, `spirv-tools`, `python3`, `freetype2`
+and `git`.
+
+## Install
+
+### 1. Enable Developer Mode and SSH on the headset
+
+1. On the Frame: **Steam Settings → System → Enable Developer Mode**.
+2. In the left menu, scroll down to the **Developer** section, then scroll toward the bottom of that page and click
+   **Set User Password**.
+3. Find the headset's IP address in its Wi-Fi settings.
+
+The username is `steamos`. Check that it works from the PC:
+
+```powershell
+ssh steamos@<headset-ip>
+```
+
+### 2. Set up a `frame` SSH alias with a key (on the PC)
+
+The PC tools reach the headset through an SSH alias named `frame`, using key login so they never prompt for a
+password. In PowerShell:
+
+```powershell
+ssh-keygen -t ed25519 -f $HOME\.ssh\id_ed25519_frame -N '""'
+type $HOME\.ssh\id_ed25519_frame.pub | ssh steamos@<headset-ip> "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Add this to `%USERPROFILE%\.ssh\config` (create the file if it doesn't exist):
+
+```
+Host frame
+    HostName <headset-ip>
+    User steamos
+    IdentityFile ~/.ssh/id_ed25519_frame
+    IdentitiesOnly yes
+    ServerAliveInterval 15
+```
+
+Now `ssh frame` should log in with no password prompt. If you only plan to use the in-headset panel, you can skip
+this step and SSH in however you like.
+
+### 3. Build and install on the headset
+
+SSH into the headset (`ssh frame`) and run the following. The repo **must be cloned to `~/mr-chroma`**, because the
+panel and PC tools call scripts at that path.
+
+```bash
+git clone https://github.com/spyjacob/steam-frame-chroma-key.git ~/mr-chroma
+cd ~/mr-chroma
+
+./build.sh && ./install.sh                                     # build the Vulkan layer + helper, install user-scope
+touch ~/.config/mrchroma/enable-compositor                     # opt the compositor in to the layer
+~/.local/share/mrchroma/mrctl set-bool camera forceSceneAlphaBlending 1
+systemctl --user restart steamvr                               # SteamVR restarts and loads the layer (~15 s)
+```
+
+Wait for SteamVR to come back (put the headset on so it wakes up), reconnect the PC stream if it dropped, then:
+
+```bash
+./mrkey.sh chroma 0 1 0 0.32 0.12 0.5      # key pure green: R G B similarity softness spill
+toggle/install_toggle.sh                   # in-headset dashboard panel (recommended)
+```
+
+Your settings persist across SteamVR restarts and reboots.
+
+### 4. PC tools (optional)
+
+From a copy of this repo on the PC:
+
+- **Desktop background sync.** This makes the panel's *Desktop background* switch work. It runs hidden at login:
+
+  ```powershell
+  python pc\mrchroma_pcsync.pyw --install      # adds a Startup-folder shortcut and starts it now
+  ```
+
+  It uses the `frame` alias by default. To use a different host, set the `MRCHROMA_HOST` environment variable.
+- **PC control panel** with the eyedropper: double-click `pc\mrchroma_panel.pyw`.
+
+## Using it
+
+1. In your game, make the background a solid colour, such as pure green `(0, 255, 0)`, using an
+   unlit skybox, scene background or large plane.
+2. Stream to the Frame as usual through SteamVR (normal **OpenVR** mode, not Virtual Desktop).
+3. Open the SteamVR dashboard and click the **Chroma Key** icon in the bottom bar.
+   - **ON/OFF** toggles keying.
+   - Pick a **key colour** preset or drag the **hue** bar to match your background.
+   - **Similarity** sets how far from the key colour still counts as background. Raise it if patches of
+     background remain, and lower it if parts of your subject disappear.
+   - **Edge softness** sets the width of the fade at edges.
+   - **Spill removal** removes the coloured fringe the key colour leaves on edges.
+   - **Desktop background**: *Key colour* shows passthrough around the SteamVR desktop view when no game is running,
+     and *Mountains* restores the normal SteamVR home. This needs the PC sync helper. The panel shows *PC in sync*,
+     *waiting for PC* or *PC helper not responding*.
+
+   Colour and slider changes apply when you release the trigger.
+
+From a shell on the headset you can do the same things:
+
+```bash
+~/mr-chroma/mrtoggle.sh on|off|toggle|status       # keying on/off, keeps the last colour/settings
+~/mr-chroma/mrkey.sh chroma R G B sim soft spill   # set colour + params (0..1 values)
+~/mr-chroma/mrkey.sh rect                          # debug: key a fixed rectangle in the middle of each eye
+~/mr-chroma/mrtoggle.sh bg on|off|toggle|status    # PC desktop background: key colour / mountains
+```
+
+## Uninstall
+
+On the headset:
+
+```bash
+cd ~/mr-chroma
+./uninstall.sh            # turns the blending setting back off, removes the layer + panel
+systemctl --user restart steamvr
+```
+
+`./uninstall.sh --purge` also deletes the config and the settings backup. A copy of your original
+`steamvr.vrsettings` is kept in `~/.local/share/mrchroma/backup/`.
+
+On the PC: `python pc\mrchroma_pcsync.pyw --uninstall` removes the helper and restores the default SteamVR background.
+
+**Emergency off switch** (if SteamVR misbehaves): delete `~/.local/share/vulkan/implicit_layer.d/mrchroma.json` or
+`~/.config/mrchroma/enable-compositor`, then restart SteamVR. There is also a crash guard: if the compositor starts 3
+times within 120 s with the layer loaded, the layer stops loading and writes
+`~/.local/share/mrchroma/compositor-guard-tripped`. Delete that file to re-arm it.
+
+---
+
+## How it works
+
+1. `vrlink` (the streaming client on the headset) does **no rendering**. It hardware-decodes the stream into NV12
+   dma-buf images (1152×4608, packed/foveated) and passes them to `vrcompositor`. vrlink never has an RGBA frame, so
+   the key can't be done there.
+2. `vrcompositor` converts YCbCr→RGB and reprojects/distorts the stream in
+   **`distort_ps_achromatic_se2.spv`**, writing `vec4(rgb, 1.0)` into each eye buffer.
+3. When the hidden setting `camera/forceSceneAlphaBlending` is true, the compositor draws the passthrough camera
+   every frame, blended `src = ONE_MINUS_DST_ALPHA, dst = ONE`. The camera shows through wherever the scene's alpha
+   is below 1.
+4. This project adds a user-scope **Vulkan layer**. Inside vrcompositor only, it swaps that one shader module in
+   memory for a patched SPIR-V. The patched shader computes alpha from a CbCr-distance chroma key, with smoothstep
+   edge softness and spill suppression, and writes premultiplied `(rgb·a, a)`.
+
+The patched shader is generated **on your headset** from your SteamVR install's own shader, so no Valve files are
+redistributed here. Dashboards and overlays are drawn afterwards with normal alpha, so they stay opaque. Stereo,
+tracking and reprojection are the compositor's own.
+
+### Components
+
+| Path | What |
+|---|---|
+| `layer/mrchroma_layer.cpp`, `layer/compositor_hooks.inc` | The Vulkan layer. It loads only into `vrcompositor` (opt-in flag file) and `vrlink` (log only). Every other process gets "Skipping layer" from the loader. |
+| `tools/gen_key_spv.py` | Patches the compositor shader disassembly into a rect-test or chroma-key variant, then assembles and validates it. |
+| `mrkey.sh` | `off` / `rect` / `chroma R G B threshold softness spill`. Regenerates the shader and hot-reloads compositor shaders (`vrcmd --reload-shaders`). |
+| `mrtoggle.sh` | `on` / `off` / `toggle` / `status`, plus `bg ...`. Re-enables the last generated shader without regenerating it. |
+| `tools/mrctl.cpp` | OpenVR helper: get/set settings, measure frame timing (`mrctl timing 8`). |
+| `toggle/` | The SteamVR dashboard overlay. It is software-rendered with FreeType via `SetOverlayRaw` and autolaunched through a user app manifest (`mrchroma.toggle`). `mrtoggle_overlay --render out.ppm` renders the layout without SteamVR. |
+| `pc/mrchroma_pcsync.pyw`, `pc/vrsettings_win.py` | PC helper that keeps the PC SteamVR home background in step with the headset. It writes through SteamVR's public settings API (`IVRSettings` in `openvr_api.dll`), applies changes live and idles while SteamVR is closed. Log: `%LOCALAPPDATA%\mrchroma\pcsync.log`. |
+| `pc/mrchroma_panel.pyw` | PC control panel (tkinter): eyedropper, colour picker, sliders, all over `ssh frame`. |
+| `install.sh` / `uninstall.sh` | User-scope install and full rollback. |
+
+### Why the desktop-background helper exists
+
+When you stream from the PC with no game running, the **PC's** SteamVR draws its own background (sky, mountains,
+floor, ground circles, base stations) into the video. The headset only receives finished pixels, so there is nothing
+to key. The helper sets the PC's `steamvr/background` to the key colour and hides `showFloor`, `showGridCircles` and
+`drawTrackingReferences`. For *Mountains* it removes those keys so the defaults come back. Games aren't affected
+because they draw their own background.
+
+### Measured (PC streaming, 90 Hz)
+
+| Mode | Refresh | Compositor GPU p50 / p95 | Dropped / 8 s |
+|---|---|---|---|
+| Off | 90.0 Hz | 2.88–2.94 / 3.31–3.33 ms | 0–1 |
+| Chroma | 90.0 Hz | 3.17–3.33 / 3.33–3.48 ms | 0 |
+
+## Fragility
+
+The patcher anchors on `OpStore %504 %994` and a few IDs in this exact SteamVR build's shader. After a SteamVR update,
+`gen_key_spv.py` refuses to generate a shader ("unexpected shader layout") instead of producing a broken one. If the
+compositor rejects a patched module, the layer falls back to the original shader. The shader filename and the
+`forceSceneAlphaBlending` setting are internal SteamVR details that Valve can change at any time. Porting to a new
+SteamVR build means re-deriving those anchors from the new `distort_ps_achromatic_se2.spv` disassembly. Issues and
+PRs are welcome.
+
+## Disclaimer
+
+Not affiliated with or endorsed by Valve. Steam, SteamVR and Steam Frame are trademarks of Valve Corporation.

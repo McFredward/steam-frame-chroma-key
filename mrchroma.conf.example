@@ -1,0 +1,18 @@
+# mrchroma live config — re-read every ~5 s by the layer inside vrlink.
+# mode: off | log | rect | chroma
+mode = log
+# key colour, sRGB 0..1  (pure green: 0 1 0)
+key = 0 1 0
+# CbCr distance below which a pixel is fully keyed, and the ramp width above it
+threshold = 0.18
+softness = 0.10
+# green spill suppression near the key hue, 0..1
+spill = 0.5
+# rect mode: normalized x0 y0 x1 y1 of the keyed rectangle (per eye image)
+rect = 0.30 0.30 0.70 0.70
+invert = 0
+# only process exported colour targets at least this wide; -1 target = auto
+min_width = 1024
+target = -1
+# number of detailed events written to /tmp/mrchroma-<pid>.log
+log_events = 4000
