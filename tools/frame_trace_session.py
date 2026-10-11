@@ -5,12 +5,14 @@ Run only after explicit headset authorization. No system files, sudo, boot
 configuration or persistent service settings are changed.
 """
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import stat
 import subprocess
 import sys
 import time
@@ -18,6 +20,8 @@ import time
 UNIT = "steamvr.service"
 WATCHDOG = "frame-mask-trace-rollback"
 FRAGMENT = "f333a137b4e79ced"
+CAPTURE_LIMIT = 1048576
+CAPTURE_EVENT_LIMIT = 2048
 
 
 def exclusive(path, contents):
@@ -171,8 +175,111 @@ class Session:
         if b"Environment=FRAME_MASK_TRACE_BINDINGS=1\n" not in self.dropin.read_bytes() or expected not in self.dropin.read_bytes():
             raise RuntimeError("Session was not configured for binding capture")
         self.command("systemctl", "--user", "is-active", UNIT)
+        self._require_active_capture()
         exclusive(self.folder / "bindings-arm.marker", b"FRAME_MASK_TRACE_BINDINGS/1\n")
-        self.event("binding_capture_armed", selected_video_frame_proven=False)
+        # The writer may expire after validation. Only its bindings_armed event
+        # proves acceptance; this ledger records a request, never active capture.
+        self.event("binding_capture_arm_requested", capture_accepted=False,
+                   selected_video_frame_proven=False)
+
+    def _require_active_capture(self):
+        path = self.folder / "capture.jsonl"
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        except OSError as error:
+            raise RuntimeError("Capture is missing or unsafe; binding capture refused") from error
+        with os.fdopen(descriptor, "rb", buffering=0) as capture:
+            before = os.fstat(capture.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or before.st_mode & 0o777 != 0o600 or before.st_nlink != 1
+                    or before.st_size <= 0 or before.st_size > CAPTURE_LIMIT):
+                raise RuntimeError("Capture ownership/type/size changed; binding capture refused")
+            # The background writer holds an exclusive lock for its complete
+            # lifetime. An active service alone cannot prove its capture is open.
+            try:
+                fcntl.flock(capture.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise RuntimeError("Capture liveness check failed; binding capture refused") from error
+            else:
+                fcntl.flock(capture.fileno(), fcntl.LOCK_UN)
+                raise RuntimeError("Capture writer has closed; binding capture refused")
+            # Appends may occur while reading. Never read beyond the reviewed
+            # output bound, even if the file grows or is replaced concurrently.
+            chunks = []
+            remaining = CAPTURE_LIMIT + 1
+            while remaining:
+                chunk = capture.read(min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(capture.fileno())
+            try:
+                current = path.lstat()
+            except OSError as error:
+                raise RuntimeError("Capture path changed; binding capture refused") from error
+            if (len(data) > CAPTURE_LIMIT or after.st_size > CAPTURE_LIMIT
+                    or current.st_size > CAPTURE_LIMIT or current.st_size < before.st_size
+                    or after.st_size < before.st_size
+                    or stat.S_ISLNK(current.st_mode)
+                    or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                    or (current.st_uid, current.st_mode, current.st_nlink)
+                    != (before.st_uid, before.st_mode, before.st_nlink)
+                    or (after.st_uid, after.st_mode, after.st_nlink)
+                    != (before.st_uid, before.st_mode, before.st_nlink)):
+                raise RuntimeError("Capture path/type/size changed; binding capture refused")
+            lines = data.split(b"\n", CAPTURE_EVENT_LIMIT + 3)
+            if len(lines) > CAPTURE_EVENT_LIMIT + 3 or len(lines) < 2:
+                raise RuntimeError("Capture header/record bound invalid; binding capture refused")
+            records = []
+            for line in lines[:-1]:
+                try:
+                    record = json.loads(line)
+                except (ValueError, UnicodeError) as error:
+                    raise RuntimeError("Malformed capture record; binding capture refused") from error
+                if not isinstance(record, dict) or not isinstance(record.get("event"), str):
+                    raise RuntimeError("Malformed capture record; binding capture refused")
+                records.append(record)
+            expected = {
+                "event": "header", "version": 1, "layer": "VK_LAYER_FRAME_MASK_trace",
+                "scope": "passive_pipeline_metadata", "fragment_filter": FRAGMENT,
+                "limit_bytes": CAPTURE_LIMIT, "limit_events": CAPTURE_EVENT_LIMIT,
+                "binding_metadata_version": 1, "limit_binding_snapshots": 32,
+                "binding_arm_required": True, "binding_ready_at_header": False,
+                "deadline_seconds": 120,
+            }
+            if not records or any(type(records[0].get(key)) is not type(value)
+                                  or records[0].get(key) != value for key, value in expected.items()):
+                raise RuntimeError("Capture header identity changed; binding capture refused")
+            if any(row["event"] in ("footer", "header") for row in records[1:]):
+                raise RuntimeError("Capture has finished or restarted; binding capture refused")
+            trailing = lines[-1]
+            if trailing:
+                try:
+                    record = json.loads(trailing)
+                except (ValueError, UnicodeError):
+                    # A concurrently appended ordinary row can be incomplete.
+                    # A partial footer is already evidence of writer closure.
+                    if not trailing.lstrip().startswith(b"{"):
+                        raise RuntimeError("Malformed capture record; binding capture refused")
+                    if b'"event":"footer"' in b"".join(trailing.split()):
+                        raise RuntimeError("Capture is closing; binding capture refused")
+                else:
+                    if not isinstance(record, dict) or not isinstance(record.get("event"), str):
+                        raise RuntimeError("Malformed capture record; binding capture refused")
+                    if record["event"] in ("footer", "header"):
+                        raise RuntimeError("Capture has finished or restarted; binding capture refused")
+            # Recheck the writer lock after parsing as closure may race the read.
+            try:
+                fcntl.flock(capture.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise RuntimeError("Capture liveness check failed; binding capture refused") from error
+            else:
+                fcntl.flock(capture.fileno(), fcntl.LOCK_UN)
+                raise RuntimeError("Capture writer has closed; binding capture refused")
 
     def _rollback(self):
         complete = self.folder / "rollback-complete.json"

@@ -1,11 +1,14 @@
 """Recovery checks using temporary files and mocked service commands only."""
+import fcntl
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("session", Path(__file__).resolve().parents[1] / "tools/frame_trace_session.py")
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -20,6 +23,7 @@ class SessionTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="frame-trace-recovery-")
         self.root = Path(self.temporary.name)
         self.calls = []
+        self.capture_writers = []
         self.session = MODULE.Session(self.root / "home", self.root / "runtime", self.run_command)
         self.session.folder.mkdir(parents=True)
         # Synthetic AArch64 ELF header; never loaded or executed.
@@ -28,7 +32,41 @@ class SessionTests(unittest.TestCase):
         self.sha = hashlib.sha256(self.library).hexdigest()
 
     def tearDown(self):
+        for descriptor in self.capture_writers:
+            os.close(descriptor)
         self.temporary.cleanup()
+
+    def active_capture(self, extra=b"", **header_changes):
+        header = {
+            "event": "header", "version": 1, "layer": "VK_LAYER_FRAME_MASK_trace",
+            "scope": "passive_pipeline_metadata", "fragment_filter": MODULE.FRAGMENT,
+            "limit_bytes": MODULE.CAPTURE_LIMIT, "limit_events": MODULE.CAPTURE_EVENT_LIMIT,
+            "binding_metadata_version": 1, "limit_binding_snapshots": 32,
+            "binding_arm_required": True, "binding_ready_at_header": False,
+            "deadline_seconds": 120,
+        }
+        header.update(header_changes)
+        path = self.session.folder / "capture.jsonl"
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self.capture_writers.append(descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(descriptor, json.dumps(header).encode() + b"\n" + extra)
+        return descriptor
+
+    def binding_session(self):
+        self.session.bindings = True
+        self.session.manual_rollback = True
+        self.session.start(self.sha)
+
+    def assert_arm_refused(self):
+        ledger = self.session.folder / "session.jsonl"
+        before = ledger.read_bytes()
+        with self.assertRaises(RuntimeError):
+            self.session.arm_bindings()
+        marker = self.session.folder / "bindings-arm.marker"
+        self.assertFalse(marker.exists())
+        self.assertFalse(marker.is_symlink())
+        self.assertEqual(ledger.read_bytes(), before)
 
     def run_command(self, arguments, **options):
         self.calls.append(arguments)
@@ -228,8 +266,12 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(scope["binding_snapshot_limit"], 32)
         self.assertFalse(scope["mapped_memory_read"])
         self.assertFalse(scope["image_readback"])
+        self.active_capture()
         self.session.arm_bindings()
         self.assertEqual((self.session.folder / "bindings-arm.marker").read_bytes(), b"FRAME_MASK_TRACE_BINDINGS/1\n")
+        requested = json.loads((self.session.folder / "session.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(requested["event"], "binding_capture_arm_requested")
+        self.assertFalse(requested["capture_accepted"])
         with self.assertRaises(FileExistsError):
             self.session.arm_bindings()
         self.session.rollback()
@@ -248,6 +290,143 @@ class SessionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.session.arm_bindings()
         self.assertFalse((self.session.folder / "bindings-arm.marker").exists())
+
+    def test_binding_arm_refuses_capture_missing_or_closed_without_footer(self):
+        self.binding_session()
+        self.assert_arm_refused()
+        descriptor = self.active_capture()
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        self.assert_arm_refused()
+
+    def test_binding_arm_refuses_completed_capture_and_partial_footer(self):
+        self.binding_session()
+        for extra in (b'{"event":"footer","capture_bounded":true}\n',
+                      b'{"event":"footer","capture_bounded":true}',
+                      b'{ "event" : "footer", "emitted":'):
+            with self.subTest(extra=extra):
+                self.active_capture(extra)
+                self.assert_arm_refused()
+                (self.session.folder / "capture.jsonl").unlink()
+
+    def test_binding_arm_accepts_concurrent_partial_event(self):
+        self.binding_session()
+        self.active_capture(b'{"event":"shader","serial":1}\n{"event":"pipeline","serial":')
+        self.session.arm_bindings()
+        self.assertTrue((self.session.folder / "bindings-arm.marker").exists())
+        requested = json.loads((self.session.folder / "session.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(requested["event"], "binding_capture_arm_requested")
+        self.assertFalse(requested["capture_accepted"])
+
+    def test_binding_arm_refuses_invalid_header_or_complete_json(self):
+        self.binding_session()
+        for changes, extra in (
+                ({"event": "pipeline"}, b""), ({"layer": "unrelated"}, b""),
+                ({"binding_arm_required": False}, b""), ({"version": True}, b""),
+                ({"fragment_filter": "0000000000000000"}, b""),
+                ({}, b'{"event":"header"}\n'), ({}, b"not-json\n"),
+                ({}, b"{not-json}\n"), ({}, b"[1,2,3]\n"),
+                ({}, b'{"serial":1}\n'), ({}, b"not-json")):
+            with self.subTest(changes=changes, extra=extra):
+                self.active_capture(extra, **changes)
+                self.assert_arm_refused()
+                (self.session.folder / "capture.jsonl").unlink()
+
+    def test_binding_arm_refuses_oversized_capture(self):
+        self.binding_session()
+        descriptor = self.active_capture()
+        os.ftruncate(descriptor, MODULE.CAPTURE_LIMIT + 1)
+        self.assert_arm_refused()
+
+    def test_binding_arm_refuses_growth_beyond_bound_during_read(self):
+        self.binding_session()
+        writer = self.active_capture()
+        original_fstat = MODULE.os.fstat
+        checks = 0
+        def expanded(descriptor):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                os.ftruncate(writer, MODULE.CAPTURE_LIMIT + 1)
+            return original_fstat(descriptor)
+        with mock.patch.object(MODULE.os, "fstat", side_effect=expanded):
+            self.assert_arm_refused()
+
+    def test_binding_arm_refuses_excess_records_within_byte_bound(self):
+        self.binding_session()
+        self.active_capture(b'{"event":"shader"}\n' * (MODULE.CAPTURE_EVENT_LIMIT + 3))
+        self.assert_arm_refused()
+
+    def test_binding_arm_refuses_nonprivate_and_symlink_capture(self):
+        self.binding_session()
+        self.active_capture()
+        path = self.session.folder / "capture.jsonl"
+        path.chmod(0o644)
+        self.assert_arm_refused()
+        path.chmod(0o600)
+        owned = self.session.folder / "private-capture.jsonl"
+        path.rename(owned)
+        path.symlink_to(owned)
+        self.assert_arm_refused()
+        self.assertTrue(path.is_symlink())
+        self.assertTrue(owned.exists())
+
+    def test_binding_arm_refuses_shared_capture_inode(self):
+        self.binding_session()
+        self.active_capture()
+        path = self.session.folder / "capture.jsonl"
+        other = self.session.folder / "borrowed-capture.jsonl"
+        os.link(path, other)
+        self.assert_arm_refused()
+        self.assertTrue(other.exists())
+
+    def test_binding_arm_refuses_fifo_without_blocking(self):
+        self.binding_session()
+        os.mkfifo(self.session.folder / "capture.jsonl", 0o600)
+        self.assert_arm_refused()
+
+    def test_binding_arm_refuses_path_replaced_during_read(self):
+        self.binding_session()
+        self.active_capture()
+        path = self.session.folder / "capture.jsonl"
+        original_fstat = MODULE.os.fstat
+        checks = 0
+        def replaced(descriptor):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                path.unlink()
+                path.write_text('replacement')
+                path.chmod(0o600)
+            return original_fstat(descriptor)
+        with mock.patch.object(MODULE.os, "fstat", side_effect=replaced):
+            self.assert_arm_refused()
+        self.assertEqual(path.read_text(), "replacement")
+
+    def test_binding_arm_refuses_writer_closing_during_read(self):
+        self.binding_session()
+        writer = self.active_capture()
+        original_fstat = MODULE.os.fstat
+        checks = 0
+        def closed(descriptor):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                fcntl.flock(writer, fcntl.LOCK_UN)
+            return original_fstat(descriptor)
+        with mock.patch.object(MODULE.os, "fstat", side_effect=closed):
+            self.assert_arm_refused()
+
+    def test_binding_arm_refuses_capture_ownership_change(self):
+        self.binding_session()
+        self.active_capture()
+        original_fstat = MODULE.os.fstat
+        def foreign(descriptor):
+            actual = original_fstat(descriptor)
+            fields = list(actual)
+            fields[4] = os.getuid() + 1
+            return os.stat_result(fields)
+        with mock.patch.object(MODULE.os, "fstat", side_effect=foreign):
+            self.assert_arm_refused()
 
     def test_opt_in_loader_debug_uses_same_exact_rollback(self):
         self.session.loader_debug = True
