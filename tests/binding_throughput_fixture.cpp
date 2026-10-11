@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 // Original, CPU-only public-API-shaped metadata workload. No Vulkan device,
@@ -47,6 +49,17 @@ struct Slot {
     VkImageView view;
     VkSampler sampler;
 };
+template<class Counters, class = void> struct HasCompactCounters : std::false_type {};
+template<class Counters> struct HasCompactCounters<Counters, std::void_t<
+    decltype(std::declval<Counters>().headerQueue), decltype(std::declval<Counters>().byteQueue),
+    decltype(std::declval<Counters>().maxLaneBytes)>> : std::true_type {};
+template<class Counters> void printCompactCounters(const Counters& counters) {
+    // Compile the identical workload against the pre-repair public API too.
+    // New fields explain the actual limiting bound without weakening it.
+    if constexpr (HasCompactCounters<Counters>::value)
+        std::cout << ",\"header_queue_loss\":" << counters.headerQueue << ",\"byte_queue_loss\":" << counters.byteQueue
+                  << ",\"max_lane_records\":" << counters.maxLaneOccupancy << ",\"max_lane_bytes\":" << counters.maxLaneBytes;
+}
 Slot slot(std::uint32_t index, std::uint32_t producers, std::uint32_t objects) {
     const auto family = index / 2;
     const auto owner = index / (objects / producers);
@@ -268,7 +281,8 @@ void startupBenchmark(std::uint32_t idleUs) {
               << ",\"unknown_loss\":" << journal->lossCount(Reason::Unknown) << ",\"snapshot_complete\":" << (complete ? "true" : "false")
               << ",\"total_ns\":" << ns << ",\"replay_ns\":" << replayNs
               << ",\"us_per_replayed_operation\":" << static_cast<double>(replayNs) / counters.replayed / 1000.0
-              << ",\"queue_loss_percent\":" << static_cast<double>(counters.queue) * 100.0 / attempted << "}\n";
+              << ",\"queue_loss_percent\":" << static_cast<double>(counters.queue) * 100.0 / attempted;
+    printCompactCounters(counters); std::cout << "}\n";
 }
 struct Configuration {
     std::uint32_t producers = 1, objects = 32, iterations = 4096;
@@ -386,7 +400,8 @@ void journalBenchmark(Configuration config, bool requireLossless = false) {
         << ",\"producer_ns\":" << producerNs << ",\"total_ns\":" << totalNs << ",\"replay_ns\":" << replayNs
         << ",\"requested_consumer_stall_us\":" << stalledUs
         << ",\"us_per_replayed_operation\":" << static_cast<double>(replayNs) / replayed / 1000.0
-        << ",\"queue_loss_percent\":" << static_cast<double>(queue) * 100.0 / attempts.load() << "}\n";
+        << ",\"queue_loss_percent\":" << static_cast<double>(queue) * 100.0 / attempts.load();
+    printCompactCounters(all); std::cout << "}\n";
 }
 } // namespace
 
