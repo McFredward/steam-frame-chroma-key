@@ -4,6 +4,7 @@
 // optionally substitute a patched SPIR-V for a named shader.
 // (#included into mrchroma_layer.cpp)
 #include <dirent.h>
+#include "mask_module_guard.h"
 
 static std::unordered_map<uint64_t, std::string> g_shaderNames;
 static std::once_flag g_shaderNamesOnce;
@@ -57,13 +58,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice dev, const VkS
         Config c = cfg();
         for (auto &o : c.overrides) {
             if (o.first != name) continue;
-            repl = readFile(o.second);
-            if (repl.size() >= 20 && repl.size() % 4 == 0 && *(const uint32_t *)repl.data() == 0x07230203) {
+            auto candidate = readFile(o.second);
+            if (mr::mask::legacyOverrideAllowed(candidate.data(), candidate.size(), ci->pCode, ci->codeSize)) {
+                // Keep an earlier valid replacement alive when a later duplicate
+                // override is rejected; mci.pCode must never point into freed data.
+                repl = std::move(candidate);
                 mci.pCode = (const uint32_t *)repl.data();
                 mci.codeSize = repl.size();
                 tag = " OVERRIDDEN by " + o.second;
             } else {
-                LOG("override for %s: bad SPIR-V file %s, ignored", name.c_str(), o.second.c_str());
+                LOG("override for %s: invalid, explicit-mask or changed-descriptor SPIR-V %s ignored; explicit masks require a verified frame/descriptor binding adapter",
+                    name.c_str(), o.second.c_str());
             }
         }
     }

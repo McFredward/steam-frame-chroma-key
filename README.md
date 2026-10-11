@@ -1,4 +1,25 @@
-# mr-chroma-frame: chroma-key passthrough for Steam Frame streaming
+# Steam Frame passthrough: explicit-mask development fork
+
+This fork is adding **real per-eye opacity masks** for PC streaming. Scene colors
+will remain independent of transparency, and the passthrough camera remains on
+the headset.
+
+The first development checkpoint contains the bounded mask transport, an
+explicit-mask shader generator, actual Vulkan rendering tests, and a Frame
+diagnostics collector. **The Steam Link frame/texture adapter is not implemented
+yet; this is not an installable genuine-mask passthrough feature.** The legacy
+layer refuses mask shaders until that adapter can bind them correctly.
+
+Development branch: [`dev`](https://github.com/McFredward/steam-frame-chroma-key/tree/dev).
+See [mask implementation and tests](docs/MASK-TRANSPORT.md) and
+[remaining Steam Link integration](docs/MASK-BRIDGE-INVESTIGATION.md).
+
+The original upstream chroma-key implementation and instructions below remain
+available as a separate path. They do not enable the new explicit-mask path.
+
+---
+
+## Original chroma-key passthrough
 
 Mixed reality on the Steam Frame over Valve's normal PC streaming, with no ALVR and no Virtual Desktop.
 
