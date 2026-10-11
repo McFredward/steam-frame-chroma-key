@@ -60,8 +60,8 @@ reads a separate presentation-number field. A diagnostic variable name does
 not establish the protocol meaning of its value.
 
 The standard V4L2 stateful decoder interface preserves the input timestamp on
-the matching output, including reordered decode results. That makes this a
-an exact native receiver-side association mechanism, rather than approximate
+the matching output, including reordered decode results. That makes this an
+exact native receiver-side association mechanism, rather than approximate
 timestamp matching. It does not establish how the PC encoder assigns the
 received key or associates it with source coverage.
 [Linux V4L2 decoder documentation](https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dev-decoder.html)
