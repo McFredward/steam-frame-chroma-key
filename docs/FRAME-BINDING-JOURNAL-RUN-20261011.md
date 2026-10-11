@@ -106,3 +106,12 @@ session directory. A final read-only check confirmed that directory and both
 activation files were absent and native SteamVR remained active. Cleanup caused
 no further restart. The SSH credential session was closed, and the maintainer
 was told that the Frame could enter standby.
+
+## Later lossless resource-metadata capture
+
+The [compact-journal native run](FRAME-COMPACT-JOURNAL-RUN-20261011.md) subsequently
+retained all 703,494 binding observations without loss and all 32 source-complete
+CPU resource snapshots. Its successful result does not rewrite this earlier
+run's failed evidence. Exact source-video, selected-resource and coherent-eye
+association remain the next gates; no mask was activated. That later session
+was also manually restored and its owned files removed.

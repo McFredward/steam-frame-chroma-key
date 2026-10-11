@@ -24,9 +24,13 @@ The supplied PC driver now has a concrete
 inspection identifies a [conditional full-eye UV route](docs/FRAME-UV-BINDING-20261011.md).
 A separate [bounded passive pipeline diagnostic](docs/PASSIVE-PIPELINE-TRACE.md)
 has verified 39 complete recorded/submitted stage pairings on the inspected Frame
-build. It changes no rendered pixels and remains opt-in; it does not establish
-the remaining descriptor/UV/mask/video association or enable
-genuine-mask passthrough.
+build. The later [compact-journal native capture](docs/FRAME-COMPACT-JOURNAL-RUN-20261011.md)
+retains 703,494 resource observations without loss and 32 complete CPU resource
+snapshots. Neither capture establishes GPU-consumed eye values or source-video
+identity. The next adapters must join [native receiver selection and resource import](docs/FRAME-NEXT-ADAPTER.md)
+with [actual Windows composition and transmitter keys](docs/PC-NEXT-ADAPTER.md).
+These diagnostics change no rendered pixels and do not enable genuine-mask
+passthrough.
 
 The original upstream chroma-key implementation and instructions below remain
 available as a separate path. They do not enable the new explicit-mask path.

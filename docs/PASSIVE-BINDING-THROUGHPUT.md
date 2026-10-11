@@ -1,9 +1,12 @@
 # Passive binding throughput repair, 2026-10-11
 
-The [native journal run](FRAME-BINDING-JOURNAL-RUN-20261011.md) lost 201,483
+The first [native journal run](FRAME-BINDING-JOURNAL-RUN-20261011.md) lost 201,483
 binding publications despite zero binding-lock contention and no exhausted object
-tables. This repair addresses measured replay and burst limits. It is not a new
-Frame result, a video-frame association, or working streaming passthrough.
+tables. This repair addresses measured replay and burst limits. The subsequent
+[compact native run](FRAME-COMPACT-JOURNAL-RUN-20261011.md) retains 703,494
+observations without loss and all 32 selected CPU resource snapshots. Neither
+the repair nor that capture proves a video-frame association or working streaming
+passthrough.
 
 ## What the measurements distinguish
 
@@ -98,7 +101,7 @@ below the existing 256-KiB deployment guard. Private native evidence and small
 validation records are retained; completed worker binaries and checkouts are
 removed after integration.
 
-## Next native check
+## Native check and next gate
 
 No diagnostic is currently installed on the Frame. Activation still uses the
 approved [temporary session](FRAME-TRACE-SESSION.md), one announced restart,
@@ -118,3 +121,12 @@ arrives. They do not identify video frames or certify GPU-consumed uniform data.
 A native result must retain all required lifecycle observations and the selected
 snapshots without historical loss before proceeding to descriptor/frame/eye
 association. An incomplete result remains opaque and does not authorize masking.
+
+The [fresh native capture](FRAME-COMPACT-JOURNAL-RUN-20261011.md) now satisfies
+that CPU resource-metadata gate with zero per-operation losses. Its writer used
+approximately 1.715% of one core over its observed window; that is background
+thread cost, not total hook or stream overhead. Exact receiver selection,
+successful resource import, sender identity and coherent eye values are the
+next gates in [the Frame adapter plan](FRAME-NEXT-ADAPTER.md) and
+[the Windows sender plan](PC-NEXT-ADAPTER.md). Another descriptor-only recording
+cannot establish those missing relations.

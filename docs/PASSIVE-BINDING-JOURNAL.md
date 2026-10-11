@@ -5,8 +5,10 @@ binding observations and unsupported imported-resource metadata in the armed
 Frame recording. This implementation addresses those two source-level causes.
 The subsequent [native Frame run](FRAME-BINDING-JOURNAL-RUN-20261011.md) loaded
 this implementation and retained the supported import/sampler fields. It also
-exposed substantial journal queue overflow. Both hardware recordings remain
-incomplete; no replacement shader or mask is activated.
+exposed substantial journal queue overflow. Those two hardware recordings remain
+incomplete. The subsequent [compact native run](FRAME-COMPACT-JOURNAL-RUN-20261011.md)
+retains 703,494 observations without loss and all 32 selected CPU resource
+snapshots. No replacement shader or mask is activated.
 
 ## Hook and writer responsibilities
 
@@ -134,7 +136,7 @@ separate complete CI result; the local limited-repair scope above is unchanged.
 
 ## Remaining acceptance gates
 
-The authorized native run recorded all 32 selected snapshots with locally
+The earlier authorized native run recorded all 32 selected snapshots with locally
 complete supported import/sampler metadata and zero binding-lock contention.
 It also recorded 201,483 journal queue losses and 9,222 unknown-state losses;
 none of its snapshots is globally complete. Queue capacity is therefore
@@ -142,12 +144,17 @@ insufficient for that observed producer/replay balance. The subsequent
 [throughput repair](PASSIVE-BINDING-THROUGHPUT.md) measures background lookup,
 replay and burst limits, then indexes tables and compacts owned storage within
 the previous memory budget. Its six scheduled burst cases retain every snapshot,
-but extreme asynchronous startup still overflows. This is not a complete native
-Frame result; pre-arm losses remain sticky and cannot be cleared to accept it.
+but extreme asynchronous startup still overflows. These software cases alone
+are not native Frame evidence; pre-arm losses remain sticky and cannot be
+cleared to accept a recording.
 The footer now separates header and byte pressure, attributes publication/replay
 losses to API operations, and reports background replay, serialization, output,
 wall and thread CPU time. Clocks and serialization run only on the background
 writer; render hooks do not sample clocks or write logs.
+The [fresh compact native run](FRAME-COMPACT-JOURNAL-RUN-20261011.md) subsequently
+retains all 703,494 binding observations, zero per-operation losses and all 32
+source-complete snapshots. That closes the observed CPU resource-metadata loss
+gate; its explicit byte cap still omits two trailing output events.
 The frame/eye/source association, GPU-consumed uniform coherence, selected
 decoded resource generation and submit-time binding validation remain open.
 `gpu_consumed_coherent` and `video_frame_associated` stay false.

@@ -581,3 +581,22 @@ The [ordered-journal run report](FRAME-BINDING-JOURNAL-RUN-20261011.md) records
 the actual counts, limitations, native recovery and next source-level approach.
 Further headset activation requires a reviewed repair and renewed restart
 readiness; this recording does not authorize a replacement shader or mask.
+
+## Compact-journal run and completed recovery
+
+The next authorized run used source checkpoint `95ddb65` and library SHA-256
+`9100902dfa240427523099062ccf4f77fd647d48979b37eb966d391943dc175d`.
+It retained all 703,494 binding observations and all 32 selected CPU resource
+snapshots without journal loss. Recording closed at its byte cap without a timed
+restart. After explicit manual-rollback readiness, native recovery completed
+at 22:49:10 CEST; exact owned-file cleanup and the final native-state check
+completed by 22:50:10. No diagnostic mapping, environment, owned folder, manifest
+or runtime drop-in remains. SteamVR is active and the watchdog inactive.
+
+The [compact-run report](FRAME-COMPACT-JOURNAL-RUN-20261011.md) records artifact
+and capture hashes, bounded-output limits, measured background cost, resource
+aliases and recovery evidence. The Frame may enter standby. The next
+[receiver/resource adapter](FRAME-NEXT-ADAPTER.md) and
+[Windows sender adapter](PC-NEXT-ADAPTER.md) need additional native identities;
+this complete CPU metadata capture does not authorize private record reads,
+shader replacement or mask activation.
