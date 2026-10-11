@@ -19,6 +19,14 @@ existing Frame diagnostics without installing anything or starting another VR
 client. The [PC source collector](docs/PC-MASK-SOURCE.md) inspects the installed
 Steam Link driver separately. Neither tool enables masks or changes SteamVR.
 
+The supplied PC driver now has a concrete
+[encoder/transmitter dataflow](docs/PC-DRIVER-20261011.md), and the native shader
+inspection identifies a [conditional full-eye UV route](docs/FRAME-UV-BINDING-20261011.md).
+A separate [bounded passive pipeline diagnostic](docs/PASSIVE-PIPELINE-TRACE.md)
+can verify the actual stage tuple. It changes no rendered pixels and remains
+opt-in; it does not establish the remaining mask/video association or enable
+genuine-mask passthrough.
+
 The original upstream chroma-key implementation and instructions below remain
 available as a separate path. They do not enable the new explicit-mask path.
 

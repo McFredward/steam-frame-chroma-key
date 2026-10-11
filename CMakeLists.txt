@@ -4,6 +4,23 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 include(CTest)
+option(FRAME_MASK_BUILD_TRACE "Build the opt-in passive compositor diagnostic layer" OFF)
+
+if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE))
+    find_package(Vulkan REQUIRED)
+    find_package(Threads REQUIRED)
+    add_library(VkLayer_frame_mask_trace SHARED layer/passive_pipeline_trace.cpp)
+    target_include_directories(VkLayer_frame_mask_trace PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(VkLayer_frame_mask_trace PRIVATE
+        -Wall -Wextra -Wpedantic -fvisibility=hidden)
+    target_link_options(VkLayer_frame_mask_trace PRIVATE -Wl,-Bsymbolic-functions)
+    target_link_libraries(VkLayer_frame_mask_trace PRIVATE Threads::Threads)
+    set(FRAME_MASK_TRACE_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}VkLayer_frame_mask_trace${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    configure_file(layer/VkLayer_frame_mask_trace.json.in
+        ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_mask_trace.json @ONLY)
+elseif(FRAME_MASK_BUILD_TRACE)
+    message(FATAL_ERROR "The passive compositor trace targets Linux Vulkan")
+endif()
 
 add_library(frame_mask STATIC mask/mask_protocol.cpp)
 target_include_directories(frame_mask PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -26,6 +43,13 @@ if(BUILD_TESTING)
     target_include_directories(test_mask_module_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME mask_module_guard COMMAND test_mask_module_guard)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    if(TARGET VkLayer_frame_mask_trace)
+        add_executable(test_passive_pipeline_trace tests/test_passive_pipeline_trace.cpp)
+        target_include_directories(test_passive_pipeline_trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_passive_pipeline_trace PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(test_passive_pipeline_trace PRIVATE Threads::Threads)
+        add_test(NAME passive_pipeline_trace COMMAND test_passive_pipeline_trace)
+    endif()
     add_test(NAME mask_endpoint COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mask_endpoint.py $<TARGET_FILE:mask_endpoint>)
     add_test(NAME mask_shader COMMAND ${Python3_EXECUTABLE}
@@ -61,6 +85,11 @@ if(BUILD_TESTING)
         add_test(NAME mask_gpu COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_mask_gpu.py $<TARGET_FILE:test_mask_gpu>
             $<TARGET_FILE:test_mask_module_guard>)
+        if(TARGET VkLayer_frame_mask_trace)
+            add_test(NAME passive_pipeline_trace_gpu COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_passive_pipeline_trace.py
+                $<TARGET_FILE:test_mask_gpu> ${CMAKE_CURRENT_BINARY_DIR})
+        endif()
     else()
         message(FATAL_ERROR "Mask validation needs Vulkan headers, glslc and spirv-tools. For transport-only builds use -DBUILD_TESTING=OFF.")
     endif()
