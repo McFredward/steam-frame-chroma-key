@@ -410,9 +410,9 @@ behavior, not headset resource/eye/frame association or working passthrough.
 ### Live result and pre-arm budget defect
 
 The initial resource deployment used the exact 133,696-byte artifact above.
-Activation was requested at 15:49:58 CEST; the service reported active at
-15:50:04. The maintainer confirmed a real PC-VR stream and the helper requested
-arming at 15:51:29. Read-only verification found both the native compositor and
+Activation was requested at 14:29:58 CEST; the service reported active at
+14:30:04. The maintainer confirmed a real PC-VR stream and the helper requested
+arming at 14:31:29. Read-only verification found both the native compositor and
 the actual `vrlinkrunthread` executable, with the diagnostic mapped in the
 compositor. No stream arguments or credentials were collected.
 
@@ -449,3 +449,34 @@ draws, their resource snapshots and accepted submissions. A separate 2,400-draw
 unarmed fixture must remain empty of those records. Every rendered pixel is
 still checked. Focused validation and the replacement artifact are recorded
 below once complete; a local pass cannot repair this rejected hardware run.
+
+### Reviewed repair artifact, awaiting operator readiness
+
+The replacement AArch64 library is 154,088 bytes, SHA-256
+`e0f976e4f42ab0fbf03383dc97e928401a8760bce7a1a8277d6ced3255653473`.
+It cross-compiles with strict warnings. The three affected pipeline, resource
+and real-loader/GPU suites pass; the integrated recovery helper passes 33 checks.
+After adding a real-writer file-lock assertion, only its affected GPU suite was
+rerun and passed. The other nine suites inherit checkpoint `00e7270`'s complete
+green CI evidence. No new complete local gate or hardware success is claimed.
+Small records remain in `build/arm-repair-validation-20261011/`.
+
+The old library may remain mapped after its recording closes. Never overwrite
+or truncate a mapped `.so`. Stage the replacement under a new filename/inode,
+check its exact hash and passive loader probe, then wait for the maintainer's
+readiness before interrupting the active stream. A verified rotation may remove
+only the old helper's byte-identical manifest/drop-in, retain its tiny rejected
+capture in a private archive and install a fresh owned session directory. The
+next helper start performs one SteamVR restart with the reviewed replacement:
+
+```bash
+python3 ~/.local/share/frame-mask-trace/frame_trace_session.py start \
+  --sha256 e0f976e4f42ab0fbf03383dc97e928401a8760bce7a1a8277d6ced3255653473 \
+  --manual-rollback --bindings
+```
+
+The same exact activation paths and manual rollback command remain applicable.
+If a rotation cannot be verified, stop and use the documented native recovery;
+do not delete unknown files or bypass loader policy. No automatic restart at
+capture expiry is reinstated. The rejected archive/staged files have no loader
+manifest of their own and must be removed after retained evidence and recovery.

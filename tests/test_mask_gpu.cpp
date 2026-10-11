@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <array>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <sys/file.h>
 #include <vector>
 #include <unistd.h>
 
@@ -49,6 +51,14 @@ static void waitForTrace(const char* expected) {
 static void armTrace() {
     const auto* path = std::getenv("FRAME_MASK_TRACE_BINDINGS_ARM_FILE");
     if (!path) throw std::runtime_error("Delayed trace-arm fixture has no marker path");
+    const auto* output = std::getenv("FRAME_MASK_TRACE_OUTPUT");
+    const int capture = output ? open(output, O_RDONLY | O_CLOEXEC) : -1;
+    if (capture < 0) throw std::runtime_error("Delayed trace-arm capture is missing");
+    const int locked = flock(capture, LOCK_SH | LOCK_NB);
+    const int error = errno;
+    close(capture);
+    if (!locked || (error != EAGAIN && error != EWOULDBLOCK))
+        throw std::runtime_error("Trace writer did not retain exclusive liveness lock");
     constexpr char marker[] = "FRAME_MASK_TRACE_BINDINGS/1\n";
     const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0) throw std::runtime_error("Fixture could not create exclusive arm marker");
