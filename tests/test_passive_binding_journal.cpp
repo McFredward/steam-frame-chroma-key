@@ -1,11 +1,13 @@
 #include "layer/passive_binding_journal.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <new>
 #include <thread>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -296,6 +298,56 @@ void registryQueueBatchAndWrap() {
     });
     require(called && gap->transportCounters().orderGap == 1, "gap closure omitted an incomplete queued snapshot");
 }
+std::size_t operationIndex(std::string_view name) {
+    for (std::size_t i = 0; i < Journal::OperationCount; ++i)
+        if (name == Journal::operationName(i)) return i;
+    std::abort();
+}
+void operationLossAttribution() {
+    auto journal = std::make_unique<Journal>();
+    for (std::size_t i = 0; i < Journal::LaneCapacity; ++i)
+        journal->updateSets(1, 0, nullptr, 0, nullptr);
+    journal->updateSets(1, 0, nullptr, 0, nullptr);
+    require(journal->transportCounters().maxLaneOccupancy == Journal::LaneCapacity,
+            "producer lane high-water omitted a full bounded burst");
+    const auto update = operationIndex("update_sets");
+    const auto begin = operationIndex("begin_command");
+    const auto allocate = operationIndex("allocate_sets");
+    const auto snapshot = operationIndex("snapshot");
+    auto counters = journal->operationCounters();
+    require(counters[update].publicationLoss == 1 && counters[update].replayLoss == 0,
+            "queue loss was not attributed to its rejected operation");
+    const auto callback = [](std::uint32_t, const Snapshot&) noexcept {};
+    journal->drain(callback);
+    journal->beginCommand(1, h<VkCommandBuffer>(999));
+    journal->drain(callback);
+    counters = journal->operationCounters();
+    require(counters[begin].replayLoss == 1 && counters[begin].publicationLoss == 0,
+            "Core unknown-state loss was confused with publication rejection");
+    auto allocateInfo = info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+    allocateInfo.descriptorSetCount = Journal::CallCapacity + 1;
+    allocateInfo.pSetLayouts = reinterpret_cast<const VkDescriptorSetLayout*>(1);
+    journal->allocateSets(1, allocateInfo, reinterpret_cast<const VkDescriptorSet*>(1));
+    journal->close();
+    require(!journal->requestSnapshot(1, cb, pl, 0), "closed journal retained a new snapshot");
+    counters = journal->operationCounters();
+    require(counters[allocate].publicationLoss == 1 && counters[snapshot].publicationLoss == 1,
+            "batch or closed-call loss omitted its operation attribution");
+    require(journal->transportCounters().maxLaneOccupancy == Journal::LaneCapacity &&
+            counters[update].publicationLoss == 1 && counters[begin].replayLoss == 1,
+            "later drainage or closure reset historical attribution/high-water");
+    std::uint64_t publicationLoss = 0, replayLoss = 0;
+    for (std::size_t i = 0; i < counters.size(); ++i) {
+        require(std::string_view(Journal::operationName(i)) != "unknown", "operation name missing from diagnostics");
+        for (std::size_t j = 0; j < i; ++j)
+            require(std::string_view(Journal::operationName(i)) != Journal::operationName(j), "operation diagnostic names overlap");
+        publicationLoss += counters[i].publicationLoss; replayLoss += counters[i].replayLoss;
+    }
+    require(std::string_view(Journal::operationName(Journal::OperationCount)) == "unknown",
+            "out-of-range operation name access was not bounded");
+    require(publicationLoss == 3 && replayLoss == 1 && journal->lostState() == 4,
+            "operation counters changed or omitted aggregate sticky losses");
+}
 void laneWrapAndDependencies() {
     auto journal = std::make_unique<Journal>(); seed(*journal); auto initial = snap(*journal);
     for (std::uint32_t i = 0; i < 160; ++i) {
@@ -390,8 +442,44 @@ void extensionOwnership() {
     journal->close();
 }
 }
-int main() {
+// A reproducible selector microbenchmark: the replay operation is an empty
+// descriptor update so object lookup population cannot mask lane-selection
+// cost. It measures real hook publication and background drain independently;
+// it does not reproduce compositor scheduling or establish hardware throughput.
+void benchmark() {
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t batches = 5000;
+    for (const auto producerIndex : {std::size_t{0}, Journal::ProducerCapacity - 1}) {
+        auto journal = std::make_unique<Journal>();
+        for (std::size_t i = 0; i < producerIndex; ++i) {
+            std::thread registerOnly([&] { journal->updateSets(1, 0, nullptr, 0, nullptr); });
+            registerOnly.join();
+        }
+        const auto callback = [](std::uint32_t, const Snapshot&) noexcept {};
+        journal->drain(callback);
+        std::int64_t publicationNs = 0, drainNs = 0;
+        for (std::size_t batch = 0; batch < batches; ++batch) {
+            const auto begin = Clock::now();
+            for (std::size_t i = 0; i < Journal::LaneCapacity; ++i)
+                journal->updateSets(1, 0, nullptr, 0, nullptr);
+            const auto published = Clock::now();
+            const auto count = journal->drain(callback, Journal::LaneCapacity);
+            const auto end = Clock::now();
+            require(count == Journal::LaneCapacity, "benchmark lost a retained operation");
+            publicationNs += std::chrono::duration_cast<std::chrono::nanoseconds>(published - begin).count();
+            drainNs += std::chrono::duration_cast<std::chrono::nanoseconds>(end - published).count();
+        }
+        require(journal->lostState() == 0, "benchmark incurred hidden state loss");
+        journal->close(); require(journal->finished(), "benchmark did not finish");
+        const auto records = batches * Journal::LaneCapacity;
+        std::cout << "{\"producer_index\":" << producerIndex << ",\"records\":" << records
+                  << ",\"publication_ns_per_record\":" << static_cast<double>(publicationNs) / records
+                  << ",\"drain_ns_per_record\":" << static_cast<double>(drainNs) / records << "}\n";
+    }
+}
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--benchmark") { benchmark(); return 0; }
     ownershipAndOrdering(); selectedSnapshotBurst(); writeBeforeCopyBatch(); delayedPredecessorAndClosure(); concurrentProducers();
-    registryQueueBatchAndWrap(); laneWrapAndDependencies(); extensionOwnership();
+    registryQueueBatchAndWrap(); operationLossAttribution(); laneWrapAndDependencies(); extensionOwnership();
     std::cout << checks << " journal checks passed; " << sizeof(Journal) << " bytes fixed state; no hook allocations\n";
 }
