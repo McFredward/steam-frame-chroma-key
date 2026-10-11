@@ -277,6 +277,52 @@ void concurrentBoundaryAccounting() {
     require(last.size() == 1 && last[0].serial == EventLimit,
             "concurrent lifetime closure altered the accepted final record");
 }
+void writerNeverTakesTheProducerMutex() {
+    EventRing ring;
+    Event event, consumed;
+    event.commandGeneration = 712;
+    require(ring.push(event), "single-consumer setup did not publish its event");
+    {
+        auto producer = TestAccess::hold(ring);
+        require(ring.pop(consumed) && consumed.serial == 1 && consumed.commandGeneration == 712,
+                "writer drain contended with the producer mutex");
+        require(ring.empty() && !ring.pop(consumed),
+                "writer empty check contended with the producer mutex");
+        require(!ring.push(event) && ring.dropped() == 1,
+                "removing reader contention also concealed genuine producer contention");
+    }
+    require(ring.push(event) && ring.pop(consumed) && consumed.serial == 2,
+            "single consumer did not release its slot for the next producer");
+}
+void singleProducerAndWriterPreserveEveryPublishedSlot() {
+    EventRing ring;
+    constexpr std::uint64_t Records = EventLimit;
+    std::atomic<std::uint64_t> drained{0};
+    std::thread writer([&] {
+        Event event;
+        for (std::uint64_t expected = 1; expected <= Records;) {
+            if (!ring.pop(event)) { std::this_thread::yield(); continue; }
+            require(event.serial == expected && event.commandGeneration == expected &&
+                    event.relatedGeneration == (expected ^ 0x55aa),
+                    "concurrent writer observed a torn or reordered published slot");
+            ++expected;
+            drained.fetch_add(1);
+        }
+    });
+    for (std::uint64_t serial = 1; serial <= Records; ++serial) {
+        // Deliberately keep below capacity; only reader/producer overlap is
+        // under test. A real capacity overflow remains a separate rejected loss.
+        while (serial - drained.load() > EventCapacity / 2) std::this_thread::yield();
+        Event event;
+        event.commandGeneration = serial;
+        event.relatedGeneration = serial ^ 0x55aa;
+        require(ring.push(event), "background draining dropped single-producer metadata");
+    }
+    writer.join();
+    ring.close();
+    require(ring.empty() && ring.emitted() == Records && ring.dropped() == 0,
+            "concurrent single-consumer drain changed final counts or lost metadata");
+}
 void writerClosureWaitsForBookkeeping() {
     EventRing ring;
     Core core(ring, true);
@@ -459,6 +505,8 @@ int main() {
     multiRecordCallClosesCleanly();
     closureKeepsEarlierLoss();
     concurrentBoundaryAccounting();
+    writerNeverTakesTheProducerMutex();
+    singleProducerAndWriterPreserveEveryPublishedSlot();
     writerClosureWaitsForBookkeeping();
     closedBookkeepingCannotRaceFooter();
     concurrentWriterClosureKeepsAStableDrain();

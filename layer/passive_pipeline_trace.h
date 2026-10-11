@@ -94,7 +94,8 @@ struct SubmitTicket {
 };
 
 // try_lock deliberately drops diagnostics rather than delaying a render thread.
-// Producers share one bounded ring; the writer is its only consumer.
+// Producers share one bounded ring; its single writer-thread consumer never
+// takes the producer mutex or causes rendering to lose a record by contention.
 class EventRing {
     friend struct TestAccess;
 public:
@@ -146,30 +147,31 @@ public:
         // Another producer may have accepted the last record between the first
         // check and this acquisition. Check closure before queue capacity.
         if (finished()) return false;
-        if (count_ == EventCapacity) {
+        const auto published = published_.load(std::memory_order_relaxed);
+        if (published - consumed_.load(std::memory_order_acquire) == EventCapacity) {
             dropped_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         event.serial = ++emitted_;
-        events_[write_] = event;
-        write_ = (write_ + 1) % EventCapacity;
-        ++count_;
+        events_[published % EventCapacity] = event;
+        published_.store(published + 1, std::memory_order_release);
         return true;
     }
     bool pop(Event& event) noexcept {
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-        if (!lock.owns_lock() || !count_) return false;
-        event = events_[read_];
-        read_ = (read_ + 1) % EventCapacity;
-        --count_;
+        // Only this consumer advances consumed_. Acquire observes the complete
+        // published slot; release prevents a producer overwriting it until the
+        // copy finishes. No render-side mutex is held while the writer drains.
+        const auto consumed = consumed_.load(std::memory_order_relaxed);
+        if (consumed == published_.load(std::memory_order_acquire)) return false;
+        event = events_[consumed % EventCapacity];
+        consumed_.store(consumed + 1, std::memory_order_release);
         return true;
     }
     std::uint64_t dropped() const noexcept { return dropped_.load(); }
     std::uint64_t emitted() const noexcept { return emitted_.load(); }
     bool finished() const noexcept { return emitted() >= EventLimit; }
     bool empty() noexcept {
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-        return lock.owns_lock() && count_ == 0;
+        return consumed_.load(std::memory_order_acquire) == published_.load(std::memory_order_acquire);
     }
 private:
     static constexpr std::uint32_t Closed = 1u << 31;
@@ -178,7 +180,7 @@ private:
     std::atomic<std::uint32_t> producers_{0};
     std::array<Event, EventCapacity> events_{};
     std::mutex mutex_;
-    std::size_t read_ = 0, write_ = 0, count_ = 0;
+    std::atomic<std::uint64_t> published_{0}, consumed_{0};
     std::atomic<std::uint64_t> emitted_{0}, dropped_{0};
 };
 
