@@ -217,6 +217,38 @@ class SessionTests(unittest.TestCase):
     def test_default_never_changes_native_loader_logging(self):
         self.assertNotIn(b"VK_LOADER_DEBUG", self.session.contents()[self.session.dropin])
 
+    def test_binding_scope_is_opt_in_and_uses_exact_manual_recovery(self):
+        self.assertNotIn(b"FRAME_MASK_TRACE_BINDINGS", self.session.contents()[self.session.dropin])
+        self.session.bindings = True
+        self.session.manual_rollback = True
+        self.session.start(self.sha)
+        self.assertIn(b"Environment=FRAME_MASK_TRACE_BINDINGS=1\n", self.session.dropin.read_bytes())
+        ledger = [json.loads(line) for line in (self.session.folder / "session.jsonl").read_text().splitlines()]
+        scope = next(row for row in ledger if row["event"] == "diagnostic_scope")
+        self.assertEqual(scope["binding_snapshot_limit"], 32)
+        self.assertFalse(scope["mapped_memory_read"])
+        self.assertFalse(scope["image_readback"])
+        self.session.arm_bindings()
+        self.assertEqual((self.session.folder / "bindings-arm.marker").read_bytes(), b"FRAME_MASK_TRACE_BINDINGS/1\n")
+        with self.assertRaises(FileExistsError):
+            self.session.arm_bindings()
+        self.session.rollback()
+        self.assertFalse(self.session.dropin.exists())
+        self.assertFalse(self.session.manifest.exists())
+        with self.assertRaises(RuntimeError):
+            self.session.arm_bindings()
+
+    def test_binding_arm_rejects_unconfigured_or_changed_activation(self):
+        self.session.manual_rollback = True
+        self.session.start(self.sha)
+        with self.assertRaises(RuntimeError):
+            self.session.arm_bindings()
+        self.assertFalse((self.session.folder / "bindings-arm.marker").exists())
+        self.session.dropin.write_text("unrelated environment")
+        with self.assertRaises(RuntimeError):
+            self.session.arm_bindings()
+        self.assertFalse((self.session.folder / "bindings-arm.marker").exists())
+
     def test_opt_in_loader_debug_uses_same_exact_rollback(self):
         self.session.loader_debug = True
         self.session.start(self.sha)

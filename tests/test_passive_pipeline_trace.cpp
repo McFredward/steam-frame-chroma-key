@@ -495,6 +495,32 @@ void submitRaceKeepsPreCallGeneration() {
             current[0].commandGeneration == replacement.commandGeneration,
             "old submit ticket consumed replacement-generation evidence");
 }
+void selectedDrawSnapshotsDoNotCollapseTheSecondEye() {
+    EventRing ring;
+    Core core(ring, true);
+    core.filterFragment(fingerprint(fragment, sizeof(fragment)));
+    seed(core);
+    begin(core);
+    drain(ring);
+    core.draw(1, 30, 1);
+    Event first, second;
+    require(core.describeDraw(1, 30, first) && first.complete, "first selected binding query missing");
+    core.draw(1, 30, 1);
+    require(core.describeDraw(1, 30, second) && second.complete &&
+            second.commandGeneration == first.commandGeneration && second.layout == 99,
+            "same-pipeline second-eye query was deduplicated");
+    require(kind(drain(ring), Kind::Draw).size() == 1,
+            "source queries changed ordinary pipeline event deduplication");
+    core.commandEnd(1, 30);
+    require(!core.describeDraw(1, 30, second), "non-recording command described as a new draw");
+    core.commandBegin(1, 30);
+    core.bind(1, 30, 20);
+    core.filterFragment(1);
+    require(!core.describeDraw(1, 30, second), "unrelated shader escaped resource filter");
+    core.filterFragment(fingerprint(fragment, sizeof(fragment)));
+    core.pipelineDestroyed(1, 20);
+    require(!core.describeDraw(1, 30, second), "destroyed pipeline satisfied binding query");
+}
 }
 
 int main() {
@@ -513,5 +539,6 @@ int main() {
     contentionCannotCertifyStaleState();
     fragmentFilter();
     submitRaceKeepsPreCallGeneration();
+    selectedDrawSnapshotsDoNotCollapseTheSecondEye();
     std::cout << "passive pipeline trace: lifecycle, exact stage metadata, submit links, bounds, contention and disabled paths passed\n";
 }

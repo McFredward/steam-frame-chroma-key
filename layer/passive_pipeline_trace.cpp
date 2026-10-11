@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define TRACE_EXPORT extern "C" __attribute__((visibility("default")))
@@ -28,11 +29,16 @@ constexpr std::uint32_t CallRecordLimit = 512;
 struct Capture {
     EventRing events;
     Core core{events};
+    frame_bindings::Core bindings;
     std::atomic<bool> stop{false};
     std::thread writer;
     std::once_flag once;
     bool processAllowed = false;
     std::uint64_t fragmentFilter = 0;
+    bool bindingsEnabled = false;
+    std::atomic<bool> bindingsArmed{false};
+    std::atomic<std::uint32_t> bindingSnapshots{0};
+    static constexpr std::uint32_t BindingSnapshotLimit = 32;
 
     void start() {
         std::call_once(once, [&] {
@@ -46,6 +52,15 @@ struct Capture {
             const auto* basename = std::strrchr(executable, '/');
             if (std::strcmp(basename ? basename + 1 : executable, "vrcompositor")) return;
             processAllowed = true;
+            const auto* bindingFlag = std::getenv("FRAME_MASK_TRACE_BINDINGS");
+            bindingsEnabled = bindingFlag && !std::strcmp(bindingFlag, "1");
+            const auto* arm = std::getenv("FRAME_MASK_TRACE_BINDINGS_ARM_FILE");
+            if (arm && (arm[0] != '/' || strnlen(arm, 4096) >= 4096)) {
+                processAllowed = false;
+                return;
+            }
+            std::string armPath = bindingsEnabled && arm ? arm : "";
+            bindingsArmed.store(bindingsEnabled && armPath.empty());
             const auto* filter = std::getenv("FRAME_MASK_TRACE_FRAGMENT_HASH");
             std::uint64_t parsedFilter = 0;
             if (filter) {
@@ -71,7 +86,7 @@ struct Capture {
                 path = configured;
             else path = "/tmp/frame-mask-trace-" + std::to_string(getpid()) + ".jsonl";
             core.enable(true);
-            try { writer = std::thread([this, path] { write(path); }); }
+            try { writer = std::thread([this, path, armPath] { write(path, armPath); }); }
             catch (...) { core.enable(false); processAllowed = false; }
         });
     }
@@ -106,10 +121,10 @@ struct Capture {
         }
         target[used] = 0;
     }
-    static std::size_t serialize(const Event& e, char (&out)[8192]) {
+    static std::size_t serialize(const Event& e, char (&out)[16384]) {
         std::size_t used = 0;
         const char* names[] = {"shader", "pipeline", "draw_recorded", "execute_recorded",
-                               "submit_accepted", "incomplete"};
+                               "submit_accepted", "incomplete", "bindings_recorded"};
         bool valid = append(out, sizeof(out), used,
             "{\"event\":\"%s\",\"serial\":%llu,\"device\":%llu,\"complete\":%s,"
             "\"reason\":%u,\"command\":\"%llx\",\"command_generation\":%llu,"
@@ -136,7 +151,9 @@ struct Capture {
                 static_cast<unsigned long long>(stage.generation), static_cast<unsigned long long>(stage.hash),
                 stage.bytes, entry, stage.complete ? "true" : "false");
         }
-        valid = valid && append(out, sizeof(out), used, "]}\n");
+        valid = valid && append(out, sizeof(out), used, "]");
+        if (e.kind == Kind::Bindings) valid = valid && serializeBindings(e.bindings, out, sizeof(out), used);
+        valid = valid && append(out, sizeof(out), used, "}\n");
         return valid ? used : 0;
     }
     static bool writeAll(int fd, const char* bytes, std::size_t count) {
@@ -149,11 +166,27 @@ struct Capture {
         }
         return true;
     }
-    void write(const std::string& path) {
+    static bool armRequested(const std::string& path) {
+        // Writer thread only. Do not spend the bounded binding budget on native
+        // Home rendering while the operator reconnects the actual VR stream.
+        const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0) return false;
+        struct stat status{};
+        constexpr char expected[] = "FRAME_MASK_TRACE_BINDINGS/1\n";
+        char bytes[sizeof(expected)]{};
+        const bool owned = !fstat(fd, &status) && S_ISREG(status.st_mode) && status.st_uid == getuid() &&
+            (status.st_mode & 0777) == 0600 && status.st_size == sizeof(expected) - 1;
+        const bool valid = owned && read(fd, bytes, sizeof(bytes)) == sizeof(expected) - 1 &&
+            !std::memcmp(bytes, expected, sizeof(expected) - 1);
+        close(fd);
+        return valid;
+    }
+    void write(const std::string& path, const std::string& armPath) {
         // O_EXCL/O_NOFOLLOW prevents replacing an existing file or following a
         // symlink. The trace contains no binary shader payload or private image.
         const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd < 0) { core.enable(false); return; }
+        if (!armPath.empty() && armRequested(armPath)) bindingsArmed.store(true, std::memory_order_release);
         // When timed recovery is enabled, leave time for its independently
         // armed 180-second watchdog to restore SteamVR after capture closure.
         // Manual recovery uses these same recording bounds without a watchdog.
@@ -164,12 +197,23 @@ struct Capture {
             "\"scope\":\"passive_pipeline_metadata\",\"hash\":\"fnv1a64_standard\","
             "\"limit_events\":2048,\"limit_bytes\":1048576,\"gpu_completion_proven\":false,"
             "\"descriptor_uv_frame_binding_proven\":false,\"fragment_filter\":\"%016llx\","
-            "\"deadline_seconds\":%u}\n", static_cast<unsigned long long>(fragmentFilter), deadlineSeconds);
+            "\"binding_metadata_version\":%u,\"limit_binding_snapshots\":%u,"
+            "\"binding_arm_required\":%s,"
+            "\"binding_ready_at_header\":%s,"
+            "\"deadline_seconds\":%u}\n", static_cast<unsigned long long>(fragmentFilter),
+            bindingsEnabled ? 1 : 0, bindingsEnabled ? BindingSnapshotLimit : 0,
+            armPath.empty() ? "false" : "true", bindingsArmed.load() ? "true" : "false", deadlineSeconds);
         std::size_t total = static_cast<std::size_t>(headerLength);
         bool ioGood = writeAll(fd, header, total), capped = false;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(deadlineSeconds);
+        auto armCheck = std::chrono::steady_clock::now();
         bool draining = false;
         for (;;) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!draining && bindingsEnabled && !bindingsArmed.load() && !armPath.empty() && now >= armCheck) {
+                if (armRequested(armPath)) bindingsArmed.store(true, std::memory_order_release);
+                armCheck = now + std::chrono::milliseconds(100);
+            }
             // Check even while records arrive continuously. Disabling producers
             // leaves only the fixed-capacity ring and bounded in-flight records
             // to drain before the footer; queue traffic cannot defer expiration.
@@ -181,7 +225,7 @@ struct Capture {
             }
             Event event;
             if (events.pop(event)) {
-                char line[8192];
+                char line[16384];
                 const auto bytes = serialize(event, line);
                 if (!bytes || total + bytes > OutputLimit - FooterReserve) {
                     capped = true;
@@ -200,17 +244,47 @@ struct Capture {
         char footer[512];
         const auto count = std::snprintf(footer, sizeof(footer),
             "{\"event\":\"footer\",\"emitted\":%llu,\"dropped_events\":%llu,"
-            "\"lost_state\":%llu,\"byte_cap_reached\":%s,\"io_ok\":%s,\"capture_bounded\":true}\n",
+            "\"lost_state\":%llu,\"lost_binding_state\":%llu,\"binding_capture_armed\":%s,"
+            "\"binding_snapshots_attempted\":%u,\"byte_cap_reached\":%s,\"io_ok\":%s,\"capture_bounded\":true}\n",
             static_cast<unsigned long long>(events.emitted()), static_cast<unsigned long long>(events.dropped()),
-            static_cast<unsigned long long>(core.lostState()), capped ? "true" : "false", ioGood ? "true" : "false");
+            static_cast<unsigned long long>(core.lostState()), static_cast<unsigned long long>(bindings.lostState()),
+            bindingsArmed.load() ? "true" : "false", std::min(bindingSnapshots.load(), BindingSnapshotLimit),
+            capped ? "true" : "false", ioGood ? "true" : "false");
         if (ioGood && count > 0) writeAll(fd, footer, static_cast<std::size_t>(count));
         close(fd);
     }
+    static bool serializeBindings(const frame_bindings::Snapshot&, char*, std::size_t, std::size_t&);
 };
+#include "passive_binding_serialize.inc"
 
 Capture& capture() { static Capture instance; return instance; }
 template <typename T> std::uint64_t number(T handle) { return (std::uint64_t)(std::uintptr_t)handle; }
 template <typename T> void* dispatchKey(T handle) { return *reinterpret_cast<void**>(handle); }
+
+template <typename Observer> void observeBindings(Observer observer) {
+    auto& c = capture();
+    if (!c.bindingsEnabled || !c.core.enabled()) return;
+    // Admission includes source-table updates in the stable writer footer.
+    // This scope never spans a driver call and never waits for the writer.
+    const auto admission = c.events.admit();
+    if (admission && c.core.enabled()) observer(c.bindings);
+}
+void recordedDraw(std::uint64_t device, VkCommandBuffer command, std::uint32_t kind) {
+    auto& c = capture();
+    const auto admission = c.events.admit();
+    if (!admission || !c.core.enabled()) return;
+    c.core.draw(device, number(command), kind);
+    if (!c.bindingsEnabled || !c.bindingsArmed.load(std::memory_order_acquire) ||
+        c.bindingSnapshots.load(std::memory_order_relaxed) >= Capture::BindingSnapshotLimit) return;
+    Event event;
+    if (!c.core.describeDraw(device, number(command), event)) return;
+    if (c.bindingSnapshots.fetch_add(1, std::memory_order_relaxed) >= Capture::BindingSnapshotLimit) return;
+    event.kind = Kind::Bindings;
+    event.drawKind = kind;
+    event.bindings = c.bindings.snapshot(device, command, (VkPipelineLayout)(std::uintptr_t)event.layout);
+    event.complete = event.complete && event.bindings.sourceComplete;
+    c.events.push(event);
+}
 
 struct Instance {
     PFN_vkGetInstanceProcAddr gipa = nullptr;
@@ -231,6 +305,9 @@ struct Device {
     FIELD(CmdDrawIndirectCount) FIELD(CmdDrawIndexedIndirectCount)
     FIELD(CmdExecuteCommands) FIELD(QueueSubmit) FIELD(QueueSubmit2)
     FIELD(CmdBindShadersEXT)
+#define BINDING_FIELD(name) FIELD(name)
+#include "passive_binding_commands.inc"
+#undef BINDING_FIELD
 #undef FIELD
 };
 
@@ -330,6 +407,12 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical, cons
         LOAD(CmdDrawIndirectCount) LOAD(CmdDrawIndexedIndirectCount)
         LOAD(CmdExecuteCommands) LOAD(QueueSubmit) LOAD(QueueSubmit2)
         LOAD(CmdBindShadersEXT)
+#define BINDING_FIELD(name) LOAD(name)
+#include "passive_binding_commands.inc"
+#undef BINDING_FIELD
+#define BINDING_ALIAS(alias, name) if (!record->name) record->name = reinterpret_cast<PFN_vk##name>(record->gdpa(*output, alias));
+#include "passive_binding_aliases.inc"
+#undef BINDING_ALIAS
 #undef LOAD
         if (!record->QueueSubmit2) record->QueueSubmit2 = reinterpret_cast<PFN_vkQueueSubmit2>(record->gdpa(*output, "vkQueueSubmit2KHR"));
         if (!record->CmdDrawIndirectCount) record->CmdDrawIndirectCount = reinterpret_cast<PFN_vkCmdDrawIndirectCount>(record->gdpa(*output, "vkCmdDrawIndirectCountKHR"));
@@ -342,6 +425,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical, cons
 VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device, const VkAllocationCallbacks* allocator) {
     auto* d = deviceFor(device);
     capture().core.deviceDestroyed(d->id);
+    observeBindings([&](auto& b) { b.deviceDestroyed(d->id); });
     const auto key = dispatchKey(device);
     d->DestroyDevice(device, allocator);
     std::lock_guard<std::mutex> lock(contextsMutex);
@@ -388,48 +472,65 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyPipeline(VkDevice device, VkPipeline pipe
     capture().core.pipelineDestroyed(d->id, number(pipeline));
     d->DestroyPipeline(device, pipeline, allocator);
 }
+#include "passive_binding_hooks.inc"
 VKAPI_ATTR VkResult VKAPI_CALL traceAllocateCommandBuffers(VkDevice device,
     const VkCommandBufferAllocateInfo* info, VkCommandBuffer* output) {
     auto* d = deviceFor(device);
     auto result = d->AllocateCommandBuffers(device, info, output);
-    if (result == VK_SUCCESS)
+    if (result == VK_SUCCESS) {
         for (std::uint32_t i = 0; i < limited(d, info->commandBufferCount); ++i)
             capture().core.commandAllocated(d->id, number(output[i]), number(info->commandPool));
+        observeBindings([&](auto& b) { b.allocateCommands(d->id, info->commandPool, info->commandBufferCount, output); });
+    }
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceFreeCommandBuffers(VkDevice device, VkCommandPool pool,
     std::uint32_t count, const VkCommandBuffer* commands) {
     auto* d = deviceFor(device);
     for (std::uint32_t i = 0; i < limited(d, count); ++i) capture().core.commandReset(d->id, number(commands[i]), true);
+    observeBindings([&](auto& b) { b.freeCommands(d->id, pool, count, commands); });
     d->FreeCommandBuffers(device, pool, count, commands);
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceBeginCommandBuffer(VkCommandBuffer command, const VkCommandBufferBeginInfo* info) {
     auto* d = deviceFor(command);
     auto result = d->BeginCommandBuffer(command, info);
-    if (result == VK_SUCCESS) capture().core.commandBegin(d->id, number(command));
+    if (result == VK_SUCCESS) {
+        capture().core.commandBegin(d->id, number(command));
+        observeBindings([&](auto& b) { b.beginCommand(d->id, command); });
+    }
     return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceEndCommandBuffer(VkCommandBuffer command) {
     auto* d = deviceFor(command);
     auto result = d->EndCommandBuffer(command);
-    if (result == VK_SUCCESS) capture().core.commandEnd(d->id, number(command));
+    if (result == VK_SUCCESS) {
+        capture().core.commandEnd(d->id, number(command));
+        observeBindings([&](auto& b) { b.endCommand(d->id, command); });
+    }
     return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceResetCommandBuffer(VkCommandBuffer command, VkCommandBufferResetFlags flags) {
     auto* d = deviceFor(command);
     auto result = d->ResetCommandBuffer(command, flags);
-    if (result == VK_SUCCESS) capture().core.commandReset(d->id, number(command), false);
+    if (result == VK_SUCCESS) {
+        capture().core.commandReset(d->id, number(command), false);
+        observeBindings([&](auto& b) { b.resetCommand(d->id, command); });
+    }
     return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceResetCommandPool(VkDevice device, VkCommandPool pool, VkCommandPoolResetFlags flags) {
     auto* d = deviceFor(device);
     auto result = d->ResetCommandPool(device, pool, flags);
-    if (result == VK_SUCCESS) capture().core.poolReset(d->id, number(pool), false);
+    if (result == VK_SUCCESS) {
+        capture().core.poolReset(d->id, number(pool), false);
+        observeBindings([&](auto& b) { b.resetCommandPool(d->id, pool); });
+    }
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyCommandPool(VkDevice device, VkCommandPool pool, const VkAllocationCallbacks* allocator) {
     auto* d = deviceFor(device);
     capture().core.poolReset(d->id, number(pool), true);
+    observeBindings([&](auto& b) { b.destroyCommandPool(d->id, pool); });
     d->DestroyCommandPool(device, pool, allocator);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBindPipeline(VkCommandBuffer command, VkPipelineBindPoint point, VkPipeline pipeline) {
@@ -453,43 +554,44 @@ VKAPI_ATTR void VKAPI_CALL traceCmdBindShadersEXT(VkCommandBuffer command, std::
 VKAPI_ATTR void VKAPI_CALL traceCmdDraw(VkCommandBuffer command, std::uint32_t vertices,
     std::uint32_t instances, std::uint32_t firstVertex, std::uint32_t firstInstance) {
     auto* d = deviceFor(command);
-    capture().core.draw(d->id, number(command), 1);
+    recordedDraw(d->id, command, 1);
     d->CmdDraw(command, vertices, instances, firstVertex, firstInstance);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexed(VkCommandBuffer command, std::uint32_t indices,
     std::uint32_t instances, std::uint32_t firstIndex, std::int32_t offset, std::uint32_t firstInstance) {
     auto* d = deviceFor(command);
-    capture().core.draw(d->id, number(command), 2);
+    recordedDraw(d->id, command, 2);
     d->CmdDrawIndexed(command, indices, instances, firstIndex, offset, firstInstance);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirect(VkCommandBuffer command, VkBuffer buffer,
     VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) {
     auto* d = deviceFor(command);
-    capture().core.draw(d->id, number(command), 3);
+    recordedDraw(d->id, command, 3);
     d->CmdDrawIndirect(command, buffer, offset, count, stride);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirect(VkCommandBuffer command, VkBuffer buffer,
     VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) {
     auto* d = deviceFor(command);
-    capture().core.draw(d->id, number(command), 4);
+    recordedDraw(d->id, command, 4);
     d->CmdDrawIndexedIndirect(command, buffer, offset, count, stride);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirectCount(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset,
     VkBuffer counts, VkDeviceSize countOffset, std::uint32_t maxCount, std::uint32_t stride) {
     auto* d = deviceFor(command);
-    capture().core.draw(d->id, number(command), 5);
+    recordedDraw(d->id, command, 5);
     d->CmdDrawIndirectCount(command, buffer, offset, counts, countOffset, maxCount, stride);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirectCount(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset,
     VkBuffer counts, VkDeviceSize countOffset, std::uint32_t maxCount, std::uint32_t stride) {
     auto* d = deviceFor(command);
-    capture().core.draw(d->id, number(command), 6);
+    recordedDraw(d->id, command, 6);
     d->CmdDrawIndexedIndirectCount(command, buffer, offset, counts, countOffset, maxCount, stride);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdExecuteCommands(VkCommandBuffer command, std::uint32_t count,
     const VkCommandBuffer* children) {
     auto* d = deviceFor(command);
     for (std::uint32_t i = 0; i < limited(d, count); ++i) capture().core.execute(d->id, number(command), number(children[i]));
+    if (count) observeBindings([&](auto& b) { b.executeCommands(d->id, command); });
     d->CmdExecuteCommands(command, count, children);
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit(VkQueue queue, std::uint32_t count,
@@ -548,6 +650,14 @@ TRACE_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevi
         HOOK(CmdDrawIndirectCount) HOOK(CmdDrawIndexedIndirectCount)
         HOOK(CmdExecuteCommands) HOOK(QueueSubmit) HOOK(QueueSubmit2)
         HOOK(CmdBindShadersEXT)
+        if (capture().bindingsEnabled) {
+#define BINDING_FIELD(name) HOOK(name)
+#include "passive_binding_commands.inc"
+#undef BINDING_FIELD
+#define BINDING_ALIAS(alias, name) if (!std::strcmp(nameString, alias)) return reinterpret_cast<PFN_vkVoidFunction>(trace##name);
+#include "passive_binding_aliases.inc"
+#undef BINDING_ALIAS
+        }
         if (!std::strcmp(name, "vkQueueSubmit2KHR")) return reinterpret_cast<PFN_vkVoidFunction>(traceQueueSubmit2);
         if (!std::strcmp(name, "vkCmdDrawIndirectCountKHR")) return reinterpret_cast<PFN_vkVoidFunction>(traceCmdDrawIndirectCount);
         if (!std::strcmp(name, "vkCmdDrawIndexedIndirectCountKHR")) return reinterpret_cast<PFN_vkVoidFunction>(traceCmdDrawIndexedIndirectCount);
@@ -576,6 +686,14 @@ TRACE_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkIn
     HOOK(CmdDrawIndirectCount) HOOK(CmdDrawIndexedIndirectCount)
     HOOK(CmdExecuteCommands) HOOK(QueueSubmit) HOOK(QueueSubmit2)
     HOOK(CmdBindShadersEXT)
+    if (capture().bindingsEnabled) {
+#define BINDING_FIELD(name) HOOK(name)
+#include "passive_binding_commands.inc"
+#undef BINDING_FIELD
+#define BINDING_ALIAS(alias, name) if (!std::strcmp(nameString, alias) && i->gipa(instance, nameString)) return reinterpret_cast<PFN_vkVoidFunction>(trace##name);
+#include "passive_binding_aliases.inc"
+#undef BINDING_ALIAS
+    }
 #undef HOOK
     if (capture().processAllowed) {
         if (!std::strcmp(name, "vkQueueSubmit2KHR") && i->gipa(instance, name)) return reinterpret_cast<PFN_vkVoidFunction>(traceQueueSubmit2);

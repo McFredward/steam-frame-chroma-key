@@ -166,3 +166,54 @@ The pushed checkpoint `8fe0088` subsequently passed the complete
 including the real Vulkan layer/pixel checks, Windows diagnostic-sender
 cross-build and protocol sanitizers. This is software evidence; no Frame
 capture or genuine-mask hardware result is implied.
+
+## Opt-in resource metadata extension
+
+`FRAME_MASK_TRACE_BINDINGS=1` enables a second, metadata-only diagnostic scope.
+The reviewed session helper exposes this as `start --bindings`. Its default
+scope remains unchanged. No buffer contents, mapped memory, image pixels or
+camera images are read. No GPU commands, descriptor mutation or replacement
+shader are introduced.
+
+The extension tracks bounded public Vulkan lifecycle inputs for layouts,
+descriptor pools/sets, images/views, samplers, buffers, memory and command
+buffers. At most 32 selected graphics draws emit `bindings_recorded`, including
+both eyes when one pipeline is used repeatedly in a command buffer. Each record
+contains separate resource generations, set/write revisions, image extent and
+view subresources, sampler scalar inputs and effective dynamic-buffer offsets
+for set 0 bindings 0, 2, 3, 4, 6, 9, 25 and 31.
+
+Dynamic offsets follow Vulkan's set/binding/array order, independent of layout
+input order. Incompatible descriptor rebinding cannot retain a certified old
+set. See the [Khronos descriptor-set specification](https://docs.vulkan.org/spec/latest/chapters/descriptorsets.html).
+This conservative implementation requires the exact observed pipeline-layout
+identity; it does not infer structural compatibility between different handles.
+Unsupported descriptor arrays/extensions, import `pNext` chains, missing
+lifecycles, resource reuse, capacity loss and contention remain incomplete.
+Known scalar identities are retained for investigation even when an extension
+prevents complete interpretation. `layout_has_binding31` is independently
+`unknown`, `absent` or `present`; unknown never authorizes adding a mask slot.
+
+The JSON header reports `binding_metadata_version: 1` and the 32-snapshot bound.
+The footer adds `lost_binding_state`. Require zero loss and a complete source
+record before treating its scalar relationship as established. Ordinary draw
+and accepted-submit records still establish only command-generation linkage.
+`gpu_consumed_coherent` and `video_frame_associated` stay false: recording-time
+API metadata does not prove the uniforms consumed by the GPU or the selected
+video frame. There is no post-hoc host read of eye or foveation constants.
+
+The live shader inventory is fixed at 1,024 entries, raised from 256 after the
+first successful Frame capture exhausted that original table. Pipeline/command
+storage, event count, 1 MiB output cap and capture deadlines remain bounded.
+The writer performs all serialization; rendering only observes bounded scalars
+with try-lock/drop. This diagnostic has bounded CPU overhead; it does not claim
+that native rendering is cost-free while observation is enabled.
+
+On the Frame, the helper configures a private arm marker so initial Home draws
+do not consume all 32 snapshots before a PC-VR stream is connected. Lifecycle
+tracking continues before arming. Only the background writer checks the marker,
+at most every 100 ms; hooks read an atomic ready flag. Arming never extends the
+120-second/event/byte recording bounds or restarts SteamVR. The real-loader GPU
+fixture exercises absent, malformed and accepted markers, plus 48 native draws
+with exactly 32 resource records. Header/footer fields distinguish an unarmed
+capture from a completed resource sample; neither proves frame association.

@@ -68,7 +68,8 @@ def main():
                         str(session.folder / "libVkLayer_frame_mask_trace.so"), "--sha256",
                         hashlib.sha256((session.folder / "libVkLayer_frame_mask_trace.so").read_bytes()).hexdigest()],
                        check=True, timeout=10)
-        for name in ("FRAME_MASK_TRACE_FRAGMENT_HASH", "FRAME_MASK_TRACE_DISABLE"):
+        for name in ("FRAME_MASK_TRACE_FRAGMENT_HASH", "FRAME_MASK_TRACE_DISABLE", "FRAME_MASK_TRACE_BINDINGS",
+                     "FRAME_MASK_TRACE_BINDINGS_ARM_FILE"):
             base.pop(name, None)
         for name in ("lvp_icd.x86_64.json", "lvp_icd.json"):
             software = Path("/usr/share/vulkan/icd.d") / name
@@ -81,6 +82,11 @@ def main():
                                        ("invalid-filter", compositor, "1"),
                                        ("filtered-miss", compositor, "1"),
                                        ("filtered-match", compositor, "1"),
+                                       ("bindings-enabled", compositor, "1"),
+                                       ("bindings-limit", compositor, "1"),
+                                       ("bindings-unarmed", compositor, "1"),
+                                       ("bindings-armed", compositor, "1"),
+                                       ("bindings-bad-arm", compositor, "1"),
                                        ("implicit-enabled", compositor, "1"),
                                        ("implicit-numeric-version", compositor, "1"),
                                        ("enabled", compositor, "1")):
@@ -88,6 +94,15 @@ def main():
             env = base.copy()
             env["FRAME_MASK_TRACE"] = enabled
             env["FRAME_MASK_TRACE_OUTPUT"] = str(output)
+            if mode.startswith("bindings-"):
+                env["FRAME_MASK_TRACE_BINDINGS"] = "1"
+                env["FRAME_MASK_TRACE_FRAGMENT_HASH"] = f"{fingerprint(fragment):016x}"
+                if mode in ("bindings-unarmed", "bindings-armed", "bindings-bad-arm"):
+                    marker = folder / (mode + ".marker")
+                    env["FRAME_MASK_TRACE_BINDINGS_ARM_FILE"] = str(marker)
+                    if mode != "bindings-unarmed":
+                        marker.write_bytes(b"FRAME_MASK_TRACE_BINDINGS/1\n" if mode == "bindings-armed" else b"wrong\n")
+                        marker.chmod(0o600)
             if mode.startswith("implicit-"):
                 env.pop("VK_INSTANCE_LAYERS", None)
                 env.pop("VK_LAYER_PATH", None)
@@ -110,7 +125,8 @@ def main():
                 env["FRAME_MASK_TRACE_FRAGMENT_HASH"] = "0000000000000001"
             elif mode == "filtered-match":
                 env["FRAME_MASK_TRACE_FRAGMENT_HASH"] = f"{fingerprint(fragment):016x}"
-            subprocess.run([str(program), str(vertex), str(fragment), "straight"],
+            convention = "trace-stress" if mode == "bindings-limit" else "trace-arm" if mode == "bindings-armed" else "straight"
+            subprocess.run([str(program), str(vertex), str(fragment), convention],
                            env=env, check=True, timeout=30)
             if mode == "implicit-numeric-version":
                 # Current Frame loader rejects this manifest, but older/future
@@ -129,11 +145,12 @@ def main():
             records = [json.loads(line) for line in output.read_text().splitlines()]
             assert len(records) <= 2050, "Trace escaped its event cap"
             assert records[0]["event"] == "header"
-            assert records[0]["deadline_seconds"] == (120 if mode.startswith("filtered-") else 30), records[0]
+            assert records[0]["deadline_seconds"] == (120 if mode.startswith(("filtered-", "bindings-")) else 30), records[0]
             assert records[-1]["event"] == "footer"
             footer = records[-1]
             assert footer["io_ok"] and not footer["byte_cap_reached"], footer
             assert footer["dropped_events"] == 0 and footer["lost_state"] == 0, footer
+            assert footer["lost_binding_state"] == 0, footer
             events = records[1:-1]
             assert [event["serial"] for event in events] == list(range(1, footer["emitted"] + 1)), \
                 "Footer count or event serials do not match the complete writer drain"
@@ -141,6 +158,43 @@ def main():
                         16: (fingerprint(fragment), fragment.stat().st_size)}
             draws = [record for record in records if record["event"] == "draw_recorded"]
             submits = [record for record in records if record["event"] == "submit_accepted"]
+            resources = [record for record in records if record["event"] == "bindings_recorded"]
+            if mode in ("bindings-unarmed", "bindings-bad-arm"):
+                assert records[0]["binding_arm_required"] and not footer["binding_capture_armed"]
+                assert not resources and footer["binding_snapshots_attempted"] == 0, "Pre-stream Home draws spent the resource budget"
+                continue
+            if mode.startswith("bindings-"):
+                assert records[0]["binding_metadata_version"] == 1
+                assert records[0]["limit_binding_snapshots"] == 32
+                assert 0 < len(resources) <= 32, "No bounded target resource snapshots were observed"
+                assert footer["binding_capture_armed"] and footer["binding_snapshots_attempted"] == len(resources)
+                if mode == "bindings-limit":
+                    assert len(resources) == 32 and len(draws) == 48, "Resource budget failed to close while native rendering continued"
+                for resource in resources:
+                    assert resource["complete"], resource
+                    binding = resource["bindings"]
+                    assert binding["version"] == 1 and binding["source_complete"], binding
+                    assert not binding["gpu_consumed_coherent"] and not binding["video_frame_associated"], binding
+                    assert binding["scope"] == "recording_time_api_scalars"
+                    assert binding["layout_has_binding31"] == "present", binding
+                    assert binding["pipeline_layout"]["handle"] == resource["layout"]
+                    assert binding["command"]["handle"] == resource["command"]
+                    assert binding["set"]["generation"] > 0 and binding["set_revision"] > 0
+                    targets = {target["binding"]: target for target in binding["targets"]}
+                    assert set(targets) == {0, 2, 3, 4, 6, 9, 25, 31}
+                    target = targets[31]
+                    assert target["state"] == "written" and target["type"] == 1 and target["count"] == 1
+                    assert target["image"]["extent"] == [4, 1, 1]
+                    assert target["view"]["image"] == target["image"]["identity"]
+                    assert target["image"]["memory"] == target["image"]["allocation"]["identity"]
+                    assert target["sampler"]["complete"] and target["sampler"]["identity"]["generation"] > 0
+                    assert all(targets[number]["state"] == "absent" for number in (0, 2, 3, 4, 6, 9, 25))
+                    assert any(submit["complete"] and submit["device"] == resource["device"] and
+                               submit["command"] == resource["command"] and
+                               submit["command_generation"] == resource["command_generation"] and
+                               submit["serial"] > resource["serial"] for submit in submits), resource
+            else:
+                assert records[0]["binding_metadata_version"] == 0 and not resources, "Resource tracing was not opt-in"
             if mode == "filtered-miss":
                 assert not draws and not submits, "Unrelated rendering consumed the filtered draw budget"
                 continue
@@ -163,7 +217,7 @@ def main():
                            env=env, check=True, timeout=30)
             assert output.read_bytes() == before, "Existing evidence was overwritten"
         print("PASS: exact deployment manifest in real implicit instance chain, rejected numeric preflight, "
-              "exact stage fingerprints, submitted draws, opt-in/process gates and unchanged GPU pixels")
+              "exact stage fingerprints, submitted draws, bounded opt-in resource bindings and unchanged GPU pixels")
 
 
 if __name__ == "__main__":

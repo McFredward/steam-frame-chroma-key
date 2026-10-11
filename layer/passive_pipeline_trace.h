@@ -11,10 +11,13 @@
 #include <mutex>
 #include <thread>
 #include <utility>
+#include "passive_binding_trace.h"
 
 namespace frame_trace {
 
-constexpr std::size_t ShaderCapacity = 256;
+// The first Frame capture exhausted 256 live modules before later distortion
+// bindings could be diagnosed. Keep a fixed, still bounded startup inventory.
+constexpr std::size_t ShaderCapacity = 1024;
 constexpr std::size_t PipelineCapacity = 256;
 constexpr std::size_t CommandCapacity = 512;
 constexpr std::size_t StageCapacity = 8;
@@ -54,7 +57,7 @@ inline bool copyEntry(char (&target)[EntryCapacity], const char* source) noexcep
 }
 
 enum class Kind : std::uint8_t {
-    Shader, Pipeline, Draw, Execute, Submit, Incomplete
+    Shader, Pipeline, Draw, Execute, Submit, Incomplete, Bindings
 };
 
 struct Event {
@@ -78,6 +81,7 @@ struct Event {
     std::uint32_t reason = 0;
     bool complete = false;
     std::array<Stage, StageCapacity> stages{};
+    frame_bindings::Snapshot bindings{};
 };
 
 // Captured before the native queue call. A completed fence may allow another
@@ -403,6 +407,29 @@ public:
             }
         }
         events_.push(event);
+    }
+    // A resource snapshot must observe every selected draw, including two eyes
+    // using one pipeline in a command buffer. The ordinary pipeline events stay
+    // deduplicated; this query does not change that existing capture contract.
+    bool describeDraw(std::uint64_t device, std::uint64_t handle, Event& event) noexcept {
+        if (!enabled()) return false;
+        auto lock = acquire();
+        if (!lock.owns_lock()) return false;
+        auto* command = find(commands_, device, handle);
+        if (!command || !command->recording) return false;
+        auto* pipeline = find(pipelines_, device, command->pipeline);
+        if (!pipeline || pipeline->generation != command->pipelineGeneration) return false;
+        if (fragmentHash_) {
+            bool matches = false;
+            for (std::uint32_t i = 0; i < pipeline->count; ++i)
+                if (pipeline->stages[i].stage == 0x10 && pipeline->stages[i].hash == fragmentHash_)
+                    matches = true;
+            if (!matches) return false;
+        }
+        event.command = handle;
+        event.commandGeneration = command->generation;
+        snapshot(event, *pipeline);
+        return true;
     }
     void execute(std::uint64_t device, std::uint64_t parent, std::uint64_t child) noexcept {
         if (!enabled()) return;

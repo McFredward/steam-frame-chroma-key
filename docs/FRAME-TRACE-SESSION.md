@@ -353,3 +353,55 @@ It was **not installed or tested on the Frame**. The fifth attempt still uses
 the previously recorded 68,056-byte library identity and its narrower evidence.
 Generated build caches and the completed worker worktree are removed after
 retaining small validation records; private hardware evidence stays intact.
+
+## Prepared resource diagnostic (not yet deployed)
+
+The next local artifact adds the opt-in public-API scalar binding scope. The
+reviewed AArch64 library is 133,696 bytes, SHA-256
+`c531c2e78e5c26a38c60c9fc167b744c17b41df4d9ca3908f651fb68f0f291e7`.
+It has **not** been installed or run on the Frame. All preceding headset restore
+and cleanup records remain valid. Its binary identity supersedes the earlier
+example only for this new diagnostic; never stage a different artifact under
+this hash.
+
+Activation, after staging and the operator's readiness for the initial restart:
+
+```bash
+python3 ~/.local/share/frame-mask-trace/frame_trace_session.py start \
+  --sha256 c531c2e78e5c26a38c60c9fc167b744c17b41df4d9ca3908f651fb68f0f291e7 \
+  --manual-rollback --bindings
+```
+
+This adds two service-local diagnostic variables:
+`FRAME_MASK_TRACE_BINDINGS=1` and a private `FRAME_MASK_TRACE_BINDINGS_ARM_FILE`.
+The resource tracker observes creation/binding metadata during startup, but does
+not spend its 32-draw snapshot budget before the operator reconnects a **VR**
+stream. Within the existing 120-second bounded recording window, request it with:
+
+```bash
+python3 ~/.local/share/frame-mask-trace/frame_trace_session.py arm-bindings
+```
+
+That control operation creates only
+`~/.local/share/frame-mask-trace/bindings-arm.marker`, with mode 0600 and a fixed
+versioned payload. The background writer checks it at most ten times a second
+until accepted; rendering hooks neither inspect the file nor wait. The helper
+requires unchanged owned activation files and serializes this operation with
+rollback. No second restart or timed rollback is added. Arming describes the
+operator's stream context, not proof of a specific selected frame or physical
+eye; those still require the exact native bridge.
+
+After copying the bounded capture, announce and use the same manual rollback
+command above. Remove the marker with the rest of the private diagnostic folder
+only after native operation and absence of activation have been confirmed. The
+manifest/service drop-in remain the only activation files; the marker alone
+cannot load the layer, and reboot still removes the required service environment.
+
+Software validation: the integrated 13-suite gate passed, including the exact
+loader manifest and unchanged GPU pixels. After adding control arming and the
+32-snapshot stress fixture, only the three affected recovery/GPU suites were
+rerun; all passed. The remaining ten suites inherit the complete passing gate.
+Worker association and binding cores additionally passed ASan/UBSan. The layer
+cross-compiles with strict AArch64 warnings; the new scalar association ledger
+also cross-compiles for Windows. This evidence establishes local software
+behavior, not headset resource/eye/frame association or working passthrough.

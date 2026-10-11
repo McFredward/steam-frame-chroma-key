@@ -2,12 +2,15 @@
 // Queue-idle waits and synchronous readback are test-only, never compositor code.
 #include <vulkan/vulkan.h>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 static void check(VkResult result) {
@@ -143,7 +146,8 @@ struct Gpu {
         return out;
     }
 
-    void init(const char *vertexPath, const char *fragmentPath, bool premultiplied) {
+    void init(const char *vertexPath, const char *fragmentPath, bool premultiplied, unsigned cycles = 1,
+              bool waitForTraceArm = false) {
         VkApplicationInfo application{};
         application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         application.apiVersion = VK_API_VERSION_1_1;
@@ -340,6 +344,22 @@ struct Gpu {
         VkCommandBuffer command{};
         check(vkAllocateCommandBuffers(device, &commandInfo, &command));
         bool initialized = false;
+        if (waitForTraceArm) {
+            // Fixture-only readiness wait. The diagnostic render hooks never
+            // open files or wait for the writer or an arm marker.
+            const auto* path = std::getenv("FRAME_MASK_TRACE_OUTPUT");
+            if (!path) throw std::runtime_error("Trace-arm fixture has no output path");
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            for (;;) {
+                std::ifstream file(path);
+                std::string header;
+                std::getline(file, header);
+                if (header.find("\"binding_ready_at_header\":true") != std::string::npos) break;
+                if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("Trace writer did not accept owned arm marker");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        for (unsigned cycle = 0; cycle < cycles; ++cycle) {
         for (const auto &color : std::array<std::array<float, 4>, 3>{{
             {{0, 1, 0, 1}}, {{0.2f, 0.4f, 0.8f, 1}}, {{1, 0, 1, 1}}}}) {
             for (unsigned scenario = 0; scenario < (premultiplied ? 6u : 2u); ++scenario) {
@@ -425,6 +445,7 @@ struct Gpu {
                 initialized = true;
             }
         }
+        }
         std::cout << "PASS: generated mask shader (" << (premultiplied ? "premultiplied" : "straight")
                   << "), partial edges, colour independence and opaque fallback\n";
     }
@@ -434,7 +455,9 @@ int main(int argc, char **argv) {
     if (argc != 3 && argc != 4) return 2;
     try {
         Gpu gpu;
-        gpu.init(argv[1], argv[2], argc == 4 && std::string(argv[3]) == "premultiplied");
+        gpu.init(argv[1], argv[2], argc == 4 && std::string(argv[3]) == "premultiplied",
+                 argc == 4 && std::string(argv[3]) == "trace-stress" ? 8 : 1,
+                 argc == 4 && std::string(argv[3]) == "trace-arm");
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

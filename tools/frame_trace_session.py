@@ -30,7 +30,7 @@ def exclusive(path, contents):
 
 class Session:
     def __init__(self, home, runtime, run=subprocess.run, loader_debug=False,
-                 manual_rollback=False):
+                 manual_rollback=False, bindings=False):
         self.folder = home / ".local/share/frame-mask-trace"
         self.manifest_dir = home / ".local/share/vulkan/implicit_layer.d"
         self.manifest = self.manifest_dir / "frame_mask_trace.json"
@@ -39,6 +39,7 @@ class Session:
         self.run = run
         self.loader_debug = loader_debug
         self.manual_rollback = manual_rollback
+        self.bindings = bindings
 
     def command(self, *arguments, timeout=45, check=True):
         return self.run(arguments, check=check, timeout=timeout,
@@ -64,6 +65,9 @@ class Session:
         if self.loader_debug:
             # Startup decisions only; no forced layer enable or call/API trace.
             dropin += "Environment=VK_LOADER_DEBUG=error,warn,layer\n"
+        if self.bindings:
+            dropin += "Environment=FRAME_MASK_TRACE_BINDINGS=1\n"
+            dropin += f'Environment="FRAME_MASK_TRACE_BINDINGS_ARM_FILE={self.folder}/bindings-arm.marker"\n'
         return {self.manifest: manifest.encode(), self.dropin: dropin.encode()}
 
     def recovery_event(self, name, **fields):
@@ -76,7 +80,7 @@ class Session:
     def start(self, expected_hash):
         for path in (self.manifest, self.dropin, self.folder / "armed.json",
                      self.folder / "capture.jsonl", self.folder / "rollback-complete.json",
-                     self.folder / "watchdog-ready"):
+                     self.folder / "watchdog-ready", self.folder / "bindings-arm.marker"):
             if path.exists() or path.is_symlink():
                 raise RuntimeError(f"Refusing existing session path: {path}")
         binary = self.folder / "libVkLayer_frame_mask_trace.so"
@@ -96,6 +100,9 @@ class Session:
                    rollback_mode="manual" if self.manual_rollback else "watchdog",
                    limit_trace_bytes=1048576,
                    loader_debug=self.loader_debug)
+        self.event("diagnostic_scope", bindings=self.bindings,
+                   binding_snapshot_limit=32 if self.bindings else 0,
+                   mapped_memory_read=False, image_readback=False)
         if not self.manual_rollback:
             # Separate user service, never PartOf=steamvr or in its cgroup.
             self.command("systemd-run", "--user", "--unit=" + WATCHDOG, "--collect",
@@ -144,6 +151,28 @@ class Session:
         with os.fdopen(descriptor, "wb") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self._rollback()
+
+    def arm_bindings(self):
+        # No restart. Activate snapshots only after the operator has a real VR
+        # stream; this marker is not proof of a particular selected video frame.
+        descriptor = os.open(self.folder / "rollback.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self._arm_bindings()
+
+    def _arm_bindings(self):
+        if (self.folder / "rollback-complete.json").exists():
+            raise RuntimeError("Session already restored; binding capture refused")
+        armed = json.loads((self.folder / "armed.json").read_text())
+        for path in (self.manifest, self.dropin):
+            if path.is_symlink() or str(path) not in armed or path.read_bytes() != bytes.fromhex(armed[str(path)]):
+                raise RuntimeError("Activation identity changed; binding capture refused")
+        expected = f'Environment="FRAME_MASK_TRACE_BINDINGS_ARM_FILE={self.folder}/bindings-arm.marker"\n'.encode()
+        if b"Environment=FRAME_MASK_TRACE_BINDINGS=1\n" not in self.dropin.read_bytes() or expected not in self.dropin.read_bytes():
+            raise RuntimeError("Session was not configured for binding capture")
+        self.command("systemctl", "--user", "is-active", UNIT)
+        exclusive(self.folder / "bindings-arm.marker", b"FRAME_MASK_TRACE_BINDINGS/1\n")
+        self.event("binding_capture_armed", selected_video_frame_proven=False)
 
     def _rollback(self):
         complete = self.folder / "rollback-complete.json"
@@ -198,15 +227,19 @@ class Session:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("start", "watchdog", "rollback"))
+    parser.add_argument("mode", choices=("start", "watchdog", "rollback", "arm-bindings"))
     parser.add_argument("--sha256")
     parser.add_argument("--loader-debug", action="store_true",
                         help="Record native loader startup decisions; never force-enable a layer")
     parser.add_argument("--manual-rollback", action="store_true",
                         help="Start without a timed SteamVR restart; keep explicit rollback and reboot recovery")
+    parser.add_argument("--bindings", action="store_true",
+                        help="Add bounded scalar resource/descriptor metadata; no buffer or image readback")
     args = parser.parse_args()
     if args.manual_rollback and args.mode != "start":
         parser.error("--manual-rollback applies only to start")
+    if args.bindings and args.mode != "start":
+        parser.error("--bindings applies only to start")
     if os.getuid() == 0 or platform.machine() != "aarch64":
         raise RuntimeError("Only an authorized non-root AArch64 headset session is allowed")
     home = Path.home()
@@ -219,7 +252,7 @@ def main():
         raise RuntimeError("Private session/runtime ownership check failed")
     os.umask(0o077)
     session = Session(home, runtime, loader_debug=args.loader_debug,
-                      manual_rollback=args.manual_rollback)
+                      manual_rollback=args.manual_rollback, bindings=args.bindings)
     if args.mode == "start":
         for parent in (session.manifest_dir, session.dropin_dir):
             for path in (parent, *parent.parents):
@@ -232,6 +265,8 @@ def main():
         if not args.sha256 or len(args.sha256) != 64:
             parser.error("start requires the reviewed --sha256")
         session.start(args.sha256)
+    elif args.mode == "arm-bindings":
+        session.arm_bindings()
     elif args.mode == "watchdog":
         session.watchdog()
     else:
