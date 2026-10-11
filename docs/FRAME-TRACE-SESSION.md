@@ -354,13 +354,14 @@ the previously recorded 68,056-byte library identity and its narrower evidence.
 Generated build caches and the completed worker worktree are removed after
 retaining small validation records; private hardware evidence stays intact.
 
-## Prepared resource diagnostic (not yet deployed)
+## First resource diagnostic and rejected live capture
 
 The next local artifact adds the opt-in public-API scalar binding scope. The
 reviewed AArch64 library is 133,696 bytes, SHA-256
 `c531c2e78e5c26a38c60c9fc167b744c17b41df4d9ca3908f651fb68f0f291e7`.
-It has **not** been installed or run on the Frame. All preceding headset restore
-and cleanup records remain valid. Its binary identity supersedes the earlier
+This artifact was installed and run on the Frame in the authorized manual-mode
+resource attempt below. All preceding headset restore and cleanup records
+remain historical records of their own runs. Its binary identity supersedes the earlier
 example only for this new diagnostic; never stage a different artifact under
 this hash.
 
@@ -405,3 +406,46 @@ Worker association and binding cores additionally passed ASan/UBSan. The layer
 cross-compiles with strict AArch64 warnings; the new scalar association ledger
 also cross-compiles for Windows. This evidence establishes local software
 behavior, not headset resource/eye/frame association or working passthrough.
+
+### Live result and pre-arm budget defect
+
+The initial resource deployment used the exact 133,696-byte artifact above.
+Activation was requested at 15:49:58 CEST; the service reported active at
+15:50:04. The maintainer confirmed a real PC-VR stream and the helper requested
+arming at 15:51:29. Read-only verification found both the native compositor and
+the actual `vrlinkrunthread` executable, with the diagnostic mapped in the
+compositor. No stream arguments or credentials were collected.
+
+The 981,423-byte capture contains 2,048 events: 208 shader, 107 pipeline, 867
+draw and 866 accepted-submit records. Its stable footer reports no queue or
+pipeline-state loss but **152 binding-state losses**, zero resource snapshots
+and `binding_capture_armed: false`. The event cap closed recording before the
+marker was accepted. The helper's old `binding_capture_armed` ledger entry
+described only its marker creation, not actual writer acceptance. This run is
+**rejected for resource evidence**. It establishes neither current descriptors,
+physical-eye/UV values nor exact selected-video-frame association. The causes
+of the 152 resource losses are not known from this version's aggregate counter.
+
+The defect was in diagnostic flow: only the 32 resource snapshots waited for
+arming; ordinary filtered draws/submits kept consuming the separate 2,048-event
+budget while the user reconnected. The six-draw unarmed fixture could not expose
+that lifetime exhaustion. No Vulkan rendering argument or shader was changed.
+The capture closed itself; manual-mode recovery did not restart the headset.
+Private evidence is retained in `build/private-frame-resource-run-20261011/`.
+
+The bounded repair keeps lifecycle tracking but suppresses draw, execute and
+submit **diagnostic events** until the writer accepts arming. Native calls still
+forward unchanged. Writer acceptance emits `bindings_armed`; the helper records
+only `binding_capture_arm_requested` and refuses finished/crashed captures using
+a background-writer file lock and a bounded owned-file check. No lock/file I/O
+is added to a render hook. The original 120-second total window, 2,048 events,
+32 snapshots and 1 MiB cap remain; arming does not extend them. Footer counters
+now identify resource loss reasons and the bounded table responsible for any
+capacity overflow, without adding a recurring log stream or relaxing proof.
+
+The real-loader fixture now executes 2,400 native draws before arming, confirms
+that no pre-arm draw/submit consumed capacity, and requires all six subsequent
+draws, their resource snapshots and accepted submissions. A separate 2,400-draw
+unarmed fixture must remain empty of those records. Every rendered pixel is
+still checked. Focused validation and the replacement artifact are recorded
+below once complete; a local pass cannot repair this rejected hardware run.

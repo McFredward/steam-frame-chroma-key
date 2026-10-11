@@ -210,10 +210,17 @@ with try-lock/drop. This diagnostic has bounded CPU overhead; it does not claim
 that native rendering is cost-free while observation is enabled.
 
 On the Frame, the helper configures a private arm marker so initial Home draws
-do not consume all 32 snapshots before a PC-VR stream is connected. Lifecycle
+do not consume the event or 32-snapshot budget before a PC-VR stream is connected. Lifecycle
 tracking continues before arming. Only the background writer checks the marker,
 at most every 100 ms; hooks read an atomic ready flag. Arming never extends the
 120-second/event/byte recording bounds or restarts SteamVR. The real-loader GPU
 fixture exercises absent, malformed and accepted markers, plus 48 native draws
-with exactly 32 resource records. Header/footer fields distinguish an unarmed
-capture from a completed resource sample; neither proves frame association.
+with exactly 32 resource records. It also executes 2,400 native draws before
+delayed arming and requires six complete subsequent draws/resources/submissions;
+the pre-arm draws must consume no capture events. A `bindings_armed` event marks
+writer acceptance; the helper's ledger marks only the arm request. A writer-only
+file lock lets the helper reject closed/crashed captures, including closure
+without a footer. Control-file reads and locking stay off rendering threads.
+Header/footer fields distinguish an unarmed capture from a completed resource
+sample. Fixed footer counters identify lost-state reasons and capacity tables;
+any such loss still invalidates completeness. None proves frame association.

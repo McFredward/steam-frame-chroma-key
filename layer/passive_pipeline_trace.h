@@ -57,7 +57,7 @@ inline bool copyEntry(char (&target)[EntryCapacity], const char* source) noexcep
 }
 
 enum class Kind : std::uint8_t {
-    Shader, Pipeline, Draw, Execute, Submit, Incomplete, Bindings
+    Shader, Pipeline, Draw, Execute, Submit, Incomplete, Bindings, BindingsArmed
 };
 
 struct Event {

@@ -8,10 +8,12 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <fcntl.h>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 static void check(VkResult result) {
     if (result != VK_SUCCESS) throw std::runtime_error("Vulkan error " + std::to_string(result));
@@ -27,6 +29,33 @@ static std::vector<uint32_t> readShader(const char *path) {
     if (!file.read(reinterpret_cast<char *>(words.data()), count))
         throw std::runtime_error("Cannot read shader");
     return words;
+}
+
+static void waitForTrace(const char* expected) {
+    // Fixture-only file I/O. Production render hooks never read control files.
+    const auto* path = std::getenv("FRAME_MASK_TRACE_OUTPUT");
+    if (!path) throw std::runtime_error("Trace-arm fixture has no output path");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    for (;;) {
+        std::ifstream file(path);
+        std::string line;
+        while (std::getline(file, line)) if (line.find(expected) != std::string::npos) return;
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("Trace writer did not accept owned arm marker");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+static void armTrace() {
+    const auto* path = std::getenv("FRAME_MASK_TRACE_BINDINGS_ARM_FILE");
+    if (!path) throw std::runtime_error("Delayed trace-arm fixture has no marker path");
+    constexpr char marker[] = "FRAME_MASK_TRACE_BINDINGS/1\n";
+    const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) throw std::runtime_error("Fixture could not create exclusive arm marker");
+    const auto count = write(fd, marker, sizeof(marker) - 1);
+    close(fd);
+    if (count != sizeof(marker) - 1) throw std::runtime_error("Fixture arm marker was incomplete");
+    waitForTrace("\"event\":\"bindings_armed\"");
 }
 
 struct Image {
@@ -147,7 +176,7 @@ struct Gpu {
     }
 
     void init(const char *vertexPath, const char *fragmentPath, bool premultiplied, unsigned cycles = 1,
-              bool waitForTraceArm = false) {
+              bool waitForTraceArm = false, unsigned armAfterCycles = 0) {
         VkApplicationInfo application{};
         application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         application.apiVersion = VK_API_VERSION_1_1;
@@ -345,21 +374,10 @@ struct Gpu {
         check(vkAllocateCommandBuffers(device, &commandInfo, &command));
         bool initialized = false;
         if (waitForTraceArm) {
-            // Fixture-only readiness wait. The diagnostic render hooks never
-            // open files or wait for the writer or an arm marker.
-            const auto* path = std::getenv("FRAME_MASK_TRACE_OUTPUT");
-            if (!path) throw std::runtime_error("Trace-arm fixture has no output path");
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            for (;;) {
-                std::ifstream file(path);
-                std::string header;
-                std::getline(file, header);
-                if (header.find("\"binding_ready_at_header\":true") != std::string::npos) break;
-                if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("Trace writer did not accept owned arm marker");
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
+            waitForTrace("\"binding_ready_at_header\":true");
         }
         for (unsigned cycle = 0; cycle < cycles; ++cycle) {
+        if (armAfterCycles && cycle == armAfterCycles) armTrace();
         for (const auto &color : std::array<std::array<float, 4>, 3>{{
             {{0, 1, 0, 1}}, {{0.2f, 0.4f, 0.8f, 1}}, {{1, 0, 1, 1}}}}) {
             for (unsigned scenario = 0; scenario < (premultiplied ? 6u : 2u); ++scenario) {
@@ -456,8 +474,11 @@ int main(int argc, char **argv) {
     try {
         Gpu gpu;
         gpu.init(argv[1], argv[2], argc == 4 && std::string(argv[3]) == "premultiplied",
+                 argc == 4 && std::string(argv[3]) == "trace-delayed-arm" ? 401 :
+                 argc == 4 && std::string(argv[3]) == "trace-unarmed-stress" ? 400 :
                  argc == 4 && std::string(argv[3]) == "trace-stress" ? 8 : 1,
-                 argc == 4 && std::string(argv[3]) == "trace-arm");
+                 argc == 4 && std::string(argv[3]) == "trace-arm",
+                 argc == 4 && std::string(argv[3]) == "trace-delayed-arm" ? 400 : 0);
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

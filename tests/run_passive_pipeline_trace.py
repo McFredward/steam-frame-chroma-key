@@ -85,6 +85,8 @@ def main():
                                        ("bindings-enabled", compositor, "1"),
                                        ("bindings-limit", compositor, "1"),
                                        ("bindings-unarmed", compositor, "1"),
+                                       ("bindings-unarmed-stress", compositor, "1"),
+                                       ("bindings-delayed-arm", compositor, "1"),
                                        ("bindings-armed", compositor, "1"),
                                        ("bindings-bad-arm", compositor, "1"),
                                        ("implicit-enabled", compositor, "1"),
@@ -97,10 +99,10 @@ def main():
             if mode.startswith("bindings-"):
                 env["FRAME_MASK_TRACE_BINDINGS"] = "1"
                 env["FRAME_MASK_TRACE_FRAGMENT_HASH"] = f"{fingerprint(fragment):016x}"
-                if mode in ("bindings-unarmed", "bindings-armed", "bindings-bad-arm"):
+                if mode in ("bindings-unarmed", "bindings-unarmed-stress", "bindings-delayed-arm", "bindings-armed", "bindings-bad-arm"):
                     marker = folder / (mode + ".marker")
                     env["FRAME_MASK_TRACE_BINDINGS_ARM_FILE"] = str(marker)
-                    if mode != "bindings-unarmed":
+                    if mode in ("bindings-armed", "bindings-bad-arm"):
                         marker.write_bytes(b"FRAME_MASK_TRACE_BINDINGS/1\n" if mode == "bindings-armed" else b"wrong\n")
                         marker.chmod(0o600)
             if mode.startswith("implicit-"):
@@ -125,7 +127,9 @@ def main():
                 env["FRAME_MASK_TRACE_FRAGMENT_HASH"] = "0000000000000001"
             elif mode == "filtered-match":
                 env["FRAME_MASK_TRACE_FRAGMENT_HASH"] = f"{fingerprint(fragment):016x}"
-            convention = "trace-stress" if mode == "bindings-limit" else "trace-arm" if mode == "bindings-armed" else "straight"
+            convention = {"bindings-limit": "trace-stress", "bindings-armed": "trace-arm",
+                          "bindings-unarmed-stress": "trace-unarmed-stress",
+                          "bindings-delayed-arm": "trace-delayed-arm"}.get(mode, "straight")
             subprocess.run([str(program), str(vertex), str(fragment), convention],
                            env=env, check=True, timeout=30)
             if mode == "implicit-numeric-version":
@@ -151,6 +155,8 @@ def main():
             assert footer["io_ok"] and not footer["byte_cap_reached"], footer
             assert footer["dropped_events"] == 0 and footer["lost_state"] == 0, footer
             assert footer["lost_binding_state"] == 0, footer
+            assert sum(footer["binding_loss_reasons"].values()) == footer["lost_binding_state"], footer
+            assert sum(footer["binding_capacity_tables"].values()) == 0, footer
             events = records[1:-1]
             assert [event["serial"] for event in events] == list(range(1, footer["emitted"] + 1)), \
                 "Footer count or event serials do not match the complete writer drain"
@@ -159,9 +165,10 @@ def main():
             draws = [record for record in records if record["event"] == "draw_recorded"]
             submits = [record for record in records if record["event"] == "submit_accepted"]
             resources = [record for record in records if record["event"] == "bindings_recorded"]
-            if mode in ("bindings-unarmed", "bindings-bad-arm"):
+            if mode in ("bindings-unarmed", "bindings-unarmed-stress", "bindings-bad-arm"):
                 assert records[0]["binding_arm_required"] and not footer["binding_capture_armed"]
                 assert not resources and footer["binding_snapshots_attempted"] == 0, "Pre-stream Home draws spent the resource budget"
+                assert not draws and not submits, "Pre-arm native rendering spent the event budget"
                 continue
             if mode.startswith("bindings-"):
                 assert records[0]["binding_metadata_version"] == 1
@@ -170,6 +177,11 @@ def main():
                 assert footer["binding_capture_armed"] and footer["binding_snapshots_attempted"] == len(resources)
                 if mode == "bindings-limit":
                     assert len(resources) == 32 and len(draws) == 48, "Resource budget failed to close while native rendering continued"
+                if mode == "bindings-delayed-arm":
+                    armed = [event for event in events if event["event"] == "bindings_armed"]
+                    assert len(armed) == 1 and not records[0]["binding_ready_at_header"], records
+                    assert len(resources) == len(draws) == len(submits) == 6, "2,400 pre-arm draws exhausted or contaminated capture"
+                    assert all(event["serial"] > armed[0]["serial"] for event in draws + submits + resources)
                 for resource in resources:
                     assert resource["complete"], resource
                     binding = resource["bindings"]
@@ -213,6 +225,7 @@ def main():
                            for submit in submits), "Recorded draw was never submitted"
             # Opening an existing output must not overwrite it or affect rendering.
             before = output.read_bytes()
+            env.pop("FRAME_MASK_TRACE_BINDINGS_ARM_FILE", None)
             subprocess.run([str(compositor), str(vertex), str(fragment), "straight"],
                            env=env, check=True, timeout=30)
             assert output.read_bytes() == before, "Existing evidence was overwritten"

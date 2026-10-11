@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -23,7 +24,7 @@
 namespace {
 using namespace frame_trace;
 constexpr std::size_t OutputLimit = 1024 * 1024;
-constexpr std::size_t FooterReserve = 1024;
+constexpr std::size_t FooterReserve = 2048;
 constexpr std::uint32_t CallRecordLimit = 512;
 
 struct Capture {
@@ -39,6 +40,12 @@ struct Capture {
     std::atomic<bool> bindingsArmed{false};
     std::atomic<std::uint32_t> bindingSnapshots{0};
     static constexpr std::uint32_t BindingSnapshotLimit = 32;
+
+    bool drawsReady() const noexcept {
+        // Keep lifecycle metadata before arming, but reserve draw/submit event
+        // capacity for the operator's actual stream instead of native Home.
+        return core.enabled() && (!bindingsEnabled || bindingsArmed.load(std::memory_order_acquire));
+    }
 
     void start() {
         std::call_once(once, [&] {
@@ -124,7 +131,7 @@ struct Capture {
     static std::size_t serialize(const Event& e, char (&out)[16384]) {
         std::size_t used = 0;
         const char* names[] = {"shader", "pipeline", "draw_recorded", "execute_recorded",
-                               "submit_accepted", "incomplete", "bindings_recorded"};
+                               "submit_accepted", "incomplete", "bindings_recorded", "bindings_armed"};
         bool valid = append(out, sizeof(out), used,
             "{\"event\":\"%s\",\"serial\":%llu,\"device\":%llu,\"complete\":%s,"
             "\"reason\":%u,\"command\":\"%llx\",\"command_generation\":%llu,"
@@ -186,6 +193,9 @@ struct Capture {
         // symlink. The trace contains no binary shader payload or private image.
         const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd < 0) { core.enable(false); return; }
+        // Control helper can reject closed/crashed captures before creating an
+        // arm marker. This lock belongs only to the background writer.
+        if (flock(fd, LOCK_EX | LOCK_NB)) { core.enable(false); close(fd); return; }
         if (!armPath.empty() && armRequested(armPath)) bindingsArmed.store(true, std::memory_order_release);
         // When timed recovery is enabled, leave time for its independently
         // armed 180-second watchdog to restore SteamVR after capture closure.
@@ -199,6 +209,7 @@ struct Capture {
             "\"descriptor_uv_frame_binding_proven\":false,\"fragment_filter\":\"%016llx\","
             "\"binding_metadata_version\":%u,\"limit_binding_snapshots\":%u,"
             "\"binding_arm_required\":%s,"
+            "\"pre_arm_draws_recorded\":false,"
             "\"binding_ready_at_header\":%s,"
             "\"deadline_seconds\":%u}\n", static_cast<unsigned long long>(fragmentFilter),
             bindingsEnabled ? 1 : 0, bindingsEnabled ? BindingSnapshotLimit : 0,
@@ -211,7 +222,12 @@ struct Capture {
         for (;;) {
             const auto now = std::chrono::steady_clock::now();
             if (!draining && bindingsEnabled && !bindingsArmed.load() && !armPath.empty() && now >= armCheck) {
-                if (armRequested(armPath)) bindingsArmed.store(true, std::memory_order_release);
+                if (now < deadline && armRequested(armPath)) {
+                    Event armed;
+                    armed.kind = Kind::BindingsArmed;
+                    armed.complete = true;
+                    if (events.push(armed)) bindingsArmed.store(true, std::memory_order_release);
+                }
                 armCheck = now + std::chrono::milliseconds(100);
             }
             // Check even while records arrive continuously. Disabling producers
@@ -241,16 +257,29 @@ struct Capture {
         }
         core.enable(false);
         events.close();
-        char footer[512];
+        char footer[FooterReserve];
         const auto count = std::snprintf(footer, sizeof(footer),
             "{\"event\":\"footer\",\"emitted\":%llu,\"dropped_events\":%llu,"
             "\"lost_state\":%llu,\"lost_binding_state\":%llu,\"binding_capture_armed\":%s,"
-            "\"binding_snapshots_attempted\":%u,\"byte_cap_reached\":%s,\"io_ok\":%s,\"capture_bounded\":true}\n",
+            "\"binding_snapshots_attempted\":%u,\"byte_cap_reached\":%s,\"io_ok\":%s,\"capture_bounded\":true,"
+            "\"binding_loss_reasons\":{\"capacity\":%llu,\"contention\":%llu,\"unknown\":%llu,"
+            "\"unsupported\":%llu,\"stale\":%llu,\"bounds\":%llu,\"layout_mismatch\":%llu},"
+            "\"binding_capacity_tables\":{\"set_layout\":%llu,\"pipeline_layout\":%llu,\"pool\":%llu,"
+            "\"set\":%llu,\"buffer\":%llu,\"image\":%llu,\"view\":%llu,\"sampler\":%llu,"
+            "\"memory\":%llu,\"command\":%llu}}\n",
             static_cast<unsigned long long>(events.emitted()), static_cast<unsigned long long>(events.dropped()),
             static_cast<unsigned long long>(core.lostState()), static_cast<unsigned long long>(bindings.lostState()),
             bindingsArmed.load() ? "true" : "false", std::min(bindingSnapshots.load(), BindingSnapshotLimit),
-            capped ? "true" : "false", ioGood ? "true" : "false");
-        if (ioGood && count > 0) writeAll(fd, footer, static_cast<std::size_t>(count));
+            capped ? "true" : "false", ioGood ? "true" : "false",
+#define LOSS(reason) static_cast<unsigned long long>(bindings.lossCount(frame_bindings::Reason::reason))
+            LOSS(Capacity), LOSS(Contention), LOSS(Unknown), LOSS(Unsupported), LOSS(Stale), LOSS(Bounds), LOSS(LayoutMismatch),
+#undef LOSS
+#define TABLE(name) static_cast<unsigned long long>(bindings.capacityLossCount(frame_bindings::Table::name))
+            TABLE(SetLayout), TABLE(PipelineLayout), TABLE(Pool), TABLE(Set), TABLE(Buffer), TABLE(Image),
+            TABLE(View), TABLE(Sampler), TABLE(Memory), TABLE(Command));
+#undef TABLE
+        if (ioGood && count > 0 && static_cast<std::size_t>(count) < sizeof(footer))
+            writeAll(fd, footer, static_cast<std::size_t>(count));
         close(fd);
     }
     static bool serializeBindings(const frame_bindings::Snapshot&, char*, std::size_t, std::size_t&);
@@ -272,7 +301,7 @@ template <typename Observer> void observeBindings(Observer observer) {
 void recordedDraw(std::uint64_t device, VkCommandBuffer command, std::uint32_t kind) {
     auto& c = capture();
     const auto admission = c.events.admit();
-    if (!admission || !c.core.enabled()) return;
+    if (!admission || !c.drawsReady()) return;
     c.core.draw(device, number(command), kind);
     if (!c.bindingsEnabled || !c.bindingsArmed.load(std::memory_order_acquire) ||
         c.bindingSnapshots.load(std::memory_order_relaxed) >= Capture::BindingSnapshotLimit) return;
@@ -590,14 +619,15 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirectCount(VkCommandBuffer comm
 VKAPI_ATTR void VKAPI_CALL traceCmdExecuteCommands(VkCommandBuffer command, std::uint32_t count,
     const VkCommandBuffer* children) {
     auto* d = deviceFor(command);
-    for (std::uint32_t i = 0; i < limited(d, count); ++i) capture().core.execute(d->id, number(command), number(children[i]));
+    if (capture().drawsReady())
+        for (std::uint32_t i = 0; i < limited(d, count); ++i) capture().core.execute(d->id, number(command), number(children[i]));
     if (count) observeBindings([&](auto& b) { b.executeCommands(d->id, command); });
     d->CmdExecuteCommands(command, count, children);
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit(VkQueue queue, std::uint32_t count,
     const VkSubmitInfo* info, VkFence fence) {
     auto* d = deviceFor(queue);
-    if (!capture().core.enabled()) return d->QueueSubmit(queue, count, info, fence);
+    if (!capture().drawsReady()) return d->QueueSubmit(queue, count, info, fence);
     std::array<SubmitTicket, CallRecordLimit> tickets{};
     std::uint32_t ticketCount = 0;
     for (std::uint32_t i = 0; i < limited(d, count); ++i) {
@@ -616,7 +646,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit(VkQueue queue, std::uint32_t cou
 VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit2(VkQueue queue, std::uint32_t count,
     const VkSubmitInfo2* info, VkFence fence) {
     auto* d = deviceFor(queue);
-    if (!capture().core.enabled()) return d->QueueSubmit2(queue, count, info, fence);
+    if (!capture().drawsReady()) return d->QueueSubmit2(queue, count, info, fence);
     std::array<SubmitTicket, CallRecordLimit> tickets{};
     std::uint32_t ticketCount = 0;
     for (std::uint32_t i = 0; i < limited(d, count); ++i) {

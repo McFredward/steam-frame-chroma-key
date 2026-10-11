@@ -43,6 +43,7 @@ inline bool same(Identity a, Identity b) noexcept {
 enum class Presence : std::uint8_t { Unknown, Absent, Present };
 enum class BindingState : std::uint8_t { Unknown, Absent, Unwritten, Written };
 enum class Reason : std::uint8_t { None, Capacity, Contention, Unknown, Unsupported, Stale, Bounds, LayoutMismatch };
+enum class Table : std::uint8_t { SetLayout, PipelineLayout, Pool, Set, Buffer, Image, View, Sampler, Memory, Command, Count };
 
 struct MemoryMetadata {
     Identity identity{};
@@ -193,6 +194,14 @@ public:
     // only after successful native API calls. Failed native calls must not
     // advance generations. Multi-device state is keyed by device AND handle.
     std::uint64_t lostState() const noexcept { return lost_.load(std::memory_order_relaxed); }
+    std::uint64_t lossCount(Reason reason) const noexcept {
+        const auto index = static_cast<std::size_t>(reason);
+        return index < losses_.size() ? losses_[index].load(std::memory_order_relaxed) : 0;
+    }
+    std::uint64_t capacityLossCount(Table table) const noexcept {
+        const auto index = static_cast<std::size_t>(table);
+        return index < capacityLosses_.size() ? capacityLosses_[index].load(std::memory_order_relaxed) : 0;
+    }
     void reportUnsupported(std::uint64_t /*device*/) noexcept { lose(Reason::Unsupported); }
 
     void createSetLayout(std::uint64_t device, VkDescriptorSetLayout value, const VkDescriptorSetLayoutCreateInfo& info) noexcept {
@@ -471,6 +480,7 @@ private:
     static bool supported(VkDescriptorType type) noexcept { return bufferType(type) || imageType(type) || samplerType(type); }
     void lose(Reason reason) noexcept {
         lost_.fetch_add(1, std::memory_order_relaxed); lastLoss_.store(reason, std::memory_order_relaxed);
+        losses_[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     }
     std::unique_lock<std::mutex> acquire() noexcept {
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
@@ -495,6 +505,12 @@ private:
         for (auto& entry : table) if (!entry.id.generation) {
             entry = {}; entry.device = device; entry.id = {value, next()}; return &entry;
         }
+        constexpr auto kind = std::is_same_v<T, SetLayout> ? Table::SetLayout :
+            std::is_same_v<T, PipelineLayout> ? Table::PipelineLayout : std::is_same_v<T, Pool> ? Table::Pool :
+            std::is_same_v<T, Set> ? Table::Set : std::is_same_v<T, Buffer> ? Table::Buffer :
+            std::is_same_v<T, Image> ? Table::Image : std::is_same_v<T, View> ? Table::View :
+            std::is_same_v<T, Sampler> ? Table::Sampler : std::is_same_v<T, Memory> ? Table::Memory : Table::Command;
+        capacityLosses_[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
         lose(Reason::Capacity); return nullptr;
     }
     template<class T, std::size_t N> void erase(std::array<T, N>& table, std::uint64_t device, std::uint64_t value) noexcept {
@@ -644,6 +660,8 @@ private:
     }
     std::mutex mutex_;
     std::atomic<std::uint64_t> lost_{0};
+    std::array<std::atomic<std::uint64_t>, 8> losses_{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Table::Count)> capacityLosses_{};
     std::atomic<Reason> lastLoss_{Reason::None};
     std::uint64_t serial_ = 0;
     std::array<SetLayout, LayoutCapacity> layouts_{};

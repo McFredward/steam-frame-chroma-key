@@ -359,6 +359,7 @@ void unsupportedAndCapacity() {
     {
         auto core = std::make_unique<Core>(); seed(*core);
         core->updateSets(1, static_cast<std::uint32_t>(SetCapacity + 1), reinterpret_cast<const VkWriteDescriptorSet*>(1), 0, nullptr);
+        require(core->lossCount(Reason::Bounds) == 1 && core->lossCount(Reason::Unsupported) == 0, "bounds reason counter was not isolated");
         require(core->lostState() == 1 && !core->snapshot(1, cb, pl).sourceComplete &&
                 core->snapshot(1, cb, pl).layout_has_binding31 == Presence::Unknown, "oversize operation was read or failed to invalidate proof");
     }
@@ -367,6 +368,8 @@ void unsupportedAndCapacity() {
         auto si = info<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
         for (std::size_t i = 0; i < SamplerCapacity + 1; ++i) core->createSampler(3, h<VkSampler>(1000 + i), si);
         require(core->lostState() == 1 && !core->snapshot(1, cb, pl).sourceComplete, "capacity overflow silently retained proof");
+        require(core->lossCount(Reason::Capacity) == 1 && core->capacityLossCount(Table::Sampler) == 1 &&
+                core->capacityLossCount(Table::Set) == 0, "table capacity loss was not identified precisely");
         core->destroySampler(3, h<VkSampler>(1000)); core->createSampler(3, h<VkSampler>(9000), si);
         require(!core->snapshot(1, cb, pl).sourceComplete, "later free capacity erased observation gap");
     }
@@ -374,10 +377,12 @@ void unsupportedAndCapacity() {
         auto core = std::make_unique<Core>(); seed(*core);
         { const auto lock = TestAccess::hold(*core); core->resetCommand(1, cb); }
         require(core->lostState() == 1 && !core->snapshot(1, cb, pl).sourceComplete, "try-lock contention was silently ignored");
+        require(core->lossCount(Reason::Contention) == 1, "contention counter missing");
     }
     {
         auto core = std::make_unique<Core>(); seed(*core); core->reportUnsupported(1);
         require(!core->snapshot(1, cb, pl).sourceComplete && core->lostState() == 1, "unsupported command silently retained proof");
+        require(core->lossCount(Reason::Unsupported) == 1, "unsupported counter missing");
     }
 }
 }
