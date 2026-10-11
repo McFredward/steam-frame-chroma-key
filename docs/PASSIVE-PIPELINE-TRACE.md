@@ -5,9 +5,10 @@ It observes shader-module fingerprints, graphics-pipeline stage tuples, recorded
 draws and successful queue submission. It never replaces a shader, changes a
 descriptor, copies an image, reads mapped GPU memory or enables passthrough.
 
-The maintainer authorized a temporary session on 2026-10-11. It was attempted,
-then fully removed after the native compositor did not load it; no capture was
-accepted. The exact procedure, changed paths and verified rollback are recorded
+The maintainer authorized temporary sessions on 2026-10-11. Initial loading
+failed because the manifest version had the wrong JSON type. Corrected attempts
+loaded the diagnostic, but no capture has yet met the healthy-footer rule.
+The exact procedure, changed paths and verified rollback are recorded
 in [the session ledger summary](FRAME-TRACE-SESSION.md). Headset access otherwise
 remains read-only, apart from the previously authorized SSH-service setup.
 
@@ -44,9 +45,15 @@ have been established. No mask guard is removed.
   the fixed-capacity observation tables; no per-frame allocation occurs.
   Dispatch lookup has a short mutex critical section for native context lifetime;
   observation uses try-lock/drop. This is not a universally lock-free layer.
-- Filtered capture lasts at most 180 seconds; unfiltered capture at most 30.
+- Filtered capture lasts at most 120 seconds; unfiltered capture at most 30.
   It ends at its event/byte/time bound or process teardown. Native
   Vulkan calls/results are forwarded regardless of diagnostic capacity.
+  The writer checks expiration during continuous traffic and drains only its
+  bounded queue before the footer. This leaves recovery margin before the
+  separate 180-second watchdog when timed recovery is enabled. The maintainer's
+  next run explicitly uses manual recovery: recording completion causes no
+  runtime restart. Calls after intentional budget closure are ignored; genuine
+  contention/capacity loss during an open observation window remains counted.
 - Pipeline libraries, unobserved modules, overlarge modules and unsupported
   observation paths cannot provide a complete stage claim. Reordered/missed
   event data must not be treated as reliable resource/frame association.

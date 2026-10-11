@@ -13,28 +13,62 @@ All commands run as `steamos`, without `sudo`. The reviewed library is AArch64,
 The original SteamVR binaries, shader files, camera configuration, boot settings
 and persistent service configuration remain untouched.
 
+After the manifest correction and focused deadline review, the fourth attempt
+used a 68,056-byte library, SHA-256
+`abefb338e1ce8e89ee16e57a6c0b3637399fe327d1c5c41252d6c84ae670f609`.
+The next reviewed library is also 68,056 bytes, SHA-256
+`1c1fe5a040461d860fc2aeb6845d54b038f091eb4fdd2627de6e0b4081e55d1a`.
+Its filtered writer closes by 120 seconds; unfiltered capture retains its
+30-second limit. The event/byte bounds remain unchanged. The latest repair
+separates intentional closure of the event budget from genuine observation
+loss; it does not alter native rendering or forgive losses in earlier evidence.
+The earlier hashes remain the identities used in the recorded attempts.
+
+After the fourth attempt's automatic restart interrupted the maintainer's VR
+stream, the maintainer explicitly requested removal of time-triggered recovery
+for the next run. Use `start --manual-rollback` for that run. This disables the
+independent rollback timer, not the bounded recording. Finishing a recording
+does not restart SteamVR. Manual recovery and reboot recovery remain available.
+The default helper mode still provides the original watchdog for other sessions.
+
 The following new files are the entire deployment:
 
 - `~/.local/share/frame-mask-trace/`: the library, session helper and bounded
-  capture/ledger/recovery markers. This directory must not exist before staging.
+  capture/ledger/recovery markers and the read-only startup/probe helpers. This
+  directory must not exist before staging.
 - `~/.local/share/vulkan/implicit_layer.d/frame_mask_trace.json`: opt-in manifest.
 - `/run/user/<uid>/systemd/user/steamvr.service.d/90-frame-mask-trace.conf`:
   temporary environment variables for this service only.
-- An independent transient user service, `frame-mask-trace-rollback.service`.
+- In default timed mode only, an independent transient user service,
+  `frame-mask-trace-rollback.service`.
   It initiates rollback by 180 seconds, removes the activation files and restarts
   SteamVR without the layer. It is started and acknowledged before activation.
 
 Each service operation has a bounded timeout. The rollback/restart can take
 additional time after the capture window. An ordinary runtime crash remains a
-possibility for any native diagnostic layer; the independent recovery service
-and boot-scoped activation limit that risk without claiming it is impossible.
+possibility for any native diagnostic layer. Timed mode has independent recovery;
+manual mode requires the operator to recover it explicitly. Both use boot-scoped
+activation, without claiming that a runtime crash is impossible. Manual mode
+refuses activation if an earlier timed rollback service is still active.
 
 The `/run` drop-in disappears on reboot. The manifest additionally requires
 `FRAME_MASK_TRACE=1`, so any leftover manifest alone cannot activate the layer on
 the next boot. No global manager environment or persistent restart service is
 installed. A reboot therefore returns to the ordinary SteamVR launch path.
 
-The manual rollback, from SSH or a Frame terminal, is:
+The reviewed manual-mode activation, after the maintainer is ready for one
+initial SteamVR restart, is:
+
+```bash
+python3 ~/.local/share/frame-mask-trace/frame_trace_session.py start \
+  --sha256 1c1fe5a040461d860fc2aeb6845d54b038f091eb4fdd2627de6e0b4081e55d1a \
+  --manual-rollback
+```
+
+Do not add loader-debug logging now that the manifest cause is established.
+Startup failures still remove the activation and attempt native recovery.
+After capture, announce the interruption before manual restoration. The manual
+rollback, from SSH or a Frame terminal, is:
 
 ```bash
 python3 ~/.local/share/frame-mask-trace/frame_trace_session.py rollback
@@ -54,16 +88,18 @@ The helper normally refuses altered or preexisting files rather than deleting
 unrelated content. These emergency commands are for this identified deployment
 only. After recovery, copy the small ledger/capture to the development machine,
 confirm the compositor no longer maps the diagnostic library and remove the
-private session directory after confirming/stopping the rollback service. Do not
-delete unrelated Vulkan layers or service
-drop-ins. Record any exception and verify normal SteamVR/SSH operation.
+private session directory after confirming no rollback service remains active.
+Do not delete unrelated Vulkan layers or service drop-ins. Record any exception
+and verify normal SteamVR/SSH operation.
 
 ## Execution record
 
 Before activation, record the service state, current compositor PID, absence of
 both activation paths and the library identity. Restart only after the maintainer
 is ready to reconnect the PC stream. The helper writes every activation/removal
-and restart to `session.jsonl`; its watchdog is separate from the SteamVR cgroup.
+and restart to `session.jsonl`. When enabled, its watchdog is separate from the
+SteamVR cgroup. The ledger records `rollback_mode: manual` with no rollback
+deadline for the maintainer-requested variant.
 Do not interpret capture data until a healthy trace footer, unchanged output
 bounds and matching recorded/submitted generations have been verified. A timeout
 or incomplete capture never authorizes enabling a mask.
@@ -138,8 +174,10 @@ The capture collected the real startup journal, bounded to at most 1 MiB
 and 2,048 copied lines, together with actual compositor PID/executable, loader
 mapping and trace header. This bounds the evidence copy; it is not a promise
 that the native SteamVR journal producer itself obeys our trace file cap.
-No full function-call loader tracing is enabled. Abort and restore on a warning,
-missing capture or missing compositor mapping instead of retrying indefinitely.
+No full function-call loader tracing is enabled. Abort and restore on a new
+warning, missing capture or missing compositor mapping instead of retrying
+indefinitely. The exact warning separately observed in the restored native
+baseline is recorded below; it is not automatically attributed to the layer.
 `systemctl is-active` measures the launcher (`vrcmd`) only; it must never be
 accepted as compositor readiness or a successful pipeline capture.
 
@@ -159,7 +197,7 @@ not a complete startup or active pipeline.
 Manual recovery removed both activation files at 13:13:26 and completed the
 native restart at 13:13:31. At 13:14:17 the native service was active, compositor
 PID 295808 had no diagnostic mapping and the independent watchdog was inactive.
-The temporary headset directory was removed by 13:14:29. The copied ledger and
+The temporary headset directory was removed by 13:14:37. The copied ledger and
 small bounded startup record remain private under
 `build/private-frame-loader-run-20261011`; no Valve binary or shader is published.
 The SSH credential environment was cleared and its session closed.
@@ -170,3 +208,50 @@ than only a returned layer name, and verify real implicit instance loading.
 The previous name-only discovery result was insufficient: this loader can
 return partially parsed properties even after logging a skipped manifest.
 See the [startup review](FRAME-TRACE-STARTUP-REVIEW.md) for the source evidence.
+
+## Corrected loading, stream capture and manual-mode preparation
+
+The third attempt began at 13:19:45 CEST with the corrected manifest. The
+diagnostic actually mapped into compositor PID 309241 and wrote a header,
+shader and pipeline records. The operator stopped the run after a Gamescope
+warning rather than accepting a partial trace. There was no healthy footer.
+Native recovery completed at 13:20:20; the temporary directory was removed by
+13:21:25. This was successful loading, not an accepted pipeline capture.
+
+The same non-hooked-swapchain warning appeared in a read-only baseline after
+complete restoration, without the diagnostic mapping or activation. The
+maintainer confirmed the Frame remained usable and the ordinary VR stream ran.
+That exact warning alone therefore did not establish diagnostic causation.
+It does not justify ignoring new errors or accepting an incomplete capture.
+
+The fourth attempt began at 13:26:08 CEST with the deadline-reviewed library.
+It mapped into compositor PID 325073 and produced 2,048 metadata records by
+13:27:35: 211 shader, 109 pipeline, 864 draw and 864 accepted-submit events.
+The observed draw tuples paired vertex fingerprint `9cc04d186b9c8fe5` with
+fragment fingerprint `f333a137b4e79ced`. The bounded footer reported successful
+I/O, no state loss and no byte-cap hit, but **one dropped event**. The capture
+remains incomplete under the healthy-footer rule; those tuples are observations,
+not an accepted active-pipeline proof. The later boundary repair cannot establish
+the historical cause of that loss or retroactively accept this evidence.
+
+At 13:29:08 the timed watchdog removed the activation, requested native restart
+at 13:29:09 and completed it at 13:29:15. This interrupted the maintainer's newly
+connected VR stream. Recovery was verified with native compositor PID 332705,
+no diagnostic mapping, no activation files and an inactive watchdog. The private
+headset directory was removed by 13:31:47. Capture and recovery evidence remain
+ignored in `build/private-frame-stream-run-20261011/`.
+
+The maintainer then authorized the manual-only recovery variant described above.
+Eighteen focused helper/schema/recovery checks pass, including no timer creation,
+idempotent exact-file rollback, startup-failure cleanup and refusal of a stale
+watchdog. The event-boundary core and real-loader/GPU suites pass, including the
+exact deployed implicit manifest, healthy footer and unchanged fixture pixels.
+These are focused checks, not a repeated complete foundation gate or a headset
+outcome.
+
+The new library and helper have been staged in the private headset directory.
+The dependency/discovery-only native probe reports complete matching manifest
+properties and successful `RTLD_NOW` loading. It creates no Vulkan instance or
+device and cannot prove the compositor instance chain. Both activation files
+remain absent, SteamVR remains native and no timer is active. The maintainer
+asked to wait before activation; no further restart or capture has been started.

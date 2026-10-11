@@ -77,7 +77,7 @@ different loader are retained only for their narrower original scope.
 Rollback removed both activation files at 13:13:26, restored native SteamVR at
 13:13:31 and verified native compositor PID 295808 without a diagnostic mapping.
 The independent watchdog exited; the private headset directory was removed by
-13:14:29. No stream or mask capture was accepted. The small private record is in
+13:14:37. No stream or mask capture was accepted. The small private record is in
 `build/private-frame-loader-run-20261011`.
 
 ## Other remaining distinctions

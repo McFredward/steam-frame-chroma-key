@@ -91,11 +91,16 @@ unmapped diagnostic caused it.
 
 These observations eliminate the inspected executable's custom direct-ICD
 loader or a hardcoded Vulkan-layer environment cleanup as established causes.
-They do **not** explain why the attempted diagnostic produced neither a mapping
-nor a capture. Its isolated dependency/discovery probe did not create a Vulkan
-instance, so discovery success alone did not exercise the native instance chain.
+This static review alone did **not** explain why the attempted diagnostic
+produced neither a mapping nor a capture. The subsequent
+[targeted loader run](FRAME-TRACE-STARTUP-REVIEW.md#manifest-rejection-established-by-the-targeted-startup-capture)
+identified a numeric manifest version rejected by the native parser. That field
+is now corrected to a string. Its isolated dependency/discovery probe did not
+create a Vulkan instance and checked only the name, so its original success
+did not establish a valid manifest or native instance chain.
 
-The next useful evidence is the actual loader's startup decision: discovery
+The next useful evidence, after correcting and validating the manifest, is the
+actual loader's startup decision: discovery
 paths, implicit enable/disable evaluation, selected layer order, library load,
 interface negotiation and instance-chain creation. Obtain that in a bounded,
 reviewed diagnostic session with the same recorded rollback protections,
