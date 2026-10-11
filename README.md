@@ -7,7 +7,7 @@ replaces that colour with its own passthrough camera. Valve's native streaming (
 No second video stream is added, the camera image never leaves the headset, and the cost is about 0.3 ms of GPU time
 with no extra frame of latency.
 
-![In-headset Chroma Key panel](toggle/panel_preview.png)
+![The Chroma Key panel in the SteamVR dashboard, captured on a Steam Frame](docs/headset_panel.png)
 
 What you get:
 
