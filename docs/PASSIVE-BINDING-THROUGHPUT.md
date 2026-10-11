@@ -85,6 +85,11 @@ separate header/byte saturation, malformed headers/counts, cursor/ticket wrap,
 concurrent publication, ordering, generation reuse and closure. Independent
 read-only reviews checked the final source without repeating the same suites.
 
+Integrated source `95ddb65` subsequently passed the complete
+[17-suite CI gate](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38173292576),
+Windows sender cross-build and protocol sanitizer. That separate complete CI
+result does not change the focused scope of the final local rerun above.
+
 The source trace builds strictly for AArch64. Its library is 230,272 bytes,
 SHA-256
 `9100902dfa240427523099062ccf4f77fd647d48979b37eb966d391943dc175d`;
