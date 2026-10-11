@@ -154,8 +154,9 @@ struct Capture {
         // symlink. The trace contains no binary shader payload or private image.
         const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd < 0) { core.enable(false); return; }
-        // Leave time for the independently armed 180-second rollback watchdog
-        // to restore SteamVR after this writer has closed a complete capture.
+        // When timed recovery is enabled, leave time for its independently
+        // armed 180-second watchdog to restore SteamVR after capture closure.
+        // Manual recovery uses these same recording bounds without a watchdog.
         const unsigned deadlineSeconds = fragmentFilter ? 120 : 30;
         char header[1024];
         const auto headerLength = std::snprintf(header, sizeof(header),
@@ -175,6 +176,7 @@ struct Capture {
             if (!draining && (stop.load() || events.finished() ||
                               std::chrono::steady_clock::now() >= deadline)) {
                 core.enable(false);
+                events.close();
                 draining = true;
             }
             Event event;
@@ -194,6 +196,7 @@ struct Capture {
             }
         }
         core.enable(false);
+        events.close();
         char footer[512];
         const auto count = std::snprintf(footer, sizeof(footer),
             "{\"event\":\"footer\",\"emitted\":%llu,\"dropped_events\":%llu,"

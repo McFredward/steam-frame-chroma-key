@@ -134,6 +134,9 @@ def main():
             footer = records[-1]
             assert footer["io_ok"] and not footer["byte_cap_reached"], footer
             assert footer["dropped_events"] == 0 and footer["lost_state"] == 0, footer
+            events = records[1:-1]
+            assert [event["serial"] for event in events] == list(range(1, footer["emitted"] + 1)), \
+                "Footer count or event serials do not match the complete writer drain"
             expected = {1: (fingerprint(vertex), vertex.stat().st_size),
                         16: (fingerprint(fragment), fragment.stat().st_size)}
             draws = [record for record in records if record["event"] == "draw_recorded"]
@@ -149,8 +152,10 @@ def main():
                 for stage in stages:
                     assert stage["complete"], stage
                     assert (int(stage["fnv1a64"], 16), stage["bytes"]) == expected[stage["stage"]]
-                assert any(submit["command"] == draw["command"] and
-                           submit["command_generation"] == draw["command_generation"]
+                assert any(submit["complete"] and submit["device"] == draw["device"] and
+                           submit["command"] == draw["command"] and
+                           submit["command_generation"] == draw["command_generation"] and
+                           submit["serial"] > draw["serial"]
                            for submit in submits), "Recorded draw was never submitted"
             # Opening an existing output must not overwrite it or affect rendering.
             before = output.read_bytes()

@@ -12,6 +12,7 @@ namespace frame_trace {
 struct TestAccess {
     static std::unique_lock<std::mutex> hold(Core& core) { return std::unique_lock<std::mutex>(core.mutex_); }
     static std::unique_lock<std::mutex> hold(EventRing& ring) { return std::unique_lock<std::mutex>(ring.mutex_); }
+    static auto observe(Core& core) { return core.acquire(); }
 };
 }
 
@@ -276,6 +277,98 @@ void concurrentBoundaryAccounting() {
     require(last.size() == 1 && last[0].serial == EventLimit,
             "concurrent lifetime closure altered the accepted final record");
 }
+void writerClosureWaitsForBookkeeping() {
+    EventRing ring;
+    Core core(ring, true);
+    seed(core);
+    const auto emitted = ring.emitted();
+    std::atomic<bool> observerReady{false}, releaseObserver{false}, writerDone{false};
+    std::thread observer([&] {
+        auto observation = TestAccess::observe(core);
+        require(observation.owns_lock(), "closure setup did not admit bookkeeping");
+        observerReady.store(true);
+        while (!releaseObserver.load()) std::this_thread::yield();
+    });
+    while (!observerReady.load()) std::this_thread::yield();
+    std::thread writer([&] {
+        core.enable(false);
+        ring.close();
+        writerDone.store(true);
+    });
+    while (!ring.closed()) std::this_thread::yield();
+    require(!writerDone.load(), "writer closed before in-flight bookkeeping quiesced");
+    require(!ring.push(Event{}), "closed admission accepted a later event");
+    releaseObserver.store(true);
+    observer.join();
+    writer.join();
+    const auto queued = drain(ring);
+    require(queued.size() == emitted && ring.emitted() == emitted,
+            "writer closure discarded accepted metadata or changed its count");
+    require(ring.empty() && ring.dropped() == 0 && core.lostState() == 0,
+            "intentional close reported a loss or left queued metadata");
+    ring.close(); // Idempotent, including an already drained queue.
+}
+void closedBookkeepingCannotRaceFooter() {
+    EventRing ring;
+    Core core(ring, true);
+    seed(core);
+    begin(core);
+    drain(ring);
+    {
+        auto held = TestAccess::hold(core);
+        core.pipelineDestroyed(1, 20);
+    }
+    {
+        auto held = TestAccess::hold(ring);
+        require(!ring.push(Event{}), "closure loss setup unexpectedly enqueued");
+    }
+    const auto priorStateLoss = core.lostState(), priorEventLoss = ring.dropped();
+    require(priorStateLoss == 1 && priorEventLoss == 1,
+            "closure setup did not retain genuine pre-close losses");
+    // Closing admission itself protects already-enabled hooks; their initial
+    // enabled() check need not have seen the writer disable Core yet.
+    ring.close();
+    const auto priorEmitted = ring.emitted();
+    std::vector<std::thread> producers;
+    for (unsigned i = 0; i < 8; ++i) producers.emplace_back([&] {
+        for (unsigned j = 0; j < 64; ++j) {
+            core.report(1, Core::Capacity);
+            core.draw(1, 30, 1);
+            core.shaderCreated(1, 10, vertex, sizeof(vertex));
+            require(!ring.push(Event{}), "closed producer accepted new metadata");
+        }
+    });
+    for (auto& producer : producers) producer.join();
+    require(ring.emitted() == priorEmitted && ring.dropped() == priorEventLoss &&
+            core.lostState() == priorStateLoss && ring.empty(),
+            "post-close observation changed footer counts or resumed bookkeeping");
+}
+void concurrentWriterClosureKeepsAStableDrain() {
+    EventRing ring;
+    constexpr unsigned Producers = 8;
+    std::atomic<bool> ready{false}, stop{false};
+    std::vector<std::thread> producers;
+    for (unsigned i = 0; i < Producers; ++i) producers.emplace_back([&] {
+        while (!ready.load()) std::this_thread::yield();
+        while (!stop.load()) ring.push(Event{});
+    });
+    ready.store(true);
+    while (ring.emitted() < EventCapacity) std::this_thread::yield();
+    ring.close();
+    const auto emitted = ring.emitted(), dropped = ring.dropped();
+    const auto queued = drain(ring);
+    // Closed calls keep returning immediately while the writer serializes its
+    // final records, so no process shutdown/join is needed to freeze counters.
+    for (unsigned i = 0; i < 32; ++i) std::this_thread::yield();
+    require(ring.emitted() == emitted && ring.dropped() == dropped && ring.empty(),
+            "render producers raced the closed writer drain/footer");
+    stop.store(true);
+    for (auto& producer : producers) producer.join();
+    require(queued.size() == emitted && emitted == EventCapacity,
+            "concurrent close lost queued records or changed the capacity bound");
+    for (std::size_t i = 0; i < queued.size(); ++i)
+        require(queued[i].serial == i + 1, "closed concurrent drain has a serial gap");
+}
 void contentionCannotCertifyStaleState() {
     EventRing ring;
     Core core(ring, true);
@@ -366,6 +459,9 @@ int main() {
     multiRecordCallClosesCleanly();
     closureKeepsEarlierLoss();
     concurrentBoundaryAccounting();
+    writerClosureWaitsForBookkeeping();
+    closedBookkeepingCannotRaceFooter();
+    concurrentWriterClosureKeepsAStableDrain();
     contentionCannotCertifyStaleState();
     fragmentFilter();
     submitRaceKeepsPreCallGeneration();

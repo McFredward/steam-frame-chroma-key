@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <thread>
+#include <utility>
 
 namespace frame_trace {
 
@@ -96,11 +98,44 @@ struct SubmitTicket {
 class EventRing {
     friend struct TestAccess;
 public:
+    // Admission covers both enqueue and Core bookkeeping. Only the background
+    // writer waits for observers; rendering threads never wait for shutdown.
+    class Producer {
+        friend class EventRing;
+        explicit Producer(EventRing* ring) noexcept : ring_(ring) {}
+    public:
+        Producer() noexcept = default;
+        Producer(const Producer&) = delete;
+        Producer& operator=(const Producer&) = delete;
+        Producer(Producer&& other) noexcept : ring_(other.ring_) { other.ring_ = nullptr; }
+        ~Producer() { if (ring_) ring_->producers_.fetch_sub(1, std::memory_order_release); }
+        explicit operator bool() const noexcept { return ring_ != nullptr; }
+    private:
+        EventRing* ring_ = nullptr;
+    };
+    Producer admit() noexcept {
+        auto state = producers_.load(std::memory_order_acquire);
+        while (!(state & Closed)) {
+            if (producers_.compare_exchange_weak(state, state + 1,
+                    std::memory_order_acquire, std::memory_order_relaxed)) return Producer(this);
+        }
+        return Producer();
+    }
+    void close() noexcept {
+        // Close admission first, then wait only on the writer thread for the
+        // finite set of previously admitted observers. No later enqueue or
+        // diagnostic loss counter update may race drain/footer serialization.
+        producers_.fetch_or(Closed, std::memory_order_acq_rel);
+        while (producers_.load(std::memory_order_acquire) != Closed) std::this_thread::yield();
+    }
+    bool closed() const noexcept { return (producers_.load(std::memory_order_acquire) & Closed) != 0; }
     bool push(Event event) noexcept {
         // The lifetime cap intentionally closes the observation window. A core
         // call can emit multiple records after its initial enabled() check, so
         // its trailing records must not turn normal closure into queue loss.
         if (finished()) return false;
+        const auto producer = admit();
+        if (!producer) return false;
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
         if (!lock.owns_lock()) {
             // Conservatively retain contention observed after entering an open
@@ -137,6 +172,10 @@ public:
         return lock.owns_lock() && count_ == 0;
     }
 private:
+    static constexpr std::uint32_t Closed = 1u << 31;
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+                  "Diagnostic admission must not use a hidden producer lock");
+    std::atomic<std::uint32_t> producers_{0};
     std::array<Event, EventCapacity> events_{};
     std::mutex mutex_;
     std::size_t read_ = 0, write_ = 0, count_ = 0;
@@ -425,8 +464,23 @@ public:
         if (lock.owns_lock()) incomplete(device, reason);
     }
 private:
-    std::unique_lock<std::mutex> acquire() noexcept {
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    class ObservationLock {
+    public:
+        explicit ObservationLock(EventRing::Producer producer) noexcept
+            : producer_(std::move(producer)) {}
+        ObservationLock(EventRing::Producer producer, std::mutex& mutex) noexcept
+            : producer_(std::move(producer)), lock_(mutex, std::try_to_lock) {}
+        bool owns_lock() const noexcept { return lock_.owns_lock(); }
+    private:
+        // The bookkeeping lock is released before the admission scope, so
+        // writer quiescence includes all updates made by this observation.
+        EventRing::Producer producer_;
+        std::unique_lock<std::mutex> lock_;
+    };
+    ObservationLock acquire() noexcept {
+        auto producer = events_.admit();
+        if (!producer || !enabled_.load()) return ObservationLock(std::move(producer));
+        ObservationLock lock(std::move(producer), mutex_);
         if (!lock.owns_lock()) {
             stateDrops_.fetch_add(1, std::memory_order_release);
         } else {
