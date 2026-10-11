@@ -1,0 +1,35 @@
+; Original synthetic scene shader for regression tests. Not Valve shader code.
+; The anchors intentionally match the narrow supported compositor layout.
+; UV and RGB arrive independently from the vertex shader at locations 0 and 1.
+OpCapability Shader
+%1 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %4 "main" %source_uv %source_rgb %504
+OpExecutionMode %4 OriginUpperLeft
+OpDecorate %source_uv Location 0
+OpDecorate %source_rgb Location 1
+OpDecorate %504 Location 0
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%v3float = OpTypeVector %float 3
+%v4float = OpTypeVector %float 4
+%pointer_uv = OpTypePointer Input %v2float
+%pointer_rgb = OpTypePointer Input %v3float
+%pointer_output = OpTypePointer Output %v4float
+%source_uv = OpVariable %pointer_uv Input
+%source_rgb = OpVariable %pointer_rgb Input
+%504 = OpVariable %pointer_output Output
+%opaque_alpha = OpConstant %float 1
+%4 = OpFunction %void None %3
+%entry = OpLabel
+%883 = OpLoad %v2float %source_uv
+%911 = OpLoad %v3float %source_rgb
+%native_r = OpCompositeExtract %float %911 0
+%native_g = OpCompositeExtract %float %911 1
+%native_b = OpCompositeExtract %float %911 2
+%994 = OpCompositeConstruct %v4float %native_r %native_g %native_b %opaque_alpha
+OpStore %504 %994
+OpReturn
+OpFunctionEnd
