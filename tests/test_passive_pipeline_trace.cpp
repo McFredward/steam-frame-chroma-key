@@ -4,12 +4,14 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace frame_trace {
 // Deterministic contention evidence without scheduling-dependent stress tests.
 struct TestAccess {
     static std::unique_lock<std::mutex> hold(Core& core) { return std::unique_lock<std::mutex>(core.mutex_); }
+    static std::unique_lock<std::mutex> hold(EventRing& ring) { return std::unique_lock<std::mutex>(ring.mutex_); }
 };
 }
 
@@ -183,6 +185,96 @@ void failuresAndBounds() {
         drain(full);
     }
     require(full.finished() && !full.push(dummy), "lifetime event cap not enforced");
+    require(full.dropped() == 1, "intentional lifetime closure was reported as an open-window drop");
+}
+void multiRecordCallClosesCleanly() {
+    EventRing ring;
+    Core core(ring, true);
+    seed(core);
+    drain(ring);
+    Event dummy;
+    while (ring.emitted() < EventLimit - 1) {
+        require(ring.push(dummy), "multi-record boundary setup failed");
+        drain(ring);
+    }
+    const auto stages = inputs();
+    // The aggregate failure reports Incomplete, then the valid returned handle
+    // reports Pipeline, within one enabled() check. Only one budget slot remains.
+    core.pipelineCreated(1, 22, 99, stages.data(), stages.size(), false);
+    const auto records = drain(ring);
+    require(records.size() == 1 && records[0].kind == Kind::Incomplete &&
+            records[0].reason == Core::PartialCreation && records[0].serial == EventLimit,
+            "the last lifetime record did not retain the first aggregate-failure report");
+    require(ring.finished() && !core.enabled() && ring.dropped() == 0,
+            "a trailing record after intentional closure tainted the capture");
+}
+void closureKeepsEarlierLoss() {
+    EventRing ring;
+    Event dummy, consumed;
+    while (ring.emitted() < EventLimit - EventCapacity - 1) {
+        require(ring.push(dummy), "open overflow setup failed");
+        drain(ring);
+    }
+    for (std::size_t i = 0; i < EventCapacity; ++i)
+        require(ring.push(dummy), "ring filled before boundary setup completed");
+    require(!ring.finished() && !ring.push(dummy) && ring.dropped() == 1,
+            "open-window overflow near the lifetime boundary was concealed");
+    require(ring.pop(consumed) && ring.push(dummy) && ring.finished(), "last lifetime slot was lost");
+    require(!ring.push(dummy) && ring.dropped() == 1,
+            "closure erased real loss or counted a full closed queue as new loss");
+    drain(ring);
+}
+void concurrentBoundaryAccounting() {
+    constexpr unsigned Producers = 8;
+    EventRing open;
+    {
+        auto held = TestAccess::hold(open);
+        std::vector<std::thread> producers;
+        for (unsigned i = 0; i < Producers; ++i)
+            producers.emplace_back([&] { require(!open.push(Event{}), "contended ring accepted an event"); });
+        for (auto& producer : producers) producer.join();
+    }
+    require(open.emitted() == 0 && open.dropped() == Producers,
+            "genuine concurrent contention in an open window was concealed");
+
+    EventRing boundary;
+    while (boundary.emitted() < EventLimit - 1) {
+        require(boundary.push(Event{}), "concurrent boundary setup failed");
+        drain(boundary);
+    }
+    std::atomic<bool> ready{false};
+    std::atomic<unsigned> accepted{0};
+    std::vector<std::thread> producers;
+    for (unsigned i = 0; i < Producers; ++i) {
+        producers.emplace_back([&] {
+            while (!ready.load()) std::this_thread::yield();
+            if (boundary.push(Event{})) ++accepted;
+        });
+    }
+    ready.store(true);
+    for (auto& producer : producers) producer.join();
+    require(accepted == 1 && boundary.emitted() == EventLimit && boundary.finished(),
+            "concurrent producers exceeded or failed to close the lifetime window");
+    // Pre-close contenders may legitimately lose try_lock; do not assert that
+    // their scheduling-dependent loss is zero or reinterpret it as closure.
+    const auto earlierDrops = boundary.dropped();
+    require(earlierDrops <= Producers - 1, "boundary contention accounting exceeded rejected attempts");
+    {
+        auto held = TestAccess::hold(boundary);
+        producers.clear();
+        for (unsigned i = 0; i < Producers; ++i) {
+            producers.emplace_back([&] {
+                for (unsigned j = 0; j < 32; ++j)
+                    require(!boundary.push(Event{}), "closed window accepted concurrent traffic");
+            });
+        }
+        for (auto& producer : producers) producer.join();
+    }
+    require(boundary.dropped() == earlierDrops,
+            "post-close concurrent traffic was conflated with open-window loss");
+    const auto last = drain(boundary);
+    require(last.size() == 1 && last[0].serial == EventLimit,
+            "concurrent lifetime closure altered the accepted final record");
 }
 void contentionCannotCertifyStaleState() {
     EventRing ring;
@@ -271,6 +363,9 @@ int main() {
     stageLifecycleAndActualDraw();
     resetAndSecondary();
     failuresAndBounds();
+    multiRecordCallClosesCleanly();
+    closureKeepsEarlierLoss();
+    concurrentBoundaryAccounting();
     contentionCannotCertifyStaleState();
     fragmentFilter();
     submitRaceKeepsPreCallGeneration();

@@ -94,10 +94,24 @@ struct SubmitTicket {
 // try_lock deliberately drops diagnostics rather than delaying a render thread.
 // Producers share one bounded ring; the writer is its only consumer.
 class EventRing {
+    friend struct TestAccess;
 public:
     bool push(Event event) noexcept {
+        // The lifetime cap intentionally closes the observation window. A core
+        // call can emit multiple records after its initial enabled() check, so
+        // its trailing records must not turn normal closure into queue loss.
+        if (finished()) return false;
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-        if (!lock.owns_lock() || count_ == EventCapacity || emitted_ == EventLimit) {
+        if (!lock.owns_lock()) {
+            // Conservatively retain contention observed after entering an open
+            // window, even if another producer closes it during this attempt.
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        // Another producer may have accepted the last record between the first
+        // check and this acquisition. Check closure before queue capacity.
+        if (finished()) return false;
+        if (count_ == EventCapacity) {
             dropped_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
