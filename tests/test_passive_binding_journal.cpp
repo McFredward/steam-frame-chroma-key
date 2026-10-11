@@ -15,16 +15,24 @@ thread_local bool monitorHookAllocations = false;
 std::atomic<std::uint64_t> hookAllocations{0};
 std::uint64_t checks = 0;
 }
-void* operator new(std::size_t size) {
+#if defined(__GNUC__) || defined(__clang__)
+#define JOURNAL_TEST_ALLOCATION __attribute__((noinline))
+#else
+#define JOURNAL_TEST_ALLOCATION
+#endif
+// Keep the replacement allocation boundary observable to instrumentation and
+// avoid GCC diagnosing its matching malloc/free wrappers after inlining.
+JOURNAL_TEST_ALLOCATION void* operator new(std::size_t size) {
     if (monitorHookAllocations) hookAllocations.fetch_add(1);
     if (auto* memory = std::malloc(size)) return memory;
     throw std::bad_alloc();
 }
-void* operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void* value) noexcept { std::free(value); }
-void operator delete[](void* value) noexcept { std::free(value); }
-void operator delete(void* value, std::size_t) noexcept { std::free(value); }
-void operator delete[](void* value, std::size_t) noexcept { std::free(value); }
+JOURNAL_TEST_ALLOCATION void* operator new[](std::size_t size) { return ::operator new(size); }
+JOURNAL_TEST_ALLOCATION void operator delete(void* value) noexcept { std::free(value); }
+JOURNAL_TEST_ALLOCATION void operator delete[](void* value) noexcept { std::free(value); }
+JOURNAL_TEST_ALLOCATION void operator delete(void* value, std::size_t) noexcept { std::free(value); }
+JOURNAL_TEST_ALLOCATION void operator delete[](void* value, std::size_t) noexcept { std::free(value); }
+#undef JOURNAL_TEST_ALLOCATION
 
 namespace frame_bindings {
 struct JournalTestAccess {
@@ -40,6 +48,25 @@ struct JournalTestAccess {
     static void gap(Journal& journal) { journal.tickets_.fetch_add(1); }
     static std::uint64_t reserveIdentity(std::atomic<std::uint64_t>& serial) { return Journal::reserveIdentity(serial); }
     static bool validate(Journal& journal, const Snapshot& previous) { return journal.core_.validate(previous); }
+    static std::size_t largeUpdateBytes() {
+        return offsetof(Journal::UpdateRecord, entries) + Journal::CallCapacity * sizeof(Journal::UpdateEntry);
+    }
+    static void bytePosition(Journal& journal, std::uint64_t value) {
+        auto* lane = journal.producerLane();
+        if (!journal.empty()) std::abort();
+        lane->byteRead.store(value); lane->byteWrite = value;
+    }
+    static void corruptHead(Journal& journal, unsigned kind) {
+        auto* lane = journal.producerLane();
+        auto& header = lane->records[lane->read.load() % Journal::LaneCapacity];
+        if (kind == 0) header.op = static_cast<Journal::Op>(255);
+        if (kind == 1) header.bytes = 1;
+        if (kind == 2) ++header.byteStart;
+        if (kind == 3) {
+            const std::array<std::uint32_t, 2> counts{Journal::CallCapacity + 1, 0};
+            Journal::copyToLane(*lane, header.byteStart, counts.data(), sizeof(counts));
+        }
+    }
 };
 }
 namespace {
@@ -113,6 +140,18 @@ void writeBuffer(Journal& journal, VkDeviceSize offset, VkDescriptorSet destinat
     write.pImageInfo = reinterpret_cast<const VkDescriptorImageInfo*>(1);
     journal.updateSets(1, 1, &write, 0, nullptr);
     bi.buffer = VK_NULL_HANDLE; bi.offset = 9999; write.dstSet = VK_NULL_HANDLE;
+}
+void writeLargeBatch(Journal& journal, VkDeviceSize offset) {
+    std::array<VkDescriptorBufferInfo, Journal::CallCapacity> buffers{};
+    std::array<VkWriteDescriptorSet, Journal::CallCapacity> writes{};
+    for (std::size_t i = 0; i < writes.size(); ++i) {
+        buffers[i] = {buffer, offset + i, 128};
+        writes[i] = info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+        writes[i].dstSet = ds; writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[i].pBufferInfo = &buffers[i];
+    }
+    journal.updateSets(1, writes.size(), writes.data(), 0, nullptr);
+    buffers = {}; writes = {};
 }
 void ownershipAndOrdering() {
     auto journal = std::make_unique<Journal>();
@@ -318,7 +357,7 @@ void operationLossAttribution() {
     require(counters[update].publicationLoss == 1 && counters[update].replayLoss == 0,
             "queue loss was not attributed to its rejected operation");
     const auto callback = [](std::uint32_t, const Snapshot&) noexcept {};
-    journal->drain(callback);
+    while (journal->drain(callback)) {}
     journal->beginCommand(1, h<VkCommandBuffer>(999));
     journal->drain(callback);
     counters = journal->operationCounters();
@@ -347,6 +386,83 @@ void operationLossAttribution() {
             "out-of-range operation name access was not bounded");
     require(publicationLoss == 3 && replayLoss == 1 && journal->lostState() == 4,
             "operation counters changed or omitted aggregate sticky losses");
+}
+void compactByteBoundsAndReuse() {
+    const auto callback = [](std::uint32_t, const Snapshot&) noexcept {};
+    auto compact = std::make_unique<Journal>(); seed(*compact); snap(*compact);
+    // A complete frame-sized burst of short updates must fit without borrowing
+    // caller memory, evicting history, or requiring consumer scheduling.
+    monitorHookAllocations = true;
+    for (std::uint32_t i = 0; i < 512; ++i) writeBuffer(*compact, i);
+    monitorHookAllocations = false;
+    const auto complete = snap(*compact);
+    require(complete.sourceComplete && at(complete, 0).effectiveOffset == 511,
+            "compact frame burst failed to retain every ordered short update");
+    require(compact->transportCounters().queue == 0 && hookAllocations == 0,
+            "compact frame burst lost records or allocated in a hook");
+    // Both the initial tiny prefix and a full write/copy pair cross the pool
+    // boundary. Copy entries must have the correct active union member on restore.
+    JournalTestAccess::bytePosition(*compact, Journal::ByteCapacity - 3);
+    require(snap(*compact).sourceComplete, "snapshot prefix split at byte wrap changed its fields");
+    const auto second = h<VkDescriptorSet>(41);
+    auto allocate = info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+    allocate.descriptorPool = dp; allocate.descriptorSetCount = 1; allocate.pSetLayouts = &sl;
+    compact->allocateSets(1, allocate, &second); compact->drain(callback);
+    JournalTestAccess::bytePosition(*compact, 2 * Journal::ByteCapacity - 5);
+    VkDescriptorBufferInfo bi{buffer, 96, 128};
+    auto write = info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+    write.dstSet = ds; write.descriptorCount = 1; write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; write.pBufferInfo = &bi;
+    auto copy = info<VkCopyDescriptorSet>(VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET);
+    copy.srcSet = ds; copy.dstSet = second; copy.descriptorCount = 1;
+    compact->updateSets(1, 1, &write, 1, &copy);
+    bi = {}; write = {}; copy = {};
+    compact->bindSets(1, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &second, 0, nullptr);
+    require(at(snap(*compact), 0).effectiveOffset == 96, "wrapped write/copy prefix retained dead caller arrays or wrong union member");
+    // Natural repeated byte/header reuse mixes the largest record, scalar
+    // records and small binding/snapshot prefixes without changing capacities.
+    for (std::uint32_t i = 0; i < 256; ++i) {
+        writeLargeBatch(*compact, i);
+        compact->endCommand(1, cb); compact->beginCommand(1, cb);
+        compact->bindSets(1, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
+        const auto value = snap(*compact);
+        require(value.sourceComplete && at(value, 0).effectiveOffset == i + Journal::CallCapacity - 1,
+                "mixed compact byte/header wraps changed descriptor values or lifetimes");
+    }
+    compact->close(); require(compact->finished() && compact->lostState() == 0, "compact wrap fixture failed clean closure");
+
+    auto saturated = std::make_unique<Journal>(); seed(*saturated); snap(*saturated);
+    const auto largeBytes = JournalTestAccess::largeUpdateBytes();
+    const auto accepted = Journal::ByteCapacity / largeBytes;
+    for (std::size_t i = 0; i <= accepted; ++i) writeLargeBatch(*saturated, i);
+    const auto counts = saturated->transportCounters();
+    require(counts.queue == 1 && counts.byteQueue == 1 && counts.headerQueue == 0,
+            "byte pool exhaustion was hidden or confused with header exhaustion");
+    require(counts.maxLaneBytes == accepted * largeBytes && counts.maxLaneOccupancy == accepted,
+            "byte/header high-water did not describe the retained full-payload burst");
+    while (saturated->drain(callback)) {}
+    require(!snap(*saturated).sourceComplete, "drainage erased historical byte-pool loss");
+    saturated->close(); require(saturated->finished(), "byte-saturated journal failed bounded closure");
+
+    auto wrapped = std::make_unique<Journal>(); seed(*wrapped); snap(*wrapped);
+    JournalTestAccess::bytePosition(*wrapped, UINT64_MAX - sizeof(std::uint64_t));
+    wrapped->endCommand(1, cb);
+    wrapped->drain(callback);
+    require(!wrapped->requestSnapshot(1, cb, pl, 0) && wrapped->transportCounters().orderWrap == 1,
+            "byte cursor overflow reused an earlier byte generation");
+    wrapped->close(); require(wrapped->finished() && wrapped->transportCounters().orderGap == 0,
+            "byte overflow allocated a missing global ticket before rejection");
+}
+void malformedCompactRecords() {
+    for (unsigned kind = 0; kind < 4; ++kind) {
+        auto journal = std::make_unique<Journal>(); seed(*journal); snap(*journal);
+        writeBuffer(*journal, 96);
+        JournalTestAccess::corruptHead(*journal, kind);
+        journal->drain([](std::uint32_t, const Snapshot&) noexcept {});
+        require(journal->lossCount(Reason::Bounds) == 1,
+                "malformed compact header/prefix did not fail closed before replay");
+        require(!journal->requestSnapshot(1, cb, pl, 0), "malformed compact state admitted a fresh proof request");
+        journal->close(); require(journal->finished(), "malformed compact journal did not finish bounded cleanup");
+    }
 }
 void laneWrapAndDependencies() {
     auto journal = std::make_unique<Journal>(); seed(*journal); auto initial = snap(*journal);
@@ -448,7 +564,7 @@ void extensionOwnership() {
 // it does not reproduce compositor scheduling or establish hardware throughput.
 void benchmark() {
     using Clock = std::chrono::steady_clock;
-    constexpr std::size_t batches = 5000;
+    constexpr std::size_t batches = 5000, batchSize = 128;
     for (const auto producerIndex : {std::size_t{0}, Journal::ProducerCapacity - 1}) {
         auto journal = std::make_unique<Journal>();
         for (std::size_t i = 0; i < producerIndex; ++i) {
@@ -460,18 +576,18 @@ void benchmark() {
         std::int64_t publicationNs = 0, drainNs = 0;
         for (std::size_t batch = 0; batch < batches; ++batch) {
             const auto begin = Clock::now();
-            for (std::size_t i = 0; i < Journal::LaneCapacity; ++i)
+            for (std::size_t i = 0; i < batchSize; ++i)
                 journal->updateSets(1, 0, nullptr, 0, nullptr);
             const auto published = Clock::now();
-            const auto count = journal->drain(callback, Journal::LaneCapacity);
+            const auto count = journal->drain(callback, batchSize);
             const auto end = Clock::now();
-            require(count == Journal::LaneCapacity, "benchmark lost a retained operation");
+            require(count == batchSize, "benchmark lost a retained operation");
             publicationNs += std::chrono::duration_cast<std::chrono::nanoseconds>(published - begin).count();
             drainNs += std::chrono::duration_cast<std::chrono::nanoseconds>(end - published).count();
         }
         require(journal->lostState() == 0, "benchmark incurred hidden state loss");
         journal->close(); require(journal->finished(), "benchmark did not finish");
-        const auto records = batches * Journal::LaneCapacity;
+        const auto records = batches * batchSize;
         std::cout << "{\"producer_index\":" << producerIndex << ",\"records\":" << records
                   << ",\"publication_ns_per_record\":" << static_cast<double>(publicationNs) / records
                   << ",\"drain_ns_per_record\":" << static_cast<double>(drainNs) / records << "}\n";
@@ -480,6 +596,7 @@ void benchmark() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--benchmark") { benchmark(); return 0; }
     ownershipAndOrdering(); selectedSnapshotBurst(); writeBeforeCopyBatch(); delayedPredecessorAndClosure(); concurrentProducers();
-    registryQueueBatchAndWrap(); operationLossAttribution(); laneWrapAndDependencies(); extensionOwnership();
+    registryQueueBatchAndWrap(); operationLossAttribution(); compactByteBoundsAndReuse(); malformedCompactRecords();
+    laneWrapAndDependencies(); extensionOwnership();
     std::cout << checks << " journal checks passed; " << sizeof(Journal) << " bytes fixed state; no hook allocations\n";
 }

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <cstring>
 #include <new>
 #include <type_traits>
 
@@ -26,16 +27,19 @@ class Journal {
     friend struct JournalTestAccess;
 public:
     static constexpr std::size_t ProducerCapacity = 32;
-    // Accommodate the selected 32-snapshot burst while the background owner
-    // serializes results. Saturation still invalidates proof without blocking.
-    static constexpr std::size_t LaneCapacity = 128;
+    // Separate bounded headers from owned bytes: short scalar/update bursts
+    // no longer reserve the maximum 2.5-KiB union per observation. The combined
+    // lane storage stays below the previous 128 full-record lane budget.
+    static constexpr std::size_t LaneCapacity = 2048;
+    static constexpr std::size_t ByteCapacity = 256 * 1024;
     static constexpr std::uint32_t CallCapacity = 32;
     static constexpr std::size_t OperationCount = 37;
     struct TransportCounters {
         std::uint64_t registry = 0, queue = 0, orderGap = 0, batch = 0;
         std::uint64_t orderWrap = 0, closedCalls = 0;
         std::uint64_t published = 0, replayed = 0;
-        std::uint64_t maxLaneOccupancy = 0;
+        std::uint64_t maxLaneOccupancy = 0, maxLaneBytes = 0;
+        std::uint64_t headerQueue = 0, byteQueue = 0;
     };
     struct OperationCounters {
         std::uint64_t publicationLoss = 0, replayLoss = 0;
@@ -86,7 +90,11 @@ public:
         for (const auto& lane : lanes_) {
             const auto highWater = lane.highWater.load(std::memory_order_relaxed);
             if (highWater > result.maxLaneOccupancy) result.maxLaneOccupancy = highWater;
+            const auto highBytes = lane.highWaterBytes.load(std::memory_order_relaxed);
+            if (highBytes > result.maxLaneBytes) result.maxLaneBytes = highBytes;
         }
+        result.headerQueue = headerQueue_.load(std::memory_order_relaxed);
+        result.byteQueue = byteQueue_.load(std::memory_order_relaxed);
         return result;
     }
     std::array<OperationCounters, OperationCount> operationCounters() const noexcept {
@@ -102,7 +110,7 @@ public:
         std::size_t drained = 0;
         while (drained < maxRecords) {
             Lane* chosen = nullptr;
-            Record* record = nullptr;
+            RecordHeader* record = nullptr;
             // Native API bursts commonly come from one producer. Reuse that
             // lane only when its next published ticket is exactly expected;
             // a delayed earlier producer still forces a complete search.
@@ -137,24 +145,34 @@ public:
                 }
                 break;
             }
+            Record observation;
+            const auto restored = restore(*chosen, *record, observation);
+            if (!restored) {
+                lose(Reason::Bounds, Transport::None);
+                halted_.store(true, std::memory_order_release);
+                aborted_ = true;
+            }
             const auto lossBefore = core_.lostState();
             if (record->op == Op::Snapshot) {
                 Snapshot result;
-                if (!aborted_) result = core_.snapshot(record->device, record->payload.snapshot.command, record->payload.snapshot.layout);
+                if (!aborted_ && restored) result = core_.snapshot(record->device, observation.payload.snapshot.command, observation.payload.snapshot.layout);
                 else result.device = record->device;
                 if (lost_.load(std::memory_order_acquire)) {
                     result.sourceComplete = false; result.gpuConsumedCoherent = false;
                     result.layout_has_binding31 = Presence::Unknown;
                     result.reason = lastLoss_.load(std::memory_order_relaxed);
                 }
-                callback(record->payload.snapshot.cookie, result);
-            } else if (!aborted_) replay(*record);
+                callback(restored ? observation.payload.snapshot.cookie : 0, result);
+            } else if (!aborted_ && restored) replay(observation);
             const auto replayLoss = core_.lostState() - lossBefore;
-            if (replayLoss) replayLoss_[static_cast<std::size_t>(record->op)].fetch_add(replayLoss, std::memory_order_relaxed);
+            const auto operationIndex = static_cast<std::size_t>(record->op);
+            if (replayLoss && operationIndex < OperationCount)
+                replayLoss_[operationIndex].fetch_add(replayLoss, std::memory_order_relaxed);
             if (!aborted_) ++expected_;
             preferred_ = chosen;
             // Both values have exactly one mutating background owner. Readers
             // observe atomics, but neither counter needs a locked RMW operation.
+            if (restored) chosen->byteRead.store(record->byteStart + record->bytes, std::memory_order_release);
             chosen->read.store(chosen->read.load(std::memory_order_relaxed) + 1, std::memory_order_release);
             ++drained;
             replayed_.store(replayed_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -180,7 +198,7 @@ public:
                     p.immutable[i] = info.pBindings[i].pImmutableSamplers[0]; p.hasImmutable[i] = true;
                 }
             }
-        });
+        }, arrayBytes<bool, BindingCapacity>(offsetof(SetLayoutRecord, hasImmutable), info.bindingCount));
     }
     void createPipelineLayout(std::uint64_t device, VkPipelineLayout value, const VkPipelineLayoutCreateInfo& info) noexcept {
         if (info.setLayoutCount > SetIndexCapacity || info.pushConstantRangeCount > CallCapacity ||
@@ -190,7 +208,7 @@ public:
             p.unsupported = info.pNext != nullptr; p.info.pNext = nullptr; p.info.pSetLayouts = nullptr; p.info.pPushConstantRanges = nullptr;
             for (std::uint32_t i = 0; i < info.setLayoutCount; ++i) p.layouts[i] = info.pSetLayouts[i];
             for (std::uint32_t i = 0; i < info.pushConstantRangeCount; ++i) p.ranges[i] = info.pPushConstantRanges[i];
-        });
+        }, info.pushConstantRangeCount ? arrayBytes<VkPushConstantRange, CallCapacity>(offsetof(PipelineLayoutRecord, ranges), info.pushConstantRangeCount) : arrayBytes<VkDescriptorSetLayout, SetIndexCapacity>(offsetof(PipelineLayoutRecord, layouts), info.setLayoutCount));
     }
     void createPool(std::uint64_t device, VkDescriptorPool value, const VkDescriptorPoolCreateInfo& info) noexcept {
         // Core does not consume pPoolSizes; retain no caller-owned pointer.
@@ -205,14 +223,14 @@ public:
             auto& p = construct(r.payload.sets); p = {}; p.info = info; p.unsupported = info.pNext != nullptr;
             p.info.pNext = nullptr; p.info.pSetLayouts = nullptr;
             for (std::uint32_t i = 0; i < info.descriptorSetCount; ++i) { p.values[i] = values[i]; p.layouts[i] = info.pSetLayouts[i]; }
-        });
+        }, arrayBytes<VkDescriptorSetLayout, CallCapacity>(offsetof(SetsRecord, layouts), info.descriptorSetCount));
     }
     void freeSets(std::uint64_t device, VkDescriptorPool pool, std::uint32_t count, const VkDescriptorSet* values) noexcept {
         if (count > CallCapacity || (count && !values)) { rejectBatch(Op::FreeSets); return; }
         publish(Op::FreeSets, device, [&](Record& r) {
             r.payload.freeSets = {}; r.payload.freeSets.pool = pool; r.payload.freeSets.count = count;
             for (std::uint32_t i = 0; i < count; ++i) r.payload.freeSets.values[i] = values[i];
-        });
+        }, arrayBytes<VkDescriptorSet, CallCapacity>(offsetof(FreeSetsRecord, values), count));
     }
     void updateSets(std::uint64_t device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes,
                     std::uint32_t copyCount, const VkCopyDescriptorSet* copies) noexcept {
@@ -257,7 +275,7 @@ public:
                 out = {in.srcSet, in.dstSet, in.srcBinding, in.dstBinding, in.srcArrayElement, in.dstArrayElement,
                        in.descriptorCount, in.sType, in.pNext != nullptr};
             }
-        });
+        }, arrayBytes<UpdateEntry, CallCapacity>(offsetof(UpdateRecord, entries), writeCount + copyCount));
     }
 
     void allocateMemory(std::uint64_t device, VkDeviceMemory value, const VkMemoryAllocateInfo& info) noexcept {
@@ -304,7 +322,7 @@ public:
             auto& p = construct(r.payload.memoryBatch); p.count = count;
             for (std::uint32_t i = 0; i < count; ++i)
                 p.values[i] = {handle(info[i].buffer), info[i].memory, info[i].memoryOffset, !info[i].pNext};
-        });
+        }, arrayBytes<MemoryBindingRecord, CallCapacity>(offsetof(MemoryBindingBatchRecord, values), count));
     }
     void bindImageMemory2(std::uint64_t device, std::uint32_t count, const VkBindImageMemoryInfo* info) noexcept {
         if (count > CallCapacity || (count && !info)) { rejectBatch(Op::BindImageMemoryBatch); return; }
@@ -312,7 +330,7 @@ public:
             auto& p = construct(r.payload.memoryBatch); p.count = count;
             for (std::uint32_t i = 0; i < count; ++i)
                 p.values[i] = {handle(info[i].image), info[i].memory, info[i].memoryOffset, !info[i].pNext};
-        });
+        }, arrayBytes<MemoryBindingRecord, CallCapacity>(offsetof(MemoryBindingBatchRecord, values), count));
     }
     void allocateCommands(std::uint64_t device, VkCommandPool pool, std::uint32_t count, const VkCommandBuffer* values) noexcept {
         commandArray(Op::AllocateCommands, device, pool, count, values);
@@ -331,7 +349,7 @@ public:
             p.first = firstSet; p.count = count; p.dynamicCount = dynamicCount;
             for (std::uint32_t i = 0; i < count; ++i) p.values[i] = values[i];
             for (std::uint32_t i = 0; i < dynamicCount; ++i) p.offsets[i] = offsets[i];
-        });
+        }, dynamicCount ? arrayBytes<std::uint32_t, SetIndexCapacity * BindingCapacity>(offsetof(BindSetsRecord, offsets), dynamicCount) : arrayBytes<VkDescriptorSet, SetIndexCapacity>(offsetof(BindSetsRecord, values), count));
     }
 
     void destroySetLayout(std::uint64_t d, VkDescriptorSetLayout v) noexcept { scalar(Op::DestroySetLayout, d, handle(v)); }
@@ -415,11 +433,28 @@ private:
         Payload() noexcept {}
     };
     struct Record { std::uint64_t ticket = 0, device = 0; Op op = Op::Snapshot; Payload payload; };
+    struct RecordHeader {
+        std::uint64_t ticket = 0, device = 0, byteStart = 0;
+        std::uint32_t bytes = 0;
+        Op op = Op::Snapshot;
+    };
     struct Lane {
         std::atomic<std::uint64_t> owner{0}, read{0}, write{0}, highWater{0};
+        std::atomic<std::uint64_t> byteRead{0}, highWaterBytes{0};
         std::uint64_t acquiredWrite = 0; // Background owner only.
-        std::array<Record, LaneCapacity> records;
+        std::uint64_t byteWrite = 0; // Registered producer only.
+        std::array<RecordHeader, LaneCapacity> records;
+        std::array<unsigned char, ByteCapacity> bytes;
     };
+    template<class... T> struct OwnedRepresentation : std::bool_constant<
+        (... && (std::is_standard_layout_v<T> && std::is_trivially_copyable_v<T>))> {};
+    static_assert(OwnedRepresentation<SetLayoutRecord, PipelineLayoutRecord, PoolRecord, SetsRecord,
+        FreeSetsRecord, WriteRecord, CopyRecord, UpdateEntry, UpdateRecord, MemoryRecord, BufferRecord,
+        ImageRecord, ViewRecord, SamplerRecord, ConversionRecord, MemoryBindingRecord,
+        MemoryBindingBatchRecord, CommandRecord, BindSetsRecord, SnapshotRecord>::value,
+        "Owned compact metadata must have standard layout and a trivially copyable representation");
+    static_assert(sizeof(RecordHeader) == 32, "Compact headers exceeded their bounded lane budget");
+    static_assert(sizeof(Lane) <= 128 * sizeof(Record), "Compact lanes must not increase the old memory budget");
     static_assert(std::is_trivially_copyable_v<Payload>, "Metadata records must own scalar storage");
     static_assert(sizeof(Record) <= 4096, "Journal record exceeded its memory budget");
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free, "Ticket and lane atomics must be lock-free");
@@ -428,6 +463,147 @@ private:
     static_assert(std::atomic<Reason>::is_always_lock_free, "Loss atomics must be lock-free");
 
     template<class T> static T& construct(T& storage) noexcept { return *::new (static_cast<void*>(&storage)) T{}; }
+    template<class T, std::size_t N> static constexpr std::uint32_t arrayBytes(std::size_t offset, std::uint32_t count) noexcept {
+        static_assert(std::is_standard_layout_v<std::array<T, N>> && sizeof(std::array<T, N>) == N * sizeof(T),
+                      "Compact prefixes require contiguous array storage without extra representation bytes");
+        return static_cast<std::uint32_t>(offset + count * sizeof(T));
+    }
+    static std::uint32_t fullBytes(Op op) noexcept {
+        switch (op) {
+        case Op::CreateSetLayout: return sizeof(SetLayoutRecord);
+        case Op::CreatePipelineLayout: return sizeof(PipelineLayoutRecord);
+        case Op::CreatePool: return sizeof(PoolRecord);
+        case Op::AllocateSets: return sizeof(SetsRecord);
+        case Op::FreeSets: return sizeof(FreeSetsRecord);
+        case Op::UpdateSets: return sizeof(UpdateRecord);
+        case Op::AllocateMemory: return sizeof(MemoryRecord);
+        case Op::CreateBuffer: return sizeof(BufferRecord);
+        case Op::CreateImage: return sizeof(ImageRecord);
+        case Op::CreateView: return sizeof(ViewRecord);
+        case Op::CreateSampler: return sizeof(SamplerRecord);
+        case Op::CreateConversion: return sizeof(ConversionRecord);
+        case Op::BindBufferMemory: case Op::BindImageMemory: return sizeof(MemoryBindingRecord);
+        case Op::BindBufferMemoryBatch: case Op::BindImageMemoryBatch: return sizeof(MemoryBindingBatchRecord);
+        case Op::AllocateCommands: case Op::FreeCommands: return sizeof(CommandRecord);
+        case Op::BindSets: return sizeof(BindSetsRecord);
+        case Op::Snapshot: return sizeof(SnapshotRecord);
+        default: return sizeof(std::uint64_t);
+        }
+    }
+    static std::uint32_t minimumBytes(Op op) noexcept {
+        switch (op) {
+        case Op::CreateSetLayout: return offsetof(SetLayoutRecord, hasImmutable);
+        case Op::CreatePipelineLayout: return offsetof(PipelineLayoutRecord, layouts);
+        case Op::AllocateSets: return offsetof(SetsRecord, layouts);
+        case Op::FreeSets: return offsetof(FreeSetsRecord, values);
+        case Op::UpdateSets: return offsetof(UpdateRecord, entries);
+        case Op::BindBufferMemoryBatch: case Op::BindImageMemoryBatch: return offsetof(MemoryBindingBatchRecord, values);
+        case Op::AllocateCommands: case Op::FreeCommands: return offsetof(CommandRecord, values);
+        case Op::BindSets: return offsetof(BindSetsRecord, values);
+        default: return fullBytes(op);
+        }
+    }
+    static std::uint32_t usedBytes(const Record& r) noexcept {
+        switch (r.op) {
+        case Op::CreateSetLayout: {
+            const auto count = r.payload.setLayout.info.bindingCount;
+            return count <= BindingCapacity ? arrayBytes<bool, BindingCapacity>(offsetof(SetLayoutRecord, hasImmutable), count) : 0;
+        }
+        case Op::CreatePipelineLayout: {
+            const auto& info = r.payload.pipelineLayout.info;
+            if (info.setLayoutCount > SetIndexCapacity || info.pushConstantRangeCount > CallCapacity) return 0;
+            return info.pushConstantRangeCount ? arrayBytes<VkPushConstantRange, CallCapacity>(offsetof(PipelineLayoutRecord, ranges), info.pushConstantRangeCount)
+                : arrayBytes<VkDescriptorSetLayout, SetIndexCapacity>(offsetof(PipelineLayoutRecord, layouts), info.setLayoutCount);
+        }
+        case Op::AllocateSets: {
+            const auto count = r.payload.sets.info.descriptorSetCount;
+            return count <= CallCapacity ? arrayBytes<VkDescriptorSetLayout, CallCapacity>(offsetof(SetsRecord, layouts), count) : 0;
+        }
+        case Op::FreeSets: {
+            const auto count = r.payload.freeSets.count;
+            return count <= CallCapacity ? arrayBytes<VkDescriptorSet, CallCapacity>(offsetof(FreeSetsRecord, values), count) : 0;
+        }
+        case Op::UpdateSets: {
+            const auto& p = r.payload.updates;
+            if (p.writes > CallCapacity || p.copies > CallCapacity - p.writes) return 0;
+            return arrayBytes<UpdateEntry, CallCapacity>(offsetof(UpdateRecord, entries), p.writes + p.copies);
+        }
+        case Op::BindBufferMemoryBatch: case Op::BindImageMemoryBatch: {
+            const auto count = r.payload.memoryBatch.count;
+            return count <= CallCapacity ? arrayBytes<MemoryBindingRecord, CallCapacity>(offsetof(MemoryBindingBatchRecord, values), count) : 0;
+        }
+        case Op::AllocateCommands: case Op::FreeCommands: {
+            const auto count = r.payload.commands.count;
+            return count <= CallCapacity ? arrayBytes<VkCommandBuffer, CallCapacity>(offsetof(CommandRecord, values), count) : 0;
+        }
+        case Op::BindSets: {
+            const auto& p = r.payload.bindSets;
+            if (p.count > SetIndexCapacity || p.dynamicCount > SetIndexCapacity * BindingCapacity) return 0;
+            return p.dynamicCount ? arrayBytes<std::uint32_t, SetIndexCapacity * BindingCapacity>(offsetof(BindSetsRecord, offsets), p.dynamicCount)
+                : arrayBytes<VkDescriptorSet, SetIndexCapacity>(offsetof(BindSetsRecord, values), p.count);
+        }
+        default: return fullBytes(r.op);
+        }
+    }
+    static void* initializePayload(Record& r) noexcept {
+        // Explicitly start the chosen member's lifetime before restoring bytes.
+        // Value initialization also gives every unused array tail a valid value.
+        switch (r.op) {
+        case Op::CreateSetLayout: return &construct(r.payload.setLayout);
+        case Op::CreatePipelineLayout: return &construct(r.payload.pipelineLayout);
+        case Op::CreatePool: return &construct(r.payload.pool);
+        case Op::AllocateSets: return &construct(r.payload.sets);
+        case Op::FreeSets: return &construct(r.payload.freeSets);
+        case Op::UpdateSets: return &construct(r.payload.updates);
+        case Op::AllocateMemory: return &construct(r.payload.memory);
+        case Op::CreateBuffer: return &construct(r.payload.buffer);
+        case Op::CreateImage: return &construct(r.payload.image);
+        case Op::CreateView: return &construct(r.payload.view);
+        case Op::CreateSampler: return &construct(r.payload.sampler);
+        case Op::CreateConversion: return &construct(r.payload.conversion);
+        case Op::BindBufferMemory: case Op::BindImageMemory: return &construct(r.payload.binding);
+        case Op::BindBufferMemoryBatch: case Op::BindImageMemoryBatch: return &construct(r.payload.memoryBatch);
+        case Op::AllocateCommands: case Op::FreeCommands: return &construct(r.payload.commands);
+        case Op::BindSets: return &construct(r.payload.bindSets);
+        case Op::Snapshot: return &construct(r.payload.snapshot);
+        default: return &construct(r.payload.scalar);
+        }
+    }
+    static void copyToLane(Lane& lane, std::uint64_t start, const void* source, std::uint32_t bytes) noexcept {
+        const auto offset = static_cast<std::size_t>(start % ByteCapacity);
+        const auto first = bytes < ByteCapacity - offset ? bytes : ByteCapacity - offset;
+        std::memcpy(lane.bytes.data() + offset, source, first);
+        if (first != bytes)
+            std::memcpy(lane.bytes.data(), static_cast<const unsigned char*>(source) + first, bytes - first);
+    }
+    static void copyFromLane(const Lane& lane, std::uint64_t start, void* destination, std::uint32_t bytes) noexcept {
+        const auto offset = static_cast<std::size_t>(start % ByteCapacity);
+        const auto first = bytes < ByteCapacity - offset ? bytes : ByteCapacity - offset;
+        std::memcpy(destination, lane.bytes.data() + offset, first);
+        if (first != bytes)
+            std::memcpy(static_cast<unsigned char*>(destination) + first, lane.bytes.data(), bytes - first);
+    }
+    static bool restore(Lane& lane, const RecordHeader& header, Record& record) noexcept {
+        if (static_cast<std::size_t>(header.op) >= OperationCount ||
+            header.bytes < minimumBytes(header.op) || header.bytes > fullBytes(header.op) ||
+            header.byteStart != lane.byteRead.load(std::memory_order_relaxed) ||
+            header.byteStart > std::numeric_limits<std::uint64_t>::max() - header.bytes) return false;
+        record.ticket = header.ticket; record.device = header.device; record.op = header.op;
+        auto* destination = initializePayload(record);
+        if (header.op == Op::UpdateSets) {
+            // The initialized array has WriteRecord members active. Select each
+            // CopyRecord member before copying its representation (C++17 does
+            // not start an inactive union member's lifetime via memcpy).
+            std::array<std::uint32_t, 2> counts{};
+            if (header.bytes < sizeof(counts)) return false;
+            copyFromLane(lane, header.byteStart, counts.data(), sizeof(counts));
+            if (counts[0] > CallCapacity || counts[1] > CallCapacity - counts[0]) return false;
+            for (std::uint32_t i = 0; i < counts[1]; ++i)
+                construct(record.payload.updates.entries[counts[0] + i].copy);
+        }
+        copyFromLane(lane, header.byteStart, destination, header.bytes);
+        return usedBytes(record) == header.bytes;
+    }
     template<class T> static T fromHandle(std::uint64_t value) noexcept {
         if constexpr (std::is_pointer_v<T>) return reinterpret_cast<T>(static_cast<std::uintptr_t>(value));
         else return static_cast<T>(value);
@@ -441,7 +617,7 @@ private:
         publicationLoss_[static_cast<std::size_t>(op)].fetch_add(1, std::memory_order_relaxed);
         lose(reason, transport);
     }
-    static Record* head(Lane& lane) noexcept {
+    static RecordHeader* head(Lane& lane) noexcept {
         const auto read = lane.read.load(std::memory_order_relaxed);
         // A release/acquire publication boundary covers every preceding slot.
         // Retain that boundary until exhausted; never inspect an unpublished
@@ -489,7 +665,7 @@ private:
         }
         lose(Reason::Capacity, Transport::Registry); return nullptr;
     }
-    template<class Fill> bool publish(Op op, std::uint64_t device, Fill&& fill) noexcept {
+    template<class Fill> bool publish(Op op, std::uint64_t device, Fill&& fill, std::uint32_t bytes = 0) noexcept {
         active_.fetch_add(1, std::memory_order_acq_rel);
         if (closed_.load(std::memory_order_acquire) || halted_.load(std::memory_order_acquire)) {
             publicationFailure(op, Reason::Unknown, Transport::ClosedCalls); active_.fetch_sub(1, std::memory_order_release); return false;
@@ -502,22 +678,46 @@ private:
         }
         const auto write = lane->write.load(std::memory_order_relaxed);
         const auto read = lane->read.load(std::memory_order_acquire);
-        if (write - read >= LaneCapacity || write == std::numeric_limits<std::uint64_t>::max()) {
+        if (write - read >= LaneCapacity) {
+            headerQueue_.fetch_add(1, std::memory_order_relaxed);
             publicationFailure(op, Reason::Capacity, Transport::Queue); active_.fetch_sub(1, std::memory_order_release); return false;
+        }
+        if (!bytes) bytes = fullBytes(op);
+        const auto byteRead = lane->byteRead.load(std::memory_order_acquire);
+        const auto byteWrite = lane->byteWrite;
+        if (!bytes || bytes > fullBytes(op)) {
+            publicationFailure(op, Reason::Bounds, Transport::Batch); active_.fetch_sub(1, std::memory_order_release); return false;
+        }
+        if (byteWrite - byteRead > ByteCapacity || bytes > ByteCapacity - (byteWrite - byteRead)) {
+            byteQueue_.fetch_add(1, std::memory_order_relaxed);
+            publicationFailure(op, Reason::Capacity, Transport::Queue); active_.fetch_sub(1, std::memory_order_release); return false;
+        }
+        if (write == std::numeric_limits<std::uint64_t>::max() || byteWrite > std::numeric_limits<std::uint64_t>::max() - bytes) {
+            halted_.store(true, std::memory_order_release);
+            publicationFailure(op, Reason::Capacity, Transport::OrderWrap); active_.fetch_sub(1, std::memory_order_release); return false;
         }
         const auto ticket = tickets_.fetch_add(1, std::memory_order_acq_rel);
         if (!ticket || ticket == std::numeric_limits<std::uint64_t>::max()) {
             halted_.store(true, std::memory_order_release); publicationFailure(op, Reason::Capacity, Transport::OrderWrap);
             active_.fetch_sub(1, std::memory_order_release); return false;
         }
-        auto& record = lane->records[write % LaneCapacity];
+        // Fill after ticket reservation so an interrupted producer retains its
+        // exact predecessor position. The stack object owns active typed members;
+        // the byte pool itself is never interpreted as a C++ object.
+        Record record;
         record.ticket = ticket; record.device = device; record.op = op;
         fill(record);
+        copyToLane(*lane, byteWrite, &record.payload, bytes);
+        lane->records[write % LaneCapacity] = {ticket, device, byteWrite, bytes, op};
+        lane->byteWrite = byteWrite + bytes;
         // Only this producer writes its lane maximum. Store on a new maximum;
         // no CAS retry or counter work is needed once a burst reached capacity.
         const auto occupancy = write - read + 1;
         if (occupancy > lane->highWater.load(std::memory_order_relaxed))
             lane->highWater.store(occupancy, std::memory_order_relaxed);
+        const auto byteOccupancy = byteWrite - byteRead + bytes;
+        if (byteOccupancy > lane->highWaterBytes.load(std::memory_order_relaxed))
+            lane->highWaterBytes.store(byteOccupancy, std::memory_order_relaxed);
         lane->write.store(write + 1, std::memory_order_release);
         published_.fetch_add(1, std::memory_order_relaxed);
         active_.fetch_sub(1, std::memory_order_release);
@@ -531,7 +731,7 @@ private:
         publish(op, device, [&](Record& r) {
             auto& p = construct(r.payload.commands); p.pool = pool; p.count = count;
             for (std::uint32_t i = 0; i < count; ++i) p.values[i] = values[i];
-        });
+        }, arrayBytes<VkCommandBuffer, CallCapacity>(offsetof(CommandRecord, values), count));
     }
     void replay(Record& r) noexcept {
         const auto d = r.device;
@@ -629,6 +829,7 @@ private:
     std::array<std::atomic<std::uint64_t>, 8> losses_{};
     std::array<std::atomic<std::uint64_t>, 6> transport_{};
     std::array<std::atomic<std::uint64_t>, OperationCount> publicationLoss_{}, replayLoss_{};
+    std::atomic<std::uint64_t> headerQueue_{0}, byteQueue_{0};
     Lane* preferred_ = nullptr; // Background owner only; never read by hooks.
     std::uint64_t expected_ = 1;
     bool aborted_ = false;
