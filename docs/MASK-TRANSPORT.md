@@ -130,7 +130,10 @@ sender, secure service or benchmark of Frame streaming latency/bandwidth.
 
 - Protocol: 8,482 assertions, adversarial/mutated traffic and randomized payloads;
   separate AddressSanitizer/UndefinedBehaviorSanitizer run passed.
-- Shader: 36 focused tests with real assembly, validation and refusal controls.
+- Shader: 44 focused tests with real assembly, validation and refusal controls,
+  including original separate-image/sampler resources that expose native type
+  reuse. Private generation of the inspected Frame shader passes `spirv-val`
+  for both RGB conventions; this establishes assembly compatibility only.
 - Collector: 15 focused tests, including a real synthetic shader tool roundtrip.
 - Root integration: real UDP roundtrip/wrong-identity controls, generated shader
   GPU rendering with straight and premultiplied input, legacy/stripped-module

@@ -127,6 +127,13 @@ metadata cases. This is a useful interception lead, not proof that an external
 application frame ID survives encoding, decoding and compositor surface reuse.
 Static strings alone do not establish an ABI or a reliable pairing contract.
 
+Detailed metadata and remaining coordinate constraints are recorded in
+[the installed-shader inspection](FRAME-SHADER-20261011.md). The bounded shader
+type-reuse repair was verified with the 44 focused shader tests and the headless
+Vulkan rendering/guard test. Transport, endpoint and collector evidence remains
+the earlier complete foundation gate; those unchanged areas were not rerun for
+this repair.
+
 ## Local diagnostics collector
 
 Run on the Frame, from a checkout of this fork:
