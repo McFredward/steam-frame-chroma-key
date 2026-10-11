@@ -52,7 +52,7 @@ class Session:
         manifest = json.dumps({"file_format_version": "1.2.0", "layer": {
             "name": "VK_LAYER_FRAME_MASK_trace", "type": "GLOBAL",
             "library_path": str(self.folder / "libVkLayer_frame_mask_trace.so"),
-            "api_version": "1.3.0", "implementation_version": 1,
+            "api_version": "1.3.0", "implementation_version": "1",
             "description": "Opt-in bounded passive compositor pipeline metadata",
             "enable_environment": {"FRAME_MASK_TRACE": "1"},
             "disable_environment": {"FRAME_MASK_TRACE_DISABLE": "1"}}}, indent=2) + "\n"
