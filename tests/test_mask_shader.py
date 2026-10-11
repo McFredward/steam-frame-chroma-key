@@ -56,6 +56,18 @@ class MaskLayoutTests(unittest.TestCase):
         self.assertIn("OpDecorate %smask_texture DescriptorSet 2", result)
         self.assertIn("OpDecorate %smask_texture Binding 7", result)
 
+    def test_frame_binding_marker_precedes_annotations(self):
+        result = PATCHER.patch_assembly(self.original)
+        marker = 'OpModuleProcessed "MRMASK/1 source-frame-binding-required"'
+        self.assertEqual(result.count(marker), 1)
+        self.assertLess(result.index(marker), result.index("OpDecorate"))
+
+    def test_existing_frame_binding_marker_rejected(self):
+        source = self.original.replace("OpDecorate %source_uv Location 0", '\n'.join([
+            'OpModuleProcessed "MRMASK/1 source-frame-binding-required"',
+            "OpDecorate %source_uv Location 0"]))
+        self.rejected(source, "mask binding marker already present")
+
     def test_duplicate_scene_store_rejected(self):
         self.rejected(self.original.replace("OpReturn", "OpStore %504 %994\nOpReturn"),
                       "exactly one opaque scene store")
@@ -120,7 +132,12 @@ class MaskLayoutTests(unittest.TestCase):
         self.rejected(source, "grouped/id decorations")
 
     def test_double_patch_rejected(self):
-        self.rejected(PATCHER.patch_assembly(self.original), "reserved mask identifiers")
+        self.rejected(PATCHER.patch_assembly(self.original), "mask binding marker already present")
+
+    def test_reserved_ids_rejected_without_marker(self):
+        self.rejected(PATCHER.patch_assembly(self.original).replace(
+            'OpModuleProcessed "MRMASK/1 source-frame-binding-required"\n', ""),
+            "reserved mask identifiers")
 
     def test_invalid_descriptor_numbers_rejected(self):
         for value in (-1, 0x100000000, 1.5, True):
@@ -155,6 +172,7 @@ class MaskBinaryTests(unittest.TestCase):
             result = subprocess.run(["spirv-dis", str(binary)], check=True, capture_output=True, text=True)
             self.assertIn("OpImageSampleExplicitLod", result.stdout)
             self.assertIn("Binding 31", result.stdout)
+            self.assertIn('OpModuleProcessed "MRMASK/1 source-frame-binding-required"', result.stdout)
             self.assertEqual(result.stdout.count("OpVectorTimesScalar"), 1)
             self.assertFalse(list(Path(directory).glob(".mask-shader-*")))
 

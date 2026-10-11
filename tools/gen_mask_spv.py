@@ -27,6 +27,7 @@ class ShaderLayoutError(ValueError):
 
 TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[^\s;]+')
 MASK_PREFIX = "%smask_"
+MODULE_MARKER = "MRMASK/1 source-frame-binding-required"
 
 
 def _instructions(assembly):
@@ -63,6 +64,8 @@ def patch_assembly(assembly, descriptor_set=0, binding=31):
             raise ShaderLayoutError(label + " must be an unsigned 32-bit integer")
 
     instructions = _instructions(assembly)
+    _require(not any(tokens == ["OpModuleProcessed", '"' + MODULE_MARKER + '"']
+                     for _, tokens in instructions), "mask binding marker already present")
     definitions = {}
     functions = {}
     current_function = None
@@ -146,6 +149,9 @@ def patch_assembly(assembly, descriptor_set=0, binding=31):
                   if len(tokens) >= 3 and tokens[1] == "=" and tokens[2].startswith("OpType")]
     _require(bool(type_lines), "type declarations absent")
     first_type = min(type_lines)
+    first_annotation = min((line for line, tokens in instructions
+                            if tokens[0] in ("OpDecorate", "OpMemberDecorate")),
+                           default=first_type)
     annotations = [
         "OpDecorate %smask_texture DescriptorSet {}".format(descriptor_set),
         "OpDecorate %smask_texture Binding {}".format(binding),
@@ -171,6 +177,10 @@ def patch_assembly(assembly, descriptor_set=0, binding=31):
 
     result = []
     for line, text in enumerate(assembly.splitlines()):
+        if line == first_annotation:
+            # The layer refuses this marker until a verified frame-binding
+            # adapter supplies the sampler and matching pipeline layout.
+            result.append('OpModuleProcessed "' + MODULE_MARKER + '"')
         if line == first_type:
             result.extend(annotations)
         if line == first_function:
