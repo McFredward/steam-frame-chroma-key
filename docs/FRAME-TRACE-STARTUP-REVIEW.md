@@ -40,7 +40,47 @@ prove that the compositor created its expected Vulkan instance. Also, the
 `vrcompositor-la` journal/thread comm differs from the executable name, but the
 trace uses `/proc/self/exe`, not comm. Its recorded executable still matches.
 
-## Remaining distinctions
+## Manifest rejection established by the targeted startup capture
+
+The second authorized attempt at 13:12:59 CEST enabled only the reviewed
+diagnostic and `VK_LOADER_DEBUG=error,warn,layer`. The loader found the exact
+manifest and reported that its required `implementation_version` value was
+missing, then skipped the layer. The manifest contained JSON number `1` rather
+than string `"1"`. Compositor PID 293457 had no diagnostic mapping and no
+capture file. Its startup journal retained the launcher's executable attribution
+for these early messages; the later `/proc` snapshot identifies that same PID
+as the native `vrcompositor`.
+
+This is an established failure of our deployment manifest. It matches the
+manifest hash from the first failed attempt. It does not prove that every
+remaining startup or shader-binding issue is solved by correcting that field.
+The journal copy hit its 2,048-line bound and is marked truncated, so it cannot
+serve as complete instance-chain or pipeline evidence. The direct rejection
+message, exact deployed bytes and absent mapping establish this narrower cause.
+
+The [1.4.309 loader source](https://github.com/KhronosGroup/Vulkan-Loader/blob/v1.4.309/loader/loader.c)
+explains the earlier misleading discovery probe: `loader_read_layer_json`
+expects a string for this field, but its failure branch can append partially
+initialized layer properties with a successful result. A name-only enumeration
+can therefore report the layer even though its implementation version,
+description, library and enable/disable information were not fully parsed.
+The [matching manifest documentation](https://github.com/KhronosGroup/Vulkan-Loader/blob/v1.4.309/docs/LoaderLayerInterface.md#layer-manifest-file-format)
+also uses a string. The previous probe checked only the name and did not create
+an instance. This was insufficient evidence, not proof of native layer loading.
+
+The deployment helper and CMake manifest now use string `"1"`. The probe and
+focused fixtures must share the helper's actual manifest bytes, reject partial
+properties, and verify real implicit instance loading before another headset
+capture. Previous green checks against a separately generated manifest or a
+different loader are retained only for their narrower original scope.
+
+Rollback removed both activation files at 13:13:26, restored native SteamVR at
+13:13:31 and verified native compositor PID 295808 without a diagnostic mapping.
+The independent watchdog exited; the private headset directory was removed by
+13:14:29. No stream or mask capture was accepted. The small private record is in
+`build/private-frame-loader-run-20261011`.
+
+## Other remaining distinctions
 
 The loader separately discovers, selects and dynamically loads layers. JSON
 enumeration alone does not prove selection or loading. Initial `/proc/environ`

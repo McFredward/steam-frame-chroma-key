@@ -105,10 +105,10 @@ dependency failures, but do not prove the compositor's runtime layer-selection
 policy. `/proc/environ` represents the initial environment; absence there does
 not exclude later application-side changes.
 
-No capture was accepted. The exact remaining native-compositor non-loading cause
-is unresolved. Stage/descriptor/frame proof and genuine mask passthrough remain
-blocked. Further live retries must first address this startup behavior; there is
-no installed diagnostic left on the Frame.
+No capture was accepted. At that checkpoint the native-compositor non-loading
+cause was unresolved. The subsequent targeted startup capture below identifies
+an invalid manifest field. Stage/descriptor/frame proof and genuine mask
+passthrough remain blocked; there is no installed diagnostic left on the Frame.
 
 Local validation was expanded to exercise implicit `XDG_DATA_HOME` discovery
 through the real loader, in addition to explicit loading and unchanged GPU
@@ -124,17 +124,17 @@ Windows cross-build and protocol sanitizers. Completed local build/test outputs
 were removed; only small private evidence and the still-reviewed staged library
 were retained. The SSH credential environment was cleared when the session ended.
 
-## Prepared next capture
+## Targeted loader capture and correction
 
 The bounded helper now has an opt-in `start --loader-debug` variant. This adds
 only `VK_LOADER_DEBUG=error,warn,layer` to the same temporary user-service
 drop-in. It does not force-enable a layer, disable another layer or replace the
-loader. It has not been installed/run on the Frame. Twelve focused recovery
+loader. It was used in the second authorized attempt below. Twelve focused recovery
 checks pass, including default logging preservation and exact removal of the
 debug variant. The native trace library is unchanged, so its previous compiled
 and GPU evidence remains applicable without rebuilding it.
 
-The next run must collect the real startup journal, bounded to at most 1 MiB
+The capture collected the real startup journal, bounded to at most 1 MiB
 and 2,048 copied lines, together with actual compositor PID/executable, loader
 mapping and trace header. This bounds the evidence copy; it is not a promise
 that the native SteamVR journal producer itself obeys our trace file cap.
@@ -147,3 +147,26 @@ The [startup review](FRAME-TRACE-STARTUP-REVIEW.md) records why a blind repeat,
 privilege change or forced layer enable is unjustified. All new writes/restarts
 still use the approved temporary scope and require the maintainer to be ready
 for the stream interruption.
+
+The second attempt started at 13:12:59 CEST. Its native loader found the manifest
+but rejected the numeric `implementation_version` field. The manifest must use
+string `"1"`. The same deployed manifest hash was present in the first attempt.
+No diagnostic mapping or trace header appeared, so the run was aborted without
+asking the maintainer to start a PC stream. The journal copy hit its line cap
+and is marked truncated; only the specific manifest rejection is established,
+not a complete startup or active pipeline.
+
+Manual recovery removed both activation files at 13:13:26 and completed the
+native restart at 13:13:31. At 13:14:17 the native service was active, compositor
+PID 295808 had no diagnostic mapping and the independent watchdog was inactive.
+The temporary headset directory was removed by 13:14:29. The copied ledger and
+small bounded startup record remain private under
+`build/private-frame-loader-run-20261011`; no Valve binary or shader is published.
+The SSH credential environment was cleared and its session closed.
+
+The helper and CMake manifest now serialize the version as a string. Strengthened
+checks must use the actual helper manifest, validate complete properties rather
+than only a returned layer name, and verify real implicit instance loading.
+The previous name-only discovery result was insufficient: this loader can
+return partially parsed properties even after logging a skipped manifest.
+See the [startup review](FRAME-TRACE-STARTUP-REVIEW.md) for the source evidence.
