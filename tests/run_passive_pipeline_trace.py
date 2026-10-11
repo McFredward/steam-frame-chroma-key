@@ -163,6 +163,15 @@ def main():
             assert all(value == 0 for name, value in footer["binding_journal"].items()
                        if name not in ("published", "replayed")), footer
             assert footer["binding_journal"]["published"] == footer["binding_journal"]["replayed"], footer
+            writer = footer["binding_writer"]
+            assert writer["iterations"] > 0, writer
+            assert writer["replayed"] == footer["binding_journal"]["replayed"], footer
+            assert writer["replay_ns"] >= writer["max_replay_batch_ns"], writer
+            assert writer["output_ns"] >= writer["max_output_ns"], writer
+            assert 0 <= writer["max_lane_occupancy"] <= records[0]["binding_lane_capacity"], writer
+            operations = footer["binding_operation_losses"]
+            assert len(operations) == 37 and "unknown" not in operations, operations
+            assert all(loss == 0 for counter in operations.values() for loss in counter.values()), operations
             if mode == "bindings-concurrent":
                 assert footer["binding_journal"]["replayed"] >= 256, "Concurrent native resource calls did not traverse the journal"
             events = records[1:-1]

@@ -25,7 +25,9 @@
 namespace {
 using namespace frame_trace;
 constexpr std::size_t OutputLimit = 1024 * 1024;
-constexpr std::size_t FooterReserve = 3072;
+// Reserve room for bounded aggregate replay diagnostics within the unchanged
+// 1-MiB file cap. No per-call trace or native payload is appended to the footer.
+constexpr std::size_t FooterReserve = 8192;
 constexpr std::uint32_t CallRecordLimit = 512;
 
 struct Capture {
@@ -224,11 +226,13 @@ struct Capture {
             "\"limit_events\":2048,\"limit_bytes\":1048576,\"gpu_completion_proven\":false,"
             "\"descriptor_uv_frame_binding_proven\":false,\"fragment_filter\":\"%016llx\","
             "\"binding_metadata_version\":%u,\"limit_binding_snapshots\":%u,"
+            "\"binding_lane_capacity\":%zu,"
             "\"binding_arm_required\":%s,"
             "\"pre_arm_draws_recorded\":false,"
             "\"binding_ready_at_header\":%s,"
             "\"deadline_seconds\":%u}\n", static_cast<unsigned long long>(fragmentFilter),
             bindingsEnabled ? 1 : 0, bindingsEnabled ? BindingSnapshotLimit : 0,
+            frame_bindings::Journal::LaneCapacity,
             armPath.empty() ? "false" : "true", bindingsArmed.load() ? "true" : "false", deadlineSeconds);
         std::size_t total = static_cast<std::size_t>(headerLength);
         bool ioGood = writeAll(fd, header, total), capped = false;
@@ -237,8 +241,20 @@ struct Capture {
         bool draining = false;
         Event event;
         bool pending = false;
+        std::uint64_t writerIterations = 0, replayRecords = 0, replayNanos = 0, maxReplayNanos = 0;
+        std::uint64_t snapshotWaits = 0, idleWaits = 0, serializationNanos = 0, outputNanos = 0, maxOutputNanos = 0;
+        const auto elapsedNanos = [](const auto& since) {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - since).count());
+        };
         for (;;) {
+            ++writerIterations;
+            const auto replayStart = std::chrono::steady_clock::now();
             const auto metadataRecords = drainBindings();
+            const auto replayElapsed = elapsedNanos(replayStart);
+            replayRecords += metadataRecords;
+            replayNanos += replayElapsed;
+            maxReplayNanos = std::max(maxReplayNanos, replayElapsed);
             const auto now = std::chrono::steady_clock::now();
             if (!draining && bindingsEnabled && !bindingsArmed.load() && !armPath.empty() && now >= armCheck) {
                 if (now < deadline && armRequested(armPath)) {
@@ -269,7 +285,15 @@ struct Capture {
                         // rendering thread forwards immediately. A closed gap
                         // must produce incomplete evidence, never guessed state.
                         if (!bindings.finished()) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            // More replayed metadata may precede this request.
+                            // Waiting after each productive batch unnecessarily
+                            // caps catch-up at 256 records per millisecond.
+                            // A genuinely unpublished predecessor makes zero
+                            // progress and still yields instead of busy looping.
+                            if (!metadataRecords) {
+                                ++snapshotWaits;
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
                             continue;
                         }
                         failure.device = event.device;
@@ -282,13 +306,20 @@ struct Capture {
                 }
                 if (binding) event.complete = event.complete && binding->sourceComplete;
                 char line[32768];
+                const auto serializationStart = std::chrono::steady_clock::now();
                 const auto bytes = serialize(event, line, binding);
+                serializationNanos += elapsedNanos(serializationStart);
                 if (!bytes || total + bytes > OutputLimit - FooterReserve) {
                     capped = true;
                     core.enable(false);
                     break;
                 }
-                if (!writeAll(fd, line, bytes)) { ioGood = false; break; }
+                const auto outputStart = std::chrono::steady_clock::now();
+                const bool written = writeAll(fd, line, bytes);
+                const auto outputElapsed = elapsedNanos(outputStart);
+                outputNanos += outputElapsed;
+                maxOutputNanos = std::max(maxOutputNanos, outputElapsed);
+                if (!written) { ioGood = false; break; }
                 total += bytes;
                 pending = false;
             } else {
@@ -296,6 +327,7 @@ struct Capture {
                 // Continue existing background work without an idle delay. A
                 // missing predecessor makes zero progress and still yields.
                 if (metadataRecords && !bindings.empty()) continue;
+                ++idleWaits;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
@@ -304,7 +336,18 @@ struct Capture {
         bindings.close();
         // Byte/time/event closure must include admitted metadata in the stable
         // footer, even when trailing output records no longer fit the file.
-        while (bindingsEnabled && !bindings.finished()) drainBindings();
+        while (bindingsEnabled && !bindings.finished()) {
+            const auto replayStart = std::chrono::steady_clock::now();
+            const auto replayed = drainBindings();
+            replayRecords += replayed;
+            const auto replayElapsed = elapsedNanos(replayStart);
+            replayNanos += replayElapsed;
+            maxReplayNanos = std::max(maxReplayNanos, replayElapsed);
+            if (!replayed && !bindings.finished()) {
+                ++snapshotWaits;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
         char footer[FooterReserve];
         const auto journal = bindings.transportCounters();
         const auto count = std::snprintf(footer, sizeof(footer),
@@ -317,7 +360,7 @@ struct Capture {
             "\"set\":%llu,\"buffer\":%llu,\"image\":%llu,\"view\":%llu,\"sampler\":%llu,"
             "\"memory\":%llu,\"command\":%llu,\"conversion\":%llu},"
             "\"binding_journal\":{\"registry\":%llu,\"queue\":%llu,\"order_gap\":%llu,"
-            "\"batch\":%llu,\"order_wrap\":%llu,\"closed_calls\":%llu,\"published\":%llu,\"replayed\":%llu}}\n",
+            "\"batch\":%llu,\"order_wrap\":%llu,\"closed_calls\":%llu,\"published\":%llu,\"replayed\":%llu}",
             static_cast<unsigned long long>(events.emitted()), static_cast<unsigned long long>(events.dropped()),
             static_cast<unsigned long long>(core.lostState()), static_cast<unsigned long long>(bindings.lostState()),
             bindingsArmed.load() ? "true" : "false", std::min(bindingSnapshots.load(), BindingSnapshotLimit),
@@ -333,8 +376,28 @@ struct Capture {
             static_cast<unsigned long long>(journal.orderWrap), static_cast<unsigned long long>(journal.closedCalls),
             static_cast<unsigned long long>(journal.published), static_cast<unsigned long long>(journal.replayed));
 #undef TABLE
-        if (ioGood && count > 0 && static_cast<std::size_t>(count) < sizeof(footer))
-            writeAll(fd, footer, static_cast<std::size_t>(count));
+        std::size_t footerBytes = count > 0 ? static_cast<std::size_t>(count) : sizeof(footer);
+        bool footerValid = append(footer, sizeof(footer), footerBytes,
+            ",\"binding_writer\":{\"iterations\":%llu,\"replayed\":%llu,\"replay_ns\":%llu,"
+            "\"max_replay_batch_ns\":%llu,\"snapshot_waits\":%llu,\"idle_waits\":%llu,"
+            "\"serialization_ns\":%llu,\"output_ns\":%llu,\"max_output_ns\":%llu,\"max_lane_occupancy\":%llu},"
+            "\"binding_operation_losses\":{",
+            static_cast<unsigned long long>(writerIterations), static_cast<unsigned long long>(replayRecords),
+            static_cast<unsigned long long>(replayNanos), static_cast<unsigned long long>(maxReplayNanos),
+            static_cast<unsigned long long>(snapshotWaits), static_cast<unsigned long long>(idleWaits),
+            static_cast<unsigned long long>(serializationNanos), static_cast<unsigned long long>(outputNanos),
+            static_cast<unsigned long long>(maxOutputNanos),
+            static_cast<unsigned long long>(journal.maxLaneOccupancy));
+        const auto operations = bindings.operationCounters();
+        for (std::size_t i = 0; footerValid && i < operations.size(); ++i) {
+            footerValid = append(footer, sizeof(footer), footerBytes,
+                "%s\"%s\":{\"publication\":%llu,\"replay\":%llu}", i ? "," : "",
+                frame_bindings::Journal::operationName(i),
+                static_cast<unsigned long long>(operations[i].publicationLoss),
+                static_cast<unsigned long long>(operations[i].replayLoss));
+        }
+        footerValid = footerValid && append(footer, sizeof(footer), footerBytes, "}}\n");
+        if (ioGood && footerValid) writeAll(fd, footer, footerBytes);
         close(fd);
     }
     static bool serializeBindings(const frame_bindings::Snapshot&, char*, std::size_t, std::size_t&);
