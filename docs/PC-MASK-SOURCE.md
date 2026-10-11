@@ -1,7 +1,8 @@
 # PC source for a real Steam Link mask
 
-Investigation: 2026-10-11. No PC SteamVR installation was available for local
-inspection. A subsequent live Frame inspection is recorded separately in
+Investigation: 2026-10-11. The maintainer subsequently supplied the installed
+Windows driver and manifest for private static inspection; see
+[the actual PC driver dataflow](PC-DRIVER-20261011.md). A live Frame inspection is recorded separately in
 [the runtime report](FRAME-LIVE-20261011.md). No headset file, setting or process
 was modified by these investigations. This document selects
 the next source investigation; it does not describe an installable bridge.
@@ -13,6 +14,15 @@ useful interception point is its actual encoder input: composed stereo color,
 coverage and source identity must belong to that same input. Polling the public
 mirror cannot establish this association. A second display-redirect driver is
 also not a transparent observer of the existing Steam Link driver.
+
+The supplied driver's actual HMD component dispatcher exposes
+`IVRDriverDirectModeComponent_009` and `IVRDisplayComponent_003`; it does not
+expose `IVRVirtualDisplay_002`. The latter's presence as a binary string was not
+proof of an active component. Its final encoder texture is NV12/P010, which has
+no scene-alpha channel. The native transmitter also assigns its own 16-bit frame
+key after encoded output is queued with metadata. Do not equate that key with
+the metadata presentation number. A coverage pass must remain associated with
+the original composition through this later key assignment.
 
 ### Public interfaces establish these boundaries
 

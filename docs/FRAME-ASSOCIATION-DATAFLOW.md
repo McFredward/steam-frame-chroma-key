@@ -90,8 +90,10 @@ the latest decoded frame would discard the native association.
 
 ## Remaining bridge requirements
 
-1. Obtain the real PC `vrlink` driver and establish how source coverage, encoded
-   color, the received 16-bit key, and any presentation-number field relate.
+1. The [subsequently supplied PC driver](PC-DRIVER-20261011.md) establishes that
+   the sender assigns the 16-bit key separately from queued encoder metadata.
+   Prove coverage's composition/resource association through that assignment;
+   neither the presentation number nor its low 16 bits can substitute for it.
 2. Establish a stream epoch and wrap/restart rules. A 16-bit key cannot directly
    serve as this fork's session-scoped 64-bit mask frame identity. Do not infer
    wrap generation from arrival order or truncate the mask identity.

@@ -68,8 +68,10 @@ surface and select the correct eye, crop and foveation mapping for every draw.
 
 The current fork exposes neither this link nor a verified mask descriptor/texture
 binding. A Vulkan submit counter and a timestamp are not substitutes. See
-[the bridge investigation](MASK-BRIDGE-INVESTIGATION.md) for the concrete
-`IVRVirtualDisplay::PresentInfo_t::nFrameId` candidate and Frame diagnostics.
+[the bridge investigation](MASK-BRIDGE-INVESTIGATION.md),
+[the actual PC DirectMode/TX path](PC-DRIVER-20261011.md) and
+[the conditional full-eye UV route](FRAME-UV-BINDING-20261011.md). The inspected
+PC HMD does not expose the initially considered `IVRVirtualDisplay` component.
 The later adapter must explicitly verify/negotiate UV and RGB/alpha conventions
 for the session; packet dimensions alone do not establish them.
 

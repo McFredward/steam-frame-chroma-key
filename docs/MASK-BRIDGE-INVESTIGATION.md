@@ -3,8 +3,10 @@
 Status: source and read-only installed-runtime investigation, 2026-10-11.
 The actual Frame shader has now been inspected on SteamOS 0.3.0, build
 20260922.6101926. Its interface and source-coordinate dependencies provide
-concrete integration constraints. A decoded-frame identity and the complete
-live sampling transform remain unproven. This document separates the working
+concrete integration constraints. The subsequent PC and receiver analyses trace
+the native sender-assigned 16-bit packet key through decoding. Association with
+source coverage, resource lifetime and the complete live sampling transform
+remain unproven. This document separates the working
 upstream chroma hook from the genuine-mask work.
 
 ## What the source establishes
@@ -30,12 +32,11 @@ upstream chroma hook from the genuine-mask work.
   exposes a runtime frame index for timing history. The documented API does not
   establish equivalence between a PC index and a Frame decoder surface's index.
 - The [OpenVR driver header](https://github.com/ValveSoftware/openvr/blob/master/headers/openvr_driver.h)
-  has an important candidate: `IVRVirtualDisplay::Present` receives a backbuffer
-  handle and `PresentInfo_t::nFrameId`. This may identify the PC encoder input
-  **if the deployed vrlink driver uses that component**. Its existence does not
-  prove that the ID survives streaming or is visible at the decoder. The
-  direct-mode `SubmitLayer`/`Present` interface has different inputs, so this
-  candidate must be verified before choosing an interception point.
+  exposes `IVRVirtualDisplay::Present` with a backbuffer handle and
+  `PresentInfo_t::nFrameId`. The actual supplied PC HMD instead exposes
+  `IVRDriverDirectModeComponent_009`, as established in
+  [the PC driver inspection](PC-DRIVER-20261011.md). The virtual-display candidate
+  is therefore not the interception point for this build.
 - Valve's [Steam Link vendor integration](https://github.com/ValveSoftware/openvr/wiki/Steam-Link-Integration-for-External-Vendors)
   exposes resource-only driver settings. Stream width and eye resolution both
   affect foveation. Dimensions alone therefore cannot establish the correct
@@ -79,9 +80,9 @@ must never accidentally make dashboards or unrelated applications transparent.
    views, descriptor writes/binds and target draw selection. Trace stable internal
    packet/surface identities only after verifying the deployed build. The static
    collector below deliberately does not claim to replace this trace.
-3. Inspect the deployed PC vrlink driver's component interface. If it uses
-   `IVRVirtualDisplay`, trace its `PresentInfo_t::nFrameId` and backbuffer through
-   the encoder and receiver. Otherwise identify the actual equivalent. Validate
+3. Trace coverage from the actual PC DirectMode composition through its encoder
+   output and separate transmitter-key assignment. Preserve source resource and
+   generation; the encoded YUV texture no longer contains alpha. Validate
    a PC encoder-frame to decoded-surface link. If no reliable private link
    exists, prefer a genuine mask encoded alongside color **in the same video
    frame**, with explicit layout/reconstruction. That avoids side-channel temporal
@@ -144,6 +145,14 @@ Use the [stdin-only read-only observer](LIVE-BRIDGE-INSPECTION.md) when no
 installation or headset output files are permitted. The
 [PC source collector](PC-MASK-SOURCE.md) supplies the other endpoint's static
 driver evidence without changing SteamVR.
+
+The maintainer then supplied the Windows driver. Its
+[private static inspection](PC-DRIVER-20261011.md) establishes the actual
+DirectMode component, YUV encoder texture and independent transmitter-key
+assignment. The [layered vertex/fragment dataflow](FRAME-UV-BINDING-20261011.md)
+also establishes a conditional native full-eye mask route, without inventing a
+replacement reprojection transform. Neither result proves runtime resource,
+descriptor or frame coherence; no mask was enabled.
 
 ## Local diagnostics collector
 

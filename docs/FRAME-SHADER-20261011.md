@@ -34,10 +34,12 @@ This is consistent with two-region reconstruction of packed/foveated video;
 the exact roles and values of those regions still require runtime uniform data.
 Preserving one color sample alone would discard native processing.
 
-Installed vertex-shader variants include `distort_vs_reproject_fv.spv` and
-`distort_vs_reproject_fv_dr.spv`. Their presence does not prove which variant
-produces location 1 on the live streaming pipeline. Reprojection, distortion and
-foveation must be validated across the actual bound vertex and fragment stages.
+The subsequent [vertex/fragment inspection](FRAME-UV-BINDING-20261011.md)
+identifies `distort_vs_reproject_layered.spv` as an exact declared interface match
+and derives a conditional full-eye route. The FV variants do not directly supply
+this fragment's declared interface. Installed files still do not prove the active
+stage tuple. Reprojection, distortion and foveation must be validated across the
+actual bound vertex and fragment stages.
 
 `gl_Layer` is declared in the fragment interface but is not read in this captured
 fragment. Selecting a mask by that declaration alone would not establish which
