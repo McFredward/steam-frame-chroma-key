@@ -40,6 +40,8 @@ have been established. No mask guard is removed.
 - One small forwarding record per live Vulkan instance/device is allocated at
   creation and freed at destruction. This lifecycle storage is separate from
   the fixed-capacity observation tables; no per-frame allocation occurs.
+  Dispatch lookup has a short mutex critical section for native context lifetime;
+  observation uses try-lock/drop. This is not a universally lock-free layer.
 - Filtered capture lasts at most 180 seconds; unfiltered capture at most 30.
   It ends at its event/byte/time bound or process teardown. Native
   Vulkan calls/results are forwarded regardless of diagnostic capacity.
@@ -74,6 +76,17 @@ These numbers identify candidates only. Finding a pipeline that was merely
 created is insufficient; require matching `draw_recorded` and `submit_accepted`
 command generations, accounting for `execute_recorded` secondary-buffer links.
 Neither an FNV match nor a successful submit establishes GPU completion.
+Submission tickets capture the command generation before calling the native
+driver. A concurrent completion/reset/re-record cannot be certified as the
+original submit; a changed generation remains an incomplete record. Allocated
+or reset commands are not treated as executable until a successful end.
+
+Require a healthy footer before using the captured relationships: any nonzero
+`dropped_events` or `lost_state`, `byte_cap_reached`, missing footer or failed I/O
+leaves the evidence incomplete. A later event's `complete: true` does not repair
+an earlier missing draw or secondary-buffer link. This diagnostic observes the
+six standard direct/indexed/indirect draw calls in its source; other draw families
+are not certified by absence of records.
 
 ## Local build and focused validation
 
@@ -105,3 +118,18 @@ an installer; never copy a development-machine path or an x86-64 library onto
 the AArch64 headset. A staged Frame build must use the correct architecture and
 an explicitly reviewed library/manifest path. No service environment, layer
 installation, camera setting or runtime restart is changed by these commands.
+
+## Recorded validation, 2026-10-11
+
+The final submit-ticket repair passed the focused pure-state and real Vulkan
+loader/GPU suites. Deterministic tests cover reset/re-record between capture and
+submit return, failed submissions, handle reuse, secondary links, contention,
+capacity bounds and disabled paths. The worker also passed the core under
+AddressSanitizer/UndefinedBehaviorSanitizer. The layer cross-compiles with strict
+warnings for AArch64; the ARM binary has not been loaded on a headset.
+
+Unchanged transport, shader-generator and collector checks inherit the earlier
+green eight-suite CI checkpoint `f702142`; the two-suite focused pass is not a new
+complete foundation gate. Build and test outputs are local, ignored and cleaned
+after recording evidence; only the small staged diagnostic library is retained
+while needed for a possible authorized hardware capture.
