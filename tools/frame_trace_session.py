@@ -85,6 +85,10 @@ class Session:
                 or data[:6] != b"\x7fELF\x02\x01" or data[18:20] != b"\xb7\x00"):
             raise RuntimeError("ARM64 library identity/size check failed")
         self.command("systemctl", "--user", "is-active", UNIT)
+        if self.manual_rollback and self.command(
+                "systemctl", "--user", "is-active", "--quiet", WATCHDOG + ".service",
+                check=False).returncode == 0:
+            raise RuntimeError("A previous timed rollback is still active; manual activation refused")
         exclusive(self.folder / "session.jsonl", b"")
         self.event("approved_preflight", library_sha256=expected_hash,
                    manifest=str(self.manifest), runtime_dropin=str(self.dropin),

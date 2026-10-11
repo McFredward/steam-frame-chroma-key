@@ -32,6 +32,8 @@ class SessionTests(unittest.TestCase):
 
     def run_command(self, arguments, **options):
         self.calls.append(arguments)
+        if "--quiet" in arguments and MODULE.WATCHDOG + ".service" in arguments:
+            return subprocess.CompletedProcess(arguments, 3, "inactive", "")
         if arguments[0] == "systemd-run":
             MODULE.exclusive(self.session.folder / "watchdog-ready", b"ready\n")
         return subprocess.CompletedProcess(arguments, 0, "active", "")
@@ -55,8 +57,7 @@ class SessionTests(unittest.TestCase):
     def test_manual_mode_has_no_timer_and_retains_exact_idempotent_recovery(self):
         self.session.manual_rollback = True
         self.session.start(self.sha)
-        self.assertFalse(any(command[0] == "systemd-run" or
-                             MODULE.WATCHDOG + ".service" in command for command in self.calls))
+        self.assertFalse(any(command[0] == "systemd-run" for command in self.calls))
         self.assertFalse((self.session.folder / "watchdog-ready").exists())
         self.assertTrue(self.session.manifest.exists())
         self.assertTrue(self.session.dropin.exists())
@@ -94,6 +95,20 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(self.session.dropin.exists())
         self.assertTrue((self.session.folder / "rollback-complete.json").exists())
         self.assertFalse(any(command[0] == "systemd-run" for command in self.calls))
+
+    def test_manual_start_refuses_a_leftover_timed_rollback(self):
+        self.session.manual_rollback = True
+        def stale(arguments, **options):
+            if "--quiet" in arguments and MODULE.WATCHDOG + ".service" in arguments:
+                return subprocess.CompletedProcess(arguments, 0, "active", "")
+            return self.run_command(arguments, **options)
+        self.session.run = stale
+        with self.assertRaises(RuntimeError):
+            self.session.start(self.sha)
+        self.assertFalse(self.session.manifest.exists())
+        self.assertFalse(self.session.dropin.exists())
+        self.assertFalse((self.session.folder / "armed.json").exists())
+        self.assertFalse(any("restart" in command for command in self.calls))
 
     def test_preexisting_manifest_and_symlink_preserved(self):
         self.session.manifest.parent.mkdir(parents=True)
