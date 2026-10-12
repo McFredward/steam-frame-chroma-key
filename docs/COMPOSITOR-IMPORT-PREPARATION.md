@@ -25,6 +25,9 @@ not advertised as working Steam Link passthrough.
   Unknown/inherited objects and stale reconnect credentials cannot create a
   valid lease. The native accepted parent's exclusive ownership before the
   reservation gate remains a source obligation, not kernel lifetime proof.
+  A positive cached peer PID at the first import Begin remains diagnostic;
+  only its current successful payload can establish the accepted-epoch peer.
+  This also works when earlier RPCs filled the same PID before observation.
 * `import/compositor_attempt.*` copies the checked begin/creation/reply timeline
   and replays it only on the background owner with a matching, current Journal
   receipt. Native VkDevice handles and Journal device identities are distinct;
@@ -45,8 +48,9 @@ not advertised as working Steam Link passthrough.
   actual distinct versioned forwarding aliases. A value-copied notification
   subscriber can be registered once, outside callbacks; it remains inactive
   otherwise. Native results, arguments and `errno` are preserved. Real host
-  partial-write and cancellation fixtures pass; the AArch64 forwarding object
-  was separately checked, but its actual target execution remains untested.
+  partial-write and cancellation fixtures pass. Actual AArch64 veneers also
+  execute through QEMU with the current private Frame libc/loader; real native
+  Frame kernel/headset execution remains untested.
   Suppressed recursive notifications set sticky proof loss rather than silently
   certifying a trace that missed a lifecycle event. This component reads no
   private native memory and performs no output or automatic capture activation.
@@ -73,6 +77,19 @@ not advertised as working Steam Link passthrough.
   before/after. Four exact queries have a two-second deadline and bounded
   responses. There is no packet/image read, render-thread I/O, process restart,
   file installation or automatic rollback.
+* `import/import_module_identity.*` verifies the prepared current client profile
+  against actual owned ELF header/program-header/build-note/RX bytes. Its
+  expected profile is hard-pinned; replacing both expected and observed bytes
+  cannot manufacture an approved module. Offline mapping controls are not a
+  runtime loader lease.
+* `import/import_startup_gate.*` and `native_client_birth.*` admit the exact
+  first OpenVR startup thread and constructor route. Only after the real public
+  module lookup and mapped identity check do they copy five fixed stack words
+  and reserve the generic pipe birth before original mutex initialization.
+  Current-thread stack ownership, module ownership and public-provider wiring
+  remain production integration requirements. Normal and sanitized host
+  fixtures use real `dladdr`, RX hashing and mutex initialization with synthetic
+  source frames; they do not claim native Frame bootstrap.
 
 The socket helper uses the Linux
 [UNIX diagnostic ABI](https://github.com/torvalds/linux/blob/v6.18/include/uapi/linux/unix_diag.h).
@@ -132,7 +149,7 @@ file, service, startup setting or process.
 Bind exact entry observations to the existing asynchronous Vulkan resource
 journal's real generations; no rendering callback may look up mutable object
 tables or manufacture a generation from its call number. The active
-native-memory/profile adapter, actual AArch64 callback cancellation, observed
+native-memory/profile adapter, Frame-native callback cancellation, observed
 socket creation/retirement and
 receiver-side carrier/publication recording remain required before deployment.
 The exact current executable/library/provider maps and every active read scope

@@ -48,12 +48,17 @@ The local focused gate passes:
   during an active unpublished ticket and before/after resource retirement.
 * 2,816 AArch64 machine-byte model executions across eleven entries, with CFI
   checked at every instruction; twelve mutated-object controls are rejected.
+* 894 checks execute all eleven actual AArch64 veneers through QEMU with the
+  hash-pinned Frame libc/loader. All eight GLIBC_2.17 aliases are verified through
+  real `dladdr`; read/write/close cancellation unwinds into caller cleanup.
+  Two executed register/CFI mutants fail at their intended controls. Vulkan
+  providers in this fixture are controlled ABI stubs, not a Frame GPU.
 * The actual AArch64 layer links with `--no-undefined`. All eleven entries and
   dispatchers are local, and all eight distinct libc aliases have the expected
   GLIBC_2.17 imports. Cross-building this dispatch layer needs Vulkan headers,
   not a fictitious foreign Vulkan loader library.
 
-The preceding complete CI at `101a37b` passed. This checkpoint's local evidence
+The complete CI at `2edf052` passed. This checkpoint's local evidence
 is focused, not a fresh complete local gate. Current source hashes, small logs
 and the reviewable linked artifact are retained privately under
 `build/private-import-vulkan-root-evidence-20261012/`; completed CMake and
@@ -66,5 +71,12 @@ automatic registration are enabled by this checkpoint. Before any deployment,
 bind the copied events to the exact current module maps, owned native windows,
 observed pipe lifetimes, immutable successful reply and receiver publication.
 The new private scalar scope requires a concrete reviewed diagnostic and
-separate authorization. Actual AArch64 execution/cancellation, cross-endpoint
-association and PC source-frame/eye/UV/GPU ownership remain unproven.
+separate authorization. QEMU execution establishes actual ARM64 register/CFI
+and current-provider forwarding behavior under host kernel translation. It
+does not establish Frame-native kernel/cancellation or headset behavior,
+cross-endpoint association, or PC source-frame/eye/UV/GPU ownership.
+
+The optional CMake native-execution test requires both explicit
+`FRAME_MASK_IMPORT_QEMU` and `FRAME_MASK_IMPORT_PROVIDERS` paths. Private provider
+files are neither downloaded automatically nor added to public CI. It retains
+a bounded JSON receipt and removes its completed temporary build directory.

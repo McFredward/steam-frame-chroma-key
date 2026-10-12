@@ -179,6 +179,11 @@ void mapped_checks(const char* profile_path,const char* native_path) {
 }
 } // namespace
 int main(int argc,char** argv) {
+    if(argc==2 && std::string(argv[1])=="--sha-self-test") {
+        sha_vectors();
+        std::cout<<"import module hashing: "<<checks<<" public SHA-256 controls passed; no private module input\n";
+        return 0;
+    }
     if(argc==3 && std::string(argv[1])=="--sha-length") {
         const auto length=std::strtoul(argv[2],nullptr,10);
         if(length>kMaxModuleBytes) return 2;

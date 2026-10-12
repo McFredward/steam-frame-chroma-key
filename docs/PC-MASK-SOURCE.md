@@ -62,6 +62,14 @@ generate coverage. Application color and coverage must enter the same compositio
 and reprojection before export. SteamVR dashboards and unrelated applications
 remain opaque. No mod code was changed for this investigation.
 
+Fractional opacity must survive the source rendering and every later layer
+composition. Include tinted translucent glass over both transparent clear and
+opaque virtual geometry, plus overlapping translucent surfaces, in the source
+test. Two 50-percent layers over transparent clear have 75-percent combined
+opacity. The existing R8 transport and straight/premultiplied shader tests
+support intermediate values; they do not prove Unity material alpha or glass
+in the final Steam Link stream.
+
 ## Smallest useful PC evidence
 
 From the **SteamVR installation used to stream**, privately supply:

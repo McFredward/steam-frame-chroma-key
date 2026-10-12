@@ -12,7 +12,9 @@ single candidate public mutex-init entry can discover the actual client module
 through the prepared public `dladdr` provider, validate its mapping, and then
 reserve its source-proven birth **before forwarding the original mutex init**.
 This is bounded startup work, not a new lookup on graphics or import callbacks.
-It needs implementation and runtime validation; this audit does neither.
+The offline startup gate and mapped-module verifier are implemented. Actual
+provider wrappers, runtime ownership acquisition and Frame validation remain
+required; this source audit does not supply those proofs.
 
 ## Exact inputs and early constructor
 
@@ -170,10 +172,19 @@ guess which module survives.
 Private `build/private-client-bootstrap/validate.py` passes **71 exact
 instruction, branch, relocation, ELF-identity and actual-provider checks**.
 The bounded startup plan now has concrete current API/caller/constructor inputs;
-the initially missing API-library input was acquired and resolved. The actual
-wrapper, first-load/recursion/error controls, prepared current-thread ownership,
-fresh loaded-module verification and shutdown invalidation must still be
-implemented and tested before deployment. No hardware bootstrap is claimed.
+the initially missing API-library input was acquired and resolved. The bounded
+gate now has 266 normal and sanitized host controls for first-load/thread,
+recursion/error, current-stack bounds and shutdown invalidation, plus 23 birth
+decoder controls. These use real host module lookup/RX hashing/mutex calls with
+synthetic source frames. The separate mapped verifier passes 2,401 offline
+controls with current private bytes, plus 54 independent profile/hash controls.
+Neither fixture establishes production loader ownership or a deployed provider
+wrapper. No hardware bootstrap is claimed.
+
+Public CI runs the startup fixture, birth decoder and public SHA-256 controls.
+The full mapped-client fixture additionally needs explicit private
+`FRAME_MASK_IMPORT_CLIENT_PROFILE` and `FRAME_MASK_IMPORT_CLIENT_REFERENCE`
+paths. Public CI never acquires or redistributes the native client file.
 
 This bootstrap supplies local observed object/module lifetime, not endpoint
 pairing, token namespace, source-frame identity, UV mapping or GPU ownership.

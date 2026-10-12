@@ -9,7 +9,8 @@ Steam Link mask integration**. The existing chroma path remains separate.
 `mask/mask_protocol.{h,cpp}` exports a portable C++17 encoder and bounded receiver.
 Each mask identifies a 128-bit session, monotonically increasing 64-bit source
 frame, eye and pixel extent. It contains row-major R8 coverage: 0 means camera,
-255 means virtual scene, intermediate values preserve antialiased edges. Its
+255 means virtual scene, intermediate values preserve antialiased edges and
+fractional material opacity, such as glass. Its
 coordinate convention is upper-left origin, matching the source-eye texture's
 normalized valid rectangle; a later adapter must prove the native mapping.
 

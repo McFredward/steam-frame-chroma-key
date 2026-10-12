@@ -9,6 +9,10 @@ option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
 option(FRAME_MASK_BUILD_IMPORT_ENTRY
     "Build uninstalled AArch64 import entry forwarding (no observer activation)" OFF)
+set(FRAME_MASK_IMPORT_QEMU "" CACHE FILEPATH "Explicit local qemu-aarch64 for optional native ABI checks")
+set(FRAME_MASK_IMPORT_PROVIDERS "" CACHE PATH "Private pinned Frame libc/loader prefix for native ABI checks")
+set(FRAME_MASK_IMPORT_CLIENT_PROFILE "" CACHE FILEPATH "Private prepared client hash/layout profile")
+set(FRAME_MASK_IMPORT_CLIENT_REFERENCE "" CACHE FILEPATH "Private reviewed client ELF for mapped identity checks")
 if(FRAME_MASK_BUILD_IMPORT_ENTRY AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
     NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$"))
     message(FATAL_ERROR "Import entry forwarding requires the audited Linux AArch64 ABI")
@@ -161,6 +165,50 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_entry_abi.py
             --source ${CMAKE_CURRENT_SOURCE_DIR}/import/native_import_entry.S)
         set_tests_properties(compositor_import_entry_abi PROPERTIES SKIP_RETURN_CODE 77)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(test_import_module_identity tests/test_import_module_identity.cpp
+                import/import_module_identity.cpp)
+            target_include_directories(test_import_module_identity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_compile_options(test_import_module_identity PRIVATE -Wall -Wextra -Wpedantic)
+            add_test(NAME import_module_hashing COMMAND test_import_module_identity --sha-self-test)
+            if(FRAME_MASK_IMPORT_CLIENT_PROFILE OR FRAME_MASK_IMPORT_CLIENT_REFERENCE)
+                if(NOT FRAME_MASK_IMPORT_CLIENT_PROFILE OR NOT FRAME_MASK_IMPORT_CLIENT_REFERENCE)
+                    message(FATAL_ERROR "Private mapped-identity checks require both client profile and reference")
+                endif()
+                add_test(NAME import_module_mapped_identity COMMAND test_import_module_identity
+                    ${FRAME_MASK_IMPORT_CLIENT_PROFILE} ${FRAME_MASK_IMPORT_CLIENT_REFERENCE})
+            endif()
+            add_executable(test_native_client_birth tests/test_native_client_birth.cpp
+                import/native_client_birth.cpp)
+            target_include_directories(test_native_client_birth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_compile_options(test_native_client_birth PRIVATE -Wall -Wextra -Wpedantic)
+            add_test(NAME import_client_birth_decoder COMMAND test_native_client_birth)
+            if(NOT CMAKE_CROSSCOMPILING)
+                add_library(import_startup_fixture SHARED tests/test_import_startup_gate.cpp)
+                target_compile_definitions(import_startup_fixture PRIVATE FRAME_STARTUP_FIXTURE_LIBRARY)
+                target_link_options(import_startup_fixture PRIVATE
+                    -Wl,--section-start=.fixture_rx=0x90000 -Wl,--section-start=.fixture_hmd=0x647d78)
+                add_executable(test_import_startup_gate tests/test_import_startup_gate.cpp
+                    import/import_startup_gate.cpp import/native_client_birth.cpp import/import_pipe_epoch.cpp)
+                target_include_directories(test_import_startup_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+                target_compile_options(test_import_startup_gate PRIVATE -Wall -Wextra -Wpedantic)
+                target_link_libraries(test_import_startup_gate PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+                add_test(NAME import_startup_gate COMMAND test_import_startup_gate $<TARGET_FILE:import_startup_fixture>)
+                # The fixture tests actual pthread-owned stack bounds. ASan's
+                # optional artificial return stack is outside that ownership.
+                set_tests_properties(import_startup_gate PROPERTIES
+                    ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0:detect_leaks=1")
+            endif()
+            if(FRAME_MASK_IMPORT_QEMU OR FRAME_MASK_IMPORT_PROVIDERS)
+                if(NOT FRAME_MASK_IMPORT_QEMU OR NOT FRAME_MASK_IMPORT_PROVIDERS)
+                    message(FATAL_ERROR "Native ARM64 execution requires explicit QEMU and private providers")
+                endif()
+                add_test(NAME import_native_arm64_execution COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_import_native_forwarding.py
+                    --qemu ${FRAME_MASK_IMPORT_QEMU} --providers ${FRAME_MASK_IMPORT_PROVIDERS}
+                    --record ${CMAKE_CURRENT_BINARY_DIR}/import-native-arm64-validation.json)
+            endif()
+        endif()
         add_test(NAME unix_connection_snapshot COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
             -p test_inspect_unix_connection.py)
