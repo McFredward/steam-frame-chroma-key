@@ -5,7 +5,7 @@
 The next useful step is **one raw client import transaction on the already
 prepared decoder thread**, rather than broader thread discovery or a renderer
 hook. Keep native rendering unchanged and do not modify the PC Steam sender.
-The integrator is implementing the candidate offline under
+The separately reviewed candidate is now implemented offline under
 `FRAME_CLIENT_RESOURCE_RAW_TRANSACTION`, requiring cold preparation, census and
 connection scopes. Its explicit marker is `FCRAW001`, schema 5, with the existing
 11,800-byte envelope extent. These identify a separate mode, not an extension
@@ -131,8 +131,8 @@ Proposed immutable limits for this single-transaction mode:
   for this client-only attempt. No timer-triggered restart or rollback.
 
 Before scratch is bounded owner-local state, not an additional unbounded queue.
-Store at most 24 owned transport observations and serialize their closed result
-as a compact aggregate. Individually enqueuing every transfer alongside existing
+Aggregate at most 24 owned transport observations into one closed result,
+retaining only the current call pair and required header/scalar facts. Individually enqueuing every transfer alongside existing
 startup evidence can exceed the unchanged 32-record cap; aggregate rather than
 silently raising that cap. The output worker may interpret immutable copies,
 never revisit native addresses. The combined additional private read maximum
@@ -144,14 +144,15 @@ small request/reply header and token capture is the minimum additional evidence
 needed to distinguish an actual matching reply from stale parsed state; a
 second stack-only hardware round would not close that question.
 
-## Offline implementation blockers to resolve before deployment
+## Baseline gaps and implemented repairs
 
-The route decoder and general forwarding implementation already exist, but the
-deployed cold-thread startup artifact does **not** expose the required transport
-scope. Its audit preparation currently binds Init/Shutdown, four mutex entries,
-Connect and receiver EpollWait. It has no client Read/Write audit functions.
-The optional connection assembly also omits the general Read/Write veneers.
-Therefore reusing the current uploaded binary cannot acquire this transaction.
+The route decoder and general forwarding implementation already existed, but
+the tested cold-thread artifact at `8aa8535` did **not** expose the required
+transport scope. That baseline audit preparation bound Init/Shutdown, four mutex entries,
+Connect and receiver EpollWait. It had no client Read/Write audit functions; the connection assembly also omitted
+their veneers. The temporary cold-thread binary was fully removed afterward.
+The [new raw candidate and final evidence](CLIENT-RESOURCE-RAW-PREPARATION.md)
+implement the repairs below; it remains uninstalled.
 
 Finish the separate explicit raw-transaction mode, marker, envelope schema and
 session acknowledgement. Extend hidden client-to-actual-libc Read/Write binding
@@ -209,7 +210,8 @@ descriptor lifetime, with replacement/duplication/unload/loss invalidation
 coverage. Client mutex ownership and cached peer PID do not supply that coverage.
 Resource generation/retirement, selected source/video frame, eye/extent and
 native UV/reprojection/foveation/GPU consumption remain further independent
-gates. None of these stages requires a native PC Steam sender patch.
+gates. The current candidate makes no native PC Steam sender changes. The remaining
+source-frame adapters still require their own feasibility and association proof.
 
 ## Deployment and manual recovery boundary
 
