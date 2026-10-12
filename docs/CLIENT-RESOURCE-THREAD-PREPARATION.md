@@ -50,18 +50,18 @@ schema **4**, envelope size **11,800**. Older modes cannot silently adopt it.
 
 | Own artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| Main ARM library | 353,976 | `a6fa8da56b5110510db190fca63176d30424c75dd3f76da9997bad86ac387c01` |
+| Main ARM library | 354,064 | `1eb29432bfe3e78f594eb88e24013a6969bb94f0c2babd78f1e1202bb474afe7` |
 | Dependency-free audit | 69,080 | `3ab7920a449011fec1f047be6a52d66adeecbd46591741d94466a2e7c02502d7` |
-| Envelope | 11,800 | `868226487e2aac46f44e20f264c73e93385274e8cf563cbc686b5db994f0493a` |
+| Envelope | 11,800 | `7fd69f7c0b15acefe331e7c91845201be5744a0366221b04d188f64299253cd0` |
 
 The offline plan hash is
-`0793666bbd6461d4b1e05a00deff1febd0ebfd4872ec17893fbcc350155887cb`.
+`0a1ef852e5e60e528b709ecaaa9cb541f56757c54bef2e9b090435a04297eedb`.
 The compiled audit preparation is 200 bytes, with five relative string fixups
 and six pinned libc RVAs. Main retains **18-byte static TLS**, one own public
 bridge and eight private entry veneers. Native profiles/providers and client
 `RTLD_NOW|RTLD_DEEPBIND` flags remain unchanged.
 
-The proposed eight own inputs total **555,284 bytes**, including both exact
+The proposed eight own inputs total **555,372 bytes**, including both exact
 session helpers and the corrected external kernel helper. Private native
 reference files are not distributed or installed.
 
@@ -69,7 +69,7 @@ reference files are not distributed or installed.
 
 - **425** first-entry/current-thread controls pass normally and under ASan/UBSan,
   including real pthread bounds, reused addresses with fresh markers,
-  overlapping preparation, invalid geometry, failed queries and late arming.
+  overlapping preparation, invalid geometry, failed preparations and late arming.
   Native-stack tests disable ASan's artificial return stack, without weakening
   production ownership guards. The new core object has no TLS or I/O/query
   imports; the root supplies the explicitly cold POSIX query.
@@ -89,7 +89,14 @@ reference files are not distributed or installed.
 
 A missing `<cerrno>` include was caught in the first ARM compile. Only that
 bounded ARM build was repeated after the repair; already passing host checks
-were inherited. The later CMake change only registers the new audit CTest and
+were inherited. CI then caught a direct-assembly checker restriction: the
+shared entry source must remain free of C preprocessing. The selector now lives
+in the separate connection wrapper, while the shared source uses assembler
+conditionals. All four affected ABI checks passed after that repair. Only the
+ARM artifact was rebuilt; its executable, unwind, TLS and data load bytes are
+identical to the preceding candidate. The final new ELF again passed the 39
+native epoll/forced-unwind controls; unchanged inert-load evidence is inherited
+by that verified equivalence. The later CMake change only registers the new audit CTest and
 does not alter artifact build flags/source. Debug stripping preserved program
 headers and load/executable bytes, apart from ELF section-table bookkeeping.
 
