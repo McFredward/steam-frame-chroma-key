@@ -14,6 +14,7 @@ from pathlib import Path
 import resource
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 
@@ -43,13 +44,32 @@ def recorded_run(command, directory, logs, label, timeout, environment=None):
             value = value.decode("utf-8", errors="replace")
         return (value or "")[-32768:]
 
+    process = subprocess.Popen(command, cwd=directory, env=environment, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, start_new_session=True,
+                               preexec_fn=disable_core_dumps)
+
+    def kill_and_reap_owned_group():
+        # The compiler driver may own cc1/as/ld descendants. Kill the complete
+        # session's process group before reaping the driver and deleting inputs.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # The owned group already exited; still reap the direct child.
+        return process.communicate()
+
     try:
-        result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
-                                text=True, timeout=timeout, preexec_fn=disable_core_dumps)
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as error:
-        logs[label] = {"timeout_seconds": timeout, "stdout": clipped(error.stdout),
-                       "stderr": clipped(error.stderr)}
+        stdout, stderr = kill_and_reap_owned_group()
+        logs[label] = {"timeout_seconds": timeout, "exit_status": process.returncode,
+                       "owned_group_terminated": True, "direct_child_reaped": True,
+                       "stdout": clipped(stdout), "stderr": clipped(stderr)}
         raise SystemExit(f"Bounded {label} run timed out") from error
+    except BaseException:
+        # Interrupted runs must not let a live tool retain the temporary paths.
+        kill_and_reap_owned_group()
+        raise
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     logs[label] = {"exit_status": result.returncode, "stdout": clipped(result.stdout),
                    "stderr": clipped(result.stderr)}
     return result
