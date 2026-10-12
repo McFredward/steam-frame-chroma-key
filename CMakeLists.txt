@@ -9,6 +9,8 @@ option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
 option(FRAME_MASK_BUILD_IMPORT_ENTRY
     "Build uninstalled AArch64 import entry forwarding (no observer activation)" OFF)
+option(FRAME_MASK_BUILD_STARTUP_AUDIT
+    "Build an uninstalled startup audit bridge with inactive default preparation" OFF)
 set(FRAME_MASK_IMPORT_QEMU "" CACHE FILEPATH "Explicit local qemu-aarch64 for optional native ABI checks")
 set(FRAME_MASK_IMPORT_PROVIDERS "" CACHE PATH "Private pinned Frame libc/loader prefix for native ABI checks")
 set(FRAME_MASK_IMPORT_CLIENT_PROFILE "" CACHE FILEPATH "Private prepared client hash/layout profile")
@@ -16,6 +18,19 @@ set(FRAME_MASK_IMPORT_CLIENT_REFERENCE "" CACHE FILEPATH "Private reviewed clien
 if(FRAME_MASK_BUILD_IMPORT_ENTRY AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
     NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$"))
     message(FATAL_ERROR "Import entry forwarding requires the audited Linux AArch64 ABI")
+endif()
+if(FRAME_MASK_BUILD_STARTUP_AUDIT)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "The startup audit bridge targets the reviewed Linux/glibc ABI")
+    endif()
+    add_library(frame_startup_audit SHARED import/import_startup_audit.cpp)
+    target_compile_options(frame_startup_audit PRIVATE
+        -Wall -Wextra -Wpedantic -fvisibility=hidden -fno-exceptions -fno-rtti
+        -fno-builtin -fno-stack-protector)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        target_compile_options(frame_startup_audit PRIVATE -mno-outline-atomics)
+    endif()
+    target_link_options(frame_startup_audit PRIVATE -nostdlib -Wl,--no-undefined)
 endif()
 
 if(FRAME_MASK_BUILD_RECEIVER_OBSERVER)
@@ -175,6 +190,54 @@ if(BUILD_TESTING)
             target_include_directories(test_import_module_identity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
             target_compile_options(test_import_module_identity PRIVATE -Wall -Wextra -Wpedantic)
             add_test(NAME import_module_hashing COMMAND test_import_module_identity --sha-self-test)
+            add_executable(test_import_startup_forwarding tests/test_import_startup_forwarding.cpp
+                import/import_startup_forwarding.cpp)
+            target_include_directories(test_import_startup_forwarding PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_compile_options(test_import_startup_forwarding PRIVATE -Wall -Wextra -Wpedantic -fexceptions)
+            target_link_libraries(test_import_startup_forwarding PRIVATE Threads::Threads)
+            add_test(NAME import_startup_provider_forwarding COMMAND test_import_startup_forwarding)
+            if(NOT CMAKE_CROSSCOMPILING)
+                add_test(NAME import_startup_audit_binding COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py
+                    --record ${CMAKE_CURRENT_BINARY_DIR}/import-startup-audit-validation.json)
+            endif()
+            if(NOT CMAKE_CROSSCOMPILING)
+                add_library(import_loader_fixture SHARED tests/test_import_loader_reader.cpp)
+                target_compile_definitions(import_loader_fixture PRIVATE IMPORT_LOADER_TEST_DSO)
+                target_compile_options(import_loader_fixture PRIVATE -fcf-protection=none)
+                target_link_options(import_loader_fixture PRIVATE
+                    -nostdlib -nostartfiles -Wl,--no-eh-frame-hdr -Wl,-z,norelro)
+                add_executable(test_import_loader_reader tests/test_import_loader_reader.cpp
+                    import/import_loader_reader.cpp import/import_module_identity.cpp)
+                target_include_directories(test_import_loader_reader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+                target_compile_options(test_import_loader_reader PRIVATE -Wall -Wextra -Wpedantic)
+                target_link_libraries(test_import_loader_reader PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+                add_test(NAME import_loader_lease COMMAND test_import_loader_reader $<TARGET_FILE:import_loader_fixture>)
+                add_test(NAME import_loader_cold_preflight COMMAND test_import_loader_reader --cold-only)
+                add_library(import_main_fixture SHARED tests/test_import_main_preparation.cpp)
+                target_compile_definitions(import_main_fixture PRIVATE IMPORT_MAIN_TEST_DSO)
+                target_compile_options(import_main_fixture PRIVATE -fcf-protection=none)
+                set(import_main_profile_dir ${CMAKE_CURRENT_BINARY_DIR}/import-main-fixture-profile)
+                add_custom_command(OUTPUT ${import_main_profile_dir}/module-6.bin
+                    COMMAND ${CMAKE_COMMAND} -E make_directory ${import_main_profile_dir}
+                    COMMAND ${CMAKE_COMMAND} -E remove -f ${import_main_profile_dir}/module-6.bin
+                        ${import_main_profile_dir}/module-6.json
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_import_main_modules.py
+                        --fixture $<TARGET_FILE:import_main_fixture> --output ${import_main_profile_dir}
+                    DEPENDS import_main_fixture tools/prepare_import_main_modules.py
+                    VERBATIM)
+                add_custom_target(import_main_profile DEPENDS ${import_main_profile_dir}/module-6.bin)
+                add_executable(test_import_main_preparation tests/test_import_main_preparation.cpp
+                    import/import_main_preparation.cpp import/import_loader_reader.cpp
+                    import/import_module_identity.cpp)
+                target_include_directories(test_import_main_preparation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+                target_compile_options(test_import_main_preparation PRIVATE -Wall -Wextra -Wpedantic)
+                target_link_libraries(test_import_main_preparation PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+                add_dependencies(test_import_main_preparation import_main_profile)
+                add_test(NAME import_main_cold_preparation COMMAND test_import_main_preparation
+                    $<TARGET_FILE:import_main_fixture> ${import_main_profile_dir}/module-6.bin)
+            endif()
             if(FRAME_MASK_IMPORT_CLIENT_PROFILE OR FRAME_MASK_IMPORT_CLIENT_REFERENCE)
                 if(NOT FRAME_MASK_IMPORT_CLIENT_PROFILE OR NOT FRAME_MASK_IMPORT_CLIENT_REFERENCE)
                     message(FATAL_ERROR "Private mapped-identity checks require both client profile and reference")
@@ -211,6 +274,10 @@ if(BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_import_native_forwarding.py
                     --qemu ${FRAME_MASK_IMPORT_QEMU} --providers ${FRAME_MASK_IMPORT_PROVIDERS}
                     --record ${CMAKE_CURRENT_BINARY_DIR}/import-native-arm64-validation.json)
+                add_test(NAME import_startup_native_arm64_execution COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_import_startup_native.py
+                    --qemu ${FRAME_MASK_IMPORT_QEMU} --providers ${FRAME_MASK_IMPORT_PROVIDERS}
+                    --record ${CMAKE_CURRENT_BINARY_DIR}/import-startup-native-arm64-validation.json)
             endif()
         endif()
         add_test(NAME unix_connection_snapshot COMMAND ${Python3_EXECUTABLE}

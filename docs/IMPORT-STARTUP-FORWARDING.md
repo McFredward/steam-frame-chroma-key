@@ -129,10 +129,18 @@ unchanged `dlsym` pointers and two semantic negative controls. Host child exec
 also retains missing API availability. ARM child exec is not claimed: QEMU is
 not registered as a host binfmt handler.
 
-The fixture uses its own C++ main wrapper and API/client DSOs. It has **not yet
-executed the root's two production true-entry veneers with this audit path**,
-and never calls native OpenVR initialization. Root integration must separately
-validate those entries/core, connect real cold preparation and retirement, pin
+The audit fixture uses its own C++ main wrapper and API/client DSOs. A separate
+`tools/run_import_startup_native.py` fixture now executes the two production
+true-entry veneers with the actual startup forwarding core, under AArch64 QEMU
+and the pinned Frame libc/loader. Its 83 checks reuse the existing executed
+register probe: original general registers/SP, preserved SIMD registers,
+32-bit token and error output, errno, native exception and pthread forced-unwind
+cleanup. It uses controlled API providers, not native OpenVR initialization.
+Neither fixture has yet executed the **combined production audit/veneer/runtime
+path**. Explicit QEMU/provider paths opt this test into CTest; private inputs
+are neither downloaded by the runner nor published by CI.
+
+Root integration must connect real cold preparation and retirement, pin
 the final own ELF/hidden RVAs, verify the actual current launch environment and
 obtain permission before any changed runtime instrumentation. Native
 constructor discovery, binding absence/presence, startup thread ownership and
