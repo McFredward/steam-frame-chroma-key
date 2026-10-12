@@ -59,13 +59,13 @@ def parse_reply(data, sequence, port, inode):
 
 
 class KernelQuery:
-    def __init__(self):
+    def __init__(self, deadline=None):
         self.channel = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4)
         self.channel.settimeout(0.5)
         self.channel.bind((0, 0))
         self.port = self.channel.getsockname()[0]
         self.sequence = 0
-        self.deadline = time.monotonic() + 2.0
+        self.deadline = time.monotonic() + 2.0 if deadline is None else deadline
 
     def _timeout(self):
         remaining = self.deadline - time.monotonic()
@@ -107,9 +107,9 @@ def _bounded(path, limit):
     return value.decode("ascii")
 
 
-def endpoint(pid, fd, start_ticks):
-    if not 0 < pid <= 0x7fffffff or not 0 <= fd <= 0x7fffffff or start_ticks <= 0:
-        raise ConnectionError("Invalid exact endpoint identity")
+def _process_identity(pid, start_ticks):
+    if not 0 < pid <= 0x7fffffff or start_ticks <= 0:
+        raise ConnectionError("Invalid exact process identity")
     proc = Path("/proc") / str(pid)
     status = _bounded(proc / "status", 65536)
     uids = next((line.split()[1:] for line in status.splitlines() if line.startswith("Uid:")), [])
@@ -122,25 +122,57 @@ def endpoint(pid, fd, start_ticks):
     inspector = Path("/proc/self/ns/net").stat()
     if (namespace.st_dev, namespace.st_ino) != (inspector.st_dev, inspector.st_ino):
         raise ConnectionError("Endpoint belongs to another network namespace")
-    target = proc / "fd" / str(fd)
-    match = re.fullmatch(r"socket:\[(\d+)\]", os.readlink(target))
-    metadata = target.stat()
-    if not match or not stat.S_ISSOCK(metadata.st_mode) or metadata.st_ino != int(match[1]):
-        raise ConnectionError("Changed descriptor or non-socket endpoint")
-    return {"pid": pid, "fd": fd, "process_start_ticks": start_ticks,
-            "inode": metadata.st_ino, "uid": os.geteuid(),
+    return {"pid": pid, "process_start_ticks": start_ticks, "uid": os.geteuid(),
             "netns_device": namespace.st_dev, "netns_inode": namespace.st_ino}
 
 
-def inspect_pair(left, right):
-    """Four bounded queries within2seconds; no continuous-epoch claim."""
-    before = [endpoint(*x) for x in (left, right)]
-    if before[0]["inode"] == before[1]["inode"]:
-        raise ConnectionError("Aliases of one socket are not a peer pair")
-    with KernelQuery() as query:
-        first = [query.get(x["inode"]) for x in before]
-        again = [query.get(x["inode"], x["cookie"]) for x in first]
-    after = [endpoint(*x) for x in (left, right)]
+def endpoint(pid, fd, start_ticks):
+    if not 0 <= fd <= 0x7fffffff:
+        raise ConnectionError("Invalid exact endpoint identity")
+    identity = _process_identity(pid, start_ticks)
+    proc = Path("/proc") / str(pid)
+    target = proc / "fd" / str(fd)
+    match = re.fullmatch(r"socket:\[(\d+)\]", os.readlink(target))
+    metadata = target.stat()
+    if not match or not stat.S_ISSOCK(metadata.st_mode) or metadata.st_ino != int(match[1]) \
+            or metadata.st_uid != identity["uid"]:
+        raise ConnectionError("Changed descriptor or non-socket endpoint")
+    return {**identity, "fd": fd, "inode": metadata.st_ino}
+
+
+def _check_deadline(deadline):
+    if time.monotonic() >= deadline:
+        raise ConnectionError("Peer discovery deadline exceeded")
+
+
+def _peer_descriptor(right, peer_inode, deadline):
+    """Inspect at most 256 entries in one specified process, never all PIDs."""
+    pid, start_ticks = right
+    found = None
+    examined = 0
+    with os.scandir(Path("/proc") / str(pid) / "fd") as entries:
+        for entry in entries:
+            _check_deadline(deadline)
+            examined += 1
+            if examined > 256:
+                raise ConnectionError("Known peer process descriptor limit exceeded")
+            if not re.fullmatch(r"[0-9]+", entry.name):
+                raise ConnectionError("Unexpected process descriptor entry")
+            # readlink and fstat contain kernel metadata only, not socket payloads.
+            match = re.fullmatch(r"socket:\[(\d+)\]", os.readlink(entry.path))
+            if match and int(match[1]) == peer_inode:
+                if found is not None:
+                    raise ConnectionError("Ambiguous peer descriptor aliases")
+                found = endpoint(pid, int(entry.name), start_ticks)
+                if found["inode"] != peer_inode:
+                    raise ConnectionError("Peer descriptor changed during discovery")
+    _check_deadline(deadline)
+    if found is None:
+        raise ConnectionError("Kernel peer is not in the specified process")
+    return found, examined
+
+
+def _pair_result(before, after, first, again):
     if before != after or first != again:
         raise ConnectionError("Endpoint or kernel socket metadata changed")
     if any(x["uid"] != os.geteuid() for x in first) or \
@@ -151,6 +183,50 @@ def inspect_pair(left, right):
             "kernel_peer_pair_snapshot": True, "socket_epoch_continuity": False,
             "native_cross_process_namespace": False, "source_frame_associated": False,
             "accepted_submit": False, "gpu_consumed_coherent": False}
+
+
+def inspect_pair(left, right):
+    """Four bounded queries within 2 seconds; no continuous-epoch claim."""
+    before = [endpoint(*x) for x in (left, right)]
+    if before[0]["inode"] == before[1]["inode"]:
+        raise ConnectionError("Aliases of one socket are not a peer pair")
+    with KernelQuery() as query:
+        first = [query.get(x["inode"]) for x in before]
+        again = [query.get(x["inode"], x["cookie"]) for x in first]
+    after = [endpoint(*x) for x in (left, right)]
+    return _pair_result(before, after, first, again)
+
+
+def inspect_peer(left, right):
+    """Discover a peer FD in one exact process within a single 2-second budget.
+
+    left is (pid, fd, process_start_ticks); right is (pid, process_start_ticks).
+    This validates a contemporaneous kernel snapshot only. It does not bind a
+    historically captured descriptor, native Registry lease or source frame.
+    """
+    deadline = time.monotonic() + 2.0
+    left_before = endpoint(*left)
+    right_identity = _process_identity(*right)
+    _check_deadline(deadline)
+    with KernelQuery(deadline=deadline) as query:
+        left_first = query.get(left_before["inode"])
+        if left_first["uid"] != left_before["uid"]:
+            raise ConnectionError("Kernel socket owner differs from process owner")
+        right_before, examined = _peer_descriptor(right, left_first["peer_inode"], deadline)
+        if any(right_before[key] != value for key, value in right_identity.items()):
+            raise ConnectionError("Peer process changed during discovery")
+        _check_deadline(deadline)
+        right_first = query.get(right_before["inode"])
+        first = [left_first, right_first]
+        again = [query.get(x["inode"], x["cookie"]) for x in first]
+    after = [endpoint(*left), endpoint(right[0], right_before["fd"], right[1])]
+    _check_deadline(deadline)
+    result = _pair_result([left_before, right_before], after, first, again)
+    result.update({"kind": "unix_peer_discovery_snapshot",
+                   "right_process_fd_entries_examined": examined,
+                   "historical_captured_descriptor_authenticated": False,
+                   "native_registry_lease_authenticated": False})
+    return result
 
 
 def main():

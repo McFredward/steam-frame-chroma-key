@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Protocol refusals plus real local kernel peer snapshots; no Frame access."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import socket
 import struct
+import subprocess
+import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -126,6 +130,224 @@ class LiveKernelTests(unittest.TestCase):
             return data
         with patch.object(connection,"endpoint",changed):
             with self.assertRaises(connection.ConnectionError):connection.inspect_pair(self.a,self.b)
+
+
+@unittest.skipUnless(os.name=="posix" and hasattr(socket,"AF_NETLINK"),"Linux socket diagnostics required")
+class PeerDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.left,self.right=socket.socketpair()
+        self.ticks=own_ticks()
+        self.a=(os.getpid(),self.left.fileno(),self.ticks)
+        self.peer=(os.getpid(),self.ticks)
+
+    def tearDown(self):
+        self.left.close();self.right.close()
+
+    def test_real_socketpair_four_cookie_queries_and_false_claims(self):
+        queries=[]
+        original=connection.KernelQuery.get
+        def observe(query,inode,cookie=0xffffffffffffffff):
+            result=original(query,inode,cookie)
+            queries.append((inode,cookie,result["cookie"]))
+            return result
+        with patch.object(connection.KernelQuery,"get",observe):
+            result=connection.inspect_peer(self.a,self.peer)
+        self.assertEqual(result["kind"],"unix_peer_discovery_snapshot")
+        self.assertEqual(result["endpoints"][1]["fd"],self.right.fileno())
+        self.assertTrue(result["kernel_peer_pair_snapshot"])
+        self.assertLessEqual(result["right_process_fd_entries_examined"],256)
+        self.assertEqual(len(queries),4)
+        self.assertEqual([x[0] for x in queries[:2]],[x[0] for x in queries[2:]])
+        self.assertEqual([x[2] for x in queries[:2]],[x[1] for x in queries[2:]])
+        for flag in ("socket_epoch_continuity","native_cross_process_namespace",
+                     "source_frame_associated","accepted_submit","gpu_consumed_coherent",
+                     "historical_captured_descriptor_authenticated","native_registry_lease_authenticated"):
+            self.assertFalse(result[flag],flag)
+
+    def test_separate_real_client_server_process_without_known_peer_fd(self):
+        # The server's independently reported descriptor is only an assertion
+        # oracle; discovery receives just its PID/start ticks, never its FD/name.
+        server_code="""
+import json, os, socket, sys
+from pathlib import Path
+listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+address='\\0frame-peer-test-'+str(os.getpid())
+listener.bind(address);listener.listen(1)
+value=Path('/proc/self/stat').read_text()
+ticks=int(value[value.rindex(')')+2:].split()[19])
+print(json.dumps({'pid':os.getpid(),'ticks':ticks,'address':address}),flush=True)
+accepted,_=listener.accept()
+os.dup2(accepted.fileno(),61);accepted.close()
+print(61,flush=True)
+sys.stdin.readline()
+os.close(61);listener.close()
+"""
+        process=subprocess.Popen([sys.executable,"-u","-c",server_code],
+                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,text=True)
+        client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+        try:
+            server=json.loads(process.stdout.readline())
+            client.connect(server["address"])
+            actual_fd=int(process.stdout.readline())
+            result=connection.inspect_peer((os.getpid(),client.fileno(),self.ticks),
+                                           (server["pid"],server["ticks"]))
+            self.assertEqual(result["endpoints"][1]["fd"],actual_fd)
+            self.assertNotEqual(actual_fd,8)
+            self.assertNotEqual(result["endpoints"][0]["pid"],result["endpoints"][1]["pid"])
+            with self.assertRaisesRegex(connection.ConnectionError,"specified process"):
+                connection.inspect_peer((os.getpid(),client.fileno(),self.ticks),self.peer)
+        finally:
+            client.close()
+            try:
+                process.communicate("\n",timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill();process.communicate()
+
+    def test_wrong_peer_start_ticks_rejected_before_query(self):
+        with patch.object(connection.KernelQuery,"get",side_effect=AssertionError("must not query")):
+            with self.assertRaisesRegex(connection.ConnectionError,"lifetime"):
+                connection.inspect_peer(self.a,(os.getpid(),self.ticks+1))
+
+    def test_peer_alias_ambiguity_fails_after_only_left_query(self):
+        duplicate=os.dup(self.right.fileno())
+        try:
+            calls=[]
+            original=connection.KernelQuery.get
+            def observe(query,*args):
+                calls.append(args);return original(query,*args)
+            with patch.object(connection.KernelQuery,"get",observe):
+                with self.assertRaisesRegex(connection.ConnectionError,"Ambiguous"):
+                    connection.inspect_peer(self.a,self.peer)
+            self.assertEqual(len(calls),1)
+        finally:os.close(duplicate)
+
+    def test_scan_hard_cap_even_with_matching_peer_found(self):
+        class Entry:
+            def __init__(self,name):
+                self.name=str(name);self.path="/fake/"+self.name
+        class Entries:
+            def __enter__(self):return iter([Entry(self.right_fd)]+[Entry(999)]*256)
+            def __exit__(self,*_):pass
+        found=connection.endpoint(os.getpid(),self.right.fileno(),self.ticks)
+        entries=Entries();entries.right_fd=self.right.fileno()
+        def link(path):return f"socket:[{found['inode']}]" if path=="/fake/"+str(self.right.fileno()) else "/dev/null"
+        with patch.object(connection.os,"scandir",return_value=entries), \
+                patch.object(connection.os,"readlink",side_effect=link), \
+                patch.object(connection,"endpoint",return_value=found):
+            with self.assertRaisesRegex(connection.ConnectionError,"descriptor limit"):
+                connection._peer_descriptor(self.peer,found["inode"],time.monotonic()+2)
+
+    def test_real_process_descriptor_cap(self):
+        descriptors=[]
+        try:
+            for _ in range(257):descriptors.append(os.open("/dev/null",os.O_RDONLY))
+            with self.assertRaisesRegex(connection.ConnectionError,"descriptor limit"):
+                connection.inspect_peer(self.a,self.peer)
+        finally:
+            for fd in descriptors:os.close(fd)
+
+    def test_selected_peer_descriptor_rebound_before_final_validation(self):
+        original=connection.KernelQuery.get
+        calls=0
+        replacement,other=socket.socketpair()
+        def rebind(query,*args):
+            nonlocal calls
+            calls+=1;result=original(query,*args)
+            if calls==4:os.dup2(replacement.fileno(),self.right.fileno())
+            return result
+        try:
+            with patch.object(connection.KernelQuery,"get",rebind):
+                with self.assertRaisesRegex(connection.ConnectionError,"metadata changed"):
+                    connection.inspect_peer(self.a,self.peer)
+        finally:replacement.close();other.close()
+
+    def test_peer_identity_changes_during_discovery(self):
+        original=connection._process_identity
+        calls=0
+        def changed(*args):
+            nonlocal calls
+            calls+=1;result=original(*args)
+            if calls==3:result["netns_inode"]+=1
+            return result
+        with patch.object(connection,"_process_identity",changed):
+            with self.assertRaisesRegex(connection.ConnectionError,"process changed"):
+                connection.inspect_peer(self.a,self.peer)
+
+    def test_left_descriptor_identity_changes_after_queries(self):
+        original=connection.endpoint
+        calls=0
+        def changed(*args):
+            nonlocal calls
+            calls+=1;result=original(*args)
+            if calls==3:result["process_start_ticks"]+=1
+            return result
+        with patch.object(connection,"endpoint",changed):
+            with self.assertRaisesRegex(connection.ConnectionError,"metadata changed"):
+                connection.inspect_peer(self.a,self.peer)
+
+    def test_deadline_includes_metadata_and_directory_scan(self):
+        original=connection.endpoint
+        def elapsed(*args):
+            result=original(*args)
+            clock[0]+=2.1
+            return result
+        clock=[100.0]
+        with patch.object(connection.time,"monotonic",side_effect=lambda:clock[0]), \
+                patch.object(connection,"endpoint",elapsed), \
+                patch.object(connection.KernelQuery,"get",side_effect=AssertionError("must not query")):
+            with self.assertRaisesRegex(connection.ConnectionError,"deadline"):
+                connection.inspect_peer(self.a,self.peer)
+        with self.assertRaisesRegex(connection.ConnectionError,"deadline"):
+            connection._peer_descriptor(self.peer,1,time.monotonic()-1)
+
+    def test_owner_change_is_refused_before_kernel_queries(self):
+        original=connection._bounded
+        def changed(path,limit):
+            if path.name=="status":return "Uid:\t"+"\t".join([str(os.geteuid()+1)]*4)+"\n"
+            return original(path,limit)
+        with patch.object(connection,"_bounded",changed), \
+                patch.object(connection.KernelQuery,"get",side_effect=AssertionError("must not query")):
+            with self.assertRaisesRegex(connection.ConnectionError,"owned"):
+                connection.inspect_peer(self.a,self.peer)
+
+    def test_total_deadline_refuses_after_four_real_queries(self):
+        original=connection.KernelQuery.get
+        calls=0
+        clock=[100.0]
+        def elapsed(query,*args):
+            nonlocal calls
+            calls+=1;result=original(query,*args)
+            if calls==4:clock[0]+=2.1
+            return result
+        with patch.object(connection.time,"monotonic",side_effect=lambda:clock[0]), \
+                patch.object(connection.KernelQuery,"get",elapsed):
+            with self.assertRaisesRegex(connection.ConnectionError,"deadline"):
+                connection.inspect_peer(self.a,self.peer)
+        self.assertEqual(calls,4)
+
+    def test_cli_discovers_real_peer_without_right_fd_argument(self):
+        result=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/"tools/inspect_client_connection.py"),
+                               "--left-pid",str(os.getpid()),"--left-fd",str(self.left.fileno()),
+                               "--left-start-ticks",str(self.ticks),"--right-pid",str(os.getpid()),
+                               "--right-start-ticks",str(self.ticks)],
+                              capture_output=True,text=True,timeout=3)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        receipt=json.loads(result.stdout)
+        self.assertEqual(receipt["endpoints"][1]["fd"],self.right.fileno())
+        self.assertTrue(receipt["kernel_peer_pair_snapshot"])
+        self.assertFalse(receipt["historical_captured_descriptor_authenticated"])
+
+    def test_cli_refusal_has_no_positive_claims(self):
+        result=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/"tools/inspect_client_connection.py"),
+                               "--left-pid","0","--left-fd","0","--left-start-ticks","1",
+                               "--right-pid",str(os.getpid()),"--right-start-ticks",str(self.ticks)],
+                              capture_output=True,text=True,timeout=3)
+        self.assertEqual(result.returncode,1)
+        receipt=json.loads(result.stdout)
+        self.assertEqual(receipt["kind"],"unix_peer_discovery_refusal")
+        for key,value in receipt.items():
+            if isinstance(value,bool):self.assertFalse(value,key)
 
 
 if __name__=="__main__":unittest.main()
