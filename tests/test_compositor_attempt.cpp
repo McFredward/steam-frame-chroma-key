@@ -30,21 +30,6 @@ void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
-namespace frame_bindings {
-// This worktree predates the root-owned public Journal validator. The fallback
-// uses precisely its background-owner pending-publication/lifecycle contract.
-// Integrated builds select the actual production method through the overload.
-struct JournalTestAccess {
-    static bool validate(Journal& j, const ImportResourceReceipt& r) noexcept {
-        const auto ticket = j.tickets_.load(std::memory_order_acquire);
-        if (j.closed_.load() || j.halted_.load() || j.active_.load() || !j.empty() ||
-            j.expected_ != ticket || j.lostState()) return false;
-        const auto valid = j.core_.validate(r);
-        return valid && !j.active_.load() && j.empty() && j.expected_ == ticket &&
-            j.tickets_.load() == ticket && !j.closed_.load() && !j.halted_.load() && !j.lostState();
-    }
-};
-}
 namespace {
 using namespace frame_compositor_attempt;
 using Boundary = frame_import_native::Boundary;
@@ -58,11 +43,6 @@ template<class T> T h(std::uint64_t v) {
     else return static_cast<T>(v);
 }
 template<class T> T info(VkStructureType type) { T value{}; value.sType = type; return value; }
-template<class T> auto owner_validate(T& j, const frame_bindings::ImportResourceReceipt& r, int)
-    -> decltype(j.validateImportResourceReceipt(r)) { return j.validateImportResourceReceipt(r); }
-bool owner_validate(frame_bindings::Journal& j, const frame_bindings::ImportResourceReceipt& r, long) {
-    return frame_bindings::JournalTestAccess::validate(j, r);
-}
 struct ValidatorOwner {
     frame_bindings::Journal* journal = nullptr;
     frame_import_pipe::Registry* registry = nullptr;
@@ -75,7 +55,7 @@ struct ValidatorOwner {
             auto ignore = [](auto, const auto&) {};
             while (self.journal->drain(ignore)) {}
         }
-        return owner_validate(*self.journal, receipt, 0);
+        return self.journal->validateImportResourceReceipt(receipt);
     }
 };
 struct Fixture {
@@ -219,6 +199,19 @@ struct Fixture {
 void denials(const frame_import::Record& r) {
     check(!r.native_cross_process_namespace && !r.source_frame_associated && !r.accepted_submit && !r.gpu_consumed_coherent);
 }
+void cached_peer_control() {
+    Fixture f;
+    f.lease=f.registry.activate(f.boundary(false),7,7123);
+    check(f.lease.valid() && !f.lease.fresh_native_peer_pid && !f.lease.peer_pid);
+    const auto diagnostic=f.lease;
+    const auto attempt=f.completed();
+    check(f.lease.fresh_native_peer_pid && f.lease.peer_pid==7123);
+    check(f.lease.socket_generation==diagnostic.socket_generation && !f.registry.check_lease(diagnostic));
+    const auto receipt=f.receipt(); frame_import::Record result;
+    check(f.run(attempt,receipt,result)==Refusal::None && result.import_reply_complete);
+    check(result.route.peer_credentials_verified && result.route.peer_pid==7123);
+    denials(result);
+}
 void device_identity_controls() {
     { Fixture f; const auto a=f.completed(); const auto receipt=f.receipt(); frame_import::Record r;
       check(a.device()==journal_device && journal_device!=native_device);
@@ -255,6 +248,11 @@ void device_identity_controls() {
 }
 
 int main(int argc, char** argv) {
+    cached_peer_control();
+    if(argc==2 && std::strcmp(argv[1],"--cached-peer-only")==0) {
+        std::printf("%u cached-peer timeline checks passed: diagnostic Begin, unchanged-PID payload upgrade, real Journal replay\n",checks);
+        return 0;
+    }
     device_identity_controls();
     if(argc==2 && std::strcmp(argv[1],"--device-identity-only")==0) {
         std::printf("%u focused native-handle/Journal-device identity checks passed; Journal7 and VkDevice0xabc0 are distinct\n",checks);

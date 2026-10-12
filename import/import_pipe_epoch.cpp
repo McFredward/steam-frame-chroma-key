@@ -333,7 +333,15 @@ Lease Registry::activate(const BoundaryProof& proof, int fd, int pid) noexcept {
         return reject_lease(Reason::InvalidProof);
     }
     const auto current = lookup(proof.object);
-    if (current.valid() && current.fd == fd && current.copied_native_peer_pid == pid)
+    const bool fresh_payload = pid > 0 && payload_site(proof.object.domain, proof.entry_return) &&
+                               proof.native_payload_read_succeeded;
+    // The first observed import can follow other RPC payloads on this same
+    // accepted connection. Begin retains their cached PID only diagnostically;
+    // the current successful payload can establish it even if its value did
+    // not change. A connected/reconnected pipe never gains that claim here.
+    if (current.valid() && current.fd == fd && current.copied_native_peer_pid == pid &&
+        (current.fresh_native_peer_pid || !pid ||
+         !payload_site(proof.object.domain, proof.entry_return) || candidate->state.load() == Connected))
         return current;
     Mutation mutation(*this);
     if (!mutation.admitted) return reject_lease(Reason::ObserverLoss);
@@ -355,8 +363,8 @@ Lease Registry::activate(const BoundaryProof& proof, int fd, int pid) noexcept {
         invalidate(*slot, Invalid, false); observer_loss(); return reject_lease(Reason::ConflictingFD);
     }
     if (previous != Connected && pid > 0 && !slot->fresh_pid.load() &&
-        (!slot->zero_initialized.load() || !payload_site(proof.object.domain, proof.entry_return) ||
-         !proof.native_payload_read_succeeded)) {
+        payload_site(proof.object.domain, proof.entry_return) &&
+        (!slot->zero_initialized.load() || !proof.native_payload_read_succeeded)) {
         invalidate(*slot, Invalid, false); return reject_lease(Reason::InvalidProof);
     }
     if (previous == Accepted && slot->fresh_pid.load() && pid != slot->fresh_pid.load()) {
@@ -371,7 +379,9 @@ Lease Registry::activate(const BoundaryProof& proof, int fd, int pid) noexcept {
     slot->native_pid.store(pid);
     // Reconnect can retain an old positive native PID. Its scalar is retained
     // for diagnostics only; this narrow core never upgrades it to fresh facts.
-    slot->fresh_pid.store(previous == Connected ? 0 : pid);
+    const auto established_pid = slot->fresh_pid.load();
+    slot->fresh_pid.store(previous == Connected ? 0 :
+        (established_pid > 0 ? established_pid : (fresh_payload ? pid : 0)));
     slot->state.store(previous == Connected ? Connected : Accepted);
     if (!census()) return reject_lease(Reason::ObserverLoss);
     return lease(*slot, active_writes_.load() == 1 ? Reason::None : Reason::Busy);

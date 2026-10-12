@@ -203,6 +203,39 @@ int main() {
         check(registry.healthy() && !registry.check_lease(fresh) && !registry.lookup(object).valid());
         check(!registry.activate(boundary(object), 19, 0).valid()); // A later snapshot cannot invent a reconnect.
     }
+    for (const auto domain : {Domain::Compositor045, Domain::Client045}) {
+        Registry registry(500);
+        const auto object = born(registry, accepted(0x10000, 19, domain));
+        // Earlier unobserved RPC payloads may have filled the native peer PID.
+        // Its first import Begin must not reject the proven accepted epoch or
+        // claim that the current import payload already established the peer.
+        const auto diagnostic = registry.activate(boundary(object), 19, 7123);
+        check(diagnostic.valid() && registry.check_lease(diagnostic));
+        check(diagnostic.copied_native_peer_pid == 7123 && !diagnostic.peer_pid &&
+              !diagnostic.fresh_native_peer_pid);
+        const auto repeated_begin = registry.activate(boundary(object), 19, 7123);
+        check(repeated_begin.valid() && repeated_begin.registry_revision == diagnostic.registry_revision);
+        denials(diagnostic);
+        const auto fresh = registry.activate(boundary(object, true), 19, 7123);
+        check(fresh.valid() && registry.check_lease(fresh));
+        check(fresh.fresh_native_peer_pid && fresh.peer_pid == 7123);
+        check(fresh.socket_generation == diagnostic.socket_generation &&
+              fresh.registry_revision != diagnostic.registry_revision && !registry.check_lease(diagnostic));
+        const auto later_begin = registry.activate(boundary(object), 19, 7123);
+        check(later_begin.valid() && later_begin.registry_revision == fresh.registry_revision);
+        registry.close_fd(19);
+        check(!registry.activate(boundary(object, true), 19, 7123).valid());
+    }
+    {
+        Registry registry(500);
+        const auto object = born(registry, accepted());
+        const auto diagnostic = registry.activate(boundary(object), 19, 7123);
+        check(diagnostic.valid());
+        auto failed_payload = boundary(object, true);
+        failed_payload.native_payload_read_succeeded = false;
+        check(!registry.activate(failed_payload, 19, 7123).valid());
+        check(!registry.check_lease(diagnostic) && !registry.lookup(object).valid());
+    }
     {
         Registry registry(500);
         auto reservation = registry.reserve_birth(accepted());
