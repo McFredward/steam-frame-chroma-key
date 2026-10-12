@@ -145,6 +145,57 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.calls, previous)
         self.assertEqual(sum("restart" in x for x in self.calls), 2)
         self.assertFalse(any(x[0] != "systemctl" for x in self.calls))
+        completion = json.loads((self.session.folder / "rollback-complete.json").read_text())
+        self.assertIs(completion["exact_manager"], True)
+        self.assertIs(completion["manager_matches_except_session_paths"], True)
+        self.assertEqual(completion["manager_changed_keys"], [])
+
+    def test_native_manager_session_paths_may_change_without_being_overwritten(self):
+        self.manager += f"GAMESCOPE_LIMITER_FILE={self.runtime}/gamescope-limiter-XX7eT9as\nMANGOHUD_CONFIGFILE={self.runtime}/gamescope-mangoapp-XXCn3LeI\n"
+        self.start()
+        self.manager = f"NATIVE_ENV=yes\nGAMESCOPE_LIMITER_FILE={self.runtime}/gamescope-limiter-XXJgzni8\nMANGOHUD_CONFIGFILE={self.runtime}/gamescope-mangoapp-XXx8y6yP\n"
+        self.session.rollback(restart_ready=True)
+        completion = json.loads((self.session.folder / "rollback-complete.json").read_text())
+        self.assertIs(completion["exact_manager"], False)
+        self.assertIs(completion["manager_matches_except_session_paths"], True)
+        changed = ["GAMESCOPE_LIMITER_FILE", "MANGOHUD_CONFIGFILE"]
+        self.assertEqual(completion["manager_changed_keys"], changed)
+        self.assertEqual(completion["permitted_path_changes"], changed)
+        events = [json.loads(row) for row in (self.session.folder / "session.jsonl").read_text().splitlines()]
+        event = next(row for row in events if row["event"] == "rollback_complete")
+        self.assertIs(event["exact_manager"], False)
+        self.assertEqual(event["manager_changed_keys"], changed)
+        self.assertIn("gamescope-limiter-XXJgzni8", self.manager)
+        self.assertFalse(any("set-environment" in call or "unset-environment" in call for call in self.calls))
+
+    def test_other_manager_change_still_refuses_completion(self):
+        self.start()
+        self.manager = "NATIVE_ENV=changed\n"
+        with self.assertRaises(RuntimeError): self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.dropin.exists())
+        self.assertFalse((self.session.folder / "rollback-complete.json").exists())
+        events = [json.loads(row) for row in (self.session.folder / "session.jsonl").read_text().splitlines()]
+        event = next(row for row in events if row["event"] == "restoration_comparison")
+        self.assertIs(event["manager_matches_except_session_paths"], False)
+        self.assertEqual(event["manager_changed_keys"], ["NATIVE_ENV"])
+
+    def test_session_path_exception_requires_existing_absolute_path_values(self):
+        original = {"GAMESCOPE_LIMITER_FILE": str(self.runtime / "gamescope-limiter-original")}
+        for restored in ({}, {"GAMESCOPE_LIMITER_FILE": "relative"},
+                         {"GAMESCOPE_LIMITER_FILE": "/tmp/../changed"},
+                         {"GAMESCOPE_LIMITER_FILE": "/tmp/changed\n"},
+                         {"GAMESCOPE_LIMITER_FILE": "/tmp/gamescope-limiter-other"},
+                         {"GAMESCOPE_LIMITER_FILE": str(self.runtime / "wrong-prefix")},
+                         {"GAMESCOPE_LIMITER_FILE": str(self.runtime / "sub/gamescope-limiter-other")},
+                         {"GAMESCOPE_LIMITER_FILE": str(self.runtime / "gamescope-limiter-other"), "NEW_KEY": "unexpected"}):
+            self.assertIs(M.compare_manager(original, restored, self.runtime)["manager_matches_except_session_paths"], False)
+        self.assertIs(M.compare_manager({}, {"MANGOHUD_CONFIGFILE": "/tmp/new"}, self.runtime)["manager_matches_except_session_paths"], False)
+
+    def test_preload_values_never_use_the_session_path_exception(self):
+        self.start()
+        self.manager = "NATIVE_ENV=yes\nFRAME_RECEIVER_TRACE_OUTPUT=/tmp/foreign\n"
+        with self.assertRaises(RuntimeError): self.session.rollback(restart_ready=True)
+        self.assertFalse((self.session.folder / "rollback-complete.json").exists())
 
     def test_scope_and_restart_readiness_are_required_separately(self):
         for options in ({"runtime_scope": False}, {"restart_ready": False}):

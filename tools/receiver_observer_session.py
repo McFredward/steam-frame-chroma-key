@@ -26,6 +26,8 @@ LIMIT = 1048576
 RECEIVER = "0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b"
 PREFIX = "FRAME_RECEIVER_"
 FOREIGN_PREFIXES = (PREFIX, "FRAME_MASK_TRACE")
+SESSION_MANAGER_PATHS = {"GAMESCOPE_LIMITER_FILE": "gamescope-limiter-",
+                         "MANGOHUD_CONFIGFILE": "gamescope-mangoapp-"}
 
 
 def digest(data):
@@ -96,6 +98,22 @@ def exclusive(path, data):
 
 def json_bytes(value):
     return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+
+
+def compare_manager(original, restored, runtime):
+    """Native restarts can replace only these two per-session file paths."""
+    changed = sorted(key for key in original.keys() | restored.keys()
+                     if key not in original or key not in restored or original[key] != restored[key])
+    def session_path(key, value):
+        return (isinstance(value, str) and value.startswith("/") and ".." not in Path(value).parts
+                and os.path.normpath(value) == value and not re.search(r"[\x00-\x1f]", value)
+                and Path(value).parent == runtime and Path(value).name.startswith(SESSION_MANAGER_PATHS[key])
+                and len(Path(value).name) > len(SESSION_MANAGER_PATHS[key]))
+    permitted = all(key in SESSION_MANAGER_PATHS and key in original and key in restored
+                    and session_path(key, original[key]) and session_path(key, restored[key]) for key in changed)
+    return {"exact_manager": original == restored,
+            "manager_matches_except_session_paths": permitted, "manager_changed_keys": changed,
+            "permitted_path_changes": changed if permitted else []}
 
 
 class Session:
@@ -579,14 +597,18 @@ class Session:
         restored_manager = self.reject_environment(restored)
         snapshots = self.native_environment_files(restored, {name: data["sha256"]
                     for name, data in manifest["original_environment_files"].items()})
+        comparison = compare_manager(manifest["original_manager_environment"], restored_manager, self.runtime)
+        self.recovery_event("restoration_comparison", original_service_matches=restored == manifest["original_service"],
+                            native_environment_files_match=snapshots == manifest["original_environment_files"],
+                            **comparison)
         if (restored != manifest["original_service"]
-                or restored_manager != manifest["original_manager_environment"]
+                or not comparison["manager_matches_except_session_paths"]
                 or snapshots != manifest["original_environment_files"]):
             raise RuntimeError("Native service configuration differs from original snapshot")
         exclusive(complete, json_bytes({"restored": True, "runtime_activation_absent": True,
                                        "original_service_matches": True, "time": time.time(),
-                                       "native_receiver_process_verified": False}))
-        self.event("rollback_complete", receiver_process_verified=False)
+                                       "native_receiver_process_verified": False, **comparison}))
+        self.event("rollback_complete", receiver_process_verified=False, **comparison)
 
 
 def main(argv=None):

@@ -146,7 +146,24 @@ python3 ~/.local/share/frame-receiver-observer/receiver_observer_session.py roll
 
 Rollback removes **only** an exact matching owned drop-in, reloads the user
 manager, requests one native **Steam client restart**, and compares service/manager/environment
-files against the original snapshots. A completed restoration is idempotent.
+files against the original snapshots. The service environment, drop-ins and native
+EnvironmentFiles must match exactly. Manager values also match exactly except
+that `GAMESCOPE_LIMITER_FILE` and `MANGOHUD_CONFIGFILE` may retain existing path
+values that change during a native session restart. Both old/new values must be
+normalized absolute direct children of the user's runtime directory, with the
+respective `gamescope-limiter-` and `gamescope-mangoapp-` filename prefixes.
+Their contents are never read or changed.
+Missing/added keys, relative values and changes to any other manager key still
+refuse completion. The helper never sets or overwrites the manager environment
+to force equality, and preload/observer/trace refusals remain in place.
+
+This exception follows the 2026-10-12 rollback evidence: native configuration was
+restored and the observer was absent, while those two native session paths had
+changed. `rollback-complete.json` and the ledger record `exact_manager`,
+`manager_matches_except_session_paths`, changed key names and
+`permitted_path_changes`. A permitted
+path change has `exact_manager:false`; successful restoration does not claim a
+byte-identical manager environment. A completed restoration is idempotent.
 Changed or foreign activation bytes are preserved and reported for manual review;
 they are never blindly deleted. Missing activation after an interrupted rollback
 can be recovered using the saved manifest. Ledger ENOSPC/bound errors cannot
