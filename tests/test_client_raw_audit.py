@@ -190,10 +190,20 @@ int main(int argc,char** argv) {
 
 def abi_check(folder, logs, env):
     source = ROOT / 'import/native_connection_entry.S'
+    def assemble(target, definitions, label):
+        # The wrapper needs preprocessing only. Use the ordinary host compiler
+        # for that step and the existing cross-binutils for actual ARM assembly;
+        # CI need not install a full cross compiler for a source/CFI control.
+        expanded = target.with_suffix('.s')
+        result = common.recorded_run(['gcc', '-E', '-P', '-x', 'assembler-with-cpp',
+            *definitions, str(source), '-o', str(expanded)], folder, logs, label+'_preprocess', 30, env)
+        if result.returncode:
+            return result
+        return common.recorded_run(['aarch64-linux-gnu-as', '-g', str(expanded), '-o', str(target)],
+                                   folder, logs, label, 30, env)
     obj = folder / 'raw-entry.o'
-    command = ['aarch64-linux-gnu-gcc', '-c', '-g', '-DFRAME_CLIENT_RESOURCE_THREAD_PREPARATION=1',
-               '-DFRAME_CLIENT_RESOURCE_RAW_TRANSACTION=1', str(source), '-o', str(obj)]
-    result = common.recorded_run(command, folder, logs, 'raw_arm_entry_compile', 30, env)
+    result = assemble(obj, ['-DFRAME_CLIENT_RESOURCE_THREAD_PREPARATION=1',
+                           '-DFRAME_CLIENT_RESOURCE_RAW_TRANSACTION=1'], 'raw_arm_entry_compile')
     if result.returncode:
         raise RuntimeError(result.stderr)
     data = obj.read_bytes()
@@ -239,8 +249,7 @@ def abi_check(folder, logs, env):
     if direct_object.section_data(direct_object.section('.text')) != parsed.section_data(text):
         raise RuntimeError('CPP selector and pure-assembler selector produce different code')
     disabled = folder / 'cold-only.o'
-    result = common.recorded_run(['aarch64-linux-gnu-gcc', '-c', '-DFRAME_CLIENT_RESOURCE_THREAD_PREPARATION=1',
-        str(source), '-o', str(disabled)], folder, logs, 'cold_selector_without_raw', 30, env)
+    result = assemble(disabled, ['-DFRAME_CLIENT_RESOURCE_THREAD_PREPARATION=1'], 'cold_selector_without_raw')
     if result.returncode:
         raise RuntimeError(result.stderr)
     cold = abi.Object(disabled.read_bytes())
@@ -248,8 +257,7 @@ def abi_check(folder, logs, env):
     raw_names = {'frame_import_read_entry', 'frame_import_read_dispatch', 'frame_import_write_entry', 'frame_import_write_dispatch'}
     if cold_names != expected - raw_names:
         raise RuntimeError('Zero raw selector changed the old cold entry set')
-    result = common.recorded_run(['aarch64-linux-gnu-gcc', '-c', '-DFRAME_CLIENT_RESOURCE_RAW_TRANSACTION=1',
-        str(source), '-o', str(folder / 'invalid-selector.o')], folder, logs, 'raw_selector_without_cold', 30, env)
+    result = assemble(folder/'invalid-selector.o', ['-DFRAME_CLIENT_RESOURCE_RAW_TRANSACTION=1'], 'raw_selector_without_cold')
     if result.returncode == 0 or 'Raw transaction entry requires cold resource-thread entry' not in result.stderr:
         raise RuntimeError('Raw selector can bypass cold scope')
     return {'functions': len(names), 'executions': len(names) * 128, 'private_standard_entries': True,
