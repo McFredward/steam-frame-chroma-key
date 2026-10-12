@@ -256,6 +256,9 @@ if(BUILD_TESTING)
                 add_test(NAME import_startup_audit_binding COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py
                     --record ${CMAKE_CURRENT_BINARY_DIR}/import-startup-audit-validation.json)
+                add_test(NAME import_startup_deepbind_binding COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py --deepbind
+                    --record ${CMAKE_CURRENT_BINARY_DIR}/import-startup-deepbind-validation.json)
             endif()
             if(NOT CMAKE_CROSSCOMPILING)
                 add_library(import_loader_fixture SHARED tests/test_import_loader_reader.cpp)
@@ -345,6 +348,9 @@ if(BUILD_TESTING)
         add_test(NAME receiver_observer_session_recovery COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
             -p test_receiver_observer_session.py)
+        add_test(NAME client_startup_session_recovery COMMAND ${Python3_EXECUTABLE}
+            -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            -p test_client_startup_session.py)
         add_test(NAME frame_trace_session_recovery COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_frame_trace_session.py)
     endif()

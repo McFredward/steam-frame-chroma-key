@@ -20,15 +20,16 @@ struct Setup {
     std::uint64_t local_verification_label=0;
     std::uintptr_t hidden_init_entry=0,hidden_shutdown_entry=0;
     ClientSlot client{};
+    std::uintptr_t hidden_mutex_init_entry=0,hidden_mutex_destroy_entry=0;
 };
 enum class Refusal : unsigned {
     None,Unprepared,MainPreparation,ClientProfile,Setup,Providers,Subscriber,
     Audit,Stack,Gate,ClientName,ClientGeometry,RecordLoss,NotificationLoss,
-    InitializationFailure,Shutdown,Unload,Finalized
+    InitializationFailure,Shutdown,Unload,Finalized,MutexProvider,ClientBinding
 };
 enum class Kind : unsigned {
     Prepared,AuditAttached,InitBefore,ClientMapped,PipeBorn,InitAfter,
-    InitAbandon,Shutdown,Retire,Refused,Loss
+    InitAbandon,Shutdown,Retire,Refused,Loss,MutexBound
 };
 struct Record {
     Kind kind=Kind::Refused;

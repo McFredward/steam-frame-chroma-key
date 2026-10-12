@@ -8,7 +8,19 @@ frame or prove the GPU-consumed eye mapping.
 
 ## Decision
 
-The next useful runtime investigation is on the **Windows sender**, observing
+**Maintainer steering, 2026-10-12:** prefer an implementation with no additional
+modification, injection or private hook in the native PC Steam sender. The
+GloomhavenVR application still needs genuine eye coverage. First investigate
+an app-owned route through the unchanged stream; a separate mask channel needs
+an independently proven selected-video identity and composed UV relation. Do
+not treat that requirement as automatically authorizing a sender hook.
+
+The private-driver observation plan below is retained as a documented alternative,
+not the selected next implementation. It requires a separate decision if the
+app-owned feasibility gates cannot be met. See the
+[no-sender-modification review](PC-WITHOUT-SENDER-MODIFICATION.md) for those gates.
+
+The previously planned runtime investigation is on the **Windows sender**, observing
 one actual composition through encoder input, encoded output and native TX-key
 allocation. Another public mirror poll or Frame descriptor-only capture cannot
 close this missing relation. Build an opt-in, version-guarded metadata observer

@@ -12,6 +12,8 @@
 
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_init_entry();
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_shutdown_entry();
+extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_init_entry();
+extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_destroy_entry();
 // glibc's public pthread_atfork ABI uses its own libpthread_nonshared wrapper
 // on the reviewed build. Validate the real registration provider cold, too.
 extern "C" int __register_atfork(void(*)(void),void(*)(void),void(*)(void),void*) noexcept;
@@ -164,7 +166,8 @@ void record(Line& line,const frame_client_startup::Record& r) noexcept {
             name,u(v.bias),u(v.rx_begin),u(v.rx_end),u(v.observed_open_generation));
     };
     view("audit_receiver",r.audit_bindings.receiver);view("audit_api",r.audit_bindings.api);
-    view("audit_observer",r.audit_bindings.observer);view("retired_module",r.retired_view);
+    view("audit_observer",r.audit_bindings.observer);view("audit_libc",r.audit_bindings.libc);
+    view("audit_client",r.audit_bindings.client);view("retired_module",r.retired_view);
     line.add(",\"audit_function\":%u,\"audit_original\":\"%llx\"",unsigned(r.audit_bindings.function),u(r.audit_bindings.original));
     line.add(",\"actual_init_token\":%u,\"actual_native_result\":%d,\"errno\":%d,\"gate_refusal\":%u,\"refusal\":%u,"
              "\"source_frame_proven\":false,\"native_namespace_proven\":false,\"accepted_submit_proven\":false,\"gpu_proven\":false}\n",
@@ -209,6 +212,8 @@ __attribute__((constructor)) void begin_observer() noexcept {
     setup.local_verification_label=1; // A local observer label, not a native/audit/source generation.
     setup.hidden_init_entry=reinterpret_cast<std::uintptr_t>(&frame_import_vr_init_entry);
     setup.hidden_shutdown_entry=reinterpret_cast<std::uintptr_t>(&frame_import_vr_shutdown_entry);
+    setup.hidden_mutex_init_entry=reinterpret_cast<std::uintptr_t>(&frame_import_init_entry);
+    setup.hidden_mutex_destroy_entry=reinterpret_cast<std::uintptr_t>(&frame_import_destroy_entry);
     if(!frame_client_startup::initialize_once(prepared,client,setup)){errno=saved;return;}
     if(!register_child_retirement(prepared)){frame_client_startup::finalize();errno=saved;return;}
     reviewed_observer=profiles.reviewed_observer_identity;active.store(true,std::memory_order_release);

@@ -2,7 +2,8 @@
 
 The viable user-directory route is a small **`LD_AUDIT` selector plus a main-
 namespace observer**, configured in the existing Steam user-service environment.
-The selector redirects only an already resolved native OpenVR binding. Neither
+The selector redirects only already resolved native OpenVR bindings and,
+when explicitly prepared, source-client mutex bindings to authenticated libc. Neither
 library exports `VR_InitInternal2` or `VR_ShutdownInternal`, depends on
 `libopenvr_api.so`, or forces the client to load. Missing APIs therefore remain
 missing in unrelated Steam children. Native launch scripts and binaries stay
@@ -15,21 +16,27 @@ The retained SteamOS 0.4.5 receiver is SHA-256
 `31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153`.
 Its `DT_NEEDED` names `libopenvr_api.so`, but not `vrclient.so`; both startup
 functions have real AArch64 `JUMP_SLOT` relocations. It has `PIE`, but no
-`BIND_NOW`/`NOW`. The API is SHA-256
-`a07163c436b3d791a0aa2442029d2ef0ba40a772ebf1dc6006d610c3a7934ee2`:
+`BIND_NOW`/`NOW`. The read-only live preflight located its actual API in
+`steamrtarm64/libopenvr_api.so`, SHA-256
+`4a8723b7134c53ec6c9291d9d2f55ea86349ffd0d227d10ae49a4951ae5395d4`.
+The earlier `/opt/steamvr` API is a different compositor-side provider and is
+ineligible for receiver startup preparation:
 
 | Public function | API-relative address | Bytes | Native ABI |
 | --- | ---: | ---: | --- |
-| `VR_InitInternal2` | `0x5ab8` | 236 | u32 token; error-output pointer in x0, 32-bit application type in w1, startup string in x2 |
-| `VR_ShutdownInternal` | `0x5680` | 192 | no arguments, void result |
+| `VR_InitInternal2` | `0x5768` | 236 | u32 token; error-output pointer in x0, 32-bit application type in w1, startup string in x2 |
+| `VR_ShutdownInternal` | `0x5330` | 192 | no arguments, void result |
 
 These unversioned public providers are naturally mapped as receiver dependencies
 before its normal initialization call. Their availability is not inferred from
-our wrapper. The [existing constructor audit](IMPORT-CLIENT-BOOTSTRAP.md) proves
-that original init loads `vrclient.so` naturally and its pipe is born inside
-client ELF initializers, before that native `dlopen` returns. Late mapping
-adoption cannot repair a missed birth. The existing 71 source checks are reused;
-nine additional ELF/hash/relocation checks confirm the current provider inputs.
+our wrapper. The [actual receiver API audit](RECEIVER-STEAMRT-API-20261012.md)
+rechecks native startup, failure and retirement with 114 static source checks;
+the unchanged client constructor proof comes from the
+[existing constructor audit](IMPORT-CLIENT-BOOTSTRAP.md). Original init loads
+`vrclient.so` with **`RTLD_NOW | RTLD_DEEPBIND`**. Its pipe is born inside client
+ELF initializers before that `dlopen` returns. Public preload aliases alone can
+miss this binding. Selective source-client-to-libc audit forwarding retains the
+native flags and caller entry. Late mapping adoption cannot repair a missed birth.
 
 The main observer prepares once, outside audit/render/import callbacks: actual
 receiver/API/libc/loader/own-observer mappings, owned file identities, stack
@@ -48,8 +55,9 @@ source-prepared RX intervals and function RVAs. Names/RVAs alone are candidate
 filters: the main observer must validate its already prepared actual mapped
 identities before acknowledging the handshake.
 
-1. `la_objopen` accepts the initial namespace only and records three bounded,
-   atomic module slots: candidate main executable, API, and owned observer. The
+1. `la_objopen` accepts the initial namespace only and records bounded,
+   atomic module slots: candidate main executable, API, and owned observer,
+   plus explicitly prepared client and libc slots for the mutex route. The
    main executable's loader name is normally empty; that is **not executable
    identity**. Fresh executable and API checks belong to main preparation.
    The public loader bias plus prepared relative intervals yields copied views;
@@ -66,7 +74,14 @@ identities before acknowledging the handshake.
    function. The main callback compares it to its cached real provider and
    returns the corresponding known hidden entry. The selector rejects an entry
    outside the owned observer RX interval and caches accepted results.
-4. The original API call runs through a hidden main-namespace true-entry veneer
+4. During natural client `dlopen`, eligible mutex bindings require the exact
+   client reference cookie, libc definition cookie, public symbol and resolved
+   native export RVA (`0x86a00` init; `0x86980` destroy). The copied views must
+   match cached authenticated main-namespace mappings and open generations.
+   MAIN returns its known hidden mutex entry; unsupported bindings remain native.
+   The actual client code and live constructor stack are verified separately by
+   the source Gate, not inferred from these scalar audit cookies.
+5. The original API call runs through a hidden main-namespace true-entry veneer
    and the actual main-namespace provider, preserving arguments, token, error
    output, errno, unwind and caller continuation. The init scope prepares the
    actual calling thread before admitting source-supported constructor birth.
@@ -103,7 +118,12 @@ prove that an audit PLT trampoline preserves the receiver's original LR.
   bounds lose proof without blocking native continuation. The selector never
   calls the original provider in the audit namespace and never interposes
   `dlopen`, `execve`, loader search, or native script execution.
-- An optional fourth slot is an explicitly prepared client loader name/RX
+- A first sticky audit loss after MAIN has admitted preparation sends an immediate
+  copied `Stage::Loss` notification. MAIN retires provisional evidence even if
+  an earlier eager mutex slot was already redirected. That slot is not unbound;
+  its existing veneer continues forwarding the real provider and original errno.
+  This matters when destroy binds successfully before a later init binding fails.
+- An optional client slot is an explicitly prepared client loader name/RX
   profile. Its real `la_objclose` sends `Stage::Retire` with a copied closing view
   only after the main bridge was admitted. Main code compares that view to its
   known client/module lifetime and atomically retires it before unmap. Unknown
@@ -115,6 +135,11 @@ prove that an audit PLT trampoline preserves the receiver's original LR.
   therefore still retires gate evidence **before** original cleanup/unload.
   Finalizer callbacks on an otherwise unsupported close route need their own
   source/lifecycle validation. Reloads are not silently adopted.
+
+The client-to-libc scope is all-or-none. It does not alter the receiver's lazy
+API imports, the client's eager deep binding or other modules' lookup order.
+The main observer's distinct versioned libc aliases are authenticated before
+activation; no audit-namespace libc dispatch or replacement native token is used.
 
 ## Focused evidence and remaining integration
 
@@ -128,6 +153,17 @@ cleanup, finalizer/retire order, wrong process, absent APIs, eager `NOW`,
 unchanged `dlsym` pointers and two semantic negative controls. Host child exec
 also retains missing API availability. ARM child exec is not claimed: QEMU is
 not registered as a host binfmt handler.
+
+The new `--deepbind` subset separately passes eight host processes and eight
+AArch64 processes with the retained actual Frame libc/loader. These include the
+preload-only miss, positive eager client/libc redirect, wrong client/provider,
+partial preparation, early client, invalid owned entry and unchanged `dlsym`.
+ARM executes the shared production mutex assembler and real versioned libc
+forwarder. A platform-specific relocation-order negative control confirms that
+an already redirected earlier mutex still forwards native behavior while the
+later rejection immediately retires evidence. Only that bounded repaired case
+and previously unrun cases were rerun; one focused ARM legacy case confirms the
+original API-only preparation. No full legacy matrix is claimed for this update.
 
 The audit fixture uses its own C++ main wrapper and API/client DSOs. A separate
 `tools/run_import_startup_native.py` fixture now executes the two production
@@ -157,6 +193,12 @@ provider mapping, mutex results/errno, inactive bridge and unchanged missing
 OpenVR presence. This is actual final-library forwarding evidence, **not a
 production Ready/native OpenVR or Frame-kernel test**. The complete positive
 audit/veneer/runtime path still requires that native initialization.
+
+The current runtime consumes init notifications for the source constructor
+birth only. Authenticating/forwarding the destroy binding does not establish
+observed pipe destruction or a continuous socket/import lifetime. Never promote
+the recorded local birth token into later cross-process or GPU evidence without
+the corresponding source/lifecycle adapter.
 
 `tools/prepare_client_startup_observer.py` now produces only an offline reviewed
 candidate bundle. Loader names are explicitly expected inputs, not observed

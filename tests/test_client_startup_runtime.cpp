@@ -40,7 +40,12 @@ int main() {
     request={};request.stage=audit::Stage::Bind;request.provider.function=audit::Function::Init;
     request.provider.original=0x123450;inert(request);
     request.provider.function=audit::Function::Shutdown;inert(request);
+    request.provider.function=audit::Function::MutexInit;
+    request.provider.libc={0x1000,0x2000,0x3000,71};
+    request.provider.client={0x4000,0x4000,0x60699a,72};inert(request);
+    request.provider.function=audit::Function::MutexDestroy;inert(request);
     request.stage=audit::Stage::Retire;request.retired_module={0x1000,0x2000,0x3000,55};inert(request);
+    request.stage=audit::Stage::Loss;inert(request);
 
     // A generic owned fixture fact can be valid for its separate reader while
     // still having no conversion/constructor route into production preparation.
@@ -72,6 +77,8 @@ int main() {
     check(!runtime::initialize_once(copied,missing_client,setup),"Once-only preparation was replaced");
     check(runtime::status().queued==1 && runtime::status().drained==1,"Failed repetition grew diagnostic records");
     request={};inert(request);request.stage=audit::Stage::Bind;inert(request);
+    request.provider.function=audit::Function::MutexInit;inert(request);
+    request.provider.function=audit::Function::MutexDestroy;inert(request);
     request.stage=audit::Stage::Retire;inert(request);
     runtime::finalize();const auto closed=runtime::status();
     check(closed.finalized && closed.retired && !closed.prepared && !closed.gate_constructed,
@@ -79,6 +86,7 @@ int main() {
     const auto queued=closed.queued;
     request={};inert(request);request.stage=audit::Stage::Bind;inert(request);
     request.stage=audit::Stage::Retire;request.retired_module.observed_open_generation=77;inert(request);
+    request.stage=audit::Stage::Loss;inert(request);
     runtime::finalize();
     check(runtime::status().queued==queued && !runtime::pop(record),"Late la_objclose used finalized context");
     check(!runtime::initialize_once(denied,missing_client,setup),"Finalized runtime reactivated");

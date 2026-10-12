@@ -9,7 +9,19 @@ the next source investigation; it does not describe an installable bridge.
 
 ## Decision
 
-Inspect the **installed PC vrlink driver** before building a capture hook. The
+The maintainer's 2026-10-12 preference is to avoid any additional modification,
+injection or private hook in the PC Steam sender. Application coverage export
+remains necessary. Investigate app-owned explicit-mask/data transport through
+the unchanged video path first; do not assume a separate channel has an exact
+video association merely because both endpoints receive data.
+
+The [no-sender-modification review](PC-WITHOUT-SENDER-MODIFICATION.md) ranks the
+preferred experiments, measurable compromises and stop conditions.
+
+The installed-driver inspection below remains useful source evidence and a
+possible fallback investigation. It does not authorize a PC sender hook.
+
+Inspect the **installed PC vrlink driver** before considering such a hook. The
 useful interception point is its actual encoder input: composed stereo color,
 coverage and source identity must belong to that same input. Polling the public
 mirror cannot establish this association. A second display-redirect driver is

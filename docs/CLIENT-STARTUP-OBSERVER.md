@@ -7,11 +7,21 @@ exports `frame_client_startup_bridge`, and drains copied records on one owned
 background thread. It does not export `VR_Init*` or `VR_Shutdown*`, load OpenVR,
 change shaders, alter scene pixels, install itself, or restart Steam.
 
-The shared native entry assembler supplies the public mutex aliases and hidden
-Init/Shutdown entries. C wrappers must not replace those entries: the audited
+The shared native entry assembler supplies public mutex aliases and hidden
+Init/Shutdown and mutex entries. C wrappers must not replace those entries: the audited
 original caller LR, SP, FP and arguments are part of the birth proof. The audit
 DSO uses the bridge only after its own preinit boundary; preparation alone does
 not authorize an early redirect or prove an object lifetime.
+
+The actual receiver uses the Steam-runtime API described in
+[RECEIVER-STEAMRT-API-20261012.md](RECEIVER-STEAMRT-API-20261012.md). Its native
+`RTLD_NOW | RTLD_DEEPBIND` client load requires selective audit forwarding of
+the real source-client-to-libc mutex binding; preload aliases alone are not
+capture evidence. MAIN prepares distinct versioned libc providers and compares
+the copied client/libc open generations and executable spans before accepting
+that route. A later `Stage::Loss` immediately retires evidence while any already
+bound entry keeps forwarding native calls. See
+[IMPORT-STARTUP-FORWARDING.md](IMPORT-STARTUP-FORWARDING.md) for the full boundary.
 
 ## Explicit cold inputs
 
@@ -73,6 +83,7 @@ The output is JSON Lines, bounded by 32 records, 64 KiB total and 120 seconds of
 recording. The header names those caps and the reviewed observer fingerprint.
 Records retain original entry registers, actual validated module geometry and
 code identity, local object registry labels, observed audit-open generations,
+copied client/libc binding views,
 actual native outcomes where available, and explicit refusals. A footer records
 the drained/queued counts and why recording stopped. Failed writes, capacity or
 time limits disarm recording; they do not restart services, roll back files or
