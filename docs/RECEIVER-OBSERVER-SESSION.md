@@ -2,10 +2,13 @@
 
 `tools/receiver_observer_session.py` prepares a reversible user-service session
 for the [protected scalar observer](RECEIVER-OBSERVER-IMPLEMENTATION.md).
-The helper is tested offline; **this document does not authorize installation**.
+The helper is tested offline and has performed a manually restored Steam-client
+attempt; **this document does not authorize installation**.
 New sessions require permission for private scalar copies, a **Steam client
 service** preload and restart readiness. The previous concrete approval targeted
-the SteamVR drop-in; it does not authorize this different unit. Restarting the
+the SteamVR drop-in; it did not authorize this different unit. The maintainer
+separately approved the Steam-client scope for
+[the corrected attempt](FRAME-RECEIVER-STEAM-RUN-20261012.md). Restarting the
 Steam client interrupts the Frame interface and stream. No mask or shader is
 activated.
 
@@ -16,7 +19,10 @@ The pinned `vrlink` receiver was started through `run_vrlink.sh` by the Steam
 client in `steam.service`, while the schema-v1 preload reached `vrcompositor` in
 `steamvr.service`. Receiver hashes and service activity could not prove that the
 receiver inherited the observer. Its actual mapped libc/loader matched the native
-provider review despite a `Steam/steamrtarm64` library search path.
+provider review despite a `Steam/steamrtarm64` library search path. The subsequent
+approved Steam-client attempt loaded the receiver observer, then refused arming
+on a Btrfs mapping/stat device mismatch. The capture contained no protected
+records, and its activation was fully removed after manual restart readiness.
 
 Schema v2 therefore supports **only `receiver_service:steam.service`**. Never
 overwrite a schema-v1 helper in an active session: use that session's original
@@ -115,14 +121,25 @@ bounded `/proc/locks` metadata. That user-owned PID must have the pinned
 `/proc/PID/exe`, belong to `steam.service`, map the exact owned observer and
 inherit its three expected environment values. Actual libc and loader are read
 as on-disk files through `/proc/PID/root`, and their device/inode and fingerprints
-must match both `/proc/PID/maps` and the reviewed native proposal. A search path,
-similar library basename or mapping path alone is insufficient.
+must match both `/proc/PID/maps` and the reviewed native proposal. Direct
+device/inode comparison stays the normal path. The observed top-level Btrfs
+layout has a narrowly checked reconciliation for **libc and loader only**:
+their exact reviewed paths and inode numbers must match, a unique deepest mount
+must be `/` with `btrfs`, `subvolid=5,subvol=/` and the mapping's superblock
+device, and the receiver root must have inode 256 and the same anonymous
+file-stat device. Other mounts/subvolumes, ambiguous mounts, other filesystems
+and observer-device mismatches remain refused. Equal hashes alone never authorize
+this reconciliation. Its evidence is recorded in the arm event.
+A search path, similar library basename or mapping path alone is insufficient.
 
 PID starttime, cgroup, relevant mappings, executable inode and capture-lock owner
-are rechecked before creating the empty mode-0600 arm marker. There is no process
+are rechecked before creating the empty mode-0600 arm marker. When Btrfs
+reconciliation is needed, bounded mount metadata, root identity and native file
+path identities are also rechecked. There is no process
 enumeration: only the capture lock's identified PID is inspected. Bounds are
 1 MiB/8192 rows for lock metadata, 512 KiB/4096 rows for maps, 64 KiB for filtered
-environment metadata, 8 KiB for stat/cgroup, and the existing native file limits.
+environment metadata, 8 KiB for stat/cgroup, 512 KiB/4096 rows for mountinfo,
+and the existing native file limits.
 Unavailable, ambiguous or changing evidence refuses arming. This reads metadata
 and on-disk ELF bytes only, never `/proc/PID/mem`, map_files, mapped uniform data
 or images. It is an instantaneous receiver/writer verification, not proof of GPU
@@ -192,3 +209,8 @@ operations. Receiver C++/preflight evidence is documented separately; these
 Python tests do not replace native provider checks or a headset test. One focused
 Linux host case verifies the real `/proc/locks` FLOCK-owner format and lock release
 using a temporary local fixture; receiver process/mapping cases remain mocked.
+The Btrfs cases reproduce the captured `0:29` mapping / `0:30` stat identities
+while retaining real fixture-file reads and hashes. Negative fixtures cover
+inode/content/path changes, other filesystems, wrong superblock/anonymous root,
+bind and nested mounts, colliding subvolumes, stacked ambiguity, metadata bounds
+and changed mounts/root/file identities. They do not establish native arming.

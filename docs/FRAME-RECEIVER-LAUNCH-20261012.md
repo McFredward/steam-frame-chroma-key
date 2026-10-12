@@ -7,6 +7,10 @@ but could not reach the receiver. No receiver capture file or arm marker was
 created, and no protected selection records were read. This is a startup-scope
 failure, not a lossless scalar capture or evidence of frame association.
 
+The separately approved [follow-up Steam-client attempt](FRAME-RECEIVER-STEAM-RUN-20261012.md)
+later verified receiver loading. It refused arming on a Btrfs file-identity guard
+and was fully restored; this report retains the first attempt's original evidence.
+
 ## Native evidence
 
 The production observer was 74,896 bytes, SHA-256

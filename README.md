@@ -33,8 +33,9 @@ An [opt-in receiver observer](docs/RECEIVER-OBSERVER-IMPLEMENTATION.md) is now b
 and tested offline to inspect bounded, protected selection metadata. Its first
 [native startup attempt](docs/FRAME-RECEIVER-LAUNCH-20261012.md) established that
 the receiver starts under the Steam client service; the original SteamVR-only
-activation could not reach it. A corrected, separately approved receiver capture
-is still required.
+activation could not reach it. The [approved Steam-client attempt](docs/FRAME-RECEIVER-STEAM-RUN-20261012.md)
+loaded the observer in the receiver, but a Btrfs file-identity guard refused
+arming. Protected receiver data and exact frame/GPU association are still missing.
 These diagnostics change no rendered pixels and do not enable genuine-mask
 passthrough.
 

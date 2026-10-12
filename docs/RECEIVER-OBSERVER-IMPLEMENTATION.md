@@ -5,9 +5,11 @@
 diagnostic and does not enable passthrough. The first authorized Frame attempt
 [identified a launcher mismatch](FRAME-RECEIVER-LAUNCH-20261012.md): the library
 loaded in the compositor, while the receiver was launched separately by Steam.
-No protected receiver records were captured. The corrected Steam-client launch
-scope still needs its own permission and restart readiness; an offline plan
-or software test cannot grant that permission.
+No protected receiver records were captured. A separately approved
+[Steam-client-service attempt](FRAME-RECEIVER-STEAM-RUN-20261012.md) reached the
+receiver, but the arm guard refused a Btrfs device-identity difference before
+recording. The source-video and GPU association gates remain unresolved; an
+offline plan or software test cannot grant runtime permission.
 
 ## Build and activation boundary
 
@@ -50,8 +52,9 @@ native restart are the session tooling's responsibility. It must verify that the
 native libc provider exports the required aliases before activation. An absent
 versioned alias is a loader failure, not something a constructor can repair.
 The separately reviewed [manual session helper](RECEIVER-OBSERVER-SESSION.md)
-records exact owned activation files and original native configuration; it is
-also offline preparation and grants no runtime permission.
+records exact owned activation files and original native configuration. Its
+software checks grant no runtime permission; each hardware operation stays
+within the maintainer's approved scope and coordinated restart readiness.
 
 `tools/prepare_receiver_observer.py` checks local input fingerprints, AArch64
 ELF headers and versioned imports, then writes an exclusive private **proposal**.
