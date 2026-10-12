@@ -39,9 +39,10 @@ struct ObjectToken {
     bool valid() const noexcept { return reason == Reason::None; }
 };
 
-// Reserve BEFORE forwarding mutex_init. The accepted parent's exclusive FD
-// ownership before this public entry remains a native-source obligation, not a
-// generally observed kernel lifecycle. A reservation is not an object birth.
+// Reserve BEFORE forwarding mutex_init. The accepted parent's exclusive FD/
+// object ownership until reservation begins remains a native-source obligation;
+// this is not generally observed coverage since accept return. Publication and
+// the forwarding interval are guarded here. A reservation is not object birth.
 struct Reservation {
     std::uintptr_t registry_identity = 0, pipe = 0;
     std::uint64_t process_generation = 0, generation = 0;
@@ -99,7 +100,8 @@ public:
     // 1 and revision 0; labels denote observed lifecycle events, never video.
     explicit Registry(std::uint64_t process_generation,
                       std::uint64_t first_generation = 1,
-                      std::uint64_t first_revision = 0) noexcept;
+                      std::uint64_t first_revision = 0,
+                      std::uint64_t first_publication_revision = 0) noexcept;
     Registry(const Registry&) = delete;
     Registry& operator=(const Registry&) = delete;
     Counters counters{};
@@ -135,10 +137,23 @@ private:
         ~Mutation();
         Mutation(const Mutation&) = delete;
     };
+    struct BirthPublication {
+        Registry& registry;
+        bool counted = false, admitted = false;
+        explicit BirthPublication(Registry&) noexcept;
+        ~BirthPublication();
+        void finish() noexcept;
+        BirthPublication(const BirthPublication&) = delete;
+    };
     const std::uint64_t process_generation_;
     std::array<Slot, kCapacity> slots_{};
     mutable std::atomic<bool> lost_{false};
     std::atomic<std::uint64_t> next_generation_, revision_, active_writes_{0};
+    // This activity/revision pair closes the unknown-key publication window;
+    // it is not a lock, source frame or native socket/namespace generation.
+    std::atomic<std::uint64_t> publishing_births_{0}, publication_revision_;
+    bool publication_step() noexcept;
+    void reject_unknown_during_publication(std::uint64_t prior_revision) noexcept;
     std::uint64_t generation() noexcept;
     bool owned(const ObjectToken&) const noexcept;
     Slot* find(std::uintptr_t pipe) noexcept;

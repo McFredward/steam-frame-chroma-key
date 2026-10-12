@@ -2,6 +2,12 @@
 
 #include <limits>
 
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+// Deterministic fixture-only pauses. This symbol/call does not exist in an
+// ordinary core object, and never enters a deployed/native callback path.
+extern "C" void frame_import_pipe_epoch_fixture(unsigned phase) noexcept;
+#endif
+
 namespace frame_import_pipe {
 namespace {
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free, "64-bit atomics must be lock-free");
@@ -18,8 +24,9 @@ bool payload_site(Domain domain, std::uint64_t site) noexcept {
 }
 
 Registry::Registry(std::uint64_t process_generation, std::uint64_t first_generation,
-                   std::uint64_t first_revision) noexcept
-    : process_generation_(process_generation), next_generation_(first_generation), revision_(first_revision) {
+                   std::uint64_t first_revision, std::uint64_t first_publication_revision) noexcept
+    : process_generation_(process_generation), next_generation_(first_generation), revision_(first_revision),
+      publication_revision_(first_publication_revision) {
     if (!process_generation || !first_generation) lost_.store(true);
 }
 bool Registry::healthy() const noexcept { return !lost_.load(); }
@@ -54,6 +61,38 @@ Registry::Mutation::Mutation(Registry& owner) noexcept : registry(owner) {
 }
 Registry::Mutation::~Mutation() {
     if (counted) registry.active_writes_.fetch_sub(1);
+}
+
+bool Registry::publication_step() noexcept {
+    auto revision = publication_revision_.load();
+    for (std::size_t attempt = 0; attempt < kCapacity; ++attempt) {
+        if (revision == std::numeric_limits<std::uint64_t>::max()) break;
+        if (publication_revision_.compare_exchange_strong(revision, revision + 1)) return true;
+    }
+    counters.exhausted.fetch_add(1); observer_loss(); return false;
+}
+Registry::BirthPublication::BirthPublication(Registry& owner) noexcept : registry(owner) {
+    if (!registry.healthy()) return;
+    auto publishers = registry.publishing_births_.load();
+    for (std::size_t attempt = 0; attempt < kCapacity; ++attempt) {
+        if (publishers >= kCapacity) break;
+        if (registry.publishing_births_.compare_exchange_strong(publishers, publishers + 1)) {
+            counted = true; break;
+        }
+    }
+    if (!counted) { registry.observer_loss(); return; }
+    admitted = registry.publication_step() && registry.healthy();
+}
+void Registry::BirthPublication::finish() noexcept {
+    if (!counted) return;
+    // Complete the revision before activity disappears: an invalidator that
+    // scanned before publication must detect even a fully completed window.
+    (void)registry.publication_step();
+    registry.publishing_births_.fetch_sub(1); counted = false;
+}
+Registry::BirthPublication::~BirthPublication() { finish(); }
+void Registry::reject_unknown_during_publication(std::uint64_t prior_revision) noexcept {
+    if (publishing_births_.load() || publication_revision_.load() != prior_revision) observer_loss();
 }
 
 std::uint64_t Registry::generation() noexcept {
@@ -178,6 +217,8 @@ Reservation Registry::reserve_birth(const BirthProof& proof) noexcept {
         (!accepted && (proof.kind != BirthKind::GenericClient || !client ||
                        proof.pending_accepted_fd != -1 || !proof.constructor_parent_return)))
         return reject_reservation(Reason::InvalidProof);
+    BirthPublication publication(*this);
+    if (!publication.admitted) return reject_reservation(Reason::ObserverLoss);
     Mutation mutation(*this);
     if (!mutation.admitted) return reject_reservation(Reason::ObserverLoss);
     Slot* slot = find(proof.pipe);
@@ -206,6 +247,9 @@ Reservation Registry::reserve_birth(const BirthProof& proof) noexcept {
     if (!already_claimed && previous != Destroyed) {
         invalidate(*slot, Invalid, false); observer_loss(); return reject_reservation(Reason::DuplicateBirth);
     }
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+    frame_import_pipe_epoch_fixture(1); // Writing, neither key has been published.
+#endif
     const auto gen = generation();
     if (!gen) { invalidate(*slot, Invalid, false); return reject_reservation(Reason::GenerationExhausted); }
     slot->pipe.store(proof.pipe); slot->domain.store(static_cast<unsigned>(proof.domain));
@@ -215,6 +259,10 @@ Reservation Registry::reserve_birth(const BirthProof& proof) noexcept {
     slot->birth_valid.store(false); slot->zero_initialized.store(false);
     slot->reservation_pending.store(true); counters.reserved.fetch_add(1);
     counters.pending_reservations.fetch_add(1); slot->state.store(Reserved);
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+    frame_import_pipe_epoch_fixture(2); // Both keys are visible; invalidators can match.
+#endif
+    publication.finish();
     const Reservation reservation{reinterpret_cast<std::uintptr_t>(this), proof.pipe,
                                   process_generation_, gen, Reason::None};
     if (!census()) { cancel_birth(reservation); return reject_reservation(Reason::ObserverLoss); }
@@ -296,6 +344,9 @@ Lease Registry::activate(const BoundaryProof& proof, int fd, int pid) noexcept {
     if (!matching(*slot, proof.object)) {
         slot->state.store(previous); observer_loss(); return reject_lease(Reason::StaleObject);
     }
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+    frame_import_pipe_epoch_fixture(3); // Ordinary mutation, no birth publication.
+#endif
     if ((previous != Pending && previous != Accepted && previous != Connected) ||
         (previous == Pending ? slot->pending_fd.load() : slot->fd.load()) != fd) {
         invalidate(*slot, Invalid, false); return reject_lease(Reason::ChangedNativeFields);
@@ -362,13 +413,19 @@ Lease Registry::connected(const ConnectProof& proof, int result) noexcept {
 
 void Registry::close_fd(int fd) noexcept {
     if (fd < 0) return;
+    const auto publication_revision = publication_revision_.load();
     bool tracked = false;
     for (const auto& slot : slots_) {
         if (slot.fd.load() == fd || slot.pending_fd.load() == fd) { tracked = true; break; }
     }
     // Plane descriptors, log files and unrelated sockets are common on the
     // compositor. They must not invalidate a proven pipe or its current lease.
-    if (!tracked) return;
+    if (!tracked) {
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+        frame_import_pipe_epoch_fixture(4); // Unknown scan completed, before publication recheck.
+#endif
+        reject_unknown_during_publication(publication_revision); return;
+    }
     Mutation mutation(*this);
     if (!mutation.admitted) return;
     // Apply also at entry to shutdown, dup/dup2/dup3 and rebind-capable fcntl:
@@ -399,7 +456,14 @@ void Registry::protected_retire(const BoundaryProof& proof) noexcept {
     (void)census();
 }
 void Registry::destroy(std::uintptr_t pipe, int result) noexcept {
-    if (!find(pipe)) return; // Unrelated native mutex destruction is not our lifecycle.
+    const auto publication_revision = publication_revision_.load();
+    if (!find(pipe)) {
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+        frame_import_pipe_epoch_fixture(5); // Unknown scan completed, before publication recheck.
+#endif
+        reject_unknown_during_publication(publication_revision);
+        return; // A quiescent unrelated mutex is not our lifecycle.
+    }
     Mutation mutation(*this);
     if (!mutation.admitted) return;
     auto* slot = find(pipe);

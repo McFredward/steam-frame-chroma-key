@@ -1,6 +1,7 @@
 #include "import/import_pipe_epoch.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -12,10 +13,33 @@ namespace {
 unsigned checks = 0;
 thread_local bool forbid_allocation = false;
 std::atomic<unsigned> unexpected_allocations{0};
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+std::atomic<unsigned> requested_pause{0};
+std::atomic<bool> publication_paused{false}, release_publication{false};
+void wait_for_pause() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!publication_paused.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) std::abort();
+        std::this_thread::yield();
+    }
+}
+#endif
 void check_at(bool condition, unsigned line) {
     ++checks;
     if (!condition) { std::fprintf(stderr, "pipe epoch check %u failed at line %u\n", checks, line); std::abort(); }
 }
+
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+extern "C" void frame_import_pipe_epoch_fixture(unsigned phase) noexcept {
+    if (requested_pause.load() != phase) return;
+    publication_paused.store(true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!release_publication.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) std::abort();
+        std::this_thread::yield(); // Deterministic fixture only, absent from ordinary core.
+    }
+}
+#endif
 #define check(condition) check_at((condition), __LINE__)
 struct NoAllocation {
     NoAllocation() { forbid_allocation = true; }
@@ -87,6 +111,55 @@ void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); 
 void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
 
 int main() {
+#ifdef FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE
+    for (unsigned phase : {1u, 2u}) for (bool destroying : {false, true}) {
+        Registry registry(500);
+        requested_pause = phase; publication_paused = false; release_publication = false;
+        Reservation reservation{};
+        std::thread writer([&] { reservation = registry.reserve_birth(accepted()); });
+        wait_for_pause();
+        if (destroying) registry.destroy(0x10000, 0);
+        else registry.close_fd(19);
+        if (phase == 1) check(!registry.healthy()); // Neither key existed: proof loss required.
+        else check(registry.healthy()); // Known key is explicitly retired without global loss.
+        release_publication = true; writer.join(); requested_pause = 0;
+        const auto object = registry.created(reservation, 0);
+        check(!object.valid());
+        check(!registry.activate(boundary(object), 19, 0).valid());
+        check(registry.counters.pending_reservations == 0 && registry.counters.activations == 0);
+    }
+    {
+        Registry registry(500);
+        const auto object = born(registry, accepted());
+        const auto first = registry.activate(boundary(object), 19, 0);
+        check(first.valid());
+        requested_pause = 3; publication_paused = false; release_publication = false;
+        Lease refreshed{};
+        std::thread writer([&] { refreshed = registry.activate(boundary(object, true), 19, 123); });
+        wait_for_pause();
+        registry.close_fd(900); registry.destroy(0x99000, 0);
+        check(registry.healthy()); // Ordinary row Writing does not imply unknown birth ownership.
+        release_publication = true; writer.join(); requested_pause = 0;
+        check(refreshed.valid() && registry.check_lease(refreshed));
+    }
+    for (bool destroying : {false, true}) {
+        Registry registry(500);
+        requested_pause = destroying ? 5 : 4;
+        publication_paused = false; release_publication = false;
+        std::thread invalidator([&] {
+            if (destroying) registry.destroy(0x10000, 0);
+            else registry.close_fd(19);
+        });
+        wait_for_pause();
+        const auto object = born(registry, accepted());
+        const auto current = registry.activate(boundary(object), 19, 0);
+        check(current.valid());
+        release_publication = true; invalidator.join(); requested_pause = 0;
+        // Activity has already returned to zero. Revision must still expose
+        // the complete publication that occurred during the earlier scan.
+        check(!registry.healthy() && !registry.check_lease(current));
+    }
+#endif
     {
         Registry registry(500);
         const auto proof = accepted();
@@ -373,6 +446,12 @@ int main() {
             check(object.valid());
             check(!registry.activate(boundary(object), 19, 0).valid());
         } else check(!reservation.valid());
+        check(!registry.healthy() && registry.counters.exhausted > 0);
+    }
+    for (const auto seed : {std::numeric_limits<std::uint64_t>::max(),
+                            std::numeric_limits<std::uint64_t>::max() - 1}) {
+        Registry registry(500, 1, 0, seed);
+        check(!registry.reserve_birth(accepted()).valid());
         check(!registry.healthy() && registry.counters.exhausted > 0);
     }
     {
