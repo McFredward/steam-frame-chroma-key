@@ -801,11 +801,19 @@ def main():
     if bool(args.qemu)!=bool(args.providers): parser.error('explicit QEMU and providers must be supplied together')
     if args.native_only and not args.qemu:parser.error('--native-only requires the explicit QEMU/provider pair')
     if args.connection and args.deepbind:parser.error('--connection and --deepbind are separate focused scopes')
+    if args.case:
+        if args.connection and any(case not in CONNECTION_CASES for case in args.case):
+            parser.error('--connection accepts only connection fixture cases')
+        if args.deepbind and any(case not in DEEP_CASES for case in args.case):
+            parser.error('--deepbind accepts only mutex deepbind fixture cases')
+        if not (args.connection or args.deepbind) and any(case in DEEP_CASES+CONNECTION_CASES for case in args.case):
+            parser.error('selected deepbind cases require their explicit --deepbind or --connection scope')
     helper_path=ROOT/'tools/run_import_native_forwarding.py'
     spec=importlib.util.spec_from_file_location('owned_runner',helper_path)
     helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
     report={'status':'failed','frame_access':False,'native_openvr_init_executed':False,'source_sha256':{'core':sha(CORE),'header':sha(HEADER),'fixture':sha(Path(__file__).resolve())},'architectures':{}}
-    report['selected_cases']=args.case or 'complete own-source audit fixture'
+    report['selected_cases']=args.case or list(CONNECTION_CASES) if args.connection else \
+        args.case or list(DEEP_CASES) if args.deepbind else args.case or 'complete own-source API audit fixture'
     clean=os.environ.copy()
     for name in ('LD_PRELOAD','LD_AUDIT','LD_LIBRARY_PATH','QEMU_LD_PREFIX'): clean.pop(name,None)
     try:
