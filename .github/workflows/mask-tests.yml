@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install small native test dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends glslc spirv-tools libvulkan-dev mesa-vulkan-drivers g++-mingw-w64-x86-64
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends glslc spirv-tools libvulkan-dev mesa-vulkan-drivers g++-mingw-w64-x86-64-win32
       - name: Configure and build
         run: |
           cmake -S . -B build/mask -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFRAME_MASK_BUILD_RECEIVER_OBSERVER=ON
@@ -29,7 +29,7 @@ jobs:
       - name: Focused checks in parallel
         run: ctest --test-dir build/mask --output-on-failure --parallel 4
       - name: Windows sender cross-build
-        run: x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -Wextra -Werror -static-libgcc -static-libstdc++ -I. tools/mask_endpoint.cpp mask/mask_protocol.cpp -lws2_32 -o build/mask_endpoint.exe
+        run: x86_64-w64-mingw32-g++-win32 -std=c++17 -O2 -Wall -Wextra -Werror -static-libgcc -static-libstdc++ -I. tools/mask_endpoint.cpp mask/mask_protocol.cpp -lws2_32 -o build/mask_endpoint.exe
       - name: Protocol memory and undefined-behavior checks
         run: |
           g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -I. mask/mask_protocol.cpp tests/test_mask_protocol.cpp -o build/test-mask-sanitized

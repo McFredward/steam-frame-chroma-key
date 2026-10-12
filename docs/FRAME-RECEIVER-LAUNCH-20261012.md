@@ -67,6 +67,30 @@ no new Steam-service activation is authorized merely by this report or a green
 test. Remove and verify the previous session before attempting the new one.
 Keep the observer library unchanged; the diagnosed problem is the launch route.
 
+## Verified restoration
+
+After the maintainer confirmed manual restart readiness, the original v1 helper
+removed its exact owned SteamVR drop-in and restarted the native service. It
+then conservatively reported a manager snapshot difference. Independent checks
+proved the original service configuration and native environment file matched;
+all affected SteamVR processes lacked observer mappings, and compositor PID
+805882 retained the native SHA-256
+`9b1bd5fe4463592cbc71b2517b9ceb0a0fcd66cd6885a19dca4be0784bf6c265`.
+
+Only `GAMESCOPE_LIMITER_FILE` and `MANGOHUD_CONFIGFILE` changed: both named newly
+allocated native session files under `/run/user/1000`. The diagnostic did not
+write either manager variable. Do not force these pointers back to obsolete
+session files. The corrected helper permits only the exact two normalized
+runtime-child path shapes and records `exact_manager:false` when they change;
+all other manager values remain strictly compared.
+
+Exact-file inventories and the independent restoration record were archived
+before removing the owned session, staging files and generated staging cache.
+The final check proved both owned directories and the old drop-in absent,
+native SteamVR active, and no Steam-client drop-in created. The SSH session was
+closed, and the maintainer was told the Frame could enter standby. No timed
+rollback or unapproved Steam-client restart occurred.
+
 This attempt does not establish accepted presentation, source-session/video
 identity, GPU coherence or native-mask passthrough. The preceding
 [public resource capture](FRAME-COMPACT-JOURNAL-RUN-20261011.md) retains its
