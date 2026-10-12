@@ -1,7 +1,6 @@
 #include "client_resource_thread.h"
 
 #include <cerrno>
-#include <limits>
 
 namespace frame_client_resource_thread {
 namespace {
@@ -13,19 +12,20 @@ constexpr std::array<std::uint8_t,32> digest(const char* text) noexcept {
     return out;
 }
 constexpr auto receiver_identity=digest("31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153");
+constexpr std::uintptr_t max_address=0x0000ffffffffffffULL;
 std::uintptr_t return_point(const frame_import_startup::PreparedImage& receiver) noexcept {
-    return receiver.bias && kFirstWaitReturn<=std::numeric_limits<std::uintptr_t>::max()-receiver.bias
+    return receiver.bias>=4096 && receiver.bias<=max_address-kFirstWaitReturn
         ? receiver.bias+kFirstWaitReturn : 0;
 }
 bool valid_image(const frame_import_startup::PreparedImage& receiver,std::uintptr_t at) noexcept {
     return at && receiver.bias%4096==0 && receiver.file_identity==receiver_identity &&
-        receiver.code_begin<receiver.code_end && receiver.code_begin<=receiver.bias+0x32878 &&
+        receiver.code_begin>=4096 && receiver.code_begin<receiver.code_end && receiver.code_end<=max_address &&
+        receiver.code_begin<=receiver.bias+0x32878 &&
         at<receiver.code_end;
 }
 bool geometry(const Entry& e) noexcept {
-    return e.sp && e.sp%16==0 && e.x[29]==e.sp &&
-        e.sp<=std::numeric_limits<std::uintptr_t>::max()-kWorkerFrameBytes &&
-        e.x[1]==e.sp+120 && e.x[23]==e.x[1] && e.x[19] && e.x[19]%8==0 &&
+    return e.sp>=4096 && e.sp<=max_address-kWorkerFrameBytes && e.sp%16==0 && e.x[29]==e.sp &&
+        e.x[1]==e.sp+120 && e.x[23]==e.x[1] && e.x[19]>=4096 && e.x[19]<=max_address && e.x[19]%8==0 &&
         static_cast<std::uint32_t>(e.x[0])<=0x7fffffffU &&
         static_cast<std::uint32_t>(e.x[2])==1 && static_cast<std::uint32_t>(e.x[3])==0xffffffffU;
 }

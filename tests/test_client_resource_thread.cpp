@@ -148,7 +148,7 @@ int main() {
         check(gate.before_first_wait(input,fixture_marker,prepare,&control).kind==Kind::Refused);
         check(control.calls==1);
     });
-    for(unsigned mutation=0;mutation<6;++mutation)child([mutation] {
+    for(unsigned mutation=0;mutation<9;++mutation)child([mutation] {
         auto prepared=image();
         switch(mutation) {
         case 0:prepared.file_identity[0]^=1;break;
@@ -157,11 +157,14 @@ int main() {
         case 3:prepared.code_end=bias+0x328d0;break;
         case 4:prepared.bias=0;break;
         case 5:prepared.bias=std::numeric_limits<std::uintptr_t>::max()-15;break;
+        case 6:prepared.bias=1ULL<<48;break;
+        case 7:prepared.code_begin=1;break;
+        case 8:prepared.code_end=(1ULL<<48)+4096;break;
         }
         Gate gate(prepared);check(!gate.arm_before_receiver_threads());no_region(gate);
         check(gate.reason()==Reason::UnpreparedImage);
     });
-    for(unsigned mutation=0;mutation<12;++mutation)child([mutation] {
+    for(unsigned mutation=0;mutation<17;++mutation)child([mutation] {
         alignas(16)std::array<unsigned char,512> frame{};
         auto input=entry(frame.data());
         switch(mutation) {
@@ -178,6 +181,11 @@ int main() {
         case 10:input.x[3]=0;break;
         case 11:input.sp=std::numeric_limits<std::uintptr_t>::max()-15;input.x[29]=input.sp;
             input.x[1]=input.x[23]=input.sp+120;break;
+        case 12:input.x[19]=8;break;
+        case 13:input.x[19]=(1ULL<<48)+8;break;
+        case 14:input.sp=0xff0;input.x[29]=input.sp;input.x[1]=input.x[23]=input.sp+120;break;
+        case 15:input.sp=(1ULL<<48)+4096;input.x[29]=input.sp;input.x[1]=input.x[23]=input.sp+120;break;
+        case 16:input.sp=(1ULL<<48)-16;input.x[29]=input.sp;input.x[1]=input.x[23]=input.sp+120;break;
         }
         Gate gate(image());check(gate.arm_before_receiver_threads());Control control{&gate,input};
         const auto result=gate.before_first_wait(input,fixture_marker,prepare,&control);
