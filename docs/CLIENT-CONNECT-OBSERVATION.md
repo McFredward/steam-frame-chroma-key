@@ -7,8 +7,12 @@ transport, live socket lease or working Steam Link passthrough.
 
 ## Concrete scope
 
-`FRAME_MASK_CLIENT_CONNECT_OBSERVATION=ON` selects five original libc entry
-veneers: mutex init/destroy, lock/unlock and connect. The ordinary eleven-entry
+`FRAME_MASK_CLIENT_CONNECT_OBSERVATION=ON` selects five hidden libc entry
+veneers: mutex init/destroy, lock/unlock and connect. Only the own bridge is
+public: the observer does not define or replace any public libc function.
+Authenticated client-to-libc audit binding redirects only the intended native
+client calls; unrelated Steam/UI calls retain their original providers.
+The ordinary eleven-entry
 object, two-entry OpenVR object and two-entry startup-mutex object retain their
 original instruction and unwind bytes. The existing distinct native providers
 forward arguments, flags, results, errno and cancellation without a lookup or
@@ -17,11 +21,13 @@ substitute syscall.
 The sealed preparation and actual startup gate must first authenticate the real
 modules and successful target birth. Only then is an immutable copied target
 published. A bounded atomic claim selects one thread's exact supported native
-lock-before entry. Its initial-exec TLS scope matches successful original lock,
+lock-before entry. Its exclusively owned process-lifetime scope matches successful original lock,
 connect entry/return and final unlock. After that single sample completes, later
 ordinary native RPC locks are ignored across all threads. Destroy/re-init of the
 exact target, module/audit loss, queue loss, child/shutdown and finalization retire
-admission. Unrelated mutex helper calls do not invent target ownership.
+admission. Unrelated mutex helper calls do not invent target ownership. Only
+small owner markers use static TLS, totaling 18 bytes as in the working startup
+artifact; a new thread with a reused marker address cannot adopt the old scope.
 
 The connection observation copies the existing true-entry registers and original
 result/errno. It reads **zero additional private bytes**: no FD/PID fields,
@@ -36,12 +42,12 @@ The source constraints and deferred scopes are in
 
 ## Reviewed candidate and tests
 
-The private final ARM main library is **210,096 bytes**, SHA-256
-`3a9bf6a315394cc6ab5aa7b580cfb1cb7a029ba885218195beedd8130b2828e5`.
+The repaired private ARM main library is **209,904 bytes**, SHA-256
+`cfaf1cf6147fbcf7b219f8fa9a630fb688cc1a9caacfcc560039ac0e94a96703`.
 Its prepared dependency-free audit is **69,080 bytes**, SHA-256
-`3f2499135a0e69766a3569ece278bb2fbde3649b48b18aeb3dcd140360b1bd55`.
+`169918eaeaa8eab6c8657eaa2b74f123c6f90db4074d828614419383834f275f`.
 The offline plan SHA-256 is
-`0e07d64b954fd0e109f904aac7e939912aae1a05c69a1a39247558368b5e8524`.
+`2eaa1452669c6cec1b6941fb7566213775ca2bd6ce60a1d21bf127e7f101448a`.
 These are own artifacts; Valve binaries and private reference/capture data are
 not tracked or distributed.
 
@@ -57,11 +63,22 @@ a connected Frame endpoint or native OpenVR execution. The independent final
 bundle review passed **142** bounded checks on the actual ELF imports/exports,
 audit's compiled immutable initializer and relocations, native provider sizes,
 unchanged DEEPBIND flags, distinct envelope and manual scope/recovery guards.
+The repaired hidden-only artifact and bundle subsequently passed **147**
+independent checks. Its actual ARM preload cases now require every unrelated
+public libc function to resolve directly to native libc; the old global-export
+artifact fails that acceptance criterion. Selective native client binding still
+redirects all five intended calls, preserving arguments, LR, results and flags.
 The CI run for the integrated source checkpoint `4088828` also passed:
 <https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38290719178>.
 
-No expanded connection scope has yet run on hardware. The prepared bundle is
-inactive and cannot authorize its own installation. Fresh native-file/service
+The first expanded artifact failed during Steam UI initialization, before any
+receiver or connection capture. It was fully removed and the original service
+and readable process mappings were verified; the maintainer confirmed normal
+Steam startup. The failed variant is superseded, and the current session helper
+rejects its global-interception plan before staging. The cause and evidence limits
+are recorded in [STEAM-START-FAILURE-20261012.md](STEAM-START-FAILURE-20261012.md).
+The repaired bundle is inactive and cannot authorize its own installation.
+Fresh native-file/service
 checks, a separately reviewed final bundle/helper inventory and maintainer scope
 and restart readiness are required before deployment.
 
@@ -87,5 +104,6 @@ readable user-process mappings are free of the diagnostics, then remove only
 inventory-matching files. Do not remove foreign overrides or native/system/game
 files. Tell the maintainer when standby is safe; no timed restart is scheduled.
 
-The earlier coordinated test has already completed this recovery and left the
-Frame unchanged. A new installation requires a new explicit scope approval.
+Both earlier coordinated tests have completed recovery and left the Frame
+unchanged. A repaired-artifact headset run remains unverified and requires
+new coordinated restart readiness; there is no automatic retry.

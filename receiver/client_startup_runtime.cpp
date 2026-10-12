@@ -67,11 +67,13 @@ struct Runtime {
     std::atomic<connection::Gate*> connection_gate{nullptr};
     std::atomic<std::uintptr_t> connection_owner{0};
     std::atomic<unsigned> connection_sample_completed{0};
+    // The single atomically claimed sampler owns these fields exclusively.
+    // They do not inflate every inherited Steam process/thread's static TLS.
+    connection::Scope connection_scope{};
+    bool connection_scope_ready=false;
     Reader* reader=nullptr; // Written/read solely on the startup owner thread.
 };
 Runtime runtime;
-thread_local connection::Scope connection_scope __attribute__((tls_model("initial-exec"))){};
-thread_local bool connection_scope_ready __attribute__((tls_model("initial-exec")))=false;
 thread_local unsigned char connection_owner_marker __attribute__((tls_model("initial-exec")))=0;
 static_assert(std::atomic<unsigned>::is_always_lock_free &&
               std::atomic<std::uint64_t>::is_always_lock_free &&
@@ -310,14 +312,18 @@ void libc(frame_import_forwarding::Notification n,void* owner) noexcept {
                    n.entry.x[0]!=runtime.connection_target.object.pipe ||
                    n.entry.x[19]!=runtime.connection_target.object.pipe ||
                    n.entry.x[30]!=runtime.connection_target.module.load_bias+0x245ea8)return;
-                if(runtime.connection_owner.compare_exchange_strong(sampling_owner,owner_id,std::memory_order_acq_rel))sampling_owner=owner_id;
+                if(runtime.connection_owner.compare_exchange_strong(sampling_owner,owner_id,std::memory_order_acq_rel)) {
+                    connection_owner_marker=1;sampling_owner=owner_id;
+                }
             }
-            if(sampling_owner!=owner_id)return;
-            if(!connection_scope_ready) {
-                connection_scope=connection::Scope::prepare_current();connection_scope_ready=true;
+            // A later thread reusing the same TLS address starts with marker 0
+            // and cannot adopt another thread's unfinished sampler state.
+            if(sampling_owner!=owner_id || connection_owner_marker!=1)return;
+            if(!runtime.connection_scope_ready) {
+                runtime.connection_scope=connection::Scope::prepare_current();runtime.connection_scope_ready=true;
             }
-            const auto value=observer->observe(n,connection_scope);
-            if(connection_scope.complete())runtime.connection_sample_completed.store(1,std::memory_order_release);
+            const auto value=observer->observe(n,runtime.connection_scope);
+            if(runtime.connection_scope.complete())runtime.connection_sample_completed.store(1,std::memory_order_release);
             if(value.kind!=connection::Kind::None && admission_alive()) {
                 auto copied=record(value.kind==connection::Kind::Rejected?Kind::ConnectRefused:Kind::ConnectObserved);
                 copied.entry=value.entry;copied.connection=value;

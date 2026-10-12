@@ -181,7 +181,9 @@ class Session(base.Session):
         magic, schema=(b"FCCONN01",2) if mode else (b"FCSTART1",1)
         if mode and (plan.get("connection_private_bytes_read") != 0 or plan.get("continuous_connection_owned") is not False or
                      plan.get("audit",{}).get("native_connection_rvas") != {"lock":"0x87370","unlock":"0x88f74","connect":"0xebcb0"} or
-                     plan.get("observer",{}).get("connection_register_observation") is not True):
+                     plan.get("observer",{}).get("connection_register_observation") is not True or
+                     plan.get("observer",{}).get("audit_only_libc_routing") is not True or
+                     plan.get("observer",{}).get("public_mutex_aliases") != {}):
             raise RuntimeError("Connection scope differs from reviewed register-only observation")
         if not mode and plan.get("audit",{}).get("native_connection_rvas",{}):
             raise RuntimeError("Startup-only scope cannot acquire connection providers")

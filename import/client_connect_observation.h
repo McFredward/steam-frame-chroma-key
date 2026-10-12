@@ -36,8 +36,9 @@ struct Outcome {
 class Gate;
 class Scope {
 public:
-    // Root stores one scope in initial-exec TLS, never shares its mutable state,
-    // and never replaces it during an active invocation. No syscall/lookup is
+    // Root gives one scope exclusively to its atomically claimed sampling
+    // thread, never shares mutable access or replaces an active invocation.
+    // Only the owner marker needs initial-exec TLS. No syscall/lookup is
     // needed. A wrong-thread callback must also retire root's global admission.
     static Scope prepare_current() noexcept;
     bool current() const noexcept;

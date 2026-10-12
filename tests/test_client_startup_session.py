@@ -132,6 +132,8 @@ class SessionTests(unittest.TestCase):
             if item['name']==M.ENVELOPE:item['sha256']=sha
         self.plan.update(connection_register_observation=True,connection_private_bytes_read=0,continuous_connection_owned=False)
         self.plan['observer']['connection_register_observation']=True
+        self.plan['observer']['audit_only_libc_routing']=True
+        self.plan['observer']['public_mutex_aliases']={}
         self.plan['audit']['native_connection_rvas']={'lock':'0x87370','unlock':'0x88f74','connect':'0xebcb0'}
         self.save_plan()
 
@@ -159,6 +161,13 @@ class SessionTests(unittest.TestCase):
         for key,value in (('connection_private_bytes_read',8),('continuous_connection_owned',True),('connection_register_observation','true')):
             self.connection_plan();self.plan[key]=value;self.save_plan()
             with self.subTest(key=key),self.assertRaises(RuntimeError):
+                self.stage(connect_scope=True)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_connection_scope_rejects_old_global_interception_before_staging(self):
+        for change in ({'audit_only_libc_routing':False},{'public_mutex_aliases':{'pthread_mutex_lock':0x1000}}):
+            self.connection_plan();self.plan['observer'].update(change);self.save_plan()
+            with self.subTest(change=change),self.assertRaises(RuntimeError):
                 self.stage(connect_scope=True)
             self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
 
