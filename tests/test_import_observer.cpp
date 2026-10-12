@@ -79,8 +79,16 @@ struct Fixture {
         image_view.owned_public_scalars_verified = true;
         observer.armed = true;
     }
-    EventProof event(std::uint64_t site) const { return {route, site}; }
-    bool begin() { return observer.begin({route, kBeginSite, 0}, scope); }
+    Route provisional_route() const {
+        Route provisional = route;
+        provisional.client_identity = provisional.client_generation = 0;
+        provisional.client_identity_available = provisional.client_ownership_verified = false;
+        return provisional;
+    }
+    EventProof event(std::uint64_t site) const {
+        return {site == kEarlyUnlockSite ? provisional_route() : route, site};
+    }
+    bool begin() { return observer.begin({provisional_route(), kBeginSite, 0}, scope); }
     void gpu() {
         observer.candidate(event(kImageSite), image, scope);
         observer.bind(event(kBindSite), binding, scope);
@@ -148,9 +156,13 @@ int main() {
         check(f.begin());
         check(!f.observer.begin({f.route, 0x153418, 0}, f.scope));
         check(f.scope.depth == 1 && !f.scope.record.reason);
+        check(!f.scope.client_attached && !f.scope.record.client_identity_available);
+        check(!f.scope.record.route.client_identity && !f.scope.record.route.client_generation);
         f.observer.early_unlock(f.event(kEarlyUnlockSite), f.scope);
         check(f.scope.active && !f.observer.counters.completed);
         f.gpu();
+        check(f.scope.client_attached && f.scope.record.route.client_identity == 51);
+        check(f.scope.record.route.client_generation == 3 && f.scope.record.client_identity_available);
         f.write(kReplyBytes);
         check(!f.scope.record.import_reply_complete && f.scope.record.token == kToken);
         f.finish();
@@ -162,6 +174,85 @@ int main() {
         check(r.observation == 1 && r.route.request_sequence == 0x10203040);
         check(r.client_identity_available && f.observer.counters.complete == 1);
         verify_denials(r);
+    }
+    // The typed client does not exist at the pipe-lock boundary. The old
+    // fixture invented that future fact and therefore never modeled this route.
+    {
+        Fixture f;
+        check(f.begin());
+        f.observer.early_unlock(f.event(kEarlyUnlockSite), f.scope);
+        check(!f.scope.client_attached && !f.scope.record.reason);
+        f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        check(f.scope.client_attached && f.scope.record.route.client_identity == f.route.client_identity);
+        // The native object is now allowed to be released. Later event proofs
+        // carry its owned scalar copy; no native pointer exists in this fixture.
+        f.observer.bind(f.event(kBindSite), f.binding, f.scope);
+        f.observer.view(f.event(kViewSite), f.image_view, f.scope);
+        f.write(21); f.finish(); check(f.take().import_reply_complete);
+    }
+    for (unsigned missing = 0; missing < 3; ++missing) {
+        Fixture f; check(f.begin());
+        if (missing == 0) f.route.client_identity_available = false;
+        if (missing == 1) f.route.client_ownership_verified = false;
+        if (missing == 2) f.route.client_generation = 0;
+        f.gpu();
+        check(!f.scope.client_attached && !f.scope.record.client_identity_available);
+        check(!f.scope.record.route.client_identity && !f.scope.record.route.client_generation);
+        f.write(21); rejected(f, MissingClient);
+    }
+    {
+        Fixture f; check(f.begin());
+        // Client ID zero is a known scalar, not an absent scalar. Availability
+        // and protected ownership, rather than a guessed numeric range, decide.
+        f.route.client_identity = 0;
+        f.gpu(); f.write(21); f.finish(); check(f.take().import_reply_complete);
+    }
+    for (unsigned duplicate = 0; duplicate < 2; ++duplicate) {
+        Fixture f; check(f.begin());
+        f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        if (duplicate) ++f.route.client_identity;
+        f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        check(f.scope.record.route.client_identity == 51);
+        rejected(f, DuplicateClientAttachment);
+    }
+    {
+        Fixture f; check(f.begin());
+        f.write(21); rejected(f, MissingClient);
+    }
+    {
+        Fixture f;
+        check(f.observer.begin({f.route, kBeginSite, 0}, f.scope));
+        check(!f.scope.client_attached && !f.scope.record.route.client_identity);
+        f.gpu(); f.write(21); rejected(f, UnexpectedClient);
+    }
+    {
+        Fixture f; check(f.begin());
+        f.observer.early_unlock({f.route, kEarlyUnlockSite}, f.scope);
+        rejected(f, UnexpectedClient);
+    }
+    {
+        Fixture f; check(f.begin()); f.gpu();
+        f.observer.early_unlock(f.event(kEarlyUnlockSite), f.scope);
+        rejected(f, UnexpectedClient);
+    }
+    // Each post-creation phase must carry the same protected client copy.
+    for (unsigned phase = 0; phase < 4; ++phase) {
+        for (unsigned changed = 0; changed < 5; ++changed) {
+            Fixture f; check(f.begin());
+            f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+            if (phase > 0) f.observer.bind(f.event(kBindSite), f.binding, f.scope);
+            if (phase > 1) f.observer.view(f.event(kViewSite), f.image_view, f.scope);
+            if (phase > 2) f.write(21);
+            if (changed == 0) f.route.client_identity_available = false;
+            if (changed == 1) f.route.client_ownership_verified = false;
+            if (changed == 2) f.route.client_generation = 0;
+            if (changed == 3) ++f.route.client_identity;
+            if (changed == 4) ++f.route.client_generation;
+            if (phase == 0) f.observer.bind(f.event(kBindSite), f.binding, f.scope);
+            if (phase == 1) f.observer.view(f.event(kViewSite), f.image_view, f.scope);
+            if (phase == 2) f.write(21);
+            rejected(f, changed < 3 ? MissingClient : ChangedRoute);
+        }
     }
     // Every possible two-part boundary, including splits inside the token.
     for (std::size_t split = 1; split < kReplyBytes; ++split) {
@@ -191,27 +282,28 @@ int main() {
     }
     for (unsigned which = 0; which < 17; ++which) {
         Fixture f;
+        auto provisional = f.provisional_route();
         switch (which) {
-        case 0: f.route.process_generation = 0; break;
-        case 1: f.route.anchor_frame = 0; break;
-        case 2: f.route.anchor_frame = 0x1008; break;
-        case 3: f.route.pipe_identity = 0; break;
-        case 4: f.route.client_generation = 0; break;
-        case 5: f.route.socket_generation = 0; break;
-        case 6: f.route.socket_fd = -1; break;
-        case 7: f.route.peer_pid = 0; break;
-        case 8: f.route.native_route_verified = false; break;
-        case 9: f.route.active_anchor_verified = false; break;
-        case 10: f.route.client_identity_available = false; break;
-        case 11: f.route.client_ownership_verified = false; break;
-        case 12: f.route.socket_lifetime_verified = false; break;
-        case 13: f.route.peer_credentials_verified = false; break;
-        case 14: f.route.same_native_connection_verified = false; break;
-        case 15: f.route.foreign_namespace = true; break;
+        case 0: provisional.process_generation = 0; break;
+        case 1: provisional.anchor_frame = 0; break;
+        case 2: provisional.anchor_frame = 0x1008; break;
+        case 3: provisional.pipe_identity = 0; break;
+        case 4: provisional.client_generation = 1; break;
+        case 5: provisional.socket_generation = 0; break;
+        case 6: provisional.socket_fd = -1; break;
+        case 7: provisional.peer_pid = 0; break;
+        case 8: provisional.native_route_verified = false; break;
+        case 9: provisional.active_anchor_verified = false; break;
+        case 10: provisional.client_identity_available = true; break;
+        case 11: provisional.client_ownership_verified = true; break;
+        case 12: provisional.socket_lifetime_verified = false; break;
+        case 13: provisional.peer_credentials_verified = false; break;
+        case 14: provisional.same_native_connection_verified = false; break;
+        case 15: provisional.foreign_namespace = true; break;
         default: break;
         }
-        check(f.observer.begin({f.route, kBeginSite, which == 16 ? 1 : 0}, f.scope));
-        f.gpu(); f.write(kReplyBytes); rejected(f, InvalidRoute);
+        check(f.observer.begin({provisional, kBeginSite, which == 16 ? 1 : 0}, f.scope));
+        f.gpu(); f.write(kReplyBytes); rejected(f, which == 4 || which == 10 || which == 11 ? UnexpectedClient : InvalidRoute);
     }
     // Reused frame address alone never permits a changed native invocation.
     for (unsigned which = 0; which < 9; ++which) {
@@ -463,7 +555,7 @@ int main() {
                 for (unsigned byte = 0; byte < 4; ++byte)
                     f.packet[4 + byte] = static_cast<std::uint8_t>(f.route.request_sequence >> (8 * byte));
                 Scope scope{};
-                if (!o.begin({f.route, kBeginSite, 0}, scope)) std::abort();
+                if (!o.begin({f.provisional_route(), kBeginSite, 0}, scope)) std::abort();
                 o.early_unlock(f.event(kEarlyUnlockSite), scope);
                 o.candidate(f.event(kImageSite), f.image, scope);
                 o.bind(f.event(kBindSite), f.binding, scope);

@@ -32,7 +32,8 @@ enum Reason : std::uint64_t {
     IncompleteReply = 1ULL << 16, Abandoned = 1ULL << 17,
     SocketInvalidated = 1ULL << 18, ResourceRetired = 1ULL << 19,
     InvalidFinish = 1ULL << 20, DepthOverflow = 1ULL << 21,
-    ObserverMismatch = 1ULL << 22, MissingClient = 1ULL << 23
+    ObserverMismatch = 1ULL << 22, MissingClient = 1ULL << 23,
+    DuplicateClientAttachment = 1ULL << 24, UnexpectedClient = 1ULL << 25
 };
 
 // These are adapter-established ownership facts, not guesses made by the core.
@@ -43,6 +44,8 @@ struct Route {
     std::uintptr_t anchor_frame = 0;
     std::uint64_t pipe_identity = 0;
     std::uint64_t client_identity = 0;
+    // Local ownership/capture label within this exact invocation. It is not a
+    // native namespace, token lifetime or source-frame generation. Zero at begin.
     std::uint64_t client_generation = 0;
     std::uint64_t socket_generation = 0;
     std::uint32_t request_sequence = 0;
@@ -60,6 +63,8 @@ struct Route {
     bool foreign_namespace = true;
 };
 
+// Begin precedes the typed native handler: client fields must be absent. Only
+// candidate() can attach their owned copies during nested Vulkan creation.
 struct BeginProof { Route route{}; std::uint64_t site = 0; int lock_result = -1; };
 struct EventProof { Route route{}; std::uint64_t site = 0; };
 
@@ -125,7 +130,7 @@ struct Scope {
     std::uint64_t packet_identity = 0;
     std::uintptr_t packet_base = 0, observer_identity = 0;
     std::uint32_t depth = 0, image_count = 0, binding_count = 0, view_count = 0;
-    bool active = false, excluded = false;
+    bool active = false, excluded = false, client_attached = false;
 };
 
 struct Counters {
@@ -139,6 +144,8 @@ public:
     std::atomic<bool> armed{false};
     Counters counters{};
     bool begin(const BeginProof&, Scope&) noexcept;
+    // Sole client-attachment boundary: require the live retained typed context.
+    // Later events carry this exact copy without rereading a released object.
     void candidate(const EventProof&, const ImageCandidate&, Scope&) noexcept;
     void bind(const EventProof&, const Binding&, Scope&) noexcept;
     void view(const EventProof&, const View&, Scope&) noexcept;

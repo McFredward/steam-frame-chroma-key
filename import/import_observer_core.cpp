@@ -6,25 +6,30 @@
 namespace frame_import {
 namespace {
 
-bool valid_route(const Route& r) noexcept {
+bool valid_base_route(const Route& r) noexcept {
     return r.process_generation && r.anchor_frame && r.anchor_frame % 16 == 0 &&
         r.pipe_identity && r.socket_generation && r.socket_fd >= 0 && r.peer_pid &&
         r.native_route_verified && r.active_anchor_verified &&
-        r.client_identity_available && r.client_generation &&
-        r.client_ownership_verified && r.socket_lifetime_verified &&
+        r.socket_lifetime_verified &&
         r.peer_credentials_verified && r.same_native_connection_verified &&
         !r.foreign_namespace;
 }
 
-bool equal_route(const Route& a, const Route& b) noexcept {
+bool client_absent(const Route& r) noexcept {
+    return !r.client_identity_available && !r.client_identity &&
+        !r.client_generation && !r.client_ownership_verified;
+}
+
+bool client_owned(const Route& r) noexcept {
+    return r.client_identity_available && r.client_generation && r.client_ownership_verified;
+}
+
+bool equal_base_route(const Route& a, const Route& b) noexcept {
     return a.process_generation == b.process_generation &&
         a.anchor_frame == b.anchor_frame && a.pipe_identity == b.pipe_identity &&
-        a.client_identity == b.client_identity &&
-        a.client_generation == b.client_generation &&
         a.socket_generation == b.socket_generation &&
         a.request_sequence == b.request_sequence && a.peer_pid == b.peer_pid &&
-        a.socket_fd == b.socket_fd &&
-        a.client_identity_available == b.client_identity_available;
+        a.socket_fd == b.socket_fd;
 }
 
 bool matches_image(const ImageCandidate& image, std::uint64_t device,
@@ -96,10 +101,14 @@ bool Observer::begin(const BeginProof& proof, Scope& scope) noexcept {
     scope.active = true;
     scope.record.observation = ticket + 1;
     scope.record.route = proof.route;
-    scope.record.client_identity_available = proof.route.client_identity_available;
-    if (proof.lock_result != 0 || !valid_route(proof.route))
+    scope.record.route.client_identity = scope.record.route.client_generation = 0;
+    scope.record.route.client_identity_available = false;
+    scope.record.route.client_ownership_verified = false;
+    // This native return precedes retention of the typed client context. Future
+    // client facts cannot be supplied here; admission is explicitly provisional.
+    if (proof.lock_result != 0 || !valid_base_route(proof.route))
         scope.record.reason |= InvalidRoute;
-    if (!proof.route.client_identity_available) scope.record.reason |= MissingClient;
+    if (!client_absent(proof.route)) scope.record.reason |= UnexpectedClient;
     counters.active.fetch_add(1, std::memory_order_seq_cst);
     return true;
 }
@@ -111,13 +120,38 @@ bool Observer::route(const EventProof& proof, std::uint64_t site, Scope& scope) 
         counters.unmatched.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (proof.site != site || !valid_route(proof.route)) {
+    if (proof.site != site || !valid_base_route(proof.route)) {
         scope.record.reason |= InvalidRoute;
         return false;
     }
-    if (!equal_route(scope.record.route, proof.route)) {
+    if (!equal_base_route(scope.record.route, proof.route)) {
         scope.record.reason |= ChangedRoute;
         return false;
+    }
+    if (site == kEarlyUnlockSite) {
+        if (scope.client_attached || !client_absent(proof.route)) {
+            scope.record.reason |= UnexpectedClient;
+            return false;
+        }
+    } else if (site == kImageSite) {
+        if (scope.client_attached) {
+            scope.record.reason |= DuplicateClientAttachment | MultipleImages;
+            return false;
+        }
+        if (!client_owned(proof.route)) {
+            scope.record.reason |= MissingClient;
+            return false;
+        }
+    } else {
+        if (!scope.client_attached || !client_owned(proof.route)) {
+            scope.record.reason |= MissingClient;
+            return false;
+        }
+        if (scope.record.route.client_identity != proof.route.client_identity ||
+            scope.record.route.client_generation != proof.route.client_generation) {
+            scope.record.reason |= ChangedRoute;
+            return false;
+        }
     }
     return scope.record.reason == None && scope.depth == 1;
 }
@@ -125,6 +159,12 @@ bool Observer::route(const EventProof& proof, std::uint64_t site, Scope& scope) 
 void Observer::candidate(const EventProof& proof, const ImageCandidate& image,
                          Scope& scope) noexcept {
     if (!route(proof, kImageSite, scope)) return;
+    scope.record.route.client_identity = proof.route.client_identity;
+    scope.record.route.client_generation = proof.route.client_generation;
+    scope.record.route.client_identity_available = true;
+    scope.record.route.client_ownership_verified = true;
+    scope.record.client_identity_available = true;
+    scope.client_attached = true;
     if (++scope.image_count != 1) {
         scope.record.reason |= MultipleImages;
         return;
@@ -243,6 +283,7 @@ void Observer::finish(const FinishProof& proof, Scope& scope) noexcept {
     if (!verified || proof.parent_return != kReplyParent || proof.unlock_result != 0)
         scope.record.reason |= InvalidFinish;
     if (!proof.native_send_success) scope.record.reason |= NativeSendFailed;
+    if (!scope.client_attached) scope.record.reason |= MissingClient;
     if (scope.image_count != 1) scope.record.reason |= MissingImage;
     if (scope.binding_count != 1) scope.record.reason |= MissingBinding;
     if (scope.view_count != 1) scope.record.reason |= MissingView;
