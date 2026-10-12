@@ -4,6 +4,8 @@
 An optional explicit QEMU/private-provider pair repeats these own-source ELF
 fixtures under AArch64 and the already supplied Frame libc/loader. No network,
 Frame access, system package changes or production observer activation occurs.
+An explicit private own-source override lets isolated workers test an unmerged
+audit core. Its two source hashes are recorded; it grants no runtime authority.
 """
 import argparse
 import hashlib
@@ -11,12 +13,31 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / 'import/import_startup_audit.h'
 CORE = ROOT / 'import/import_startup_audit.cpp'
+AUDIT_ROOT = ROOT
+
+
+def private_audit_source(path):
+    """Explicit bounded borrowed OWN source for a worker's unmerged core check."""
+    root=path.resolve(strict=True)
+    if root!=path.absolute() or not root.is_dir() or root.stat().st_uid!=os.getuid() or stat.S_IMODE(root.stat().st_mode)!=0o700:
+        raise SystemExit('Audit source directory must be normalized, private and user-owned')
+    folder=root/'import'
+    if (folder.is_symlink() or not folder.is_dir() or folder.stat().st_uid!=os.getuid() or
+        stat.S_IMODE(folder.stat().st_mode)!=0o700 or
+        set(p.name for p in folder.iterdir())!={'import_startup_audit.cpp','import_startup_audit.h'}):
+        raise SystemExit('Exact two borrowed own audit sources required')
+    for name in ('import_startup_audit.cpp','import_startup_audit.h'):
+        file=folder/name;before=file.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_uid!=os.getuid() or stat.S_IMODE(before.st_mode)!=0o600 or not 64<=before.st_size<=65536:
+            raise SystemExit('Borrowed audit source must be bounded private regular files')
+    return root
 
 API = r'''
 #include <cerrno>
@@ -644,6 +665,153 @@ CONNECTION_CASES = ('connection_redirect','connection_preload_only','connection_
     'connection_partial_optin','connection_duplicate_rva','connection_outside_rx','connection_no_mutex_scope',
     'connection_wrong_client','connection_wrong_native_rva','connection_early_client','connection_bad_owned_entry')
 
+RESOURCE_THREAD_OBSERVER = r'''
+#include <sys/epoll.h>
+#include <cstring>
+#include <unistd.h>
+using Epoll = int(*)(int,epoll_event*,int,int);
+static Epoll native_epoll;
+static BoundProvider thread_attached;
+static std::uintptr_t epoll_label,epoll_args[4];
+static unsigned epoll_before,epoll_after,epoll_bindings,epoll_nonclient;
+static int epoll_result,epoll_errno;
+static bool receiver_owner,thread_missed;
+extern "C" __attribute__((visibility("hidden"))) int fixture_owned_epoll(int fd,epoll_event* events,int maxevents,int timeout) {
+    if(retired)return native_epoll(fd,events,maxevents,timeout);
+    if(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))!=epoll_label)std::abort();
+    ++epoll_before;epoll_args[0]=static_cast<std::uint32_t>(fd);epoll_args[1]=reinterpret_cast<std::uintptr_t>(events);
+    epoll_args[2]=static_cast<std::uint32_t>(maxevents);epoll_args[3]=static_cast<std::uint32_t>(timeout);
+    const int value=native_epoll(fd,events,maxevents,timeout);
+    epoll_result=value;epoll_errno=errno;++epoll_after;return value;
+}
+__attribute__((constructor)) static void thread_initialize() {
+    const int saved=errno;
+    native_epoll=reinterpret_cast<Epoll>(dlsym(RTLD_NEXT,"epoll_wait"));
+    Dl_info d{};if(!native_epoll||!dladdr(reinterpret_cast<void*>(native_epoll),&d)||
+        reinterpret_cast<std::uintptr_t>(d.dli_fbase)!=libc_bias)std::abort();
+    char path[1024];const auto length=readlink("/proc/self/exe",path,sizeof(path)-1);
+    if(length>0){path[length]=0;receiver_owner=!std::strcmp(path,RECEIVER_FILE)||
+        !std::strcmp(path,RECEIVER_EARLY_FILE)||!std::strcmp(path,RECEIVER_NOW_FILE);}
+    errno=saved;
+}
+static bool equal_view(ModuleView a,ModuleView b) {
+    return a.bias==b.bias&&a.rx_begin==b.rx_begin&&a.rx_end==b.rx_end&&
+           a.observed_open_generation==b.observed_open_generation&&a.observed_open_generation;
+}
+static bool fixture_resource_thread_bridge(BridgeRequest r,BridgeResponse& out) noexcept {
+    if(r.stage==Stage::Prepare){thread_attached=r.provider;thread_missed=r.missed_before_preinit;if(!receiver_owner){++prepares;return true;}return false;}
+    if(r.stage!=Stage::Bind||r.provider.function!=Function::EpollWait)return false;
+    ++epoll_bindings;
+    out.ready=receiver_owner&&!retired&&!std::getenv("FIXTURE_REJECT_THREAD_BIND")&&
+        r.provider.original==reinterpret_cast<std::uintptr_t>(native_epoll)&&
+        equal_view(r.provider.receiver,thread_attached.receiver)&&equal_view(r.provider.api,thread_attached.api)&&
+        equal_view(r.provider.observer,thread_attached.observer)&&equal_view(r.provider.libc,thread_attached.libc);
+    out.hidden_entry=std::getenv("FIXTURE_BAD_THREAD_ENTRY")?reinterpret_cast<std::uintptr_t>(native_epoll):
+        reinterpret_cast<std::uintptr_t>(&fixture_owned_epoll);
+    return true;
+}
+extern "C" void fixture_resource_thread_label(std::uintptr_t label){epoll_label=label;}
+extern "C" void fixture_resource_thread_check(int fd,epoll_event* events,int count,int timeout,int result,int saved,bool redirected) {
+    if(!redirected){if(epoll_before||epoll_after)std::abort();return;}
+    if(epoll_before!=epoll_after||epoll_args[0]!=static_cast<std::uint32_t>(fd)||
+       epoll_args[1]!=reinterpret_cast<std::uintptr_t>(events)||epoll_args[2]!=static_cast<std::uint32_t>(count)||
+       epoll_args[3]!=static_cast<std::uint32_t>(timeout)||epoll_result!=result||epoll_errno!=saved)std::abort();
+}
+extern "C" void fixture_resource_thread_nonclient() {
+    if(reinterpret_cast<std::uintptr_t>(&epoll_wait)!=reinterpret_cast<std::uintptr_t>(native_epoll))std::abort();
+    const auto before_count=epoll_before;epoll_event event{};
+    if(epoll_wait(-1,&event,1,0)!=-1||errno!=EBADF||epoll_before!=before_count)std::abort();
+    ++epoll_nonclient;
+}
+extern "C" std::uintptr_t fixture_resource_thread_probe(unsigned n) {
+    switch(n){case 0:return epoll_before;case 1:return epoll_after;case 2:return epoll_bindings;
+        case 3:return epoll_nonclient;case 4:return thread_missed;default:return 0;}
+}
+'''
+RESOURCE_THREAD_MAIN = r'''
+#include <sys/epoll.h>
+#include <cerrno>
+#include <unistd.h>
+extern "C" int fixture_call_epoll(int,epoll_event*,int,int);
+extern "C" void fixture_return_epoll();
+extern "C" void fixture_resource_thread_label(std::uintptr_t);
+extern "C" void fixture_resource_thread_check(int,epoll_event*,int,int,int,int,bool);
+extern "C" void fixture_resource_thread_nonclient();
+extern "C" std::uintptr_t fixture_resource_thread_probe(unsigned);
+#if defined(__aarch64__)
+__asm__(".text\n.global fixture_call_epoll\n.hidden fixture_call_epoll\n.type fixture_call_epoll,%function\nfixture_call_epoll:\nstp x29,x30,[sp,#-16]!\nmov x29,sp\nbl epoll_wait\n.global fixture_return_epoll\nfixture_return_epoll:\nldp x29,x30,[sp],#16\nret\n");
+#else
+__asm__(".text\n.global fixture_call_epoll\n.hidden fixture_call_epoll\n.type fixture_call_epoll,@function\nfixture_call_epoll:\npush %rbp\nmov %rsp,%rbp\ncall epoll_wait@PLT\n.global fixture_return_epoll\nfixture_return_epoll:\npop %rbp\nret\n");
+#endif
+#ifdef THREAD_EARLY
+__attribute__((constructor)) static void thread_early() {
+    fixture_resource_thread_label(reinterpret_cast<std::uintptr_t>(&fixture_return_epoll));
+    epoll_event event{};if(fixture_call_epoll(-1,&event,1,0)!=-1||errno!=EBADF)std::abort();
+}
+#endif
+static void resource_thread_checks(int argc,char** argv) {
+    const bool redirected=argc>2&&!std::strcmp(argv[2],"epoll");
+    fixture_resource_thread_label(reinterpret_cast<std::uintptr_t>(&fixture_return_epoll));
+    fixture_resource_thread_nonclient();
+    if(std::getenv("FIXTURE_THREAD_DLSYM")&&!dlsym(RTLD_DEFAULT,"epoll_wait"))std::abort();
+    const int fd=epoll_create1(0);if(fd<0)std::abort();epoll_event events[2]{};
+    // Real native success, bad FD and invalid-capacity outcomes. Timeout zero
+    // prevents this controlled receiver call from blocking on an event wait.
+    errno=73;int result=fixture_call_epoll(fd,events,2,0);int saved=errno;
+    if(result||saved!=73)std::abort();
+    fixture_resource_thread_check(fd,events,2,0,result,saved,redirected);
+    errno=79;result=fixture_call_epoll(-1,events,2,0);saved=errno;
+    if(result!=-1||saved!=EBADF)std::abort();
+    fixture_resource_thread_check(-1,events,2,0,result,saved,redirected);
+    errno=83;result=fixture_call_epoll(fd,events,0,0);saved=errno;
+    if(result!=-1||saved!=EINVAL)std::abort();
+    fixture_resource_thread_check(fd,events,0,0,result,saved,redirected);
+    close(fd);fixture_resource_thread_nonclient();
+    if(fixture_resource_thread_probe(0)!=(redirected?3u:0u)||fixture_resource_thread_probe(1)!=(redirected?3u:0u)||
+       fixture_resource_thread_probe(3)!=2)std::abort();
+    std::printf("THREAD={\"epoll_redirected\":%s,\"calls\":%llu,\"bindings\":%llu,\"missed_before_preinit\":%s,\"unrelated_epoll_native\":true,\"four_arguments_results_errno\":true,\"exact_caller_lr\":%s,\"production_cold_ready_proven\":false}\n",
+        redirected?"true":"false",static_cast<unsigned long long>(fixture_resource_thread_probe(0)),
+        static_cast<unsigned long long>(fixture_resource_thread_probe(2)),fixture_resource_thread_probe(4)?"true":"false",redirected?"true":"false");
+}
+static void resource_thread_after_retire() {
+    if(!std::getenv("FIXTURE_THREAD_POST_RETIRE"))return;
+    const auto before_count=fixture_resource_thread_probe(0),after_count=fixture_resource_thread_probe(1);
+    epoll_event event{};if(fixture_call_epoll(-1,&event,1,0)!=-1||errno!=EBADF||
+        fixture_resource_thread_probe(0)!=before_count||fixture_resource_thread_probe(1)!=after_count)std::abort();
+    std::puts("RETIRE={\"cached_entry_native_after_lifetime_end\":true,\"new_observer_events\":false}");
+}
+'''
+RESOURCE_THREAD_ALT_AUDIT = r'''
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <link.h>
+#include <cstdint>
+extern "C" unsigned la_version(unsigned v){return v>=LAV_CURRENT?LAV_CURRENT:0;}
+extern "C" unsigned la_objopen(link_map*,Lmid_t,std::uintptr_t*){return LA_FLG_BINDFROM|LA_FLG_BINDTO;}
+extern "C" std::uintptr_t la_symbind64(Elf64_Sym* symbol,unsigned,std::uintptr_t*,std::uintptr_t*,unsigned* flags,const char* name){
+    const char wanted[]="epoll_wait";unsigned i=0;for(;wanted[i]&&name[i]==wanted[i];++i){}
+    if(!wanted[i]&&!name[i])*flags|=LA_SYMB_ALTVALUE;
+    return symbol->st_value;
+}
+'''
+RESOURCE_THREAD_CASES = ('resource_thread_redirect','resource_thread_preload_only','resource_thread_zero_default',
+    'resource_thread_eager_now','resource_thread_environment_now','resource_thread_preinit_wait',
+    'resource_thread_wrong_receiver','resource_thread_wrong_native_rva','resource_thread_wrong_libc_name',
+    'resource_thread_missing_history','resource_thread_partial_scope','resource_thread_bad_owned_entry',
+    'resource_thread_bridge_refusal','resource_thread_dlsym_first_miss','resource_thread_altvalue_first_miss','resource_thread_retired_binding')
+
+
+def resource_thread_sources():
+    observer=CONNECTION_OBSERVER.replace('extern "C" __attribute__((visibility("hidden"))) BridgeResponse fixture_connection_bridge',
+        'static bool fixture_resource_thread_bridge(BridgeRequest,BridgeResponse&) noexcept;\nextern "C" __attribute__((visibility("hidden"))) BridgeResponse fixture_connection_bridge')
+    observer=observer.replace('BridgeResponse out{};','BridgeResponse out{};if(fixture_resource_thread_bridge(r,out))return out;',1)
+    observer+=RESOURCE_THREAD_OBSERVER
+    main=CONNECTION_MAIN.replace('static void* early;',RESOURCE_THREAD_MAIN+'\nstatic void* early;')
+    main=main.replace('fixture_connection_nonclient();\n    void* handle','resource_thread_checks(argc,argv);\n    fixture_connection_nonclient();\n    void* handle',1)
+    main=main.replace('dlclose(handle);\n    fixture_connection_nonclient();','dlclose(handle);\n    resource_thread_after_retire();\n    fixture_connection_nonclient();',1)
+    return observer,main
+
 DEEP_CASES = ('deepbind_preload_only','deepbind_redirect','deepbind_wrong_client',
               'deepbind_wrong_native_rva','deepbind_partial_optin','deepbind_early_client',
               'deepbind_bad_owned_entry','deepbind_dlsym')
@@ -661,7 +829,7 @@ def run_deepbind(args,helper,report,clean):
         logs={};cases={};data={'logs':logs,'cases':cases};report['architectures'][arch]=data
         with tempfile.TemporaryDirectory(prefix='frame-deepbind-audit-'+arch+'-') as name:
             folder=Path(name);folder.chmod(0o700)
-            common=[compiler,'-std=c++17','-O2','-g','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I',str(ROOT)]
+            common=[compiler,'-std=c++17','-O2','-g','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I',str(AUDIT_ROOT),'-I',str(ROOT)]
             def compile_one(label,command):
                 value=helper.recorded_run(command,folder,logs,label+'_compile',45,clean)
                 if value.returncode:raise SystemExit(value.stderr)
@@ -670,10 +838,15 @@ def run_deepbind(args,helper,report,clean):
             client_cpp.write_text(CONNECTION_CLIENT if args.connection else DEEP_CLIENT)
             observer_cpp.write_text(CONNECTION_OBSERVER if args.connection else DEEP_OBSERVER)
             main_cpp.write_text(CONNECTION_MAIN if args.connection else DEEP_MAIN)
+            if args.resource_thread:
+                thread_observer,thread_main=resource_thread_sources();observer_cpp.write_text(thread_observer);main_cpp.write_text(thread_main)
             api_cpp.write_text('#include <cstdint>\nextern "C" std::uint32_t VR_InitInternal2(void*,std::uint32_t,const char*){return 0;}\nextern "C" void VR_ShutdownInternal(){}\n')
             compile_one('client',common+['-shared','-fPIC',str(client_cpp),'-pthread','-ldl','-o',str(client)])
             compile_one('foreign',common+['-shared','-fPIC',str(client_cpp),'-pthread','-ldl','-o',str(foreign)])
             obs_args=common+['-shared','-fPIC','-ftls-model=initial-exec',str(observer_cpp)]
+            if args.resource_thread:
+                obs_args+=['-DRECEIVER_FILE='+json.dumps(str(main)),'-DRECEIVER_EARLY_FILE='+json.dumps(str(early)),
+                           '-DRECEIVER_NOW_FILE='+json.dumps(str(folder/'now'))]
             if args.connection:
                 obs_args += [str(ROOT/'import/import_forwarding.cpp')]
                 if qemu:obs_args += [str(ROOT/'import/native_connection_entry.S')]
@@ -684,6 +857,7 @@ def run_deepbind(args,helper,report,clean):
                     subprocess.check_output(['nm','-D','--defined-only',str(observer)],text=True).splitlines()
                     if line.split()}
                 forbidden={'pthread_mutex_init','pthread_mutex_destroy','pthread_mutex_lock','pthread_mutex_unlock','connect'}
+                if args.resource_thread:forbidden.add('epoll_wait')
                 if defined_names & forbidden:raise SystemExit('Audit-only observer exports a public libc provider')
                 data['public_libc_aliases_absent']=sorted(forbidden)
             compile_one('api',common+['-shared','-fPIC',str(api_cpp),'-o',str(api)])
@@ -691,7 +865,10 @@ def run_deepbind(args,helper,report,clean):
                         '-DFOREIGN_FILE='+json.dumps(str(foreign)),str(main_cpp),'-L',str(folder),
                         '-Wl,-rpath,'+str(folder),'-Wl,--no-as-needed','-lobserver','-lapi','-pthread','-ldl']
             compile_one('main',exe+['-o',str(main)])
-            compile_one('early',exe+['-DDEEP_EARLY','-o',str(early)])
+            compile_one('early',exe+['-DTHREAD_EARLY' if args.resource_thread else '-DDEEP_EARLY','-o',str(early)])
+            if args.resource_thread:
+                compile_one('now',exe+['-Wl,-z,now','-o',str(folder/'now')])
+                compile_one('wrong_receiver',exe+['-o',str(folder/'wrong')])
             def command_for(program,env_values,extra=()):
                 if qemu:
                     command=[str(qemu),'-L',str(prefix)]
@@ -721,8 +898,9 @@ def run_deepbind(args,helper,report,clean):
             init=symbol(api,'VR_InitInternal2');shutdown=symbol(api,'VR_ShutdownInternal')
             mutex_init=symbol(libc,'pthread_mutex_init');mutex_destroy=symbol(libc,'pthread_mutex_destroy')
             connection_rvas=[symbol(libc,n) for n in ('pthread_mutex_lock','pthread_mutex_unlock','connect')] if args.connection else []
+            epoll_rva=symbol(libc,'epoll_wait') if args.resource_thread else 0
             config=folder/'configuration.cpp'
-            def configured(label,rva_delta=0,partial=False,wrong_target='init',connection_mode='full'):
+            def configured(label,rva_delta=0,partial=False,wrong_target='init',connection_mode='full',resource_mode='full'):
                 def spec(name,extent):return '{'+json.dumps(name)+','+str(extent[0])+','+str(extent[1])+'}'
                 extra=list(connection_rvas)
                 if args.connection:
@@ -734,11 +912,15 @@ def run_deepbind(args,helper,report,clean):
                 native_init=mutex_init+(rva_delta if wrong_target=='init' else 0)
                 native_destroy=0 if partial else mutex_destroy+(rva_delta if wrong_target=='destroy' else 0)
                 libc_spec=spec(libc_name,rx['libc'])
+                if resource_mode=='wrong_libc_name':libc_spec=spec(libc_name+'.wrong',rx['libc'])
                 if connection_mode=='no_mutex':native_init=native_destroy=0;libc_spec='{nullptr,0,0}'
+                api_spec=spec(str(api)+('.missing' if resource_mode=='missing_history' else ''),rx['api'])
+                wait_rva=0 if resource_mode=='zero' else epoll_rva+(1 if resource_mode=='wrong_rva' else 0)
                 config.write_text('#include "import/import_startup_audit.h"\nnamespace frame_import_startup_audit {const Preparation* preparation() noexcept {static const Preparation p={'+
-                    spec('',rx['main'])+','+spec(str(api),rx['api'])+','+spec(str(observer),rx['observer'])+','+
+                    spec('',rx['main'])+','+api_spec+','+spec(str(observer),rx['observer'])+','+
                     f'{bridge},{init},{shutdown},true,'+spec(str(client),rx['client'])+','+libc_spec+','+
-                    f'{native_init},{native_destroy}'+(''.join(','+str(rva) for rva in extra))+'};return &p;}}\n')
+                    f'{native_init},{native_destroy}'+(''.join(','+str(rva) for rva in extra))+
+                    (','+str(wait_rva) if args.resource_thread else '')+'};return &p;}}\n')
                 audit=folder/(label+'.so')
                 audit_args=common+['-shared','-fPIC','-nostdlib','-fvisibility=hidden','-fno-exceptions','-fno-rtti','-fno-builtin']
                 if qemu:audit_args+=['-mno-outline-atomics']
@@ -756,14 +938,31 @@ def run_deepbind(args,helper,report,clean):
             data['actual_client_mutex_relocation_order']=order
             audit=configured('audit');bad=configured('bad',1,wrong_target=order[-1]);partial=configured('partial',partial=True)
             alternatives={}
-            if args.connection:
+            if args.resource_thread:
+                alternatives={key:configured('thread_'+key,resource_mode=key) for key in ('zero','wrong_rva','wrong_libc_name','missing_history')}
+                alternatives['partial']=configured('thread_partial',connection_mode='partial')
+                alt_cpp=folder/'alternative.cpp';alt_cpp.write_text(RESOURCE_THREAD_ALT_AUDIT);alt_audit=folder/'alternative.so'
+                compile_one('alternative_audit',common+['-shared','-fPIC','-nostdlib',str(alt_cpp),'-o',str(alt_audit)])
+            elif args.connection:
                 alternatives={key:configured('connection_'+key,connection_mode=key)
                     for key in ('zero','partial','duplicate','outside','no_mutex')}
-            selected=args.case or (CONNECTION_CASES if args.connection else DEEP_CASES)
+            selected=args.case or (RESOURCE_THREAD_CASES if args.resource_thread else CONNECTION_CASES if args.connection else DEEP_CASES)
             for label in selected:
-                if label not in (CONNECTION_CASES if args.connection else DEEP_CASES):raise SystemExit('Not a focused deepbind case: '+label)
+                if label not in (RESOURCE_THREAD_CASES if args.resource_thread else CONNECTION_CASES if args.connection else DEEP_CASES):raise SystemExit('Not a focused deepbind case: '+label)
                 env_values={'LD_PRELOAD':str(observer),'LD_LIBRARY_PATH':str(folder)}
-                if args.connection:
+                if args.resource_thread:
+                    mode='31' if label in ('resource_thread_redirect','resource_thread_zero_default','resource_thread_retired_binding') else '0'
+                    selected_audit=alternatives.get({'resource_thread_zero_default':'zero','resource_thread_wrong_native_rva':'wrong_rva',
+                        'resource_thread_wrong_libc_name':'wrong_libc_name','resource_thread_missing_history':'missing_history',
+                        'resource_thread_partial_scope':'partial'}.get(label,''),audit)
+                    if label!='resource_thread_preload_only':env_values['LD_AUDIT']=str(selected_audit)
+                    if label=='resource_thread_environment_now':env_values['LD_BIND_NOW']='1'
+                    if label=='resource_thread_bad_owned_entry':env_values['FIXTURE_BAD_THREAD_ENTRY']='1'
+                    if label=='resource_thread_bridge_refusal':env_values['FIXTURE_REJECT_THREAD_BIND']='1'
+                    if label=='resource_thread_dlsym_first_miss':env_values['FIXTURE_THREAD_DLSYM']='1'
+                    if label=='resource_thread_retired_binding':env_values['FIXTURE_THREAD_POST_RETIRE']='1'
+                    if label=='resource_thread_altvalue_first_miss':env_values['LD_AUDIT']=str(alt_audit)+':'+str(audit)
+                elif args.connection:
                     mode='31' if label=='connection_redirect' else '3' if label=='connection_zero_defaults' else '0'
                     selected_audit=bad if label=='connection_wrong_native_rva' else alternatives.get({
                         'connection_zero_defaults':'zero','connection_partial_optin':'partial',
@@ -778,12 +977,27 @@ def run_deepbind(args,helper,report,clean):
                     if label=='deepbind_wrong_client':env_values['FIXTURE_FOREIGN_CLIENT']='1'
                     if label=='deepbind_bad_owned_entry':env_values['FIXTURE_BAD_MUTEX_ENTRY']='1'
                 program=early if label in ('deepbind_early_client','connection_early_client') else main
-                command,environment=command_for(program,env_values,[mode])
+                if args.resource_thread:
+                    program=early if label=='resource_thread_preinit_wait' else folder/'now' if label=='resource_thread_eager_now' else folder/'wrong' if label=='resource_thread_wrong_receiver' else main
+                command,environment=command_for(program,env_values,[mode,*(['epoll' if label in ('resource_thread_redirect','resource_thread_retired_binding') else 'native'] if args.resource_thread else [])])
                 value=helper.recorded_run(command,folder,logs,label,15,environment)
                 if value.returncode:raise SystemExit(label+': '+value.stdout+value.stderr)
                 if 'RESULT=' not in value.stdout:raise SystemExit('Fixture did not complete semantics')
                 cases[label]=json.loads(value.stdout.split('RESULT=')[1])
-                if args.connection:
+                if args.resource_thread:
+                    if 'THREAD=' not in value.stdout:raise SystemExit('Missing direct receiver event-wait semantics')
+                    cases[label]['resource_thread']=json.loads(value.stdout.split('THREAD=')[1].splitlines()[0])
+                    thread=cases[label]['resource_thread']
+                    if thread['epoll_redirected']!=(label in ('resource_thread_redirect','resource_thread_retired_binding')) or not thread['four_arguments_results_errno'] or not thread['unrelated_epoll_native']:
+                        raise SystemExit('Receiver/nonreceiver event-wait isolation changed')
+                    if label in ('resource_thread_eager_now','resource_thread_environment_now','resource_thread_preinit_wait') and not thread['missed_before_preinit']:
+                        raise SystemExit('Real preinit event-wait miss was not retained')
+                    if label in ('resource_thread_wrong_native_rva','resource_thread_bad_owned_entry','resource_thread_bridge_refusal','resource_thread_dlsym_first_miss','resource_thread_altvalue_first_miss') and cases[label]['loss_events']!=1:
+                        raise SystemExit('First inadmissible event-wait binding was not sticky')
+                    if label=='resource_thread_retired_binding':
+                        if 'RETIRE=' not in value.stdout or cases[label]['loss_events']!=1:raise SystemExit('Actual client lifetime end did not retire event-wait evidence')
+                        cases[label]['post_lifetime']=json.loads(value.stdout.split('RETIRE=')[1].splitlines()[0])
+                if args.connection and not args.resource_thread:
                     result=cases[label]
                     if not result['nonclient_all_five_native'] or result['unscoped_notifications']:
                         raise SystemExit('Unrelated native callers were interposed by the audit-only observer')
@@ -800,6 +1014,7 @@ def run_deepbind(args,helper,report,clean):
             data['libc_identity']=sha(libc)
             wrapper='native_connection_entry.S' if args.connection else 'native_mutex_entry.S'
             data['entry_abi']='actual shared '+wrapper+' + versioned real libc forwarding' if qemu else 'host intrinsic caller PC + versioned real libc forwarding (not native ARM stack proof)'
+            if args.resource_thread:data['event_wait_entry_abi']='Controlled four-argument C++ veneer with exact incoming caller PC and original native provider; not production cold ARM entry proof'
             data['actual_native_flags']='RTLD_NOW|RTLD_DEEPBIND (10), not altered'
             data['audit_provider_imports']=[]
             data['fixture_only']=True
@@ -813,6 +1028,7 @@ def sha(path):
 
 
 def main():
+    global CORE,HEADER,AUDIT_ROOT
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--qemu',type=Path)
     parser.add_argument('--providers',type=Path)
@@ -820,25 +1036,36 @@ def main():
     parser.add_argument('--native-only',action='store_true',help='Use only the explicit AArch64/provider pair; reuse already passing host evidence')
     parser.add_argument('--deepbind',action='store_true',help='Run only the new actual NOW|DEEPBIND client/libc binding controls')
     parser.add_argument('--connection',action='store_true',help='Run only opt-in five-provider NOW|DEEPBIND controls; no private memory reads')
+    parser.add_argument('--resource-thread',action='store_true',help='Run only explicit receiver-to-libc event-wait binding controls; fixture bridge is not production readiness')
+    parser.add_argument('--audit-source-dir',type=Path,help='Explicit private directory containing exactly the two borrowed own import/audit sources; never native inputs')
     parser.add_argument('--case',action='append',choices=('normal','wrong_process','missing_api','eager_now',
-        'environment_now','constructor_binding','bad_owned_entry','bad_native_rva','inactive_default','weak_default_inactive',*DEEP_CASES,*CONNECTION_CASES),
+        'environment_now','constructor_binding','bad_owned_entry','bad_native_rva','inactive_default','weak_default_inactive',*DEEP_CASES,*CONNECTION_CASES,*RESOURCE_THREAD_CASES),
         help='focused case selection; the receipt records its limited scope')
     args=parser.parse_args()
     if bool(args.qemu)!=bool(args.providers): parser.error('explicit QEMU and providers must be supplied together')
     if args.native_only and not args.qemu:parser.error('--native-only requires the explicit QEMU/provider pair')
     if args.connection and args.deepbind:parser.error('--connection and --deepbind are separate focused scopes')
+    if args.resource_thread and (args.connection or args.deepbind):parser.error('--resource-thread is a separate explicit fixture scope')
     if args.case:
         if args.connection and any(case not in CONNECTION_CASES for case in args.case):
             parser.error('--connection accepts only connection fixture cases')
         if args.deepbind and any(case not in DEEP_CASES for case in args.case):
             parser.error('--deepbind accepts only mutex deepbind fixture cases')
-        if not (args.connection or args.deepbind) and any(case in DEEP_CASES+CONNECTION_CASES for case in args.case):
+        if args.resource_thread and any(case not in RESOURCE_THREAD_CASES for case in args.case):parser.error('--resource-thread accepts only its own fixture cases')
+        if not args.resource_thread and any(case in RESOURCE_THREAD_CASES for case in args.case):parser.error('event-wait cases require explicit --resource-thread')
+        if not (args.connection or args.deepbind or args.resource_thread) and any(case in DEEP_CASES+CONNECTION_CASES for case in args.case):
             parser.error('selected deepbind cases require their explicit --deepbind or --connection scope')
+    if args.audit_source_dir:
+        AUDIT_ROOT=private_audit_source(args.audit_source_dir);HEADER=AUDIT_ROOT/'import/import_startup_audit.h';CORE=AUDIT_ROOT/'import/import_startup_audit.cpp'
+    # Reuse the proven client/libc fixtures alongside the eighth receiver-only
+    # binding. The public CLI scopes remain mutually exclusive above.
+    if args.resource_thread:args.connection=True
     helper_path=ROOT/'tools/run_import_native_forwarding.py'
     spec=importlib.util.spec_from_file_location('owned_runner',helper_path)
     helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
     report={'status':'failed','frame_access':False,'native_openvr_init_executed':False,'source_sha256':{'core':sha(CORE),'header':sha(HEADER),'fixture':sha(Path(__file__).resolve())},'architectures':{}}
-    report['selected_cases']=args.case or list(CONNECTION_CASES) if args.connection else \
+    report['borrowed_own_source_override']=bool(args.audit_source_dir)
+    report['selected_cases']=args.case or list(RESOURCE_THREAD_CASES) if args.resource_thread else args.case or list(CONNECTION_CASES) if args.connection else \
         args.case or list(DEEP_CASES) if args.deepbind else args.case or 'complete own-source API audit fixture'
     clean=os.environ.copy()
     for name in ('LD_PRELOAD','LD_AUDIT','LD_LIBRARY_PATH','QEMU_LD_PREFIX'): clean.pop(name,None)
@@ -861,7 +1088,7 @@ def main():
                 files={key:folder/(key+'.cpp') for key in ('api','client','observer','main','missing')}
                 for key,source in zip(files,(API,CLIENT,OBSERVER,MAIN,MISSING)):files[key].write_text(source)
                 outputs={key:folder/(('lib'+key+'.so') if key in ('api','client','observer') else key) for key in files}
-                common=[compiler,'-std=c++17','-O2','-g','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I',str(ROOT)]
+                common=[compiler,'-std=c++17','-O2','-g','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I',str(AUDIT_ROOT),'-I',str(ROOT)]
                 def compile_one(label,command):
                     value=helper.recorded_run(command,folder,logs,label+'_compile',45,clean)
                     logs[label+'_compile']['argv']=command
@@ -964,6 +1191,9 @@ def main():
     except BaseException as error:
         report['failure']=str(error);raise
     finally:
+        source_changed=report['source_sha256']['core']!=sha(CORE) or report['source_sha256']['header']!=sha(HEADER)
+        if source_changed:
+            report['status']='failed';report['failure']='Own audit source changed during fixture execution'
         cache=ROOT/'tools/__pycache__'
         if cache.exists():
             for path in cache.glob('run_import_native_forwarding.*.pyc'):path.unlink()
@@ -971,6 +1201,7 @@ def main():
         if args.record:
             args.record.parent.mkdir(parents=True,exist_ok=True)
             args.record.write_text(json.dumps(report,indent=2)+'\n');args.record.chmod(0o600)
+        if source_changed:raise SystemExit(report['failure'])
 
 
 if __name__=='__main__':main()
