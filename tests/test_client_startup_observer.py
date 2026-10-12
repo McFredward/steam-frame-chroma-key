@@ -13,6 +13,9 @@ PROBE = r'''
 #include <initializer_list>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <dlfcn.h>
 #include <pthread.h>
 using namespace frame_import_startup_audit;
@@ -31,9 +34,23 @@ int main() {
             inert=inert&&!answer.ready&&answer.hidden_entry==0&&errno==ENOTTY;
         }
     }
-    std::printf("{\"created\":%d,\"init_errno\":%d,\"destroyed\":%d,\"destroy_errno\":%d,\"bridge_inert\":%s,\"bridge_present\":%s}\n",
-        created,init_errno,destroyed,destroy_errno,inert?"true":"false",bridge?"true":"false");
-    return !inert||created!=0||destroyed!=0;
+    const auto child=fork();
+    if(child==0) {
+        bool child_inert=true;
+        if(bridge) {
+            for(const auto stage:{Stage::Prepare,Stage::Bind,Stage::Retire}) {
+                BridgeRequest request{};request.stage=stage;
+                errno=ENOTTY;const auto answer=bridge(request);
+                child_inert=child_inert&&!answer.ready&&answer.hidden_entry==0&&errno==ENOTTY;
+            }
+        }
+        // exit (not _exit) invokes the actual preloaded observer finalizer.
+        std::exit(child_inert?0:7);
+    }
+    int status=0;const bool fork_ok=child>0&&waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0;
+    std::printf("{\"created\":%d,\"init_errno\":%d,\"destroyed\":%d,\"destroy_errno\":%d,\"bridge_inert\":%s,\"bridge_present\":%s,\"fork_inert\":%s}\n",
+        created,init_errno,destroyed,destroy_errno,inert?"true":"false",bridge?"true":"false",fork_ok?"true":"false");
+    return !inert||!fork_ok||created!=0||destroyed!=0;
 }
 '''
 
@@ -79,7 +96,7 @@ def main():
             env.pop(name, None)
         baseline = json.loads(checked([str(probe)], env=env).stdout)
         assert baseline['created'] == baseline['destroyed'] == 0
-        assert baseline['bridge_inert']
+        assert baseline['bridge_inert'] and baseline['fork_inert']
         assert baseline.pop('bridge_present') is False
         symbols = checked(['nm', '-D', '--defined-only', str(observer)]).stdout
         names = [line.split()[-1].split('@')[0] for line in symbols.splitlines()]

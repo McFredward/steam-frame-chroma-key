@@ -12,6 +12,9 @@
 
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_init_entry();
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_shutdown_entry();
+// glibc's public pthread_atfork ABI uses its own libpthread_nonshared wrapper
+// on the reviewed build. Validate the real registration provider cold, too.
+extern "C" int __register_atfork(void(*)(void),void(*)(void),void(*)(void),void*) noexcept;
 
 
 namespace {
@@ -23,6 +26,42 @@ bool writer_started=false;
 char output_path[1024]{};
 frame_import_main::Digest reviewed_observer{};
 std::uint64_t local_process_label=0;
+bool owned_process() noexcept {
+    // A real fork copies globals but not the parent writer. This PID is only
+    // local observer ownership, never a native/source frame generation.
+    return local_process_label!=0&&static_cast<std::uint64_t>(getpid())==local_process_label;
+}
+void retire_child() noexcept {
+    const auto saved=errno;
+    // No locks/I/O/joins: finalize uses fixed atomic retirement and makes
+    // already bound native notification subscribers inert in the child.
+    frame_client_startup::finalize();
+    active.store(false,std::memory_order_release);
+    stopping.store(true,std::memory_order_release);writer_started=false;
+    errno=saved;
+}
+bool register_child_retirement(const frame_import_main::Prepared& prepared) noexcept {
+    const auto images=prepared.images();
+    const auto atfork=reinterpret_cast<std::uintptr_t>(&::pthread_atfork);
+    const auto registration=reinterpret_cast<std::uintptr_t>(&::__register_atfork);
+    auto mapped=[&](std::uintptr_t address,const frame_import_main::Image& image) noexcept {
+        Dl_info info{};
+        return address>=image.rx_begin&&address<image.rx_end&&
+            prepared.lookup()(reinterpret_cast<const void*>(address),&info)&&
+            reinterpret_cast<std::uintptr_t>(info.dli_fbase)==image.bias;
+    };
+    // Actual export RVA from the independently pinned current Frame libc.
+    // The wrapper may live in the reviewed own artifact; the stateful real
+    // registration provider must be exactly the authenticated native libc.
+    if((!mapped(atfork,images[2])&&!mapped(atfork,images[4]))||
+       !mapped(registration,images[2])||registration<images[2].bias||
+       registration-images[2].bias!=0xd35c0)return false;
+    return ::pthread_atfork(nullptr,nullptr,retire_child)==0;
+}
+void disarm_owned() noexcept {
+    if(owned_process())frame_client_startup::finalize();
+    active.store(false,std::memory_order_release);
+}
 std::uint64_t little(const std::uint8_t* data,std::size_t n) noexcept {
     std::uint64_t value=0;for(std::size_t i=0;i<n;++i)value|=std::uint64_t(data[i])<<(8*i);return value;
 }
@@ -74,6 +113,7 @@ bool decode(const std::array<std::uint8_t,kEnvelopeBytes>& b,frame_import_main::
 std::uint64_t now() noexcept {timespec t{};return clock_gettime(CLOCK_MONOTONIC,&t)==0?
     std::uint64_t(t.tv_sec)*1000000000ULL+std::uint64_t(t.tv_nsec):0;}
 int open_output() noexcept {
+    if(!owned_process())return -1;
     char parent[1024]{};std::memcpy(parent,output_path,sizeof(parent));
     char* slash=std::strrchr(parent,'/');if(!slash||!slash[1])return -1;
     const char* basename=output_path+(slash-parent)+1;
@@ -86,7 +126,7 @@ int open_output() noexcept {
 }
 bool write_owned(int fd,const char* bytes,std::size_t size) noexcept {
     std::size_t sent=0;unsigned attempts=0;
-    while(sent<size&&attempts++<32) {const auto n=write(fd,bytes+sent,size-sent);if(n<=0)return false;sent+=static_cast<std::size_t>(n);}
+    while(sent<size&&attempts++<32) {if(!owned_process())return false;const auto n=write(fd,bytes+sent,size-sent);if(n<=0)return false;sent+=static_cast<std::size_t>(n);}
     return sent==size;
 }
 struct Line {
@@ -131,12 +171,12 @@ void record(Line& line,const frame_client_startup::Record& r) noexcept {
         r.actual_init_token,r.actual_native_result,r.preserved_errno,unsigned(r.gate_refusal),unsigned(r.refusal));
 }
 void* write_background(void*) noexcept {
-    const int fd=open_output();if(fd<0){frame_client_startup::finalize();active.store(false);return nullptr;}
+    const int fd=open_output();if(fd<0){disarm_owned();return nullptr;}
     std::size_t bytes=0,records=0;const auto started=now();const char* end="stopped";
     Line header;header.add("{\"schema\":1,\"capture\":\"client_startup\",\"pid\":%ld,\"local_process_label\":%llu,\"reviewed_observer_profile\":\"",long(getpid()),static_cast<unsigned long long>(local_process_label));
     header.hex(reviewed_observer);header.add("\",\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120,\"mask_enabled\":false}\n");
-    if(!header.valid||!write_owned(fd,header.bytes.data(),header.used)){close(fd);frame_client_startup::finalize();active.store(false);return nullptr;}bytes=header.used;
-    while(!stopping.load(std::memory_order_acquire)) {
+    if(!header.valid||!write_owned(fd,header.bytes.data(),header.used)){close(fd);disarm_owned();return nullptr;}bytes=header.used;
+    while(owned_process()&&!stopping.load(std::memory_order_acquire)) {
         const auto time=now();if(!started||!time||time<started||time-started>=kDurationNs){end="deadline";break;}
         frame_client_startup::Record value{};
         if(frame_client_startup::pop(value)) {
@@ -148,6 +188,7 @@ void* write_background(void*) noexcept {
     }
     // This deadline disarms recording only; it never restarts Steam/SteamVR,
     // changes loader configuration, rolls back installation or affects pixels.
+    if(!owned_process()){close(fd);active.store(false,std::memory_order_release);return nullptr;}
     frame_client_startup::finalize();const auto status=frame_client_startup::status();
     Line footer;footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%zu,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,\"startup_completed\":%s,\"refusal\":%u,\"finalized\":true}\n",
         end,records,bytes,static_cast<unsigned long long>(status.queued),static_cast<unsigned long long>(status.drained),status.startup_completed?"true":"false",unsigned(status.refusal));
@@ -169,6 +210,7 @@ __attribute__((constructor)) void begin_observer() noexcept {
     setup.hidden_init_entry=reinterpret_cast<std::uintptr_t>(&frame_import_vr_init_entry);
     setup.hidden_shutdown_entry=reinterpret_cast<std::uintptr_t>(&frame_import_vr_shutdown_entry);
     if(!frame_client_startup::initialize_once(prepared,client,setup)){errno=saved;return;}
+    if(!register_child_retirement(prepared)){frame_client_startup::finalize();errno=saved;return;}
     reviewed_observer=profiles.reviewed_observer_identity;active.store(true,std::memory_order_release);
     if(pthread_create(&writer,nullptr,write_background,nullptr)==0)writer_started=true;
     else {frame_client_startup::finalize();active.store(false,std::memory_order_release);}
@@ -176,6 +218,11 @@ __attribute__((constructor)) void begin_observer() noexcept {
 }
 __attribute__((destructor)) void finish_observer() noexcept {
     const auto saved=errno;
+    if(local_process_label!=0&&!owned_process()) {
+        // Never acknowledge a copied prepared runtime or join the parent's
+        // pthread_t in the child. Parent address space/stream remains untouched.
+        active.store(false,std::memory_order_release);errno=saved;return;
+    }
     frame_client_startup::finalize();stopping.store(true,std::memory_order_release);
     if(writer_started){pthread_join(writer,nullptr);writer_started=false;}
     active.store(false,std::memory_order_release);errno=saved;
@@ -184,6 +231,6 @@ __attribute__((destructor)) void finish_observer() noexcept {
 extern "C" __attribute__((visibility("default"))) frame_import_startup_audit::BridgeResponse
 frame_client_startup_bridge(frame_import_startup_audit::BridgeRequest request) noexcept {
     const auto saved=errno;
-    const auto response=active.load(std::memory_order_acquire)?frame_client_startup::bridge(request):frame_import_startup_audit::BridgeResponse{};
+    const auto response=active.load(std::memory_order_acquire)&&owned_process()?frame_client_startup::bridge(request):frame_import_startup_audit::BridgeResponse{};
     errno=saved;return response;
 }

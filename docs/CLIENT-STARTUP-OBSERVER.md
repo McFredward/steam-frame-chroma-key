@@ -80,7 +80,18 @@ change the headset image. The only waiting, formatting and file I/O occurs on th
 writer, outside native callbacks.
 
 The finalizer first makes the runtime inert, then stops and joins its writer.
-Late audit-close notifications cannot reactivate it. The deadline performs the
+Late audit-close notifications cannot reactivate it. A bounded PID ownership
+check refuses a real fork's inherited active state: the child bridge stays inert,
+the child cannot create/write a capture and its finalizer never acknowledges the
+copied prepared runtime or joins the parent's copied writer handle. A cold
+`pthread_atfork` child callback is registered after genuine initialization and
+before writer creation. It atomically finalizes the child's copied runtime and
+clears writer ownership, including native notification paths that bypass the
+bridge. Registration failure refuses activation. The cold function mappings are
+checked against the already authenticated libc/observer; the actual glibc
+`__register_atfork` provider must have the canonical libc export RVA `0xd35c0`.
+The public wrapper's glibc DSO ownership handles callback lifetime. No fork/exec
+interposer is introduced. The deadline performs the
 same recording-only disarm and has no automatic restart or rollback behavior.
 
 `process_generation` uses this process's PID only as single-process observer
@@ -95,7 +106,8 @@ records cannot establish streamed mask/resource association by themselves.
 `tests/test_client_startup_observer.py --observer <actual-built-library>` loads the
 actual observer into an unrelated host probe. It checks that native mutex outcomes
 and errno remain equal to the baseline, that the actual exported bridge stays
-inert for all stages, and that no public OpenVR entry is exported or output file
+inert for all stages (including an actual fork child and its normal exit/finalizer),
+and that no public OpenVR entry is exported or output file
 is created. Missing/malformed inputs, wrong exact modes, symlinks, hard links,
 FIFO and size/type failures are refusal controls. `--trace-io` additionally uses
 actual syscall traces to distinguish input-read refusal from a later schema
@@ -105,7 +117,9 @@ an actual canonical-input wrong-executable control.
 The test removes generated probes, inputs and syscall traces after child processes
 have exited, retaining only its small JSON receipt. Sanitized host execution and
 AArch64 compilation are separate focused checks. They prove bounded software
-refusal/forwarding and compilation, **not** a successful native startup capture,
+refusal/forwarding and compilation; the host fork control starts inert and does
+not fabricate an inherited production Ready/writer state. They do **not** prove a
+successful native startup capture,
 correct headset picture or working Steam Link passthrough. Production activation
 still requires Root's linked true-entry/audit artifacts, reviewed final inventory
 and an explicitly authorized hardware run.
