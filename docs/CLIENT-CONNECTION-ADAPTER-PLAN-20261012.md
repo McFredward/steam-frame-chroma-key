@@ -9,24 +9,26 @@ It does not observe that pipe's later connection, descriptor lifetime, resource
 transaction or either endpoint of the compositor channel. The completed run
 cannot be extended retrospectively into such evidence.
 
-The smallest next diagnostic is **one supported native connection candidate**
+The smallest next diagnostic is **one supported native connect-call record**
 from a fresh start, using **registers and native outcomes only**. Keep the
 existing first-load gate, exact mapping/provider authentication and
 `GenericClient` `ObjectToken`. Add source-client audit forwarding for real mutex
-lock/unlock, connect and close. At the genuine connect entry, real x0 already
+**lock/unlock and connect only**: three additional bindings, five libc bindings
+including existing init/destroy. At the genuine connect entry, real x0 already
 contains the FD loaded by the pinned native instruction at `0x245f8c`, and live
 x19 identifies the unchanged born static pipe. Record those existing entry
 registers and the original result/errno while its real native mutex is held.
 **No additional private field or stack byte**, socket query, payload, image,
 native executable detour or PC Steam sender change is necessary for this scope.
 
-This first candidate must remain explicitly **provisional**. In particular, do
+This first record certifies only the supported native invocation at its original
+return, **not a future-use connection candidate or lease**. In particular, do
 **not** call `Registry::connected()` yet: that existing core sets
 `local_socket_lifetime_observed` on its successful lease. A client-only callback
 set does not establish process-wide descriptor invalidation coverage. Returning
 such a trusted lease before that obligation is satisfied would overstate the
 evidence. Keep the authentic object in its existing ObjectOnly state, use its
-existing object label in the candidate, and leave lookup/strict carrier admission
+existing object label in the record, and leave lookup/strict carrier admission
 unavailable. A record ordinal identifies the observation, not a new socket
 epoch. No new generic lifecycle or carrier core is needed.
 
@@ -55,7 +57,7 @@ Every RVA below requires the independently validated actual mapping and a
 current audit-open lifetime. This source review used retained private bytes and
 the saved startup capture; it did not connect to or modify the Frame.
 
-## Exact native connection and retirement timeline
+## Exact supported native connect timeline
 
 The client connect function starts at `0x245e88`, allocates 192 bytes and sets
 FP = SP. Its live x19 is its pipe pointer throughout the eligible connect path.
@@ -63,21 +65,42 @@ FP = SP. Its live x19 is its pipe pointer throughout the eligible connect path.
 | Native boundary | Source-established facts |
 | --- | --- |
 | Public mutex lock, return `0x245ea8` | x0 = x19 = pipe; original return 0 establishes this thread's real native lock acquisition. Do not inspect fields in the before-lock callback. |
-| Existing descriptor branch | Native code reads pipe +172 and calls close helper `0x244eb0` before replacing a previous FD. |
+| Existing descriptor branch | Native code reads pipe +172 and calls close helper `0x244eb0` before replacing a previous FD. That nested target lock makes this first probe refuse the route; reconnect is not supported. |
 | Socket return / native store | Public socket returns at `0x245f20`; the instruction there stores the actual w0 into pipe +172. This store has completed by the later connect entry. |
 | Public connect, return `0x245f9c` | x19 = pipe, w0 = the actual FD loaded from pipe +172, x1 = native sockaddr at connect FP +80, w2 = native sockaddr length. Copy registers only; neither pipe fields nor sockaddr/stack bytes are read. |
-| Connect result | Original result 0 is the successful candidate. The observer copies the actual result and errno; failure, unwind or missing after-event cannot yield success. |
+| Connect result | Original result 0 is the successful local operation. The observer copies the actual result and errno; failure, unwind or missing after-event cannot yield success. A result -1 can be recorded as an actual failed call, never a connected endpoint. |
 | Success-path public unlock, return `0x245fb0` | Occurs after connect's original return. Its before callback ends the observer's protected scope before the native unlock can release ownership. |
-| Failure / unwind unlock | Failure has return `0x245ff0`; exception cleanup has `0x246044`. These must retire pending state rather than retain an old success. |
+| Failure / unwind unlock | Failure has return `0x245ff0`; exception cleanup has `0x246044`. Native failure normally calls the nested close helper first, which this deliberately narrower probe refuses; exceptional/missing completion cannot retain pending state. |
+
+After this one eligible native connect return and matched outer unlock, stop
+the connection-only sampler with a terminal completed state. Do **not** return
+to admission Idle and mistake subsequent ordinary RPCs for lost connection
+proof: `0x1ccae8` continues immediately into handshake and locks this same pipe
+at call `0x1ccc80` / return **`0x1ccc84`**. No future FD lease exists, so those
+later native operations do not negate the historical recorded call. Native
+forwarding, startup completion and global loss/shutdown/module retirement
+handling continue unchanged.
+
+Omitting public close is safe **for this invocation-only statement**: the record
+copies the actual original connect argument/result, and no later code uses it as
+an owned descriptor. It cannot report that the FD remains open, that no other
+thread replaced it, or that an endpoint still has that connection. It creates no
+trusted Registry lease, copied credentials or retrospective kernel epoch. An
+external close/replacement is therefore an explicit unobserved lifetime gate,
+not an ignored event in a supposedly continuous proof. During the active
+supported window, nested target lock/close-helper paths are refused before
+making the successful-call statement; normal public providers still execute.
+
+### Deferred close/destruction lifecycle expansion
 
 The close helper `0x244eb0` acquires the same native mutex at public lock return
 `0x244ec4`, reads pipe +172, calls shutdown at `0x244ed4`, calls public close at
 `0x244edc` (return **`0x244ee0`**), and only then writes FD -1 at `0x244ee4`.
-Observe/invalidate at close **entry**, even if native close fails or is cancelled;
+For a later lifecycle adapter, observe/invalidate at close **entry**, even if native close fails or is cancelled;
 never wait for that later private store to infer retirement. Also retire the
-candidate when the tracked pipe's close-helper lock succeeds, before its native
+future-use candidate when the tracked pipe's close-helper lock succeeds, before its native
 shutdown begins. This narrower source event avoids introducing a shutdown
-forwarder in the connection-only probe. It does not observe arbitrary shutdown
+forwarder in that fuller lifecycle probe. It does not observe arbitrary shutdown
 calls outside that helper.
 
 Pipe destruction at `0x245098` first calls that close helper, then frees native
@@ -104,12 +127,13 @@ or malformed argument shapes unchanged-native; do not copy paths or invoke a
 new length query.
 
 The pipe is recursive: the native init helper sets mutex type 1 before the init
-tail branch. Maintain a fixed, bounded thread-local lock scope for the one exact
-target mutex, counting only successful observed original lock calls and retiring
-before each corresponding unlock. Do not read the native pipe's private +64
-logical recursion counter or introduce an observer mutex. Overflow, missing
-acquisition, unmatched release, notification recursion, signal/nesting ambiguity
-or changed object lifetime loses the observation. An original connect may be a
+tail branch. The preferred first probe tracks only its one eligible outer
+lock scope and **refuses** recursive target acquisition; it does not implement
+reconnect, recursive close or future descriptor ownership. End local ownership
+before the matching unlock. Do not read the native pipe's private +64 logical
+recursion counter or introduce an observer mutex. Missing acquisition, unmatched
+release, notification recursion, signal/nesting ambiguity or changed object
+lifetime loses the observation. An original connect may be a
 cancellation point; existing true-entry CFI and forwarding must propagate unwind,
 and pending state must never be committed without its real after-event.
 
@@ -212,11 +236,11 @@ The actual libc's public and distinct versioned aliases independently match:
 | mutex lock | **`0x87370` /760** | `__pthread_mutex_lock@GLIBC_2.17` |
 | mutex unlock | **`0x88f74` /20** | `__pthread_mutex_unlock@GLIBC_2.17` |
 | connect | **`0xebcb0` /208** | `__connect@GLIBC_2.17` |
-| close | **`0xda610` /180** | `__close@GLIBC_2.17` |
+| close, deferred lifecycle | `0xda610` /180 | `__close@GLIBC_2.17` |
 | read, for later carrier | `0xdf330` /204 | `__read@GLIBC_2.17` |
 | write, for later carrier | `0xdfee0` /204 | `__write@GLIBC_2.17` |
 
-Append the four connection-only operations to the existing audit/bridge enum
+Append the three connection-only operations to the existing audit/bridge enum
 and immutable preparation; retain existing enum values and refusal behavior.
 Admit only bindings from the current authenticated client cookie to the current
 authenticated MAIN libc cookie and exact provider RVAs. Other namespaces,
@@ -225,8 +249,8 @@ remain native/unavailable. Sticky binding loss must notify MAIN immediately;
 already installed veneers still forward the real provider after evidence retires.
 
 Reuse `native_import_entry.S`'s existing entry macro and
-`import_forwarding.cpp`'s existing lock/unlock/connect/close dispatchers. Link a
-minimal selector for those four veneers beside the existing two mutex entries,
+`import_forwarding.cpp`'s existing lock/unlock/connect dispatchers. Link a
+minimal selector for those three veneers beside the existing two mutex entries,
 without duplicating symbols or pulling in fake Vulkan providers. Verify the
 final artifact's original registers, SP/FP/LR, native result/errno, CFI and forced
 unwind behavior. Do not create C wrappers that change the original caller LR,
@@ -297,6 +321,9 @@ small JSON receipts remain under ignored
 `build/private-client-connection-source-plan/`. Native disassembly is a
 regenerable private cache and is removed after completion. This proves the
 bounded source plan, not a new runtime connection or provider installation.
+The narrowed three-binding scope adds **7** direct-byte/hash checks, including
+the source-proven same-pipe handshake lock after the supported call. These are
+focused static checks, not another native hardware capture.
 
 New permission is required for the expanded register-only callback set. It
 introduces **zero additional private bytes** beyond the unchanged five startup
