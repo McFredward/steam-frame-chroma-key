@@ -1,5 +1,7 @@
 // Offline entry adapter, deliberately NOT exported as public libc/Vulkan APIs.
-// The C dispatchers and real-provider/lifecycle gates are not implemented here.
+// C dispatchers forward through the independently reviewed libc aliases and
+// the layer's actual per-device Vulkan providers. Lifecycle/native read gates
+// and runtime observer activation are separate, still uninstalled components.
 // Native entry context is saved before any compiler prologue or callback.
 // Keep these veneers uninstalled until their complete forwarding path is reviewed.
 #if !defined(__aarch64__)
@@ -95,5 +97,7 @@
     IMPORT_ENTRY frame_import_init_entry, frame_import_init_dispatch
     IMPORT_ENTRY frame_import_destroy_entry, frame_import_destroy_dispatch
     IMPORT_ENTRY frame_import_close_entry, frame_import_close_dispatch
+    IMPORT_ENTRY frame_import_read_entry, frame_import_read_dispatch
+    IMPORT_ENTRY frame_import_connect_entry, frame_import_connect_dispatch
 
     .section .note.GNU-stack,"",%progbits

@@ -8,7 +8,7 @@
 // identify a binary, authorize a capture, or activate a production observer.
 namespace frame_import_forwarding {
 
-enum class Operation : std::uint8_t { Init, Destroy, Lock, Unlock, Write, Close };
+enum class Operation : std::uint8_t { Init, Destroy, Lock, Unlock, Write, Close, Read, Connect };
 enum class Phase : std::uint8_t { Before, After };
 
 struct Notification {
@@ -64,6 +64,8 @@ extern "C" std::uint64_t frame_import_lock_dispatch(const frame_import_native::E
 extern "C" std::uint64_t frame_import_unlock_dispatch(const frame_import_native::Entry*);
 extern "C" std::uint64_t frame_import_write_dispatch(const frame_import_native::Entry*);
 extern "C" std::uint64_t frame_import_close_dispatch(const frame_import_native::Entry*);
+extern "C" std::uint64_t frame_import_read_dispatch(const frame_import_native::Entry*);
+extern "C" std::uint64_t frame_import_connect_dispatch(const frame_import_native::Entry*);
 
 // Vulkan image/bind/view dispatch is intentionally absent. Its real per-device
 // forwarding providers must be established by the layer integration, rather

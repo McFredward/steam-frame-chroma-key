@@ -217,6 +217,20 @@ public:
     bool requestSnapshot(std::uint64_t device, VkCommandBuffer command, VkPipelineLayout layout, std::uint32_t cookie) noexcept {
         return publish(Op::Snapshot, device, [&](Record& r) { r.payload.snapshot = {command, layout, cookie}; });
     }
+    // Background-owner only, after drain() has returned. Never call from an API
+    // hook or the drain receipt callback: pending lifecycle records must first
+    // be replayed. Refuse a concurrent publication window or an unread ticket;
+    // current handle equality alone cannot validate a queued destroy/recreate.
+    // This remains CPU lifecycle evidence, never GPU completion or a lifetime pin.
+    bool validateImportResourceReceipt(const ImportResourceReceipt& receipt) noexcept {
+        const auto ticket = tickets_.load(std::memory_order_acquire);
+        if (closed_.load(std::memory_order_acquire) || halted_.load(std::memory_order_acquire) ||
+            active_.load(std::memory_order_acquire) || !empty() || expected_ != ticket || lostState()) return false;
+        const auto valid = core_.validate(receipt);
+        return valid && !active_.load(std::memory_order_acquire) && empty() &&
+            expected_ == ticket && tickets_.load(std::memory_order_acquire) == ticket &&
+            !closed_.load(std::memory_order_acquire) && !halted_.load(std::memory_order_acquire) && !lostState();
+    }
     // The verified native adapter calls this immediately after publishing the
     // matching successful tagged view creation. Hooks copy only owned scalars;
     // the journal worker resolves actual lifecycle generations asynchronously.

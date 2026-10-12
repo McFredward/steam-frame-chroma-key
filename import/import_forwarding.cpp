@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 // Distinct, actual-provider aliases prevent recursion through the corresponding
@@ -15,6 +16,8 @@ extern "C" int frame_import_libc_lock(pthread_mutex_t*);
 extern "C" int frame_import_libc_unlock(pthread_mutex_t*);
 extern "C" ssize_t frame_import_libc_write(int, const void*, std::size_t);
 extern "C" int frame_import_libc_close(int);
+extern "C" ssize_t frame_import_libc_read(int, void*, std::size_t);
+extern "C" int frame_import_libc_connect(int, const struct sockaddr*, socklen_t);
 
 #if defined(__aarch64__)
 #define IMPORT_LIBC_VERSION "GLIBC_2.17"
@@ -29,6 +32,8 @@ __asm__(".symver frame_import_libc_lock,__pthread_mutex_lock@" IMPORT_LIBC_VERSI
 __asm__(".symver frame_import_libc_unlock,__pthread_mutex_unlock@" IMPORT_LIBC_VERSION);
 __asm__(".symver frame_import_libc_write,__write@" IMPORT_LIBC_VERSION);
 __asm__(".symver frame_import_libc_close,__close@" IMPORT_LIBC_VERSION);
+__asm__(".symver frame_import_libc_read,__read@" IMPORT_LIBC_VERSION);
+__asm__(".symver frame_import_libc_connect,__connect@" IMPORT_LIBC_VERSION);
 #undef IMPORT_LIBC_VERSION
 
 namespace frame_import_forwarding {
@@ -164,5 +169,25 @@ extern "C" std::uint64_t frame_import_write_dispatch(const frame_import_native::
 extern "C" std::uint64_t frame_import_close_dispatch(const frame_import_native::Entry* entry) {
     return frame_import_forwarding::forward_integer(frame_import_forwarding::Operation::Close, *entry, [&] {
         return frame_import_libc_close(frame_import_forwarding::integer_argument(entry->x[0]));
+    });
+}
+extern "C" std::uint64_t frame_import_read_dispatch(const frame_import_native::Entry* entry) {
+    const int incoming_errno = errno;
+    frame_import_forwarding::notify(frame_import_forwarding::Operation::Read,
+                                   frame_import_forwarding::Phase::Before, *entry, 0, incoming_errno);
+    errno = incoming_errno;
+    const ssize_t result = frame_import_libc_read(frame_import_forwarding::integer_argument(entry->x[0]),
+        reinterpret_cast<void*>(entry->x[1]), static_cast<std::size_t>(entry->x[2]));
+    const int provider_errno = errno;
+    const auto bits = static_cast<std::uint64_t>(result);
+    frame_import_forwarding::notify(frame_import_forwarding::Operation::Read,
+                                   frame_import_forwarding::Phase::After, *entry, bits, provider_errno);
+    errno = provider_errno;
+    return bits;
+}
+extern "C" std::uint64_t frame_import_connect_dispatch(const frame_import_native::Entry* entry) {
+    return frame_import_forwarding::forward_integer(frame_import_forwarding::Operation::Connect, *entry, [&] {
+        return frame_import_libc_connect(frame_import_forwarding::integer_argument(entry->x[0]),
+            reinterpret_cast<const struct sockaddr*>(entry->x[1]), static_cast<socklen_t>(entry->x[2]));
     });
 }

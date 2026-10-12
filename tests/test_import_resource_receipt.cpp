@@ -356,10 +356,31 @@ void orderedInterleavedScopes() {
         journal->close(); require(journal->finished(), "interleaved receipt journal remained pending");
     }
 }
+void backgroundOwnerValidation() {
+    Fixture f; f.create();
+    const auto receipt = f.receipt();
+    require(f.journal->validateImportResourceReceipt(receipt), "caught-up background receipt refused");
+    auto alien = std::make_unique<Journal>();
+    require(!alien->validateImportResourceReceipt(receipt), "different owning journal accepted receipt");
+    std::atomic<bool> entered{false}, release{false};
+    std::thread producer([&] { JournalTestAccess::delayedSnapshot(*f.journal, entered, release); });
+    while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
+    require(!f.journal->validateImportResourceReceipt(receipt), "active unpublished predecessor ignored");
+    release.store(true, std::memory_order_release); producer.join();
+    require(!f.journal->validateImportResourceReceipt(receipt), "unreplayed lifecycle ticket ignored");
+    Collector collector; while (f.journal->drain(collector)) {}
+    require(f.journal->validateImportResourceReceipt(receipt), "unchanged resources refused after replay");
+    f.journal->destroyImage(f.device, f.image);
+    require(!f.journal->validateImportResourceReceipt(receipt), "queued image retirement ignored");
+    while (f.journal->drain(collector)) {}
+    require(!f.journal->validateImportResourceReceipt(receipt), "retired resource accepted by owner API");
+    Fixture closed; closed.create(); const auto closed_receipt = closed.receipt(); closed.journal->close();
+    require(!closed.journal->validateImportResourceReceipt(closed_receipt), "closed observation range accepted");
+}
 }
 int main() {
     orderedOwnedSuccess(); unmatchedAndMissing(); retireReuseAndDeviceIsolation();
-    unsupportedAndLoss(); duplicateCapacityAndMissingConsumer(); orderedInterleavedScopes();
+    unsupportedAndLoss(); duplicateCapacityAndMissingConsumer(); orderedInterleavedScopes(); backgroundOwnerValidation();
     std::cout << checks << " import resource receipt checks passed; " << sizeof(Journal)
               << " bytes fixed state; no hook allocations; offline lifecycle proof only\n";
 }

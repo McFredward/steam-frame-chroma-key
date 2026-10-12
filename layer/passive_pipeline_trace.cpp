@@ -2,6 +2,9 @@
 // mutation, image/memory readback, GPU work, or render-thread log I/O.
 #include "passive_pipeline_trace.h"
 #include "passive_binding_journal.h"
+#ifdef FRAME_MASK_IMPORT_ENTRY
+#include "../import/import_vulkan_forwarding.h"
+#endif
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 
@@ -532,6 +535,48 @@ bool ordinaryPipeline(const VkGraphicsPipelineCreateInfo& info) {
 TRACE_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance, const char*);
 TRACE_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice, const char*);
 
+#ifdef FRAME_MASK_IMPORT_ENTRY
+extern "C" VkResult frame_import_image_entry(VkDevice, const VkImageCreateInfo*,
+    const VkAllocationCallbacks*, VkImage*);
+extern "C" VkResult frame_import_bind_entry(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
+extern "C" VkResult frame_import_view_entry(VkDevice, const VkImageViewCreateInfo*,
+    const VkAllocationCallbacks*, VkImageView*);
+
+namespace {
+void importPublication(const frame_import_vulkan::Publication& event) noexcept {
+    observeBindings([&](auto& journal) {
+        switch (event.operation) {
+        case frame_import_vulkan::Operation::Image:
+            (void)journal.createImageTagged(event.device, event.image, *event.image_info, event.invocation_tag);
+            break;
+        case frame_import_vulkan::Operation::Bind:
+            journal.bindImageMemory(event.device, event.image, event.memory, event.offset);
+            break;
+        case frame_import_vulkan::Operation::View:
+            (void)journal.createViewTagged(event.device, event.view, *event.view_info, event.invocation_tag);
+            break;
+        }
+    });
+}
+frame_import_vulkan::Providers importProviders(const frame_import_native::Entry& entry) {
+    // Reuse the layer's actual device record and already resolved next providers.
+    // No native-pointer scan, observer object table or new lookup lock is added.
+    const auto* device = deviceFor((VkDevice)(std::uintptr_t)entry.x[0]);
+    return {device->id, device->CreateImage, device->BindImageMemory,
+            device->CreateImageView, importPublication};
+}
+}
+extern "C" std::uint64_t frame_import_image_dispatch(const frame_import_native::Entry* entry) {
+    return frame_import_vulkan::image(*entry, importProviders(*entry));
+}
+extern "C" std::uint64_t frame_import_bind_dispatch(const frame_import_native::Entry* entry) {
+    return frame_import_vulkan::bind(*entry, importProviders(*entry));
+}
+extern "C" std::uint64_t frame_import_view_dispatch(const frame_import_native::Entry* entry) {
+    return frame_import_vulkan::view(*entry, importProviders(*entry));
+}
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateInstance(const VkInstanceCreateInfo* info,
     const VkAllocationCallbacks* allocator, VkInstance* output) {
     capture().start();
@@ -831,6 +876,11 @@ TRACE_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevi
         HOOK(CmdExecuteCommands) HOOK(QueueSubmit) HOOK(QueueSubmit2)
         HOOK(CmdBindShadersEXT)
         if (capture().bindingsEnabled) {
+#ifdef FRAME_MASK_IMPORT_ENTRY
+            if (!std::strcmp(name, "vkCreateImage")) return reinterpret_cast<PFN_vkVoidFunction>(frame_import_image_entry);
+            if (!std::strcmp(name, "vkBindImageMemory")) return reinterpret_cast<PFN_vkVoidFunction>(frame_import_bind_entry);
+            if (!std::strcmp(name, "vkCreateImageView")) return reinterpret_cast<PFN_vkVoidFunction>(frame_import_view_entry);
+#endif
 #define BINDING_FIELD(name) HOOK(name)
 #include "passive_binding_commands.inc"
 #undef BINDING_FIELD
@@ -867,6 +917,13 @@ TRACE_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkIn
     HOOK(CmdExecuteCommands) HOOK(QueueSubmit) HOOK(QueueSubmit2)
     HOOK(CmdBindShadersEXT)
     if (capture().bindingsEnabled) {
+#ifdef FRAME_MASK_IMPORT_ENTRY
+        if (capture().processAllowed && i->gipa(instance, name)) {
+            if (!std::strcmp(name, "vkCreateImage")) return reinterpret_cast<PFN_vkVoidFunction>(frame_import_image_entry);
+            if (!std::strcmp(name, "vkBindImageMemory")) return reinterpret_cast<PFN_vkVoidFunction>(frame_import_bind_entry);
+            if (!std::strcmp(name, "vkCreateImageView")) return reinterpret_cast<PFN_vkVoidFunction>(frame_import_view_entry);
+        }
+#endif
 #define BINDING_FIELD(name) HOOK(name)
 #include "passive_binding_commands.inc"
 #undef BINDING_FIELD

@@ -10,6 +10,8 @@
 #include <limits>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 using frame_import_native::Entry;
@@ -24,6 +26,8 @@ extern "C" int fixture_real_lock(pthread_mutex_t*);
 extern "C" int fixture_real_unlock(pthread_mutex_t*);
 extern "C" ssize_t fixture_real_write(int, const void*, std::size_t);
 extern "C" int fixture_real_close(int);
+extern "C" ssize_t fixture_real_read(int, void*, std::size_t);
+extern "C" int fixture_real_connect(int, const struct sockaddr*, socklen_t);
 #if defined(__x86_64__)
 #define HOST_VERSION "GLIBC_2.2.5"
 #elif defined(__aarch64__)
@@ -37,6 +41,8 @@ __asm__(".symver fixture_real_lock,__pthread_mutex_lock@" HOST_VERSION);
 __asm__(".symver fixture_real_unlock,__pthread_mutex_unlock@" HOST_VERSION);
 __asm__(".symver fixture_real_write,__write@" HOST_VERSION);
 __asm__(".symver fixture_real_close,__close@" HOST_VERSION);
+__asm__(".symver fixture_real_read,__read@" HOST_VERSION);
+__asm__(".symver fixture_real_connect,__connect@" HOST_VERSION);
 #undef HOST_VERSION
 
 namespace {
@@ -70,7 +76,7 @@ struct State {
     std::atomic<unsigned> calls{0}, wrong_context{0};
     Notification values[256]{};
     std::atomic<bool> nested{false};
-    std::atomic<bool> waiting_write{false}, waiting_close{false};
+    std::atomic<bool> waiting_write{false}, waiting_close{false}, waiting_read{false};
     pthread_mutex_t nested_mutex = PTHREAD_MUTEX_INITIALIZER;
 };
 State state{};
@@ -99,6 +105,8 @@ void observe(Notification value, void* context) noexcept {
         state.waiting_write.store(true, std::memory_order_release);
     if (value.phase == Phase::Before && value.operation == Operation::Close)
         state.waiting_close.store(true, std::memory_order_release);
+    if (value.phase == Phase::Before && value.operation == Operation::Read)
+        state.waiting_read.store(true, std::memory_order_release);
     errno = EDOM; // Dispatch must preserve the provider's errno, not this value.
 }
 void wrong_callback(Notification, void*) noexcept { std::abort(); }
@@ -107,7 +115,8 @@ void providers() {
     const void* addresses[] = {
         reinterpret_cast<const void*>(fixture_real_init), reinterpret_cast<const void*>(fixture_real_destroy),
         reinterpret_cast<const void*>(fixture_real_lock), reinterpret_cast<const void*>(fixture_real_unlock),
-        reinterpret_cast<const void*>(fixture_real_write), reinterpret_cast<const void*>(fixture_real_close)
+        reinterpret_cast<const void*>(fixture_real_write), reinterpret_cast<const void*>(fixture_real_close),
+        reinterpret_cast<const void*>(fixture_real_read), reinterpret_cast<const void*>(fixture_real_connect)
     };
     const char* path = nullptr;
     for (const auto address : addresses) {
@@ -136,6 +145,11 @@ void* pending_close(void* pointer) {
     while (!work.release.load(std::memory_order_acquire)) sched_yield();
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
     frame_import_close_dispatch(&work.entry);
+    return nullptr;
+}
+void* blocked_read(void* pointer) {
+    auto& work = *static_cast<CancelWork*>(pointer);
+    frame_import_read_dispatch(&work.entry);
     return nullptr;
 }
 bool bounded_wait(const std::atomic<bool>& flag) {
@@ -206,6 +220,56 @@ void partial_write() {
     const auto result = frame_import_write_dispatch(&entry);
     require(result == 4096 && errno == 89,
             "Dispatcher retried or altered a real positive partial write");
+    close(pipefd[0]); close(pipefd[1]);
+}
+void read_and_connect() {
+    int pipefd[2];
+    require(pipe(pipefd) == 0, "Read fixture pipe failed");
+    const char payload[] = "partial";
+    require(write(pipefd[1], payload, sizeof(payload)) == sizeof(payload), "Read fixture input failed");
+    char destination[32]{};
+    auto entry = arguments(pipefd[0], reinterpret_cast<std::uintptr_t>(destination), sizeof(destination));
+    const auto before = state.calls.load(); errno = 97;
+    require(frame_import_read_dispatch(&entry) == sizeof(payload) && errno == 97 &&
+            std::memcmp(destination, payload, sizeof(payload)) == 0, "Positive partial read changed or retried");
+    require(state.calls.load() == before + 2 && state.values[before].operation == Operation::Read &&
+            state.values[before + 1].result_bits == sizeof(payload) &&
+            state.values[before + 1].entry.x == entry.x, "Read result/true entry notification changed");
+    close(pipefd[1]);
+    require(frame_import_read_dispatch(&entry) == 0, "Native read EOF changed"); close(pipefd[0]);
+    auto invalid = arguments(std::numeric_limits<std::uint64_t>::max());
+    errno = 0;
+    require(frame_import_read_dispatch(&invalid) == std::numeric_limits<std::uint64_t>::max() && errno == EBADF,
+            "Read signed failure/errno changed");
+    errno = 0;
+    require(frame_import_connect_dispatch(&invalid) == std::numeric_limits<std::uint32_t>::max() && errno == EBADF,
+            "Connect w0 failure/errno changed");
+    const int listener = socket(AF_UNIX, SOCK_STREAM, 0), client = socket(AF_UNIX, SOCK_STREAM, 0);
+    require(listener >= 0 && client >= 0, "Connect fixture socket failed");
+    sockaddr_un address{}; address.sun_family = AF_UNIX;
+    std::snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1, "frame-import-forwarding-%ld", (long)getpid());
+    const auto length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + std::strlen(address.sun_path + 1));
+    require(bind(listener, reinterpret_cast<const sockaddr*>(&address), length) == 0 && listen(listener, 1) == 0,
+            "Connect fixture abstract listener failed");
+    auto connecting = arguments(client, reinterpret_cast<std::uintptr_t>(&address), length);
+    const auto connect_before = state.calls.load(); errno = 99;
+    require(frame_import_connect_dispatch(&connecting) == 0 && errno == 99, "Actual connect result/errno changed");
+    require(state.calls.load() == connect_before + 2 && state.values[connect_before].operation == Operation::Connect &&
+            state.values[connect_before + 1].entry.x == connecting.x &&
+            state.values[connect_before + 1].result_bits == 0, "Connect entry/result notification changed");
+    const int accepted = accept(listener, nullptr, nullptr);
+    require(accepted >= 0, "Actual connect did not reach expected listener");
+    close(accepted); close(client); close(listener);
+    require(pipe(pipefd) == 0, "Read cancellation pipe failed");
+    CancelWork work{}; work.entry = arguments(pipefd[0], reinterpret_cast<std::uintptr_t>(destination), sizeof(destination));
+    state.waiting_read.store(false);
+    const auto cancel_before = state.calls.load(); pthread_t thread;
+    require(pthread_create(&thread, nullptr, blocked_read, &work) == 0, "Read cancellation thread failed");
+    require(bounded_wait(state.waiting_read), "Read dispatcher did not enter");
+    require(pthread_cancel(thread) == 0, "Read cancellation request failed");
+    void* returned = nullptr;
+    require(pthread_join(thread, &returned) == 0 && returned == PTHREAD_CANCELED &&
+            state.calls.load() == cancel_before + 1, "Read cancellation swallowed or false After emitted");
     close(pipefd[0]); close(pipefd[1]);
 }
 
@@ -299,6 +363,7 @@ int main() {
     close(pipefd[0]);
     partial_write();
     cancellation();
+    read_and_connect();
     require(notification_loss().loss, "Sticky loss was cleared by later native completion");
     saturated_loss();
     require(state.wrong_context.load() == 0, "Borrowed descriptor mutation changed registration");

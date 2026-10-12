@@ -129,7 +129,7 @@ class Object:
         return result
 
 
-ENTRIES = ("lock", "unlock", "write", "image", "bind", "view", "init", "destroy", "close")
+ENTRIES = ("lock", "unlock", "write", "image", "bind", "view", "init", "destroy", "close", "read", "connect")
 MASK64 = (1 << 64) - 1
 CALLEE = tuple(range(19, 31))
 

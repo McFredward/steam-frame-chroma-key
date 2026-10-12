@@ -7,6 +7,12 @@ include(CTest)
 option(FRAME_MASK_BUILD_TRACE "Build the opt-in passive compositor diagnostic layer" OFF)
 option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
+option(FRAME_MASK_BUILD_IMPORT_ENTRY
+    "Build uninstalled AArch64 import entry forwarding (no observer activation)" OFF)
+if(FRAME_MASK_BUILD_IMPORT_ENTRY AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+    NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$"))
+    message(FATAL_ERROR "Import entry forwarding requires the audited Linux AArch64 ABI")
+endif()
 
 if(FRAME_MASK_BUILD_RECEIVER_OBSERVER)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -42,8 +48,15 @@ if(FRAME_MASK_BUILD_RECEIVER_OBSERVER)
     endif()
 endif()
 
-if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE))
-    find_package(Vulkan REQUIRED)
+if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE OR FRAME_MASK_BUILD_IMPORT_ENTRY))
+    if(CMAKE_CROSSCOMPILING AND NOT BUILD_TESTING)
+        # A dispatch layer resolves the next native functions through the loader
+        # chain; it needs headers, not a foreign target libvulkan to link against.
+        find_path(FRAME_VULKAN_HEADERS vulkan/vulkan.h REQUIRED)
+        set(Vulkan_INCLUDE_DIRS ${FRAME_VULKAN_HEADERS})
+    else()
+        find_package(Vulkan REQUIRED)
+    endif()
     find_package(Threads REQUIRED)
     add_library(VkLayer_frame_mask_trace SHARED layer/passive_pipeline_trace.cpp)
     target_include_directories(VkLayer_frame_mask_trace PRIVATE ${Vulkan_INCLUDE_DIRS})
@@ -51,6 +64,15 @@ if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE))
         -Wall -Wextra -Wpedantic -fvisibility=hidden)
     target_link_options(VkLayer_frame_mask_trace PRIVATE -Wl,-Bsymbolic-functions)
     target_link_libraries(VkLayer_frame_mask_trace PRIVATE Threads::Threads)
+    if(FRAME_MASK_BUILD_IMPORT_ENTRY)
+        enable_language(ASM)
+        target_sources(VkLayer_frame_mask_trace PRIVATE
+            import/native_import_entry.S import/import_forwarding.cpp
+            import/import_vulkan_forwarding.cpp)
+        target_include_directories(VkLayer_frame_mask_trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(VkLayer_frame_mask_trace PRIVATE FRAME_MASK_IMPORT_ENTRY=1)
+        target_link_options(VkLayer_frame_mask_trace PRIVATE -Wl,--no-undefined)
+    endif()
     set(FRAME_MASK_TRACE_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}VkLayer_frame_mask_trace${CMAKE_SHARED_LIBRARY_SUFFIX}")
     configure_file(layer/VkLayer_frame_mask_trace.json.in
         ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_mask_trace.json @ONLY)
@@ -102,6 +124,13 @@ if(BUILD_TESTING)
         target_compile_options(test_import_forwarding PRIVATE -Wall -Wextra -Wpedantic)
         target_link_libraries(test_import_forwarding PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
         add_test(NAME compositor_import_libc_forwarding COMMAND test_import_forwarding)
+        add_executable(test_import_vulkan_forwarding tests/test_import_vulkan_forwarding.cpp
+            import/import_vulkan_forwarding.cpp)
+        target_include_directories(test_import_vulkan_forwarding PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(test_import_vulkan_forwarding PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(test_import_vulkan_forwarding PRIVATE Vulkan::Vulkan Threads::Threads)
+        add_test(NAME compositor_import_vulkan_forwarding COMMAND test_import_vulkan_forwarding)
         add_test(NAME compositor_import_entry_abi COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_entry_abi.py
             --source ${CMAKE_CURRENT_SOURCE_DIR}/import/native_import_entry.S)

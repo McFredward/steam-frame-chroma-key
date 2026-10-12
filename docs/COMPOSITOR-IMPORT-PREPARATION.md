@@ -20,10 +20,11 @@ not advertised as working Steam Link passthrough.
   Bounds checks alone cannot authorize reading an arbitrary address.
 * `import/native_import_entry.S` captures the original AArch64 registers/SP
   before a compiler callback and retains explicit unwind rules. Its symbols
-  remain hidden, it is not installed or exported as a public interposer, and
-  its Vulkan dispatchers are not implemented. Object-model tests do not
+  remain hidden, it is not installed or exported as a public libc interposer.
+  The opt-in AArch64 layer now links all eleven veneers and their actual
+  dispatchers without undefined internal symbols. Object-model tests do not
   establish real AArch64 provider forwarding or cancellation behavior.
-* `import/import_forwarding.*` implements the six libc dispatchers using the
+* `import/import_forwarding.*` implements eight libc dispatchers using the
   actual distinct versioned forwarding aliases. A value-copied notification
   subscriber can be registered once, outside callbacks; it remains inactive
   otherwise. Native results, arguments and `errno` are preserved. Real host
@@ -32,12 +33,23 @@ not advertised as working Steam Link passthrough.
   Suppressed recursive notifications set sticky proof loss rather than silently
   certifying a trace that missed a lifecycle event. This component reads no
   private native memory and performs no output or automatic capture activation.
+* `import/import_vulkan_forwarding.*` forwards image creation, memory binding
+  and view creation through the existing layer's actual per-device next
+  providers. Both instance/device GPA routes retain the original entry snapshot.
+  Successful public metadata goes synchronously into the same journal, with
+  an optional externally verified invocation tag. Real local software Vulkan
+  creation/binding/view and lifecycle generations pass; no Frame execution or
+  private native read adapter is implied. See
+  [forwarding scope and validation](COMPOSITOR-IMPORT-FORWARDING.md).
 * The existing asynchronous Vulkan journal now accepts opt-in invocation tags
   at image/view creation and publishes a typed, immutable resource receipt.
   The worker resolves its actual image/allocation/view generations, checks
   matching creation tags and refuses destroyed/recreated, ambiguous, missing
   or lost resources. Ordinary untagged calls retain their existing behavior.
   Neither the invocation tag nor replay cursor is a video-frame identity.
+  A new background-owner validation API refuses pending/unreplayed lifecycle
+  events, concurrent publications, lost state, closed captures and retired
+  resources. It must run after `drain()` returns, never on an API hook.
 * `tools/inspect_unix_connection.py` queries only two specified UNIX stream
   endpoints, repeats each query with its real kernel generation cookie, and
   checks process start identities, FD/socket inodes, UID and network namespace
@@ -102,8 +114,9 @@ file, service, startup setting or process.
 
 Bind exact entry observations to the existing asynchronous Vulkan resource
 journal's real generations; no rendering callback may look up mutable object
-tables or manufacture a generation from its call number. Complete production
-forwarding, callback cancellation, observed socket creation/retirement and
+tables or manufacture a generation from its call number. The active
+native-memory/profile adapter, actual AArch64 callback cancellation, observed
+socket creation/retirement and
 receiver-side carrier/publication recording remain required before deployment.
 The exact current executable/library/provider maps and every active read scope
 must be independently checked in the resulting artifact.
