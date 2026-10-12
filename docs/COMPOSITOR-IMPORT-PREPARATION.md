@@ -18,6 +18,23 @@ not advertised as working Steam Link passthrough.
   FP/LR; it never chases an arbitrary frame pointer or scans a heap. The caller
   must independently establish true native entry and live-window ownership.
   Bounds checks alone cannot authorize reading an arbitrary address.
+* `import/import_pipe_epoch.*` maintains bounded observed object/connection
+  generations. Reservation precedes native init forwarding; activation waits
+  for the actual protected FD assignment. A separate atomic birth-publication
+  guard detects close/destroy races before the candidate row is visible.
+  Unknown/inherited objects and stale reconnect credentials cannot create a
+  valid lease. The native accepted parent's exclusive ownership before the
+  reservation gate remains a source obligation, not kernel lifetime proof.
+* `import/compositor_attempt.*` copies the checked begin/creation/reply timeline
+  and replays it only on the background owner with a matching, current Journal
+  receipt. Native VkDevice handles and Journal device identities are distinct;
+  fixtures explicitly test that distinction. Actual resource generations come
+  solely from the existing Journal, never callback order or an invocation tag.
+* `import/client_carrier_core.*` and `native_client_route.*` separately validate
+  the actual request header, matching complete reply, pre-store native result
+  and following receiver reference. Request payload is counted, never copied.
+  A 512-byte request bound is an observer limit, not a native size guarantee.
+  Their fixed-window source checks do not acquire or authorize runtime memory.
 * `import/native_import_entry.S` captures the original AArch64 registers/SP
   before a compiler callback and retains explicit unwind rules. Its symbols
   remain hidden, it is not installed or exported as a public libc interposer.
@@ -120,6 +137,13 @@ socket creation/retirement and
 receiver-side carrier/publication recording remain required before deployment.
 The exact current executable/library/provider maps and every active read scope
 must be independently checked in the resulting artifact.
+
+The client library constructs its pipe object during dynamic loading, before
+`dlopen()` returns. A later map refresh cannot invent that missed birth. The
+native module bootstrap must therefore be established before declaring any
+client connection lifetime observed. The current OpenVR loader reference was
+obtained through authorized read-only SSH; its size/hash match is retained
+privately, and the session closed without a file/service/stream change.
 
 The existing receiver permission covers its six protected scalars. It does not
 authorize this new compositor/client recording. Prepare the complete bounded

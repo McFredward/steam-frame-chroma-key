@@ -118,6 +118,32 @@ if(BUILD_TESTING)
         target_include_directories(test_native_import_route PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_options(test_native_import_route PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME compositor_import_native_route COMMAND test_native_import_route)
+        add_executable(test_import_pipe_epoch tests/test_import_pipe_epoch.cpp
+            import/import_pipe_epoch.cpp)
+        target_include_directories(test_import_pipe_epoch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_import_pipe_epoch PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_definitions(test_import_pipe_epoch PRIVATE FRAME_IMPORT_PIPE_EPOCH_TEST_FIXTURE)
+        target_link_libraries(test_import_pipe_epoch PRIVATE Threads::Threads)
+        add_test(NAME compositor_import_pipe_epochs COMMAND test_import_pipe_epoch)
+        add_executable(test_compositor_attempt tests/test_compositor_attempt.cpp
+            import/compositor_attempt.cpp import/native_import_route.cpp
+            import/import_pipe_epoch.cpp import/import_observer_core.cpp)
+        target_include_directories(test_compositor_attempt PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(test_compositor_attempt PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(test_compositor_attempt PRIVATE Threads::Threads)
+        add_test(NAME compositor_import_attempt COMMAND test_compositor_attempt)
+        add_executable(test_client_carrier_core tests/test_client_carrier_core.cpp
+            import/client_carrier_core.cpp)
+        target_include_directories(test_client_carrier_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_client_carrier_core PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(test_client_carrier_core PRIVATE Threads::Threads)
+        add_test(NAME client_import_carrier COMMAND test_client_carrier_core)
+        add_executable(test_native_client_route tests/test_native_client_route.cpp
+            import/native_client_route.cpp)
+        target_include_directories(test_native_client_route PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_native_client_route PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME client_import_native_route COMMAND test_native_client_route)
         add_executable(test_import_forwarding tests/test_import_forwarding.cpp
             import/import_forwarding.cpp)
         target_include_directories(test_import_forwarding PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
