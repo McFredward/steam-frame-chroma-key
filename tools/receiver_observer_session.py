@@ -28,6 +28,71 @@ PREFIX = "FRAME_RECEIVER_"
 FOREIGN_PREFIXES = (PREFIX, "FRAME_MASK_TRACE")
 SESSION_MANAGER_PATHS = {"GAMESCOPE_LIMITER_FILE": "gamescope-limiter-",
                          "MANGOHUD_CONFIGFILE": "gamescope-mangoapp-"}
+MOUNTINFO_LIMIT = 524288
+MOUNTINFO_ROWS = 4096
+
+
+def mountinfo_entries(data):
+    """Parse bounded kernel mount metadata; never guess stacked mount order."""
+    if len(data) > MOUNTINFO_LIMIT:
+        raise RuntimeError("Receiver mountinfo byte bound exceeded")
+    try:
+        rows = data.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise RuntimeError("Unsupported receiver mountinfo encoding") from error
+    if not rows or len(rows) > MOUNTINFO_ROWS:
+        raise RuntimeError("Receiver mountinfo row bound exceeded")
+    entries, ids = [], set()
+    def path_field(raw):
+        escaped = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+        def unescape(match):
+            if match[1] not in escaped:
+                raise RuntimeError("Unsupported receiver mountinfo escape")
+            return escaped[match[1]]
+        value = re.sub(r"\\([0-9]{3})", unescape, raw)
+        if ("\\" in value or not value.startswith("/") or value.startswith("//") or ".." in Path(value).parts
+                or os.path.normpath(value) != value or str(Path(value)) != value
+                or re.search(r"[\x00-\x1f\x7f]", value)):
+            raise RuntimeError("Unsupported receiver mountinfo path")
+        return value
+    for row in rows:
+        cols = row.split()
+        if len(row) > 8192 or cols.count("-") != 1:
+            raise RuntimeError("Unsupported receiver mountinfo row")
+        separator = cols.index("-")
+        if separator < 6 or len(cols) != separator + 4:
+            raise RuntimeError("Unsupported receiver mountinfo fields")
+        if any(not re.fullmatch(r"[0-9]{1,10}", value) for value in cols[:2]):
+            raise RuntimeError("Unsupported receiver mountinfo ID")
+        mount_id, parent = map(int, cols[:2])
+        if mount_id <= 0 or parent <= 0 or mount_id in ids:
+            raise RuntimeError("Ambiguous receiver mountinfo ID")
+        ids.add(mount_id)
+        if not re.fullmatch(r"[0-9]{1,10}:[0-9]{1,10}", cols[2]):
+            raise RuntimeError("Unsupported receiver mountinfo device")
+        device = tuple(map(int, cols[2].split(":")))
+        if any(value > 0xffffffff for value in device):
+            raise RuntimeError("Unsupported receiver mountinfo device")
+        entries.append({"id": mount_id, "device": device, "root": path_field(cols[3]),
+                        "point": path_field(cols[4]), "type": cols[separator + 1],
+                        "options": cols[separator + 3].split(",")})
+    return entries
+
+
+def effective_mount(entries, name):
+    if (not name.startswith("/") or name.startswith("//") or ".." in Path(name).parts or os.path.normpath(name) != name
+            or str(Path(name)) != name
+            or re.search(r"[\x00-\x1f\x7f]", name) or "\\" in name):
+        raise RuntimeError("Unsupported mapped native path")
+    candidates = [entry for entry in entries if entry["point"] == "/" or name == entry["point"]
+                  or name.startswith(entry["point"] + "/")]
+    if not candidates:
+        raise RuntimeError("Mapped native file has no effective mount")
+    depth = max(len(Path(entry["point"]).parts) for entry in candidates)
+    selected = [entry for entry in candidates if len(Path(entry["point"]).parts) == depth]
+    if len(selected) != 1:
+        raise RuntimeError("Mapped native file has ambiguous effective mounts")
+    return selected[0]
 
 
 def digest(data):
@@ -408,22 +473,58 @@ class Session:
         if not exe.startswith("/") or Path(exe).name != "vrlink":
             raise RuntimeError("Capture writer is not the native receiver")
 
-        def native_file(path, expected, identity=None, *, limit=16 * LIMIT):
+        mount_snapshot, mounts, reconciled, disk_files = None, None, {}, {}
+        stable = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+        def btrfs_identity(name, before, identity, expected):
+            nonlocal mount_snapshot, mounts
+            actual = (os.major(before.st_dev), os.minor(before.st_dev), before.st_ino)
+            if (actual[2] != identity[2] or actual[0] != 0 or actual[1] == 0
+                    or name != expected["path"]):
+                raise RuntimeError("Mapped native file identity mismatch")
+            if mount_snapshot is None:
+                mount_snapshot = self.proc_bytes(process / "mountinfo", MOUNTINFO_LIMIT)
+                mounts = mountinfo_entries(mount_snapshot)
+            mount = effective_mount(mounts, name)
+            # Linux v6.16 show_map_vma and show_mountinfo use i_sb->s_dev;
+            # btrfs_getattr uses root->anon_dev instead. This reconciliation
+            # supports only the observed top-level Btrfs root. It must prove
+            # the file is on that same anonymous root, not another subvolume
+            # with a colliding inode. No content hash substitutes for identity.
+            # https://github.com/torvalds/linux/blob/v6.16/fs/btrfs/inode.c
+            # https://github.com/torvalds/linux/blob/v6.16/fs/proc/task_mmu.c
+            # https://github.com/torvalds/linux/blob/v6.16/fs/proc_namespace.c
+            if (mount["type"] != "btrfs" or mount["device"] != identity[:2]
+                    or identity[0] != 0 or identity[1] == 0
+                    or mount["root"] != "/" or mount["point"] != "/"
+                    or [value for value in mount["options"] if value.startswith("subvolid=")] != ["subvolid=5"]
+                    or [value for value in mount["options"] if value.startswith("subvol=")] != ["subvol=/"]):
+                raise RuntimeError("Mapped native file lacks the reviewed Btrfs root identity")
+            root = (process / "root").stat()
+            if (not stat.S_ISDIR(root.st_mode) or root.st_ino != 256 or root.st_dev != before.st_dev):
+                raise RuntimeError("Mapped native file is not on the Btrfs anonymous root")
+            reconciled[name] = {"mount_id": mount["id"], "map_device": list(identity[:2]),
+                                "stat_device": list(actual[:2]), "inode": identity[2],
+                                "root_identity": (root.st_dev, root.st_ino)}
+
+        def native_file(path, expected, identity=None, *, limit=16 * LIMIT, mapped_name=None):
             # /proc/PID/exe and /proc/PID/root intentionally follow kernel links
             # to on-disk ELF files. They are not reads of mapped process memory.
             with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as stream:
                 before = os.fstat(stream.fileno())
-                if (not stat.S_ISREG(before.st_mode) or before.st_size > limit or
-                        (identity is not None and (os.major(before.st_dev), os.minor(before.st_dev),
-                            before.st_ino) != identity)):
+                if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
                     raise RuntimeError("Mapped native file identity mismatch")
+                actual = (os.major(before.st_dev), os.minor(before.st_dev), before.st_ino)
+                if identity is not None and actual != identity:
+                    if mapped_name is None:
+                        raise RuntimeError("Mapped native file identity mismatch")
+                    btrfs_identity(mapped_name, before, identity, expected)
                 data = stream.read(limit + 1)
                 after = os.fstat(stream.fileno())
-                stable = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
                 if (len(data) > limit or stable(before) != stable(after) or len(data) != expected["bytes"]
                         or digest(data) != expected["sha256"]):
                     raise RuntimeError("Mapped native file fingerprint mismatch")
-                return (os.major(before.st_dev), os.minor(before.st_dev), before.st_ino)
+                disk_files[path] = stable(before)
+                return actual
         exe_identity = native_file(process / "exe", manifest["native_files"]["receiver"])
 
         def maps():
@@ -453,7 +554,8 @@ class Session:
                 raise RuntimeError("Missing or ambiguous actual receiver provider/observer mapping")
             name, major, minor, inode = matches[0]
             native_file(process / "root" / name.lstrip("/"), expected, (major, minor, inode),
-                        limit=262144 if role == "observer" else 16 * LIMIT)
+                        limit=262144 if role == "observer" else 16 * LIMIT,
+                        mapped_name=name if role in ("provider", "loader") else None)
             selected[role] = matches[0]
         environment = self.proc_bytes(process / "environ", 65536).split(b"\0")
         values = {}
@@ -469,16 +571,26 @@ class Session:
                                 "FRAME_RECEIVER_TRACE_ARM": str(self.marker)}
         if values != expected_environment:
             raise RuntimeError("Actual receiver did not inherit the exact observer environment")
+        if mount_snapshot is not None:
+            if self.proc_bytes(process / "mountinfo", MOUNTINFO_LIMIT) != mount_snapshot:
+                raise RuntimeError("Receiver mounts changed during verification")
+            root = (process / "root").stat()
+            if (not stat.S_ISDIR(root.st_mode) or any((root.st_dev, root.st_ino) != proof["root_identity"]
+                                                    for proof in reconciled.values())):
+                raise RuntimeError("Receiver Btrfs anonymous root changed during verification")
         if (started() != start or self.capture_owner(capture) != pid or
                 self.proc_bytes(process / "cgroup", 8192).decode("ascii") != cgroup or
                 not set(selected.values()).issubset(maps()) or
+                any(stable(path.stat()) != fingerprint for path, fingerprint in disk_files.items()) or
                 os.readlink(process / "exe") != exe or
                 (os.major((last := (process / "exe").stat()).st_dev), os.minor(last.st_dev),
                  last.st_ino) != exe_identity):
             raise RuntimeError("Receiver process/lock/mappings changed during verification")
         return {"pid": pid, "starttime_ticks": start, "service": UNIT,
                 "executable_sha256": manifest["native_files"]["receiver"]["sha256"],
-                "mapped_file_sha256": {role: manifest["native_files"][role]["sha256"] for role in selected}}
+                "mapped_file_sha256": {role: manifest["native_files"][role]["sha256"] for role in selected},
+                "btrfs_root_identity_reconciliation": {name: {key: value for key, value in proof.items()
+                    if key != "root_identity"} for name, proof in reconciled.items()}}
 
     def require_writer(self, manifest):
         safe_path(self.capture)

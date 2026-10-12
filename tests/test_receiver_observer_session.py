@@ -1,4 +1,5 @@
 """User-session recovery tests. No Frame, network or real systemctl calls."""
+import contextlib
 import fcntl
 import importlib.util
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 import stat
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -125,6 +127,64 @@ class SessionTests(unittest.TestCase):
         (self.process / "maps").write_text("".join(mappings))
         info = self.session.capture.stat()
         (self.proc / "locks").write_text(f"1: FLOCK ADVISORY WRITE {pid} {os.major(info.st_dev):x}:{os.minor(info.st_dev):x}:{info.st_ino} 0 EOF\n")
+
+    @contextlib.contextmanager
+    def btrfs_fixture(self):
+        """Real file/hash reads with the recorded Frame kernel device identities.
+
+        Only stat metadata is substituted: no Btrfs mount or privileged process
+        is needed on the host. Maps retain the exact Frame paths and inodes.
+        """
+        self.start()
+        self.writer()
+        native_root = self.root / "native-root"
+        (native_root / "usr/lib").mkdir(parents=True)
+        paths = {"provider": "/usr/lib/libc.so.6", "loader": "/usr/lib/ld-linux-aarch64.so.1"}
+        ids = {"provider": 50309, "loader": 48411}
+        actual_files = {}
+        manifest_path = self.session.folder / "owned.json"
+        manifest = json.loads(manifest_path.read_text())
+        rows = []
+        for role, name in paths.items():
+            actual = native_root / name.lstrip("/")
+            actual.write_bytes(self.files[role].read_bytes())
+            actual_files[role] = actual
+            manifest["native_files"][role]["path"] = name
+            rows.append(f"1000-1100 r-xp 00000000 00:1d {ids[role]} {name}\n")
+        manifest_path.write_bytes(M.json_bytes(manifest))
+        observer = native_root / str(self.session.library).lstrip("/")
+        observer.parent.mkdir(parents=True)
+        observer.symlink_to(self.session.library)
+        info = self.session.library.stat()
+        rows.append(f"2000-2100 r-xp 00000000 {os.major(info.st_dev):x}:{os.minor(info.st_dev):x} {info.st_ino} {self.session.library}\n")
+        (self.process / "maps").write_text("".join(rows))
+        (self.process / "root").unlink()
+        (self.process / "root").symlink_to(native_root, target_is_directory=True)
+        mountinfo = self.process / "mountinfo"
+        mountinfo.write_text("32 2 0:29 / / rw,relatime shared:1 - btrfs /dev/sda5 rw,ssd,discard=async,space_cache=v2,subvolid=5,subvol=/\n")
+        original_fstat, original_stat = os.fstat, os.stat
+        def changed(info, device, inode):
+            fields = {key: getattr(info, key) for key in dir(info) if key.startswith("st_")}
+            fields.update(st_dev=device, st_ino=inode)
+            return SimpleNamespace(**fields)
+        def file_stat(fd):
+            info = original_fstat(fd)
+            name = os.readlink(f"/proc/self/fd/{fd}")
+            for role, path in actual_files.items():
+                if name == str(path):
+                    return changed(info, os.makedev(0, 30), ids[role])
+            return info
+        def path_stat(path, *args, **kwargs):
+            info = original_stat(path, *args, **kwargs)
+            if str(path) == str(self.process / "root"):
+                return changed(info, os.makedev(0, 30), 256)
+            for role, actual in actual_files.items():
+                if str(path) in (str(actual), str(self.process / "root" / paths[role].lstrip("/"))):
+                    return changed(info, os.makedev(0, 30), ids[role])
+            return info
+        with mock.patch.object(M.os, "fstat", file_stat), mock.patch.object(M.os, "stat", path_stat):
+            yield {"paths": actual_files, "mountinfo": mountinfo, "path_stat": path_stat,
+                   "file_stat": file_stat, "changed": changed}
 
     def test_start_arm_rollback_and_idempotent_recovery(self):
         self.start()
@@ -432,6 +492,201 @@ class SessionTests(unittest.TestCase):
         inode = self.session.library.stat().st_ino
         path.write_text(original.replace(f" {inode} {self.session.library}", f" {inode+1} {self.session.library}"))
         with self.assertRaisesRegex(RuntimeError, "identity"): self.session.arm(stream_ready=True)
+
+    def test_direct_mapping_identity_does_not_need_or_relax_mountinfo(self):
+        self.start()
+        self.writer()
+        self.assertFalse((self.process / "mountinfo").exists())
+        proof = self.session.receiver_process(self.session.manifest(), self.session.capture.stat())
+        self.assertEqual(proof["btrfs_root_identity_reconciliation"], {})
+        self.session.arm(stream_ready=True)
+
+    def test_recorded_frame_btrfs_superblock_and_anonymous_root_can_arm(self):
+        with self.btrfs_fixture():
+            proof = self.session.receiver_process(self.session.manifest(), self.session.capture.stat())
+            entries = proof["btrfs_root_identity_reconciliation"]
+            self.assertEqual(set(entries), {"/usr/lib/libc.so.6", "/usr/lib/ld-linux-aarch64.so.1"})
+            for name, inode in (("/usr/lib/libc.so.6", 50309), ("/usr/lib/ld-linux-aarch64.so.1", 48411)):
+                self.assertEqual(entries[name], {"mount_id": 32, "map_device": [0, 29],
+                                                "stat_device": [0, 30], "inode": inode})
+            self.session.arm(stream_ready=True)
+            self.assertTrue(self.session.marker.exists())
+
+    def test_btrfs_reconciliation_still_requires_exact_mapped_inode(self):
+        with self.btrfs_fixture():
+            path = self.process / "maps"
+            path.write_text(path.read_text().replace("50309", "50310"))
+            with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+
+    def test_btrfs_reconciliation_refuses_non_btrfs_or_wrong_superblock(self):
+        with self.btrfs_fixture() as fixture:
+            original = fixture["mountinfo"].read_text()
+            for replacement in (original.replace(" - btrfs ", " - ext4 "), original.replace("0:29", "0:31")):
+                fixture["mountinfo"].write_text(replacement)
+                with self.assertRaisesRegex(RuntimeError, "reviewed Btrfs root"):
+                    self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+
+    def test_btrfs_reconciliation_refuses_non_anonymous_stat_device(self):
+        with self.btrfs_fixture() as fixture:
+            def non_anonymous(fd):
+                info = fixture["file_stat"](fd)
+                return fixture["changed"](info, os.makedev(8, 8), info.st_ino) if info.st_ino == 50309 else info
+            with mock.patch.object(M.os, "fstat", non_anonymous):
+                with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                    self.session.arm(stream_ready=True)
+
+    def test_btrfs_reconciliation_refuses_other_root_or_colliding_subvolume(self):
+        with self.btrfs_fixture() as fixture:
+            def other_root(path, *args, **kwargs):
+                info = fixture["path_stat"](path, *args, **kwargs)
+                return fixture["changed"](info, os.makedev(0, 31), 256) if str(path) == str(self.process / "root") else info
+            with mock.patch.object(M.os, "stat", other_root):
+                with self.assertRaisesRegex(RuntimeError, "anonymous root"):
+                    self.session.arm(stream_ready=True)
+            def not_subvolume_root(path, *args, **kwargs):
+                info = fixture["path_stat"](path, *args, **kwargs)
+                return fixture["changed"](info, info.st_dev, 257) if str(path) == str(self.process / "root") else info
+            with mock.patch.object(M.os, "stat", not_subvolume_root):
+                with self.assertRaisesRegex(RuntimeError, "anonymous root"):
+                    self.session.arm(stream_ready=True)
+
+    def test_btrfs_reconciliation_refuses_bind_or_other_subvolume_mount(self):
+        with self.btrfs_fixture() as fixture:
+            original = fixture["mountinfo"].read_text()
+            for replacement in (original.replace(" / / ", " /usr / "),
+                                original.replace("subvolid=5", "subvolid=256"),
+                                original.replace("subvol=/", "subvol=/snapshot"),
+                                original.replace("subvolid=5", "subvolid=5,subvolid=5")):
+                fixture["mountinfo"].write_text(replacement)
+                with self.assertRaisesRegex(RuntimeError, "reviewed Btrfs root"):
+                    self.session.arm(stream_ready=True)
+
+    def test_btrfs_reconciliation_uses_deepest_mount_not_first_matching_device(self):
+        with self.btrfs_fixture() as fixture:
+            fixture["mountinfo"].write_text(fixture["mountinfo"].read_text() +
+                "33 32 0:29 / /usr rw - btrfs /dev/sda5 rw,subvolid=5,subvol=/\n")
+            with self.assertRaisesRegex(RuntimeError, "reviewed Btrfs root"):
+                self.session.arm(stream_ready=True)
+
+    def test_effective_mount_prefix_is_component_bound_and_order_independent(self):
+        entries = M.mountinfo_entries(b"33 32 0:99 / /usr/libc rw - tmpfs tmpfs rw\n"
+                                     b"32 2 0:29 / / rw - btrfs /dev/sda5 rw,subvolid=5,subvol=/\n")
+        self.assertEqual(M.effective_mount(entries, "/usr/lib/libc.so.6")["id"], 32)
+        self.assertEqual(M.effective_mount(entries, "/usr/libc/libc.so.6")["id"], 33)
+
+    def test_btrfs_reconciliation_refuses_ambiguous_stacked_mounts(self):
+        with self.btrfs_fixture() as fixture:
+            original = fixture["mountinfo"].read_text()
+            fixture["mountinfo"].write_text(original + original.replace("32 2", "33 32"))
+            with self.assertRaisesRegex(RuntimeError, "ambiguous effective mounts"):
+                self.session.arm(stream_ready=True)
+
+    def test_btrfs_reconciliation_refuses_same_hash_at_other_mapping_path(self):
+        with self.btrfs_fixture() as fixture:
+            alias = fixture["paths"]["provider"].parent / "other/libc.so.6"
+            alias.parent.mkdir()
+            os.link(fixture["paths"]["provider"], alias)
+            path = self.process / "maps"
+            path.write_text(path.read_text().replace("/usr/lib/libc.so.6", "/usr/lib/other/libc.so.6"))
+            def alias_stat(fd):
+                info = fixture["file_stat"](fd)
+                if os.readlink(f"/proc/self/fd/{fd}") == str(alias):
+                    return fixture["changed"](info, os.makedev(0, 30), 50309)
+                return info
+            with mock.patch.object(M.os, "fstat", alias_stat):
+                with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                    self.session.arm(stream_ready=True)
+
+    def test_btrfs_mount_metadata_is_bounded_and_malformed_rows_refused(self):
+        valid = b"32 2 0:29 / / rw - btrfs /dev/sda5 rw,subvolid=5,subvol=/\n"
+        cases = [b"", b"x" * (M.MOUNTINFO_LIMIT + 1), valid + b"x" * 8193,
+                 valid + valid, valid.replace(b"0:29", b"0:xyz"), valid.replace(b"32 2", b"x 2"),
+                 valid.replace(b"32 2", b"32 0"), valid.replace(b" - ", b" "),
+                 valid.replace(b" / / ", b" / /usr/../ "),
+                 valid.replace(b" / / ", b" / // "),
+                 valid.replace(b" / / ", b" / /\\123 "),
+                 valid.replace(b" / / ", b" / /\\012 "),
+                 valid.replace(b"0:29", b"0:4294967296"), b"\xff" + valid]
+        for raw in cases:
+            with self.subTest(raw=raw[:80]):
+                with self.assertRaises(RuntimeError): M.mountinfo_entries(raw)
+        rows = b"".join(valid.replace(b"32 2", f"{i+1} 2".encode()) for i in range(M.MOUNTINFO_ROWS + 1))
+        with self.assertRaisesRegex(RuntimeError, "row bound"): M.mountinfo_entries(rows)
+        for name in ("usr/lib/libc.so.6", "//usr/lib/libc.so.6", "/usr/../lib/libc.so.6", "/usr/lib\n/libc.so.6"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError, "mapped native path"):
+                    M.effective_mount(M.mountinfo_entries(valid), name)
+        with self.btrfs_fixture() as fixture:
+            fixture["mountinfo"].write_bytes(b"x" * (M.MOUNTINFO_LIMIT + 1))
+            with self.assertRaisesRegex(RuntimeError, "bound"): self.session.arm(stream_ready=True)
+
+    def test_btrfs_mount_or_root_change_during_verification_cannot_arm(self):
+        with self.btrfs_fixture() as fixture:
+            original_proc = self.session.proc_bytes
+            calls = 0
+            def changing_mount(path, limit):
+                nonlocal calls
+                raw = original_proc(path, limit)
+                if path == fixture["mountinfo"]:
+                    calls += 1
+                    if calls == 2: return raw.replace(b"shared:1", b"shared:2")
+                return raw
+            with mock.patch.object(self.session, "proc_bytes", changing_mount):
+                with self.assertRaisesRegex(RuntimeError, "mounts changed"):
+                    self.session.arm(stream_ready=True)
+            root_calls = 0
+            def changing_root(path, *args, **kwargs):
+                nonlocal root_calls
+                info = fixture["path_stat"](path, *args, **kwargs)
+                if str(path) == str(self.process / "root"):
+                    root_calls += 1
+                    if root_calls == 3: return fixture["changed"](info, os.makedev(0, 31), 256)
+                return info
+            with mock.patch.object(M.os, "stat", changing_root):
+                with self.assertRaisesRegex(RuntimeError, "anonymous root changed"):
+                    self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+
+    def test_btrfs_still_checks_content_and_open_file_and_path_stability(self):
+        with self.btrfs_fixture() as fixture:
+            original = fixture["paths"]["provider"].read_bytes()
+            fixture["paths"]["provider"].write_bytes(original[:-1] + b"x")
+            with self.assertRaisesRegex(RuntimeError, "fingerprint"):
+                self.session.arm(stream_ready=True)
+            fixture["paths"]["provider"].write_bytes(original)
+            reads = 0
+            def changed_fd(fd):
+                nonlocal reads
+                info = fixture["file_stat"](fd)
+                if info.st_ino == 50309:
+                    reads += 1
+                    if reads == 2: return fixture["changed"](info, info.st_dev, 50310)
+                return info
+            with mock.patch.object(M.os, "fstat", changed_fd):
+                with self.assertRaisesRegex(RuntimeError, "fingerprint"):
+                    self.session.arm(stream_ready=True)
+            original_proc = self.session.proc_bytes
+            def changed_path(path, limit):
+                raw = original_proc(path, limit)
+                if path == self.process / "environ": fixture["paths"]["loader"].write_bytes(b"changed")
+                return raw
+            with mock.patch.object(self.session, "proc_bytes", changed_path):
+                with self.assertRaisesRegex(RuntimeError, "changed during verification"):
+                    self.session.arm(stream_ready=True)
+
+    def test_btrfs_cannot_reconcile_observer_device_mismatch(self):
+        self.start()
+        self.writer()
+        path = self.process / "maps"
+        device = self.session.library.stat().st_dev
+        original = path.read_text()
+        row = next(row for row in original.splitlines() if str(self.session.library) in row)
+        path.write_text(original.replace(row, row.replace(f"{os.major(device):x}:{os.minor(device):x}", "0:1d")))
+        with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+            self.session.arm(stream_ready=True)
 
     def test_receiver_without_inherited_preload_cannot_arm(self):
         self.start()
