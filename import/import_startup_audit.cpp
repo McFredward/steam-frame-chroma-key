@@ -28,8 +28,8 @@ Slot slots[5];
 std::atomic<std::uint64_t> next_generation{1};
 std::atomic<bool> preinit_seen{false}, ready{false}, lost{false}, missed{false};
 std::atomic<bool> bridge_admitted{false};
-std::atomic<unsigned> binding_state[8];
-std::atomic<std::uintptr_t> entry_cache[8], original_cache[8];
+std::atomic<unsigned> binding_state[10];
+std::atomic<std::uintptr_t> entry_cache[10], original_cache[10];
 
 bool same_name(const char* a, const char* b) noexcept {
     if (!a || !b) return false;
@@ -56,6 +56,7 @@ bool connection_scope(const Preparation& p) noexcept {
     return p.native_mutex_lock_rva || p.native_mutex_unlock_rva || p.native_connect_rva;
 }
 bool resource_thread_scope(const Preparation& p) noexcept { return p.native_epoll_wait_rva!=0; }
+bool raw_scope(const Preparation& p) noexcept { return p.native_read_rva || p.native_write_rva; }
 const Preparation* prepared() noexcept {
     const auto* p = preparation();
     if (!p || !p->owned_prepared_files || !p->receiver.loader_name || !p->api.loader_name ||
@@ -89,6 +90,16 @@ const Preparation* prepared() noexcept {
         const std::uintptr_t other[]{p->native_mutex_init_rva,p->native_mutex_destroy_rva,
             p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_connect_rva};
         for(const auto rva:other)if(rva==p->native_epoll_wait_rva)return nullptr;
+    }
+    if(raw_scope(*p)) {
+        if(!resource_thread_scope(*p))return nullptr;
+        const std::uintptr_t providers[]{p->native_mutex_init_rva,p->native_mutex_destroy_rva,
+            p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_connect_rva,
+            p->native_epoll_wait_rva,p->native_read_rva,p->native_write_rva};
+        for(unsigned i=0;i<8;++i) {
+            if(!providers[i] || !in_range(providers[i],p->libc))return nullptr;
+            for(unsigned j=i+1;j<8;++j)if(providers[i]==providers[j])return nullptr;
+        }
     }
     return p;
 }
@@ -189,6 +200,8 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
         // Legacy scopes retain their previous unchanged binding behavior.
         if(resource_thread_scope(*p) && *reference==1 && *definition==5 &&
            same_name(name,"epoll_wait"))loss();
+        if(raw_scope(*p) && *reference==4 && *definition==5 &&
+           (same_name(name,"read") || same_name(name,"write")))loss();
         return original;
     }
     Function function;
@@ -208,6 +221,10 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
         function=Function::Connect;index=6;mutex=true;
     } else if(resource_thread_scope(*p) && *reference==1 && *definition==5 && same_name(name,"epoll_wait")) {
         function=Function::EpollWait;index=7;epoll=true;
+    } else if(raw_scope(*p) && *reference==4 && *definition==5 && same_name(name,"read")) {
+        function=Function::Read;index=8;mutex=true;
+    } else if(raw_scope(*p) && *reference==4 && *definition==5 && same_name(name,"write")) {
+        function=Function::Write;index=9;mutex=true;
     } else return original;
     BoundProvider provider{};
     if (!views(provider)) return original;
@@ -216,7 +233,7 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
     const auto& definition_view=mutex||epoll?provider.libc:provider.api;
     const std::uintptr_t native_rvas[]{p->init_rva,p->shutdown_rva,p->native_mutex_init_rva,
         p->native_mutex_destroy_rva,p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_connect_rva,
-        p->native_epoll_wait_rva};
+        p->native_epoll_wait_rva,p->native_read_rva,p->native_write_rva};
     const auto native_rva=native_rvas[index];
     if (!add(definition_view.bias,native_rva,expected_address) ||
         original!=expected_address || original<definition_view.rx_begin || original>=definition_view.rx_end) {

@@ -5,4 +5,7 @@
 #if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
     .set FRAME_RESOURCE_THREAD_ENTRY_BUILD, 1
 #endif
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    .set FRAME_RESOURCE_RAW_ENTRY_BUILD, 1
+#endif
 #include "native_import_entry.S"

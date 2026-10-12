@@ -8,7 +8,7 @@
 namespace frame_import_startup_audit {
 enum class Function : std::uint8_t {
     None, Init, Shutdown, MutexInit, MutexDestroy, MutexLock, MutexUnlock, Connect,
-    EpollWait
+    EpollWait, Read, Write
 };
 enum class Stage : std::uint8_t { Prepare, Bind, Retire, Loss };
 struct ModuleView {
@@ -65,6 +65,10 @@ struct Preparation {
     // Explicit cold decoder-thread mode only. Receiver->libc, never a public
     // all-process hook. Zero preserves every previous audit preparation.
     std::uintptr_t native_epoll_wait_rva = 0;
+    // Explicit raw resource transaction mode only. Both public libc providers
+    // require the complete cold/connection scope above. Zero retains all older
+    // scopes. Routing grants no stack/socket/transaction read capability.
+    std::uintptr_t native_read_rva = 0, native_write_rva = 0;
 };
 
 // A hidden weak default returns nullptr (inactive). A separate prepared own-

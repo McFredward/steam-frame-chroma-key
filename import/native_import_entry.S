@@ -102,6 +102,12 @@
     .ifndef FRAME_RESOURCE_THREAD_ENTRY_BUILD
     .set FRAME_RESOURCE_THREAD_ENTRY_BUILD, 0
     .endif
+    .ifndef FRAME_RESOURCE_RAW_ENTRY_BUILD
+    .set FRAME_RESOURCE_RAW_ENTRY_BUILD, 0
+    .endif
+    .if FRAME_RESOURCE_RAW_ENTRY_BUILD && !FRAME_RESOURCE_THREAD_ENTRY_BUILD
+    .error "Raw transaction entry requires cold resource-thread entry"
+    .endif
     .if FRAME_STARTUP_ENTRY_BUILD
     IMPORT_ENTRY frame_import_vr_init_entry, frame_import_vr_init_dispatch
     IMPORT_ENTRY frame_import_vr_shutdown_entry, frame_import_vr_shutdown_dispatch
@@ -125,6 +131,10 @@
     IMPORT_ENTRY frame_import_connect_entry, frame_import_connect_dispatch
     .if FRAME_RESOURCE_THREAD_ENTRY_BUILD
     IMPORT_ENTRY frame_client_startup_epoll_wait_entry, frame_client_startup_epoll_wait_dispatch
+    .endif
+    .if FRAME_RESOURCE_RAW_ENTRY_BUILD
+    IMPORT_ENTRY frame_import_read_entry, frame_import_read_dispatch
+    IMPORT_ENTRY frame_import_write_entry, frame_import_write_dispatch
     .endif
     .endif
     .else
