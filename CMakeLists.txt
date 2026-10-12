@@ -19,6 +19,11 @@ option(FRAME_MASK_CLIENT_RESOURCE_CENSUS
     "Census one register-only native import/reference timeline; no private or wire reads" OFF)
 option(FRAME_MASK_CLIENT_RESOURCE_THREAD_PREPARATION
     "Prepare the actual decoder thread once before its first event wait; no transaction reads" OFF)
+option(FRAME_MASK_CLIENT_RESOURCE_RAW_TRANSACTION
+    "Capture one bounded raw import transaction; no resource/video/GPU admission" OFF)
+if(FRAME_MASK_CLIENT_RESOURCE_RAW_TRANSACTION AND NOT FRAME_MASK_CLIENT_RESOURCE_THREAD_PREPARATION)
+    message(FATAL_ERROR "Raw resource capture requires explicit cold decoder-thread preparation")
+endif()
 if(FRAME_MASK_CLIENT_RESOURCE_THREAD_PREPARATION AND NOT FRAME_MASK_CLIENT_RESOURCE_CENSUS)
     message(FATAL_ERROR "Resource thread preparation requires the explicit resource census scope")
 endif()
@@ -70,6 +75,11 @@ if(FRAME_MASK_BUILD_CLIENT_STARTUP)
     endif()
     if(FRAME_MASK_CLIENT_RESOURCE_THREAD_PREPARATION)
         target_compile_definitions(frame_client_startup PRIVATE FRAME_CLIENT_RESOURCE_THREAD_PREPARATION=1)
+    endif()
+    if(FRAME_MASK_CLIENT_RESOURCE_RAW_TRANSACTION)
+        target_compile_definitions(frame_client_startup PRIVATE FRAME_CLIENT_RESOURCE_RAW_TRANSACTION=1)
+        target_sources(frame_client_startup PRIVATE import/client_resource_raw.cpp
+            import/client_resource_sparse.cpp import/native_client_route.cpp)
     endif()
 endif()
 if(FRAME_MASK_BUILD_STARTUP_AUDIT)
@@ -216,6 +226,16 @@ if(BUILD_TESTING)
         target_include_directories(test_native_client_route PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_options(test_native_client_route PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME client_import_native_route COMMAND test_native_client_route)
+        add_executable(test_client_resource_sparse tests/test_client_resource_sparse.cpp
+            import/client_resource_sparse.cpp import/native_client_route.cpp)
+        target_include_directories(test_client_resource_sparse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_client_resource_sparse PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME client_resource_sparse_copy COMMAND test_client_resource_sparse)
+        add_executable(test_client_resource_raw tests/test_client_resource_raw.cpp
+            import/client_resource_raw.cpp import/native_client_route.cpp import/client_carrier_core.cpp)
+        target_include_directories(test_client_resource_raw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_client_resource_raw PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME client_resource_raw_metadata COMMAND test_client_resource_raw)
         add_executable(test_import_forwarding tests/test_import_forwarding.cpp
             import/import_forwarding.cpp)
         target_include_directories(test_import_forwarding PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -323,6 +343,9 @@ if(BUILD_TESTING)
                 add_test(NAME client_resource_thread_audit_binding COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py --resource-thread
                     --record ${CMAKE_CURRENT_BINARY_DIR}/client-resource-thread-audit-validation.json)
+                add_test(NAME client_resource_raw_audit_binding COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_client_raw_audit.py
+                    --record ${CMAKE_CURRENT_BINARY_DIR}/client-resource-raw-audit-validation.json)
             endif()
             if(NOT CMAKE_CROSSCOMPILING)
                 add_library(import_loader_fixture SHARED tests/test_import_loader_reader.cpp)

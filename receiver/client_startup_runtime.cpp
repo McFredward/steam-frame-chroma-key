@@ -1,7 +1,12 @@
 #include "client_startup_runtime.h"
 #include "../import/client_thread_marker.h"
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+#include "../import/client_resource_sparse.h"
+#include <unistd.h>
+#endif
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -16,6 +21,17 @@ extern "C" int frame_client_startup_native_mutex_destroy(pthread_mutex_t*);
 extern "C" int frame_client_startup_native_mutex_lock(pthread_mutex_t*);
 extern "C" int frame_client_startup_native_mutex_unlock(pthread_mutex_t*);
 extern "C" int frame_client_startup_native_connect(int,const struct sockaddr*,unsigned);
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+extern "C" ssize_t frame_client_startup_native_read(int,void*,std::size_t);
+extern "C" ssize_t frame_client_startup_native_write(int,const void*,std::size_t);
+#if defined(__aarch64__)
+__asm__(".symver frame_client_startup_native_read,__read@GLIBC_2.17");
+__asm__(".symver frame_client_startup_native_write,__write@GLIBC_2.17");
+#elif defined(__x86_64__)
+__asm__(".symver frame_client_startup_native_read,__read@GLIBC_2.2.5");
+__asm__(".symver frame_client_startup_native_write,__write@GLIBC_2.2.5");
+#endif
+#endif
 #if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
 extern "C" int frame_client_startup_native_epoll_wait(int,struct epoll_event*,int,int);
 #if defined(__aarch64__)
@@ -95,6 +111,16 @@ struct Runtime {
     std::atomic<resource_thread::Gate*> resource_thread_gate{nullptr};
     std::atomic<unsigned> resource_thread_stack_prepared{0};
     std::uintptr_t native_epoll_wait=0;
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    std::array<std::uintptr_t,2> native_raw{};
+    std::atomic<std::uintptr_t> raw_owner{0};
+    std::atomic<unsigned> raw_started{0},raw_completed{0};
+    std::atomic<unsigned> raw_callbacks{0};
+    std::atomic<std::size_t> raw_scalar_bytes{0},raw_wire_bytes{0};
+    frame_client_raw::Observer raw_observer{};
+    frame_client_raw::Scope raw_scope{};
+    frame_client_native::Scalars pending_raw_snapshot{};
+#endif
     Reader* reader=nullptr; // Written/read solely on the startup owner thread.
 };
 Runtime runtime;
@@ -254,6 +280,132 @@ bool resource_thread_provider(const frame_import_main::Prepared& prepared) noexc
     (void)prepared;return false;
 #endif
 }
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+bool raw_providers(const frame_import_main::Prepared& prepared) noexcept {
+    const auto libc=prepared.images()[2];
+    const std::uintptr_t functions[]{reinterpret_cast<std::uintptr_t>(&frame_client_startup_native_read),
+        reinterpret_cast<std::uintptr_t>(&frame_client_startup_native_write)};
+    constexpr std::uintptr_t rvas[]{0xdf330,0xdfee0};
+    for(unsigned i=0;i<2;++i) {
+        Dl_info info{};std::uintptr_t expected=0;
+        if(!add(libc.bias,rvas[i],expected) || functions[i]!=expected || !within(libc,functions[i]) ||
+           !prepared.lookup()(reinterpret_cast<const void*>(functions[i]),&info) ||
+           reinterpret_cast<std::uintptr_t>(info.dli_fbase)!=libc.bias)return false;
+        runtime.native_raw[i]=functions[i];
+    }
+    return true;
+}
+bool raw_current() noexcept {
+    auto* cold=runtime.resource_thread_gate.load(std::memory_order_acquire);
+    return admission_alive() && cold && cold->current(connection_owner_marker) &&
+        runtime.raw_owner.load(std::memory_order_acquire)==reinterpret_cast<std::uintptr_t>(&connection_owner_marker) &&
+        runtime.client_binding.load(std::memory_order_acquire)==2 &&
+        runtime.audit_client.bias==runtime.connection_target.module.load_bias;
+}
+bool raw_stack_read(std::uintptr_t address,void* destination,std::size_t size,void* owner) noexcept {
+    if(owner!=&runtime || !size || !raw_current())return false;
+    auto* cold=runtime.resource_thread_gate.load(std::memory_order_acquire);
+    const auto bounds=cold->region_current(connection_owner_marker);
+    const auto copied=runtime.raw_scalar_bytes.load(std::memory_order_relaxed);
+    if(address<bounds.begin || address>bounds.end || size>bounds.end-address ||
+       copied>frame_client_raw::kMaxScalarBytes || size>frame_client_raw::kMaxScalarBytes-copied)return false;
+    // Only source-pinned scalar spans from an executing, independently owned
+    // worker frame. The reader never follows saved pointers or escapes bounds.
+    std::memcpy(destination,reinterpret_cast<const void*>(address),size);
+    runtime.raw_scalar_bytes.store(copied+size,std::memory_order_release);
+    return raw_current();
+}
+void publish_raw(frame_client_raw::Outcome result) noexcept {
+    if(result.kind==frame_client_raw::Kind::None)return;
+    runtime.raw_completed.store(1,std::memory_order_release);
+    auto value=record(result.kind==frame_client_raw::Kind::Matched?Kind::ResourceRawTransaction:Kind::ResourceRawRefused);
+    value.raw=result.record;
+    // Include truthful partial-copy totals even when ownership was lost during
+    // a copy. No borrowed scope or stack pointer is consumed by the writer.
+    value.raw.scalar_bytes_copied=runtime.raw_scalar_bytes.load(std::memory_order_acquire);
+    value.raw.wire_bytes_copied=runtime.raw_wire_bytes.load(std::memory_order_acquire);
+    value.module=runtime.connection_target.module;value.object=runtime.connection_target.object;
+    if(result.kind==frame_client_raw::Kind::Refused) {
+        retire(Refusal::ResourceRaw);value.refusal=runtime.refusal.load(std::memory_order_acquire);
+    }
+    enqueue(value);
+}
+void raw_boundary(frame_import_forwarding::Notification notification) noexcept {
+    namespace raw=frame_client_raw;
+    using Boundary=frame_client_native::Boundary;
+    using Operation=frame_import_forwarding::Operation;
+    using Phase=frame_import_forwarding::Phase;
+    if(!runtime.setup.resource_raw_transaction ||
+       !runtime.connection_sample_completed.load(std::memory_order_acquire) ||
+       runtime.raw_completed.load(std::memory_order_acquire))return;
+    const auto bias=runtime.connection_target.module.load_bias;
+    const auto site=notification.entry.x[30];Boundary boundary;
+    if(site==bias+0x3623c0 && notification.operation==Operation::Lock)boundary=Boundary::Begin;
+    else if(site==bias+0x3624c4 && notification.operation==Operation::Unlock)boundary=Boundary::Pending;
+    else if(site==bias+0x362d58 && notification.operation==Operation::Lock)boundary=Boundary::Reference;
+    else if(site==bias+0x2456c8 && notification.operation==Operation::Write)boundary=Boundary::Write;
+    else if(site==bias+0x245334 && notification.operation==Operation::Read)boundary=Boundary::HeaderRead;
+    else if(site==bias+0x245460 && notification.operation==Operation::Read)boundary=Boundary::PayloadRead;
+    else return;
+    struct CallbackActivity {
+        CallbackActivity() noexcept {runtime.raw_callbacks.fetch_add(1,std::memory_order_acq_rel);}
+        ~CallbackActivity() {runtime.raw_callbacks.fetch_sub(1,std::memory_order_acq_rel);}
+    } activity;
+    auto* cold=runtime.resource_thread_gate.load(std::memory_order_acquire);
+    if(!cold || !cold->current(connection_owner_marker) || !admission_alive())return;
+    const auto owner=reinterpret_cast<std::uintptr_t>(&connection_owner_marker);
+    auto claimed=runtime.raw_owner.load(std::memory_order_acquire);
+    if(!claimed) {
+        if(boundary!=Boundary::Begin || notification.phase!=Phase::Before ||
+           notification.entry.x[0]!=runtime.connection_target.object.pipe ||
+           notification.entry.x[21]!=runtime.connection_target.object.pipe)return;
+        if(runtime.raw_owner.compare_exchange_strong(claimed,owner,std::memory_order_acq_rel)) {
+            claimed=owner;runtime.raw_started.store(1,std::memory_order_release);
+        }
+    }
+    if(claimed!=owner || !raw_current())return;
+    raw::Event event;event.boundary=boundary;event.phase=notification.phase;
+    event.entry=notification.entry;event.preserved_errno=notification.preserved_errno;
+    event.thread_identity=owner;event.current_thread_owned=true;event.native_module_current=true;
+    event.native_result_available=notification.phase==Phase::After;
+    if(event.native_result_available) {
+        if(notification.operation==Operation::Read || notification.operation==Operation::Write)
+            std::memcpy(&event.native_result,&notification.result_bits,sizeof(event.native_result));
+        else event.native_result=static_cast<std::int32_t>(notification.result_bits);
+    }
+    const bool transfer=boundary==Boundary::Write || boundary==Boundary::HeaderRead || boundary==Boundary::PayloadRead;
+    // Pure source-order/pair/result admission BEFORE any private scalar copy.
+    // Aggregate byte bounds alone cannot authorize a stale/mismatched entry.
+    const bool acquire=runtime.raw_observer.can_acquire(event,runtime.raw_scope);
+    if(acquire) {
+        const auto before=runtime.raw_scalar_bytes.load(std::memory_order_acquire);
+        const auto copied=frame_client_sparse::decode(boundary,event.entry,bias,runtime.images[0].bias,
+            runtime.raw_scope.expected(),raw_stack_read,&runtime);
+        event.scalar_bytes_copied=runtime.raw_scalar_bytes.load(std::memory_order_acquire)-before;
+        event.scalars=copied.scalars;event.decoded_available=copied.valid();
+        event.current_thread_owned=raw_current();event.native_module_current=admission_alive();
+        if(boundary==Boundary::Pending && copied.valid())runtime.pending_raw_snapshot=copied.scalars;
+        if(transfer && copied.valid() && event.current_thread_owned) {
+            const auto total=boundary==Boundary::Write?raw::kHeaderBytes:event.scalars.total;
+            const auto count=event.scalars.offset<total?
+                std::min(static_cast<std::size_t>(event.native_result),total-event.scalars.offset):0;
+            const auto wire=runtime.raw_wire_bytes.load(std::memory_order_relaxed);
+            if(count<=event.prefix.bytes.size() && wire<=raw::kMaxWireBytes && count<=raw::kMaxWireBytes-wire && raw_current()) {
+                // Successful original I/O establishes only this exact live
+                // prefix. The source decoder validates its native temporary;
+                // request payload/plane descriptors are never copied.
+                if(count)std::memcpy(event.prefix.bytes.data(),reinterpret_cast<const void*>(event.entry.x[1]),count);
+                runtime.raw_wire_bytes.store(wire+count,std::memory_order_release);
+                event.current_thread_owned=raw_current();event.native_module_current=admission_alive();
+                event.prefix.count=count;event.prefix.successful_prefix_owned=count!=0 && event.current_thread_owned;
+            }
+        }
+    } else if(boundary==Boundary::Pending && event.phase==Phase::After) {
+        event.scalars=runtime.pending_raw_snapshot;event.decoded_available=true;
+    }
+    publish_raw(runtime.raw_observer.observe(event,runtime.raw_scope));
+}
+#endif
 frame_import_startup::OwnedThreadStack prepare_resource_stack(void* owner) noexcept {
     // Explicit cold decoder entry, before its first original event wait. The
     // current thread owns its attributes throughout these native calls; no
@@ -407,6 +559,10 @@ void resource_boundary(frame_import_forwarding::Notification n) noexcept {
 void libc(frame_import_forwarding::Notification n,void* owner) noexcept {
     if(owner!=&runtime || runtime.finalized.load(std::memory_order_acquire) ||
        runtime.retired.load(std::memory_order_acquire) || losses())return;
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    raw_boundary(n);
+    if(!admission_alive())return;
+#endif
     if(runtime.connection_opt_in && n.operation==frame_import_forwarding::Operation::Init &&
        n.phase==frame_import_forwarding::Phase::Before && runtime.connection_gate.load(std::memory_order_acquire) &&
        n.entry.x[0]==runtime.connection_target.object.pipe) {
@@ -525,6 +681,20 @@ bool initialize_once(const frame_import_main::Prepared& prepared,
         for(const auto entry:connection_entries)if(entry==setup.hidden_epoll_wait_entry)return deny(Refusal::Setup);
         if(!resource_thread_provider(prepared))return deny(Refusal::MutexProvider);
     } else if(setup.hidden_epoll_wait_entry)return deny(Refusal::Setup);
+    if(setup.resource_raw_transaction) {
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+        if(!setup.resource_thread_preparation || !within(images[4],setup.hidden_read_entry) ||
+           !within(images[4],setup.hidden_write_entry) || setup.hidden_read_entry==setup.hidden_write_entry ||
+           !raw_providers(prepared))return deny(Refusal::Setup);
+        for(const auto raw_entry:{setup.hidden_read_entry,setup.hidden_write_entry}) {
+            if(raw_entry==setup.hidden_epoll_wait_entry)return deny(Refusal::Setup);
+            for(const auto entry:entries)if(raw_entry==entry)return deny(Refusal::Setup);
+            for(const auto entry:connection_entries)if(raw_entry==entry)return deny(Refusal::Setup);
+        }
+#else
+        return deny(Refusal::Setup);
+#endif
+    } else if(setup.hidden_read_entry || setup.hidden_write_entry)return deny(Refusal::Setup);
     if(runtime.connection_opt_in) {
         for(unsigned i=0;i<3;++i) {
             if(!within(images[4],connection_entries[i]))return deny(Refusal::Setup);
@@ -622,8 +792,9 @@ audit::BridgeResponse bridge(audit::BridgeRequest request) noexcept {
         return {true,runtime.setup.hidden_epoll_wait_entry};
     }
     const bool connection_function=function==audit::Function::MutexLock||function==audit::Function::MutexUnlock||function==audit::Function::Connect;
+    const bool raw_function=function==audit::Function::Read || function==audit::Function::Write;
     if(request.stage==audit::Stage::Bind&&
-       (function==audit::Function::MutexInit||function==audit::Function::MutexDestroy||connection_function)) {
+       (function==audit::Function::MutexInit||function==audit::Function::MutexDestroy||connection_function||raw_function)) {
         const auto& p=request.provider;std::uintptr_t begin=0,end=0;
         const bool init=p.function==audit::Function::MutexInit;
         unsigned connection_index=0;
@@ -631,8 +802,18 @@ audit::BridgeResponse bridge(audit::BridgeRequest request) noexcept {
             if(!runtime.connection_opt_in)return {};
             connection_index=function==audit::Function::MutexLock?0:function==audit::Function::MutexUnlock?1:2;
         }
-        const auto native=connection_function?runtime.native_connection[connection_index]:
-                          init?runtime.native_mutex_init:runtime.native_mutex_destroy;
+        auto native=connection_function?runtime.native_connection[connection_index]:
+                    init?runtime.native_mutex_init:runtime.native_mutex_destroy;
+        std::uintptr_t raw_entry=0;
+        if(raw_function) {
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+            if(!runtime.setup.resource_raw_transaction)return {};
+            native=runtime.native_raw[function==audit::Function::Read?0:1];
+            raw_entry=function==audit::Function::Read?runtime.setup.hidden_read_entry:runtime.setup.hidden_write_entry;
+#else
+            return {};
+#endif
+        }
         // This callback authenticates ONLY cached scalar provider/lifetime
         // views. Actual client code and stack words are verified later by the
         // source constructor Gate under its real MAIN loader lease.
@@ -650,11 +831,11 @@ audit::BridgeResponse bridge(audit::BridgeRequest request) noexcept {
         }else if(empty!=2||!same_view(runtime.audit_client,p.client)) {
             retire(Refusal::ClientBinding);return {};
         }
-        auto value=record(Kind::MutexBound);value.audit_bindings=p;
+        auto value=record(raw_function?Kind::ResourceRawBound:Kind::MutexBound);value.audit_bindings=p;
         if(!enqueue(value)||!admission_alive())return {};
         const std::uintptr_t connection_entries[]{runtime.setup.hidden_mutex_lock_entry,
             runtime.setup.hidden_mutex_unlock_entry,runtime.setup.hidden_connect_entry};
-        return {true,connection_function?connection_entries[connection_index]:
+        return {true,raw_function?raw_entry:connection_function?connection_entries[connection_index]:
                      init?runtime.setup.hidden_mutex_init_entry:runtime.setup.hidden_mutex_destroy_entry};
     }
     if(request.stage!=audit::Stage::Bind || runtime.state.load(std::memory_order_acquire)<Attached ||
@@ -672,7 +853,12 @@ Status status() noexcept {
         runtime.refusal.load(std::memory_order_acquire),runtime.queued.load(),runtime.drained.load(),
         runtime.connection_sample_completed.load(std::memory_order_acquire)!=0,
         runtime.resource_sample_completed.load(std::memory_order_acquire)!=0,
-        runtime.resource_thread_stack_prepared.load(std::memory_order_acquire)!=0};
+        runtime.resource_thread_stack_prepared.load(std::memory_order_acquire)!=0
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+        ,runtime.raw_started.load(std::memory_order_acquire)!=0,runtime.raw_completed.load(std::memory_order_acquire)!=0,
+        runtime.raw_scalar_bytes.load(std::memory_order_acquire),runtime.raw_wire_bytes.load(std::memory_order_acquire)
+#endif
+    };
 }
 bool pop(Record& out) noexcept {
     const auto next=runtime.drained.load(std::memory_order_relaxed);
@@ -686,6 +872,13 @@ Registry* registry() noexcept {return runtime.registry.load(std::memory_order_ac
 void finalize() noexcept {
     if(runtime.finalized.exchange(1,std::memory_order_acq_rel))return;
     retire(Refusal::Finalized);
+}
+bool raw_quiescent() noexcept {
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    return runtime.raw_callbacks.load(std::memory_order_acquire)==0;
+#else
+    return true;
+#endif
 }
 #if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
 std::uint64_t invoke_epoll_wait(const frame_import_native::Entry& entry) {

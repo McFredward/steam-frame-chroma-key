@@ -10,16 +10,26 @@
 #include <time.h>
 #include <unistd.h>
 
-#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+extern "C" __attribute__((visibility("hidden"),used))
+const std::uint8_t frame_client_resource_raw_scope[16]={
+    'F','C','R','A','W','0','0','1',5,0,0,0,0x18,0x2e,0,0};
+#elif defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
 extern "C" __attribute__((visibility("hidden"),used))
 const std::uint8_t frame_client_resource_thread_scope[16]={
     'F','C','S','T','A','K','0','1',4,0,0,0,0x18,0x2e,0,0};
-extern "C" __attribute__((visibility("hidden"))) void frame_client_startup_epoll_wait_entry();
 #elif defined(FRAME_CLIENT_RESOURCE_CENSUS)
 // Retained, hidden read-only opt-in evidence for offline preparation/staging.
 extern "C" __attribute__((visibility("hidden"),used))
 const std::uint8_t frame_client_resource_census_scope[16]={
     'F','C','C','E','N','S','0','1',3,0,0,0,0x18,0x2e,0,0};
+#endif
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+extern "C" __attribute__((visibility("hidden"))) void frame_client_startup_epoll_wait_entry();
+#endif
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+extern "C" __attribute__((visibility("hidden"))) void frame_import_read_entry();
+extern "C" __attribute__((visibility("hidden"))) void frame_import_write_entry();
 #endif
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_init_entry();
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_shutdown_entry();
@@ -107,7 +117,10 @@ bool read_envelope(const char* name,std::array<std::uint8_t,kEnvelopeBytes>& byt
 }
 bool decode(const std::array<std::uint8_t,kEnvelopeBytes>& b,frame_import_main::Profiles& profiles,
             frame_import_module::ProfileBlob& client,frame_client_startup::ClientSlot& slot) noexcept {
-#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    const auto* envelope_magic=frame_client_resource_raw_scope;
+    constexpr unsigned envelope_schema=5;
+#elif defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
     const auto* envelope_magic=frame_client_resource_thread_scope;
     constexpr unsigned envelope_schema=4;
 #elif defined(FRAME_CLIENT_RESOURCE_CENSUS)
@@ -167,7 +180,7 @@ struct Line {
         else n=std::snprintf(bytes.data()+used,bytes.size()-used,format,args...);
         if(n<0||static_cast<std::size_t>(n)>=bytes.size()-used){valid=false;return;}used+=static_cast<std::size_t>(n);
     }
-    void hex(const std::array<std::uint8_t,32>& digest) noexcept {for(auto c:digest)add("%02x",unsigned(c));}
+    template<std::size_t N> void hex(const std::array<std::uint8_t,N>& digest) noexcept {for(auto c:digest)add("%02x",unsigned(c));}
     void string(const std::array<char,512>& text) noexcept {
         add("\"");bool terminated=false;
         for(unsigned i=0;i<text.size();++i) {
@@ -226,6 +239,36 @@ void record(Line& line,const frame_client_startup::Record& r) noexcept {
             u(r.resource_stack.begin),u(r.resource_stack.end));
     }
 #endif
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    if(r.kind==frame_client_startup::Kind::ResourceRawTransaction || r.kind==frame_client_startup::Kind::ResourceRawRefused) {
+        const auto& c=r.raw;
+        line.add(",\"raw_resource\":{\"raw_only\":true,\"matched\":%s,\"terminal\":%s,"
+            "\"reason\":%llu,\"decoder_refusal\":%u,\"thread_reason\":%u,"
+            "\"import_frame\":\"%llx\",\"receiver_frame\":\"%llx\",\"pipe\":\"%llx\",\"record\":\"%llx\","
+            "\"fd\":%d,\"sequence\":%u,\"sequence_available\":%s,\"request_bytes\":%u,"
+            "\"reply_header_bytes\":%u,\"reply_payload_bytes\":%u,\"writes\":%u,\"header_reads\":%u,\"payload_reads\":%u,"
+            "\"scalar_bytes_copied\":%zu,\"wire_bytes_copied\":%zu,\"reply_token\":\"%llx\","
+            "\"parsed_token\":\"%llx\",\"referenced_token\":\"%llx\",\"begin_lock_succeeded\":%s,"
+            "\"request_complete\":%s,\"reply_complete\":%s,\"pending_unlock_succeeded\":%s,"
+            "\"native_wait_success\":%s,\"matching_pending\":%s,\"reference_lock_succeeded\":%s,"
+            "\"following_reference_observed\":%s,\"last_boundary\":%u,\"last_phase\":%u,"
+            "\"last_native_result\":%lld,\"last_errno\":%d,\"last_native_result_available\":%s,"
+            "\"reference_rpc_succeeded\":false,\"continuous_connection_owned\":false,"
+            "\"native_namespace_associated\":false,\"source_frame_associated\":false,\"uv_owned\":false,"
+            "\"accepted_submit\":false,\"gpu_consumed\":false,\"request_header\":\"",
+            c.matched?"true":"false",c.terminal?"true":"false",u(c.reason),unsigned(c.decoder_refusal),c.thread_reason,
+            u(c.invocation.import_frame),u(c.invocation.receiver_frame),u(c.invocation.pipe),u(c.invocation.record),
+            c.fd,c.sequence,c.sequence_available?"true":"false",c.request_bytes,c.reply_header_bytes,c.reply_payload_bytes,
+            c.writes,c.header_reads,c.payload_reads,c.scalar_bytes_copied,c.wire_bytes_copied,
+            u(c.reply_token),u(c.parsed_token),u(c.referenced_token),c.begin_lock_succeeded?"true":"false",
+            c.request_complete?"true":"false",c.reply_complete?"true":"false",c.pending_unlock_succeeded?"true":"false",
+            c.native_wait_success?"true":"false",c.matching_pending?"true":"false",c.reference_lock_succeeded?"true":"false",
+            c.following_reference_observed?"true":"false",unsigned(c.last_boundary),unsigned(c.last_phase),
+            static_cast<long long>(c.last_native_result),c.last_preserved_errno,c.last_native_result_available?"true":"false");
+        line.hex(c.request_header);line.add("\",\"reply_header\":\"");line.hex(c.reply_header);
+        line.add("\",\"reply_payload\":\"");line.hex(c.reply_payload);line.add("\"}");
+    }
+#endif
     line.add("}\n");
 }
 void* write_background(void*) noexcept {
@@ -244,6 +287,11 @@ void* write_background(void*) noexcept {
 #if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
     header.add(",\"resource_thread_preparation\":true,\"resource_thread_private_bytes_read\":0");
 #endif
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    header.add(",\"resource_raw_transaction\":true,\"raw_transaction_limit\":1,\"raw_transfer_limit\":24,"
+        "\"raw_per_transfer_kind_limit\":8,\"raw_scalar_byte_limit\":2068,\"raw_wire_byte_limit\":33,"
+        "\"raw_additional_private_byte_limit\":2101,\"raw_namespace_proven\":false");
+#endif
     header.add("}\n");
     if(!header.valid||!write_owned(fd,header.bytes.data(),header.used)){close(fd);disarm_owned();return nullptr;}bytes=header.used;
     while(owned_process()&&!stopping.load(std::memory_order_acquire)) {
@@ -259,13 +307,29 @@ void* write_background(void*) noexcept {
     // This deadline disarms recording only; it never restarts Steam/SteamVR,
     // changes loader configuration, rolls back installation or affects pixels.
     if(!owned_process()){close(fd);active.store(false,std::memory_order_release);return nullptr;}
-    frame_client_startup::finalize();const auto status=frame_client_startup::status();
+    frame_client_startup::finalize();
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    // Wait only on the writer, bounded to short callback completion. A native
+    // blocked read is outside callback activity and is never waited on here.
+    for(unsigned attempt=0;attempt<32 && !frame_client_startup::raw_quiescent();++attempt) {
+        const timespec pause{0,1000000};nanosleep(&pause,nullptr);
+    }
+    const bool raw_totals_quiescent=frame_client_startup::raw_quiescent();
+#endif
+    const auto status=frame_client_startup::status();
     Line footer;footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%zu,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,\"startup_completed\":%s,\"refusal\":%u,\"finalized\":true,"
         "\"connect_sample_completed\":%s,\"resource_sample_completed\":%s",
         end,records,bytes,static_cast<unsigned long long>(status.queued),static_cast<unsigned long long>(status.drained),status.startup_completed?"true":"false",unsigned(status.refusal),
         status.connect_sample_completed?"true":"false",status.resource_sample_completed?"true":"false");
 #if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
     footer.add(",\"resource_thread_stack_prepared\":%s",status.resource_thread_stack_prepared?"true":"false");
+#endif
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    footer.add(",\"resource_raw_started\":%s,\"resource_raw_completed\":%s,\"resource_raw_abandoned\":%s,"
+        "\"resource_scalar_bytes_copied\":%zu,\"resource_wire_bytes_copied\":%zu,\"resource_raw_totals_quiescent\":%s",
+        status.resource_raw_started?"true":"false",status.resource_raw_completed?"true":"false",
+        status.resource_raw_started&&!status.resource_raw_completed?"true":"false",
+        status.resource_scalar_bytes_copied,status.resource_wire_bytes_copied,raw_totals_quiescent?"true":"false");
 #endif
     footer.add("}\n");
     if(footer.valid&&footer.used<=kOutputBytes-bytes)write_owned(fd,footer.bytes.data(),footer.used);
@@ -298,6 +362,11 @@ __attribute__((constructor)) void begin_observer() noexcept {
 #if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
     setup.resource_thread_preparation=true;
     setup.hidden_epoll_wait_entry=reinterpret_cast<std::uintptr_t>(&frame_client_startup_epoll_wait_entry);
+#endif
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    setup.resource_raw_transaction=true;
+    setup.hidden_read_entry=reinterpret_cast<std::uintptr_t>(&frame_import_read_entry);
+    setup.hidden_write_entry=reinterpret_cast<std::uintptr_t>(&frame_import_write_entry);
 #endif
     if(!frame_client_startup::initialize_once(prepared,client,setup)){errno=saved;return;}
     if(!register_child_retirement(prepared)){frame_client_startup::finalize();errno=saved;return;}

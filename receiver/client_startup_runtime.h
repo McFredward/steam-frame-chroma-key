@@ -7,6 +7,9 @@
 #include "../import/client_connect_observation.h"
 #include "../import/client_resource_census.h"
 #include "../import/client_resource_thread.h"
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+#include "../import/client_resource_raw.h"
+#endif
 
 namespace frame_client_startup {
 
@@ -29,17 +32,20 @@ struct Setup {
     bool resource_register_census=false;
     bool resource_thread_preparation=false;
     std::uintptr_t hidden_epoll_wait_entry=0;
+    bool resource_raw_transaction=false;
+    std::uintptr_t hidden_read_entry=0,hidden_write_entry=0;
 };
 enum class Refusal : unsigned {
     None,Unprepared,MainPreparation,ClientProfile,Setup,Providers,Subscriber,
     Audit,Stack,Gate,ClientName,ClientGeometry,RecordLoss,NotificationLoss,
     InitializationFailure,Shutdown,Unload,Finalized,MutexProvider,ClientBinding,
-    ConnectionScope,ObjectDestroyed,ObjectReinitialized,ResourceScope,ResourceThread
+    ConnectionScope,ObjectDestroyed,ObjectReinitialized,ResourceScope,ResourceThread,ResourceRaw
 };
 enum class Kind : unsigned {
     Prepared,AuditAttached,InitBefore,ClientMapped,PipeBorn,InitAfter,
     InitAbandon,Shutdown,Retire,Refused,Loss,MutexBound,ConnectObserved,ConnectRefused,
-    ResourceObserved,ResourceRefused,ResourceThreadBound,ResourceThreadPrepared,ResourceThreadRefused
+    ResourceObserved,ResourceRefused,ResourceThreadBound,ResourceThreadPrepared,ResourceThreadRefused,
+    ResourceRawBound,ResourceRawTransaction,ResourceRawRefused
 };
 struct Record {
     Kind kind=Kind::Refused;
@@ -65,6 +71,9 @@ struct Record {
     bool resource_thread_stack_owned=false;
     frame_native_client_birth::StackRegion resource_stack{};
     frame_client_resource_thread::Reason resource_thread_reason{};
+#if defined(FRAME_CLIENT_RESOURCE_RAW_TRANSACTION)
+    frame_client_raw::RawRecord raw{};
+#endif
 };
 struct Status {
     bool prepared=false,audit_attached=false,gate_constructed=false;
@@ -74,6 +83,8 @@ struct Status {
     // Historical sampler outcomes, never descriptor/transaction ownership.
     bool connect_sample_completed=false,resource_sample_completed=false;
     bool resource_thread_stack_prepared=false;
+    bool resource_raw_started=false,resource_raw_completed=false;
+    std::size_t resource_scalar_bytes_copied=0,resource_wire_bytes_copied=0;
 };
 
 // Explicit root constructor/preinit integration only; there is no constructor,
@@ -92,6 +103,9 @@ frame_import_pipe::Registry* registry() noexcept;
 // Root's own finalizer calls this BEFORE releasing writer/other context state.
 // Late audit la_objclose callbacks then return inert, even before final unmap.
 void finalize() noexcept;
+// Writer only, after finalization. Atomic callback activity, never borrowed
+// mutable scope/stack inspection or a native thread lifetime lease.
+bool raw_quiescent() noexcept;
 
 // Separate, explicitly cold first-decoder-wait bootstrap. The original epoll
 // provider can cancel/force-unwind; this dispatcher must not be noexcept.
