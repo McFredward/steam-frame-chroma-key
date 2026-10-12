@@ -20,8 +20,12 @@ visibility, initial-exec TLS, `-fno-exceptions` and `-fno-rtti`; link pthreads a
 adds an opt-in `FRAME_MASK_BUILD_RECEIVER_OBSERVER` target, disabled by default.
 Only `pthread_mutex_lock` and `pthread_mutex_unlock` are exported.
 
-Production accepts only the exact AArch64 `vrlink` executable SHA-256
-`0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b`.
+Production currently accepts only the re-audited SteamOS 0.4.5 AArch64 `vrlink`
+executable SHA-256
+`31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153`.
+Its four exact caller returns are recorded in
+[the update audit](FRAME-RECEIVER-UPDATE-20261012.md). The older receiver pin and
+sites from the original audit are refused by this production build.
 The basename is an inexpensive preliminary filter, not its identity. The hash,
 ELF architecture and executable PT_LOAD bounds are checked once before claiming
 any output file. Unrelated inherited preload processes and unsupported executables

@@ -21,8 +21,11 @@ probe; it does not make those remaining links disappear.
 
 ## Exact build and public ABI
 
-Only the private `vrlink` build already described in
-[the receiver report](FRAME-ASSOCIATION-DATAFLOW.md) is supported:
+This historical audit inspected the private `vrlink` build already described in
+[the receiver report](FRAME-ASSOCIATION-DATAFLOW.md). Its addresses below apply
+only to that exact file. Current production support was re-audited separately
+after [the SteamOS 0.4.5 update](FRAME-RECEIVER-UPDATE-20261012.md); do not reuse
+these old sites for that receiver:
 
 - SHA-256 `0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b`;
   ELF build ID `0a51addb6a9ef05dc52c055b1076947908f20acc`.

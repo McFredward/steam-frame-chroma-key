@@ -39,6 +39,13 @@ libc, dynamic loader and reviewed production observer. Its
 `offline_files_supported:true` is only offline file compatibility. A cross-sysroot
 proposal cannot substitute for the Frame's actual native provider namespace.
 
+The current production observer and preparation/session helpers pin the
+[re-audited SteamOS 0.4.5 receiver](FRAME-RECEIVER-UPDATE-20261012.md) and its four
+exact caller returns. A fresh hardware check stopped the previous observer
+before deployment when the receiver changed. Stale receiver pins or proposal
+call sites are refused. Keep an active session's original self-contained
+rollback helper; do not replace it during a port.
+
 The session helper takes these four files explicitly, rereads their bytes and
 checks hashes, sizes and ELF64 little-endian AArch64 ET_DYN headers against the
 reviewed proposal. It requires the exact supported `vrlink` hash and basename.
