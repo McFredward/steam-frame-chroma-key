@@ -164,6 +164,44 @@ struct Snapshot {
 static_assert(std::is_trivially_copyable_v<Snapshot>, "Snapshots must be safe bounded event payloads");
 static_assert(sizeof(Snapshot) <= 16384, "Snapshot exceeds the bounded trace event budget");
 
+// A receipt is an owned CPU lifecycle observation, not accepted native import,
+// source video, cross-process namespace or GPU-consumption proof. The tag and
+// cookie are supplied only after the adapter verifies the live native invocation.
+constexpr std::size_t ImportTagCapacity = 32;
+enum ImportReceiptError : std::uint32_t {
+    ImportNone = 0, ImportUnknownTag = 1U << 0, ImportUntagged = 1U << 1,
+    ImportTagMismatch = 1U << 2, ImportGenerationMismatch = 1U << 3,
+    ImportMissingImage = 1U << 4, ImportMissingView = 1U << 5,
+    ImportMissingMemory = 1U << 6, ImportMissingBinding = 1U << 7,
+    ImportUnsupported = 1U << 8, ImportCapacity = 1U << 9,
+    ImportJournalLoss = 1U << 10, ImportAmbiguousTag = 1U << 11,
+    ImportRepeatedReceipt = 1U << 12
+};
+struct ImportResourceReceipt {
+    std::uint64_t journalInstance = 0, localReplayOrder = 0;
+    // The worker's existing resource-generation cursor. It is neither native
+    // content generation nor a submit/source-frame counter.
+    std::uint64_t resourceGenerationCursor = 0;
+    std::uint64_t invocationTag = 0, cookie = 0, device = 0;
+    std::uint64_t requestedImage = 0, requestedView = 0;
+    std::uint64_t imageInvocationTag = 0, viewInvocationTag = 0;
+    ImageMetadata image{};
+    ViewMetadata view{};
+    MemoryMetadata memory{};
+    std::uint64_t lossCount = 0;
+    std::uint32_t errors = ImportNone;
+    Reason reason = Reason::Unknown;
+    bool resourceComplete = false;
+    bool nativeImportAccepted = false;
+    bool sourceFrameAssociated = false;
+    bool nativeCrossProcessNamespace = false;
+    bool acceptedSubmit = false;
+    bool gpuConsumedCoherent = false;
+};
+static_assert(std::is_trivially_copyable_v<ImportResourceReceipt>,
+              "Import receipts must contain bounded owned metadata");
+static_assert(sizeof(ImportResourceReceipt) < 4096, "Import receipt exceeds its bounded budget");
+
 class Core {
     friend struct TestAccess;
     struct Base { std::uint64_t device = 0; Identity id{}; bool complete = false; };
@@ -196,8 +234,14 @@ class Core {
         std::array<Value, BindingCapacity> values{};
     };
     struct Buffer : Base { BufferMetadata metadata{}; };
-    struct Image : Base { ImageMetadata metadata{}; };
-    struct View : Base { ViewMetadata metadata{}; };
+    struct Image : Base { ImageMetadata metadata{}; std::uint64_t invocationTag = 0; };
+    struct View : Base { ViewMetadata metadata{}; std::uint64_t invocationTag = 0; };
+    struct ImportTag {
+        std::uint64_t tag = 0, device = 0;
+        Identity image{}, view{};
+        std::uint32_t errors = ImportNone;
+        bool receiptRequested = false;
+    };
     struct Sampler : Base { SamplerMetadata metadata{}; };
     struct Memory : Base { MemoryMetadata metadata{}; };
     struct Conversion : Base { ConversionMetadata metadata{}; };
@@ -214,6 +258,7 @@ class Core {
         std::array<BoundSet, SetIndexCapacity> sets{};
     };
 public:
+    explicit Core(std::uint64_t journalInstance = 0) noexcept : journalInstance_(journalInstance) {}
     // The caller owns capture admission/lifetime and invokes mutation methods
     // only after successful native API calls. Failed native calls must not
     // advance generations. Multi-device state is keyed by device AND handle.
@@ -360,7 +405,7 @@ public:
         createImage(device, value, info, extensions::parseImage(info.pNext));
     }
     void createImage(std::uint64_t device, VkImage value, const VkImageCreateInfo& info,
-                     const extensions::ImageExtensions& extension) noexcept {
+                     const extensions::ImageExtensions& extension, std::uint64_t invocationTag = 0) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         auto* out = insert(images_, device, handle(value)); if (!out) return;
         // A modifier list describes candidates, not the implementation's selected
@@ -370,13 +415,20 @@ public:
         auto& m = out->metadata;
         m.identity = out->id; m.type = info.imageType; m.format = info.format; m.extent = info.extent; m.mipLevels = info.mipLevels;
         m.arrayLayers = info.arrayLayers; m.samples = info.samples; m.tiling = info.tiling; m.usage = info.usage; m.extensions = extension;
+        out->invocationTag = invocationTag;
+        if (invocationTag) {
+            if (auto* tag = importTag(invocationTag, device, true)) {
+                if (tag->image.generation || tag->view.generation) tag->errors |= ImportAmbiguousTag;
+                else tag->image = out->id;
+            }
+        }
     }
     void destroyImage(std::uint64_t device, VkImage value) noexcept { eraseGuarded(images_, device, handle(value)); }
     void createView(std::uint64_t device, VkImageView value, const VkImageViewCreateInfo& info) noexcept {
         createView(device, value, info, extensions::parseView(info.pNext));
     }
     void createView(std::uint64_t device, VkImageView value, const VkImageViewCreateInfo& info,
-                    const extensions::ViewExtensions& extension) noexcept {
+                    const extensions::ViewExtensions& extension, std::uint64_t invocationTag = 0) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         auto* out = insert(views_, device, handle(value)); if (!out) return;
         const auto* image = find(images_, device, handle(info.image));
@@ -384,6 +436,15 @@ public:
         auto& m = out->metadata;
         m.identity = out->id; if (image) m.image = image->id;
         m.type = info.viewType; m.format = info.format; m.components = info.components; m.subresource = info.subresourceRange; m.extensions = extension;
+        out->invocationTag = invocationTag;
+        if (invocationTag) {
+            if (auto* tag = importTag(invocationTag, device, true)) {
+                if (tag->view.generation) tag->errors |= ImportAmbiguousTag;
+                else tag->view = out->id;
+                if (!image || !same(tag->image, image->id) || image->invocationTag != invocationTag)
+                    tag->errors |= ImportTagMismatch;
+            }
+        }
         if (extension.hasConversion) {
             const auto* conversion = find(conversions_, device, extension.conversionHandle);
             if (conversion) m.conversion = conversion->metadata;
@@ -550,6 +611,41 @@ public:
             same(previous.set, current.set) && same(previous.setLayout, current.setLayout) && previous.setRevision == current.setRevision &&
             previous.commandBindingRevision == current.commandBindingRevision;
     }
+    // Only the journal's background owner calls this lookup. Numeric handles
+    // select candidate entries, but original tagged creation generations are
+    // independently required; no latest-handle/fallback association is accepted.
+    ImportResourceReceipt importResourceReceipt(std::uint64_t device, VkImage image,
+                                                 VkImageView view, std::uint64_t invocationTag) noexcept {
+        auto lock = acquire();
+        ImportResourceReceipt out;
+        out.device = device; out.requestedImage = handle(image); out.requestedView = handle(view);
+        out.invocationTag = invocationTag;
+        if (!lock.owns_lock()) { out.errors = ImportJournalLoss; out.reason = Reason::Contention; return out; }
+        out = importResourceReceiptLocked(device, handle(image), handle(view), invocationTag);
+        if (auto* tag = importTag(invocationTag, device, false)) {
+            if (tag->receiptRequested) {
+                out.errors |= ImportRepeatedReceipt; out.resourceComplete = false; out.reason = Reason::Stale;
+            }
+            tag->receiptRequested = true;
+        }
+        return out;
+    }
+    bool validate(const ImportResourceReceipt& previous) noexcept {
+        auto lock = acquire();
+        if (!lock.owns_lock() || previous.journalInstance != journalInstance_ ||
+            previous.resourceGenerationCursor > serial_ ||
+            previous.resourceGenerationCursor < previous.image.identity.generation ||
+            previous.resourceGenerationCursor < previous.view.identity.generation ||
+            previous.resourceGenerationCursor < previous.memory.identity.generation ||
+            !previous.resourceComplete || previous.nativeImportAccepted ||
+            previous.sourceFrameAssociated || previous.nativeCrossProcessNamespace ||
+            previous.acceptedSubmit || previous.gpuConsumedCoherent) return false;
+        const auto current = importResourceReceiptLocked(previous.device, previous.requestedImage,
+                                                        previous.requestedView, previous.invocationTag);
+        return current.resourceComplete && same(previous.image.identity, current.image.identity) &&
+            same(previous.view.identity, current.view.identity) && same(previous.memory.identity, current.memory.identity) &&
+            same(previous.image.memory, current.image.memory) && previous.image.memoryOffset == current.image.memoryOffset;
+    }
     void deviceDestroyed(std::uint64_t device) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         eraseDevice(layouts_, device); eraseDevice(pipelineLayouts_, device); eraseDevice(pools_, device); eraseDevice(sets_, device);
@@ -557,6 +653,75 @@ public:
         eraseDevice(memories_, device); eraseDevice(commands_, device); eraseDevice(conversions_, device);
     }
 private:
+    ImportTag* importTag(std::uint64_t value, std::uint64_t device, bool create) noexcept {
+        if (!value) return nullptr;
+        ImportTag* available = nullptr;
+        for (auto& tag : importTags_) {
+            if (tag.tag == value) {
+                if (tag.device != device) tag.errors |= ImportTagMismatch | ImportAmbiguousTag;
+                return &tag;
+            }
+            if (!tag.tag && !available) available = &tag;
+        }
+        if (!create) return nullptr;
+        if (!available) { lose(Reason::Capacity); return nullptr; }
+        available->tag = value; available->device = device;
+        return available;
+    }
+    ImportResourceReceipt importResourceReceiptLocked(std::uint64_t device, std::uint64_t imageHandle,
+                                                       std::uint64_t viewHandle, std::uint64_t invocationTag) noexcept {
+        ImportResourceReceipt out;
+        out.device = device; out.requestedImage = imageHandle; out.requestedView = viewHandle;
+        out.invocationTag = invocationTag; out.resourceGenerationCursor = serial_;
+        out.journalInstance = journalInstance_;
+        const auto* tag = importTag(invocationTag, device, false);
+        if (!tag) out.errors |= ImportUnknownTag;
+        if (!invocationTag) out.errors |= ImportUntagged;
+        if (tag) out.errors |= tag->errors;
+        const auto* image = find(images_, device, imageHandle);
+        const auto* view = find(views_, device, viewHandle);
+        if (!image) out.errors |= ImportMissingImage;
+        if (!view) out.errors |= ImportMissingView;
+        if (image) {
+            out.image = image->metadata; out.imageInvocationTag = image->invocationTag;
+            if (!image->invocationTag) out.errors |= ImportUntagged;
+            if (image->invocationTag != invocationTag) out.errors |= ImportTagMismatch;
+            if (!tag || !same(tag->image, image->id)) out.errors |= ImportGenerationMismatch;
+            if (!image->complete) out.errors |= ImportUnsupported;
+            if (!image->metadata.memory.generation) out.errors |= ImportMissingBinding;
+            out.memory = allocation(device, image->metadata.memory);
+            if (!out.memory.identity.generation) out.errors |= ImportMissingMemory;
+            if (!out.memory.complete || image->metadata.memoryOffset >= out.memory.allocationSize)
+                out.errors |= ImportUnsupported;
+            out.image.allocation = out.memory;
+            out.image.complete = image->complete && out.memory.complete &&
+                image->metadata.memoryOffset < out.memory.allocationSize;
+        }
+        if (view) {
+            out.view = view->metadata; out.viewInvocationTag = view->invocationTag;
+            if (!view->invocationTag) out.errors |= ImportUntagged;
+            if (view->invocationTag != invocationTag) out.errors |= ImportTagMismatch;
+            if (!tag || !same(tag->view, view->id) || !image || !same(view->metadata.image, image->id))
+                out.errors |= ImportGenerationMismatch;
+            out.view.complete = view->complete;
+            if (out.view.extensions.hasConversion) {
+                const auto* conversion = lookup(conversions_, device, out.view.conversion.identity);
+                out.view.conversion.complete = conversion && conversion->complete;
+                out.view.complete = out.view.complete && out.view.conversion.complete;
+            }
+            if (!out.view.complete) out.errors |= ImportUnsupported;
+        }
+        out.lossCount = lostState();
+        if (out.lossCount) {
+            out.errors |= ImportJournalLoss;
+            if (lastLoss_.load(std::memory_order_relaxed) == Reason::Capacity) out.errors |= ImportCapacity;
+        }
+        out.resourceComplete = out.errors == ImportNone;
+        out.reason = out.resourceComplete ? Reason::None :
+            out.lossCount ? lastLoss_.load(std::memory_order_relaxed) :
+            out.errors & ImportUnsupported ? Reason::Unsupported : Reason::Stale;
+        return out;
+    }
     static bool dynamic(VkDescriptorType type) noexcept { return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; }
     static bool bufferType(VkDescriptorType type) noexcept {
         return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || dynamic(type);
@@ -771,6 +936,7 @@ private:
         if (lostState()) { out.sourceComplete = false; out.reason = lastLoss_.load(std::memory_order_relaxed); }
         return out;
     }
+    const std::uint64_t journalInstance_;
     std::mutex mutex_;
     std::atomic<std::uint64_t> lost_{0};
     std::array<std::atomic<std::uint64_t>, 8> losses_{};
@@ -788,6 +954,7 @@ private:
     ObjectTable<Memory, MemoryCapacity> memories_{};
     ObjectTable<Command, CommandCapacity> commands_{};
     ObjectTable<Conversion, ConversionCapacity> conversions_{};
+    std::array<ImportTag, ImportTagCapacity> importTags_{};
 };
 
 } // namespace frame_bindings

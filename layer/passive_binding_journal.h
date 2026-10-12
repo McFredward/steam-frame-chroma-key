@@ -33,13 +33,16 @@ public:
     static constexpr std::size_t LaneCapacity = 2048;
     static constexpr std::size_t ByteCapacity = 256 * 1024;
     static constexpr std::uint32_t CallCapacity = 32;
-    static constexpr std::size_t OperationCount = 37;
+    static constexpr std::size_t OperationCount = 38;
     struct TransportCounters {
         std::uint64_t registry = 0, queue = 0, orderGap = 0, batch = 0;
         std::uint64_t orderWrap = 0, closedCalls = 0;
         std::uint64_t published = 0, replayed = 0;
         std::uint64_t maxLaneOccupancy = 0, maxLaneBytes = 0;
         std::uint64_t headerQueue = 0, byteQueue = 0;
+    };
+    struct ReceiptCounters {
+        std::uint64_t requested = 0, delivered = 0, unconsumed = 0, capRefused = 0;
     };
     struct OperationCounters {
         std::uint64_t publicationLoss = 0, replayLoss = 0;
@@ -53,11 +56,11 @@ public:
             "create_view", "destroy_view", "create_sampler", "destroy_sampler", "create_conversion", "destroy_conversion",
             "bind_buffer_memory", "bind_image_memory", "bind_buffer_memory_batch", "bind_image_memory_batch",
             "allocate_commands", "free_commands", "begin_command", "end_command", "reset_command",
-            "reset_command_pool", "destroy_command_pool", "execute_commands", "bind_sets", "device_destroyed", "snapshot"};
+            "reset_command_pool", "destroy_command_pool", "execute_commands", "bind_sets", "device_destroyed", "snapshot", "import_resource_receipt"};
         return index < names.size() ? names[index] : "unknown";
     }
 
-    Journal() noexcept : instance_(reserveIdentity(instances_)) {
+    Journal() noexcept : instance_(reserveIdentity(instances_)), core_(instance_) {
         if (!instance_) { halted_.store(true); lose(Reason::Capacity, Transport::OrderWrap); }
     }
     Journal(const Journal&) = delete;
@@ -102,6 +105,11 @@ public:
         for (std::size_t i = 0; i < result.size(); ++i)
             result[i] = {publicationLoss_[i].load(std::memory_order_relaxed), replayLoss_[i].load(std::memory_order_relaxed)};
         return result;
+    }
+
+    ReceiptCounters receiptCounters() const noexcept {
+        return {receiptRequests_.load(std::memory_order_relaxed), receiptDelivered_.load(std::memory_order_relaxed),
+                receiptUnconsumed_.load(std::memory_order_relaxed), receiptCapRefused_.load(std::memory_order_relaxed)};
     }
 
     // One background thread exclusively owns drain(). An unpublished preceding
@@ -163,6 +171,32 @@ public:
                     result.reason = lastLoss_.load(std::memory_order_relaxed);
                 }
                 callback(restored ? observation.payload.snapshot.cookie : 0, result);
+            } else if (record->op == Op::ImportResourceReceipt) {
+                ImportResourceReceipt result;
+                if (!aborted_ && restored) {
+                    const auto& p = observation.payload.importReceipt;
+                    result = core_.importResourceReceipt(record->device, p.image, p.view, p.invocationTag);
+                    result.cookie = p.cookie;
+                } else { result.device = record->device; result.errors = ImportJournalLoss; }
+                result.journalInstance = instance_;
+                result.localReplayOrder = record->ticket;
+                result.lossCount = lostState();
+                if (result.lossCount || aborted_ || !restored) {
+                    result.resourceComplete = false; result.errors |= ImportJournalLoss;
+                    if (lost_.load(std::memory_order_relaxed)) {
+                        result.reason = lastLoss_.load(std::memory_order_relaxed);
+                        if (result.reason == Reason::Capacity) result.errors |= ImportCapacity;
+                    }
+                }
+                // Opt-in capture consumers must provide the typed overload.
+                // Old Snapshot-only consumers remain valid but cannot silently
+                // claim receipts: their omissions are counted explicitly.
+                if constexpr (std::is_invocable_v<Callback&, std::uint64_t, const ImportResourceReceipt&>) {
+                    callback(result.cookie, result);
+                    receiptDelivered_.store(receiptDelivered_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                } else {
+                    receiptUnconsumed_.store(receiptUnconsumed_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                }
             } else if (!aborted_ && restored) replay(observation);
             const auto replayLoss = core_.lostState() - lossBefore;
             const auto operationIndex = static_cast<std::size_t>(record->op);
@@ -182,6 +216,30 @@ public:
 
     bool requestSnapshot(std::uint64_t device, VkCommandBuffer command, VkPipelineLayout layout, std::uint32_t cookie) noexcept {
         return publish(Op::Snapshot, device, [&](Record& r) { r.payload.snapshot = {command, layout, cookie}; });
+    }
+    // The verified native adapter calls this immediately after publishing the
+    // matching successful tagged view creation. Hooks copy only owned scalars;
+    // the journal worker resolves actual lifecycle generations asynchronously.
+    bool requestImportResourceReceipt(std::uint64_t device, VkImage image, VkImageView view,
+                                      std::uint64_t invocationTag, std::uint64_t ownedCookie) noexcept {
+        if (!device || !handle(image) || !handle(view) || !invocationTag || !ownedCookie) {
+            publicationFailure(Op::ImportResourceReceipt, Reason::Bounds, Transport::Batch); return false;
+        }
+        auto value = receiptRequests_.load(std::memory_order_relaxed);
+        bool reserved = false;
+        for (std::size_t attempt = 0; attempt <= ImportTagCapacity; ++attempt) {
+            if (value >= ImportTagCapacity) break;
+            if (receiptRequests_.compare_exchange_strong(value, value + 1, std::memory_order_relaxed)) {
+                reserved = true; break;
+            }
+        }
+        if (!reserved) {
+            receiptCapRefused_.fetch_add(1, std::memory_order_relaxed);
+            publicationFailure(Op::ImportResourceReceipt, Reason::Capacity, Transport::None); return false;
+        }
+        return publish(Op::ImportResourceReceipt, device, [&](Record& r) {
+            auto& p = construct(r.payload.importReceipt); p = {image, view, invocationTag, ownedCookie};
+        });
     }
     void reportUnsupported(std::uint64_t /*device*/) noexcept { lose(Reason::Unsupported, Transport::None); }
 
@@ -290,14 +348,22 @@ public:
         });
     }
     void createImage(std::uint64_t device, VkImage value, const VkImageCreateInfo& info) noexcept {
-        publish(Op::CreateImage, device, [&](Record& r) {
-            auto& p = construct(r.payload.image); p = {value, info, extensions::parseImage(info.pNext)};
+        (void)createImageTagged(device, value, info, 0);
+    }
+    bool createImageTagged(std::uint64_t device, VkImage value, const VkImageCreateInfo& info,
+                           std::uint64_t invocationTag) noexcept {
+        return publish(Op::CreateImage, device, [&](Record& r) {
+            auto& p = construct(r.payload.image); p = {value, info, extensions::parseImage(info.pNext), invocationTag};
             p.info.pNext = nullptr; p.info.pQueueFamilyIndices = nullptr;
         });
     }
     void createView(std::uint64_t device, VkImageView value, const VkImageViewCreateInfo& info) noexcept {
-        publish(Op::CreateView, device, [&](Record& r) {
-            auto& p = construct(r.payload.view); p = {value, info, extensions::parseView(info.pNext)}; p.info.pNext = nullptr;
+        (void)createViewTagged(device, value, info, 0);
+    }
+    bool createViewTagged(std::uint64_t device, VkImageView value, const VkImageViewCreateInfo& info,
+                          std::uint64_t invocationTag) noexcept {
+        return publish(Op::CreateView, device, [&](Record& r) {
+            auto& p = construct(r.payload.view); p = {value, info, extensions::parseView(info.pNext), invocationTag}; p.info.pNext = nullptr;
         });
     }
     void createSampler(std::uint64_t device, VkSampler value, const VkSamplerCreateInfo& info) noexcept {
@@ -378,9 +444,9 @@ private:
         AllocateMemory, FreeMemory, CreateBuffer, DestroyBuffer, CreateImage, DestroyImage,
         CreateView, DestroyView, CreateSampler, DestroySampler, CreateConversion, DestroyConversion,
         BindBufferMemory, BindImageMemory, BindBufferMemoryBatch, BindImageMemoryBatch, AllocateCommands, FreeCommands, BeginCommand, EndCommand,
-        ResetCommand, ResetCommandPool, DestroyCommandPool, ExecuteCommands, BindSets, DeviceDestroyed, Snapshot
+        ResetCommand, ResetCommandPool, DestroyCommandPool, ExecuteCommands, BindSets, DeviceDestroyed, Snapshot, ImportResourceReceipt
     };
-    static_assert(static_cast<std::size_t>(Op::Snapshot) + 1 == OperationCount, "Operation names and counters must cover every record");
+    static_assert(static_cast<std::size_t>(Op::ImportResourceReceipt) + 1 == OperationCount, "Operation names and counters must cover every record");
     struct SetLayoutRecord {
         VkDescriptorSetLayout value; VkDescriptorSetLayoutCreateInfo info; bool unsupported;
         std::array<VkDescriptorSetLayoutBinding, BindingCapacity> bindings;
@@ -411,8 +477,8 @@ private:
     struct UpdateRecord { std::uint32_t writes, copies; std::array<UpdateEntry, CallCapacity> entries; };
     struct MemoryRecord { VkDeviceMemory value; VkMemoryAllocateInfo info; extensions::MemoryExtensions chain; };
     struct BufferRecord { VkBuffer value; VkBufferCreateInfo info; bool unsupported; };
-    struct ImageRecord { VkImage value; VkImageCreateInfo info; extensions::ImageExtensions chain; };
-    struct ViewRecord { VkImageView value; VkImageViewCreateInfo info; extensions::ViewExtensions chain; };
+    struct ImageRecord { VkImage value; VkImageCreateInfo info; extensions::ImageExtensions chain; std::uint64_t invocationTag; };
+    struct ViewRecord { VkImageView value; VkImageViewCreateInfo info; extensions::ViewExtensions chain; std::uint64_t invocationTag; };
     struct SamplerRecord { VkSampler value; VkSamplerCreateInfo info; extensions::SamplerExtensions chain; };
     struct ConversionRecord { VkSamplerYcbcrConversion value; VkSamplerYcbcrConversionCreateInfo info; extensions::ConversionExtensions chain; };
     struct MemoryBindingRecord { std::uint64_t resource; VkDeviceMemory memory; VkDeviceSize offset; bool supported; };
@@ -424,12 +490,13 @@ private:
         std::array<std::uint32_t, SetIndexCapacity * BindingCapacity> offsets;
     };
     struct SnapshotRecord { VkCommandBuffer command; VkPipelineLayout layout; std::uint32_t cookie; };
+    struct ImportReceiptRecord { VkImage image; VkImageView view; std::uint64_t invocationTag, cookie; };
     union Payload {
         std::uint64_t scalar;
         SetLayoutRecord setLayout; PipelineLayoutRecord pipelineLayout; PoolRecord pool; SetsRecord sets;
         FreeSetsRecord freeSets; UpdateRecord updates; MemoryRecord memory; BufferRecord buffer; ImageRecord image;
         ViewRecord view; SamplerRecord sampler; ConversionRecord conversion; MemoryBindingRecord binding;
-        MemoryBindingBatchRecord memoryBatch; CommandRecord commands; BindSetsRecord bindSets; SnapshotRecord snapshot;
+        MemoryBindingBatchRecord memoryBatch; CommandRecord commands; BindSetsRecord bindSets; SnapshotRecord snapshot; ImportReceiptRecord importReceipt;
         Payload() noexcept {}
     };
     struct Record { std::uint64_t ticket = 0, device = 0; Op op = Op::Snapshot; Payload payload; };
@@ -451,7 +518,7 @@ private:
     static_assert(OwnedRepresentation<SetLayoutRecord, PipelineLayoutRecord, PoolRecord, SetsRecord,
         FreeSetsRecord, WriteRecord, CopyRecord, UpdateEntry, UpdateRecord, MemoryRecord, BufferRecord,
         ImageRecord, ViewRecord, SamplerRecord, ConversionRecord, MemoryBindingRecord,
-        MemoryBindingBatchRecord, CommandRecord, BindSetsRecord, SnapshotRecord>::value,
+        MemoryBindingBatchRecord, CommandRecord, BindSetsRecord, SnapshotRecord, ImportReceiptRecord>::value,
         "Owned compact metadata must have standard layout and a trivially copyable representation");
     static_assert(sizeof(RecordHeader) == 32, "Compact headers exceeded their bounded lane budget");
     static_assert(sizeof(Lane) <= 128 * sizeof(Record), "Compact lanes must not increase the old memory budget");
@@ -487,6 +554,7 @@ private:
         case Op::AllocateCommands: case Op::FreeCommands: return sizeof(CommandRecord);
         case Op::BindSets: return sizeof(BindSetsRecord);
         case Op::Snapshot: return sizeof(SnapshotRecord);
+        case Op::ImportResourceReceipt: return sizeof(ImportReceiptRecord);
         default: return sizeof(std::uint64_t);
         }
     }
@@ -566,6 +634,7 @@ private:
         case Op::AllocateCommands: case Op::FreeCommands: return &construct(r.payload.commands);
         case Op::BindSets: return &construct(r.payload.bindSets);
         case Op::Snapshot: return &construct(r.payload.snapshot);
+        case Op::ImportResourceReceipt: return &construct(r.payload.importReceipt);
         default: return &construct(r.payload.scalar);
         }
     }
@@ -772,8 +841,8 @@ private:
         }
         case Op::AllocateMemory: { const auto& p = r.payload.memory; core_.allocateMemory(d, p.value, p.info, p.chain); break; }
         case Op::CreateBuffer: { auto& p = r.payload.buffer; p.info.pNext = unsupported(p.unsupported); core_.createBuffer(d, p.value, p.info); break; }
-        case Op::CreateImage: { const auto& p = r.payload.image; core_.createImage(d, p.value, p.info, p.chain); break; }
-        case Op::CreateView: { const auto& p = r.payload.view; core_.createView(d, p.value, p.info, p.chain); break; }
+        case Op::CreateImage: { const auto& p = r.payload.image; core_.createImage(d, p.value, p.info, p.chain, p.invocationTag); break; }
+        case Op::CreateView: { const auto& p = r.payload.view; core_.createView(d, p.value, p.info, p.chain, p.invocationTag); break; }
         case Op::CreateSampler: { const auto& p = r.payload.sampler; core_.createSampler(d, p.value, p.info, p.chain); break; }
         case Op::CreateConversion: { const auto& p = r.payload.conversion; core_.createConversion(d, p.value, p.info, p.chain); break; }
         case Op::BindBufferMemory: { const auto& p = r.payload.binding; core_.bindBufferMemory(d, fromHandle<VkBuffer>(p.resource), p.memory, p.offset, p.supported); break; }
@@ -815,13 +884,13 @@ private:
         case Op::DestroyCommandPool: core_.destroyCommandPool(d, fromHandle<VkCommandPool>(r.payload.scalar)); break;
         case Op::ExecuteCommands: core_.executeCommands(d, fromHandle<VkCommandBuffer>(r.payload.scalar)); break;
         case Op::DeviceDestroyed: core_.deviceDestroyed(d); break;
-        case Op::Snapshot: break;
+        case Op::Snapshot: case Op::ImportResourceReceipt: break;
         }
     }
 
     std::array<Lane, ProducerCapacity> lanes_;
-    Core core_;
     const std::uint64_t instance_;
+    Core core_;
     std::atomic<std::uint64_t> tickets_{1}, lost_{0}, published_{0}, replayed_{0};
     std::atomic<std::uint32_t> active_{0};
     std::atomic<bool> closed_{false}, halted_{false};
@@ -830,6 +899,7 @@ private:
     std::array<std::atomic<std::uint64_t>, 6> transport_{};
     std::array<std::atomic<std::uint64_t>, OperationCount> publicationLoss_{}, replayLoss_{};
     std::atomic<std::uint64_t> headerQueue_{0}, byteQueue_{0};
+    std::atomic<std::uint64_t> receiptRequests_{0}, receiptDelivered_{0}, receiptUnconsumed_{0}, receiptCapRefused_{0};
     Lane* preferred_ = nullptr; // Background owner only; never read by hooks.
     std::uint64_t expected_ = 1;
     bool aborted_ = false;
