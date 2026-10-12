@@ -120,6 +120,9 @@
     IMPORT_ENTRY frame_import_lock_entry, frame_import_lock_dispatch
     IMPORT_ENTRY frame_import_unlock_entry, frame_import_unlock_dispatch
     IMPORT_ENTRY frame_import_connect_entry, frame_import_connect_dispatch
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+    IMPORT_ENTRY frame_client_startup_epoll_wait_entry, frame_client_startup_epoll_wait_dispatch
+#endif
     .endif
     .else
     IMPORT_ENTRY frame_import_lock_entry, frame_import_lock_dispatch

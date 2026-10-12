@@ -33,6 +33,7 @@ int main() {
     check(!empty.prepared && !empty.audit_attached && !empty.gate_constructed &&
           !empty.startup_completed && !empty.retired && !empty.finalized,"Runtime activated automatically");
     check(!empty.connect_sample_completed && !empty.resource_sample_completed,"Empty glue invented completed native samples");
+    check(!empty.resource_thread_stack_prepared,"Empty glue invented decoder stack ownership");
     check(!runtime::registry() && !runtime::pop(record),"Unprepared runtime invented a registry/record");
     check(!frame_import_forwarding::callbacks_registered() &&
           !frame_import_startup_forwarding::providers_prepared(),"Native subscribers activated automatically");
@@ -48,6 +49,7 @@ int main() {
     request.provider.function=audit::Function::MutexLock;inert(request);
     request.provider.function=audit::Function::MutexUnlock;inert(request);
     request.provider.function=audit::Function::Connect;inert(request);
+    request.provider.function=audit::Function::EpollWait;inert(request);
     request.stage=audit::Stage::Retire;request.retired_module={0x1000,0x2000,0x3000,55};inert(request);
     request.stage=audit::Stage::Loss;inert(request);
 
@@ -88,6 +90,7 @@ int main() {
     check(closed.finalized && closed.retired && !closed.prepared && !closed.gate_constructed,
           "Finalizer did not leave an inert capability");
     check(!closed.connect_sample_completed && !closed.resource_sample_completed,"Finalization invented native sample success");
+    check(!closed.resource_thread_stack_prepared,"Finalization invented decoder stack ownership");
     const auto queued=closed.queued;
     request={};inert(request);request.stage=audit::Stage::Bind;inert(request);
     request.stage=audit::Stage::Retire;request.retired_module.observed_open_generation=77;inert(request);

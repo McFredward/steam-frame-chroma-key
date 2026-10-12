@@ -10,7 +10,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#if defined(FRAME_CLIENT_RESOURCE_CENSUS)
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+extern "C" __attribute__((visibility("hidden"),used))
+const std::uint8_t frame_client_resource_thread_scope[16]={
+    'F','C','S','T','A','K','0','1',4,0,0,0,0x18,0x2e,0,0};
+extern "C" __attribute__((visibility("hidden"))) void frame_client_startup_epoll_wait_entry();
+#elif defined(FRAME_CLIENT_RESOURCE_CENSUS)
 // Retained, hidden read-only opt-in evidence for offline preparation/staging.
 extern "C" __attribute__((visibility("hidden"),used))
 const std::uint8_t frame_client_resource_census_scope[16]={
@@ -102,7 +107,10 @@ bool read_envelope(const char* name,std::array<std::uint8_t,kEnvelopeBytes>& byt
 }
 bool decode(const std::array<std::uint8_t,kEnvelopeBytes>& b,frame_import_main::Profiles& profiles,
             frame_import_module::ProfileBlob& client,frame_client_startup::ClientSlot& slot) noexcept {
-#if defined(FRAME_CLIENT_RESOURCE_CENSUS)
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+    const auto* envelope_magic=frame_client_resource_thread_scope;
+    constexpr unsigned envelope_schema=4;
+#elif defined(FRAME_CLIENT_RESOURCE_CENSUS)
     const auto* envelope_magic=frame_client_resource_census_scope;
     constexpr unsigned envelope_schema=3;
 #elif defined(FRAME_CLIENT_CONNECT_OBSERVATION)
@@ -207,6 +215,17 @@ void record(Line& line,const frame_client_startup::Record& r) noexcept {
             unsigned(c.boundary),unsigned(c.phase),c.native_result_available?"true":"false",
             c.native_result,c.preserved_errno,unsigned(c.reason),c.startup_thread_stack_owned?"true":"false");
     }
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+    if(r.kind==frame_client_startup::Kind::ResourceThreadPrepared ||
+       r.kind==frame_client_startup::Kind::ResourceThreadRefused ||
+       r.kind==frame_client_startup::Kind::ResourceObserved || r.kind==frame_client_startup::Kind::ResourceRefused) {
+        line.add(",\"resource_thread\":{\"stack_owned_current\":%s,\"reason\":%u,"
+                 "\"usable_stack_begin\":\"%llx\",\"usable_stack_end\":\"%llx\","
+                 "\"private_bytes_read\":0,\"wire_bytes_read\":0,\"namespace_proven\":false}",
+            r.resource_thread_stack_owned?"true":"false",unsigned(r.resource_thread_reason),
+            u(r.resource_stack.begin),u(r.resource_stack.end));
+    }
+#endif
     line.add("}\n");
 }
 void* write_background(void*) noexcept {
@@ -221,6 +240,9 @@ void* write_background(void*) noexcept {
 #endif
 #if defined(FRAME_CLIENT_RESOURCE_CENSUS)
     header.add(",\"resource_register_census\":true,\"resource_private_bytes_read\":0");
+#endif
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+    header.add(",\"resource_thread_preparation\":true,\"resource_thread_private_bytes_read\":0");
 #endif
     header.add("}\n");
     if(!header.valid||!write_owned(fd,header.bytes.data(),header.used)){close(fd);disarm_owned();return nullptr;}bytes=header.used;
@@ -239,9 +261,13 @@ void* write_background(void*) noexcept {
     if(!owned_process()){close(fd);active.store(false,std::memory_order_release);return nullptr;}
     frame_client_startup::finalize();const auto status=frame_client_startup::status();
     Line footer;footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%zu,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,\"startup_completed\":%s,\"refusal\":%u,\"finalized\":true,"
-        "\"connect_sample_completed\":%s,\"resource_sample_completed\":%s}\n",
+        "\"connect_sample_completed\":%s,\"resource_sample_completed\":%s",
         end,records,bytes,static_cast<unsigned long long>(status.queued),static_cast<unsigned long long>(status.drained),status.startup_completed?"true":"false",unsigned(status.refusal),
         status.connect_sample_completed?"true":"false",status.resource_sample_completed?"true":"false");
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+    footer.add(",\"resource_thread_stack_prepared\":%s",status.resource_thread_stack_prepared?"true":"false");
+#endif
+    footer.add("}\n");
     if(footer.valid&&footer.used<=kOutputBytes-bytes)write_owned(fd,footer.bytes.data(),footer.used);
     close(fd);active.store(false,std::memory_order_release);return nullptr;
 }
@@ -268,6 +294,10 @@ __attribute__((constructor)) void begin_observer() noexcept {
 #endif
 #if defined(FRAME_CLIENT_RESOURCE_CENSUS)
     setup.resource_register_census=true;
+#endif
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+    setup.resource_thread_preparation=true;
+    setup.hidden_epoll_wait_entry=reinterpret_cast<std::uintptr_t>(&frame_client_startup_epoll_wait_entry);
 #endif
     if(!frame_client_startup::initialize_once(prepared,client,setup)){errno=saved;return;}
     if(!register_child_retirement(prepared)){frame_client_startup::finalize();errno=saved;return;}

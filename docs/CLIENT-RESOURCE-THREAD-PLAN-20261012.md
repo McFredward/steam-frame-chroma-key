@@ -202,6 +202,10 @@ with every exact route/window/ownership check still required.
 
 ## Concrete implementation and validation
 
+The separately scoped [implementation and exact reviewed artifact](CLIENT-RESOURCE-THREAD-PREPARATION.md)
+are now available. The following contracts describe its integration; actual
+cold decoder-thread ownership on the Frame remains untested.
+
 Root can implement the bounded cold-bootstrap core and registration in
 `receiver/client_startup_runtime.*`, with a small independently tested helper
 for first-entry/thread-cookie admission. Extend the existing true-entry macro

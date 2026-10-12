@@ -2,10 +2,12 @@
 #include "../import/client_thread_marker.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <limits>
 #include <new>
 #include <pthread.h>
+#include <sys/epoll.h>
 
 // The actual forwarding dispatchers use these same, distinct native providers.
 // Versioned aliases are resolved in MAIN at load time, not by the audit DSO.
@@ -14,6 +16,14 @@ extern "C" int frame_client_startup_native_mutex_destroy(pthread_mutex_t*);
 extern "C" int frame_client_startup_native_mutex_lock(pthread_mutex_t*);
 extern "C" int frame_client_startup_native_mutex_unlock(pthread_mutex_t*);
 extern "C" int frame_client_startup_native_connect(int,const struct sockaddr*,unsigned);
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+extern "C" int frame_client_startup_native_epoll_wait(int,struct epoll_event*,int,int);
+#if defined(__aarch64__)
+__asm__(".symver frame_client_startup_native_epoll_wait,epoll_wait@GLIBC_2.17");
+#elif defined(__x86_64__)
+__asm__(".symver frame_client_startup_native_epoll_wait,epoll_wait@GLIBC_2.3.2");
+#endif
+#endif
 #if defined(__aarch64__)
 __asm__(".symver frame_client_startup_native_mutex_init,__pthread_mutex_init@GLIBC_2.17");
 __asm__(".symver frame_client_startup_native_mutex_destroy,__pthread_mutex_destroy@GLIBC_2.17");
@@ -39,6 +49,7 @@ namespace audit=frame_import_startup_audit;
 namespace forwarding=frame_import_startup_forwarding;
 namespace connection=frame_client_connect;
 namespace resource=frame_client_resource;
+namespace resource_thread=frame_client_resource_thread;
 constexpr unsigned kQueueCapacity=32;
 enum State : unsigned { Empty,Preparing,Prepared,Attached,Starting,Observing,Completed,Refused };
 struct Slot { std::atomic<unsigned> state{0};Record value{}; };
@@ -80,6 +91,10 @@ struct Runtime {
     std::atomic<unsigned> resource_sample_completed{0};
     resource::Scope resource_scope{};
     bool resource_scope_ready=false;
+    alignas(resource_thread::Gate)std::array<unsigned char,sizeof(resource_thread::Gate)> resource_thread_storage{};
+    std::atomic<resource_thread::Gate*> resource_thread_gate{nullptr};
+    std::atomic<unsigned> resource_thread_stack_prepared{0};
+    std::uintptr_t native_epoll_wait=0;
     Reader* reader=nullptr; // Written/read solely on the startup owner thread.
 };
 Runtime runtime;
@@ -93,6 +108,7 @@ void retire(Refusal why) noexcept {
     auto expected=Refusal::None;
     runtime.refusal.compare_exchange_strong(expected,why,std::memory_order_acq_rel);
     forwarding::retire_evidence();
+    if(auto* cold=runtime.resource_thread_gate.load(std::memory_order_acquire))cold->retire();
     if(auto* gate=runtime.gate.load(std::memory_order_acquire))gate->observer_loss();
     if(auto* registry=runtime.registry.load(std::memory_order_acquire))registry->observer_loss();
 }
@@ -225,6 +241,58 @@ bool connection_providers(const frame_import_main::Prepared& prepared) noexcept 
         runtime.native_connection[i]=functions[i];
     }return true;
 }
+bool resource_thread_provider(const frame_import_main::Prepared& prepared) noexcept {
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+    const auto libc=prepared.images()[2];
+    const auto function=reinterpret_cast<std::uintptr_t>(&frame_client_startup_native_epoll_wait);
+    Dl_info info{};std::uintptr_t expected=0;
+    if(!add(libc.bias,0xe9e10,expected) || function!=expected || !within(libc,function) ||
+       !prepared.lookup()(reinterpret_cast<const void*>(function),&info) ||
+       reinterpret_cast<std::uintptr_t>(info.dli_fbase)!=libc.bias)return false;
+    runtime.native_epoll_wait=function;return true;
+#else
+    (void)prepared;return false;
+#endif
+}
+frame_import_startup::OwnedThreadStack prepare_resource_stack(void* owner) noexcept {
+    // Explicit cold decoder entry, before its first original event wait. The
+    // current thread owns its attributes throughout these native calls; no
+    // borrowed pthread_t crosses to a background thread. Helpers were verified
+    // once in sealed MAIN, and no attribute query runs from an import/lock or
+    // later event-wait callback. libc itself may allocate/lock in this cold work.
+    if(owner!=&runtime || !admission_alive())return {};
+    pthread_attr_t attributes;
+    if(::pthread_getattr_np(::pthread_self(),&attributes)!=0)return {};
+    void* base=nullptr;std::size_t size=0;
+    const auto got=::pthread_attr_getstack(&attributes,&base,&size);
+    const auto destroyed=::pthread_attr_destroy(&attributes);
+    const auto low=reinterpret_cast<std::uintptr_t>(base);
+    if(got || destroyed || size>std::numeric_limits<std::uintptr_t>::max()-low || !admission_alive())return {};
+    return frame_import_startup::OwnedThreadStack::prepare_current(low,low+size);
+}
+void resource_first_wait(const frame_import_native::Entry& entry) noexcept {
+    if(runtime.finalized.load(std::memory_order_acquire) || runtime.retired.load(std::memory_order_acquire))return;
+    auto* cold=runtime.resource_thread_gate.load(std::memory_order_acquire);
+    if(!runtime.setup.resource_thread_preparation || !cold)return;
+    // Account for the actual first source entry even if other native startup
+    // state has not arrived. Unavailable first preparation is terminal; it can
+    // never be moved into a later hot loop iteration.
+    const auto available=admission_alive() && runtime.state.load(std::memory_order_acquire)>=Attached;
+    const auto observed=cold->before_first_wait(entry,connection_owner_marker,
+        available?prepare_resource_stack:nullptr,&runtime);
+    if(observed.kind==resource_thread::Kind::None)return;
+    const auto prepared=observed.kind==resource_thread::Kind::Prepared;
+    auto value=record(prepared?Kind::ResourceThreadPrepared:Kind::ResourceThreadRefused);
+    value.entry=entry;value.resource_thread_reason=observed.reason;
+    value.resource_thread_stack_owned=prepared;
+    if(prepared) {
+        value.resource_stack=cold->region_current(connection_owner_marker);
+        runtime.resource_thread_stack_prepared.store(1,std::memory_order_release);
+    } else {
+        retire(Refusal::ResourceThread);value.refusal=runtime.refusal.load(std::memory_order_acquire);
+    }
+    enqueue(value);
+}
 bool start(const frame_import_native::Entry& entry) noexcept {
     const auto& receiver=runtime.images[0];std::uintptr_t site=0;
     if(!add(receiver.bias,0x2ae94,site) || entry.x[30]!=site || static_cast<std::uint32_t>(entry.x[1])!=1)return false;
@@ -324,6 +392,12 @@ void resource_boundary(frame_import_forwarding::Notification n) noexcept {
     if(value.kind==resource::Kind::None || !admission_alive())return;
     auto copied=record(value.kind==resource::Kind::Rejected?Kind::ResourceRefused:Kind::ResourceObserved);
     copied.entry=value.entry;copied.resource=value;
+    if(runtime.setup.resource_thread_preparation) {
+        if(auto* cold=runtime.resource_thread_gate.load(std::memory_order_acquire)) {
+            copied.resource_thread_stack_owned=cold->current(connection_owner_marker);
+            copied.resource_stack=cold->region_current(connection_owner_marker);
+        }
+    }
     copied.module=runtime.connection_target.module;copied.object=runtime.connection_target.object;
     if(value.kind==resource::Kind::Rejected) {
         retire(Refusal::ResourceScope);copied.refusal=runtime.refusal.load(std::memory_order_acquire);
@@ -445,6 +519,12 @@ bool initialize_once(const frame_import_main::Prepared& prepared,
     const std::uintptr_t connection_entries[]{setup.hidden_mutex_lock_entry,setup.hidden_mutex_unlock_entry,setup.hidden_connect_entry};
     runtime.connection_opt_in=connection_entries[0]||connection_entries[1]||connection_entries[2];
     if(setup.resource_register_census && !runtime.connection_opt_in)return deny(Refusal::Setup);
+    if(setup.resource_thread_preparation) {
+        if(!setup.resource_register_census || !within(images[4],setup.hidden_epoll_wait_entry))return deny(Refusal::Setup);
+        for(const auto entry:entries)if(entry==setup.hidden_epoll_wait_entry)return deny(Refusal::Setup);
+        for(const auto entry:connection_entries)if(entry==setup.hidden_epoll_wait_entry)return deny(Refusal::Setup);
+        if(!resource_thread_provider(prepared))return deny(Refusal::MutexProvider);
+    } else if(setup.hidden_epoll_wait_entry)return deny(Refusal::Setup);
     if(runtime.connection_opt_in) {
         for(unsigned i=0;i<3;++i) {
             if(!within(images[4],connection_entries[i]))return deny(Refusal::Setup);
@@ -465,6 +545,11 @@ bool initialize_once(const frame_import_main::Prepared& prepared,
     if(!mutex_providers(prepared))return deny(Refusal::MutexProvider);
     runtime.setup=setup;runtime.images=images;runtime.lookup=prepared.lookup();runtime.iterate=prepared.iterate();
     runtime.native_init=prepared.native_init();runtime.native_shutdown=prepared.native_shutdown();
+    if(setup.resource_thread_preparation) {
+        auto* cold=new(runtime.resource_thread_storage.data())resource_thread::Gate(
+            frame_import_startup::PreparedImage{images[0].bias,images[0].rx_begin,images[0].rx_end,images[0].expected_file_identity});
+        runtime.resource_thread_gate.store(cold,std::memory_order_release);
+    }
     runtime.refusal.store(Refusal::None,std::memory_order_release);
     auto* registry=new(runtime.registry_storage.data())Registry(setup.process_generation);
     runtime.registry.store(registry,std::memory_order_release);
@@ -513,11 +598,29 @@ audit::BridgeResponse bridge(audit::BridgeRequest request) noexcept {
         if(!runtime.state.compare_exchange_strong(expected,Attached,std::memory_order_acq_rel)) {
             retire(Refusal::Audit);enqueue(record(Kind::Loss));return {};
         }
+        if(runtime.setup.resource_thread_preparation) {
+            auto* cold=runtime.resource_thread_gate.load(std::memory_order_acquire);
+            if(!cold || !cold->arm_before_receiver_threads()) {
+                retire(Refusal::ResourceThread);enqueue(record(Kind::Loss));return {};
+            }
+        }
         auto value=record(Kind::AuditAttached);value.audit_bindings=request.provider;
         if(!enqueue(value)||!admission_alive())return {};
         return {true,0};
     }
     const auto function=request.provider.function;
+    if(request.stage==audit::Stage::Bind && function==audit::Function::EpollWait) {
+        const auto& p=request.provider;
+        if(!runtime.setup.resource_thread_preparation || !runtime.native_epoll_wait ||
+           runtime.state.load(std::memory_order_acquire)<Attached ||
+           !same_view(runtime.audit_libc,p.libc) ||
+           !same_view(runtime.audit_prepared.receiver,p.receiver) ||
+           !same_view(runtime.audit_prepared.api,p.api) ||
+           !same_view(runtime.audit_prepared.observer,p.observer) || p.original!=runtime.native_epoll_wait)return {};
+        auto value=record(Kind::ResourceThreadBound);value.audit_bindings=p;
+        if(!enqueue(value) || !admission_alive())return {};
+        return {true,runtime.setup.hidden_epoll_wait_entry};
+    }
     const bool connection_function=function==audit::Function::MutexLock||function==audit::Function::MutexUnlock||function==audit::Function::Connect;
     if(request.stage==audit::Stage::Bind&&
        (function==audit::Function::MutexInit||function==audit::Function::MutexDestroy||connection_function)) {
@@ -568,7 +671,8 @@ Status status() noexcept {
         runtime.retired.load(std::memory_order_acquire)!=0,runtime.finalized.load(std::memory_order_acquire)!=0,
         runtime.refusal.load(std::memory_order_acquire),runtime.queued.load(),runtime.drained.load(),
         runtime.connection_sample_completed.load(std::memory_order_acquire)!=0,
-        runtime.resource_sample_completed.load(std::memory_order_acquire)!=0};
+        runtime.resource_sample_completed.load(std::memory_order_acquire)!=0,
+        runtime.resource_thread_stack_prepared.load(std::memory_order_acquire)!=0};
 }
 bool pop(Record& out) noexcept {
     const auto next=runtime.drained.load(std::memory_order_relaxed);
@@ -583,4 +687,29 @@ void finalize() noexcept {
     if(runtime.finalized.exchange(1,std::memory_order_acq_rel))return;
     retire(Refusal::Finalized);
 }
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+std::uint64_t invoke_epoll_wait(const frame_import_native::Entry& entry) {
+    const auto incoming_errno=errno;
+    resource_first_wait(entry);
+    errno=incoming_errno;
+    using Native=int(*)(int,struct epoll_event*,int,int);
+    const auto native=runtime.native_epoll_wait?reinterpret_cast<Native>(runtime.native_epoll_wait):
+        &frame_client_startup_native_epoll_wait;
+    const auto integer=[](std::uint64_t bits) noexcept {
+        const auto word=static_cast<std::uint32_t>(bits);int value;
+        static_assert(sizeof(word)==sizeof(value),"Native epoll integer ABI changed");
+        std::memcpy(&value,&word,sizeof(value));return value;
+    };
+    // The actual public libc provider retains cancellation and native output.
+    // Never substitute a syscall, copy event bytes, or synthesize a return.
+    const auto result=native(integer(entry.x[0]),reinterpret_cast<struct epoll_event*>(entry.x[1]),
+                             integer(entry.x[2]),integer(entry.x[3]));
+    return static_cast<std::uint64_t>(static_cast<std::uint32_t>(result));
+}
+#endif
 } // namespace frame_client_startup
+#if defined(FRAME_CLIENT_RESOURCE_THREAD_PREPARATION)
+extern "C" std::uint64_t frame_client_startup_epoll_wait_dispatch(const frame_import_native::Entry* entry) {
+    return frame_client_startup::invoke_epoll_wait(*entry);
+}
+#endif

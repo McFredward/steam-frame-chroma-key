@@ -28,8 +28,8 @@ Slot slots[5];
 std::atomic<std::uint64_t> next_generation{1};
 std::atomic<bool> preinit_seen{false}, ready{false}, lost{false}, missed{false};
 std::atomic<bool> bridge_admitted{false};
-std::atomic<unsigned> binding_state[7];
-std::atomic<std::uintptr_t> entry_cache[7], original_cache[7];
+std::atomic<unsigned> binding_state[8];
+std::atomic<std::uintptr_t> entry_cache[8], original_cache[8];
 
 bool same_name(const char* a, const char* b) noexcept {
     if (!a || !b) return false;
@@ -55,6 +55,7 @@ bool mutex_scope(const Preparation& p) noexcept {
 bool connection_scope(const Preparation& p) noexcept {
     return p.native_mutex_lock_rva || p.native_mutex_unlock_rva || p.native_connect_rva;
 }
+bool resource_thread_scope(const Preparation& p) noexcept { return p.native_epoll_wait_rva!=0; }
 const Preparation* prepared() noexcept {
     const auto* p = preparation();
     if (!p || !p->owned_prepared_files || !p->receiver.loader_name || !p->api.loader_name ||
@@ -82,6 +83,12 @@ const Preparation* prepared() noexcept {
             for (unsigned j=i+1;j<5;++j)
                 if (providers[i]==providers[j]) return nullptr;
         }
+    }
+    if(resource_thread_scope(*p)) {
+        if(!connection_scope(*p) || !in_range(p->native_epoll_wait_rva,p->libc))return nullptr;
+        const std::uintptr_t other[]{p->native_mutex_init_rva,p->native_mutex_destroy_rva,
+            p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_connect_rva};
+        for(const auto rva:other)if(rva==p->native_epoll_wait_rva)return nullptr;
     }
     return p;
 }
@@ -176,11 +183,17 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
     if (!symbol) return 0; // A real loader invocation always supplies this pointer.
     const auto original = symbol->st_value;
     const auto* p = prepared();
-    if (!p || !reference || !definition || !flags ||
-        (*flags & (LA_SYMB_DLSYM | LA_SYMB_ALTVALUE))) return original;
+    if (!p || !reference || !definition || !flags) return original;
+    if(*flags & (LA_SYMB_DLSYM | LA_SYMB_ALTVALUE)) {
+        // A skipped first decoder wait cannot later become a cold entry.
+        // Legacy scopes retain their previous unchanged binding behavior.
+        if(resource_thread_scope(*p) && *reference==1 && *definition==5 &&
+           same_name(name,"epoll_wait"))loss();
+        return original;
+    }
     Function function;
     unsigned index;
-    bool mutex=false;
+    bool mutex=false,epoll=false;
     if (*reference==1 && *definition==2 && same_name(name,"VR_InitInternal2")) { function=Function::Init;index=0; }
     else if (*reference==1 && *definition==2 && same_name(name,"VR_ShutdownInternal")) { function=Function::Shutdown;index=1; }
     else if (mutex_scope(*p) && *reference==4 && *definition==5 && same_name(name,"pthread_mutex_init")) {
@@ -193,14 +206,17 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
         function=Function::MutexUnlock;index=5;mutex=true;
     } else if (connection_scope(*p) && *reference==4 && *definition==5 && same_name(name,"connect")) {
         function=Function::Connect;index=6;mutex=true;
+    } else if(resource_thread_scope(*p) && *reference==1 && *definition==5 && same_name(name,"epoll_wait")) {
+        function=Function::EpollWait;index=7;epoll=true;
     } else return original;
     BoundProvider provider{};
     if (!views(provider)) return original;
     std::uintptr_t expected_address{};
     if (mutex && !view(3,provider.client)) return original;
-    const auto& definition_view=mutex?provider.libc:provider.api;
+    const auto& definition_view=mutex||epoll?provider.libc:provider.api;
     const std::uintptr_t native_rvas[]{p->init_rva,p->shutdown_rva,p->native_mutex_init_rva,
-        p->native_mutex_destroy_rva,p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_connect_rva};
+        p->native_mutex_destroy_rva,p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_connect_rva,
+        p->native_epoll_wait_rva};
     const auto native_rva=native_rvas[index];
     if (!add(definition_view.bias,native_rva,expected_address) ||
         original!=expected_address || original<definition_view.rx_begin || original>=definition_view.rx_end) {

@@ -17,6 +17,11 @@ option(FRAME_MASK_CLIENT_CONNECT_OBSERVATION
     "Add opt-in register-only supported-connect observations; no socket lifetime or pixels" OFF)
 option(FRAME_MASK_CLIENT_RESOURCE_CENSUS
     "Census one register-only native import/reference timeline; no private or wire reads" OFF)
+option(FRAME_MASK_CLIENT_RESOURCE_THREAD_PREPARATION
+    "Prepare the actual decoder thread once before its first event wait; no transaction reads" OFF)
+if(FRAME_MASK_CLIENT_RESOURCE_THREAD_PREPARATION AND NOT FRAME_MASK_CLIENT_RESOURCE_CENSUS)
+    message(FATAL_ERROR "Resource thread preparation requires the explicit resource census scope")
+endif()
 if(FRAME_MASK_CLIENT_RESOURCE_CENSUS AND NOT FRAME_MASK_CLIENT_CONNECT_OBSERVATION)
     message(FATAL_ERROR "The resource census requires the explicit connect-observation scope")
 endif()
@@ -43,7 +48,7 @@ if(FRAME_MASK_BUILD_CLIENT_STARTUP)
     add_library(frame_client_startup SHARED
         receiver/client_startup_observer.cpp receiver/client_startup_runtime.cpp
         ${client_libc_entries} import/native_startup_entry.S
-        import/client_connect_observation.cpp import/client_resource_census.cpp
+        import/client_connect_observation.cpp import/client_resource_census.cpp import/client_resource_thread.cpp
         import/import_forwarding.cpp import/import_startup_forwarding.cpp
         import/import_main_preparation.cpp import/import_loader_reader.cpp
         import/import_module_identity.cpp import/import_startup_gate.cpp
@@ -62,6 +67,9 @@ if(FRAME_MASK_BUILD_CLIENT_STARTUP)
         # Offline staging authenticates the hidden scope marker in a dedicated
         # read-only, non-executable segment, independently of code bytes.
         target_link_options(frame_client_startup PRIVATE -Wl,-z,separate-code)
+    endif()
+    if(FRAME_MASK_CLIENT_RESOURCE_THREAD_PREPARATION)
+        target_compile_definitions(frame_client_startup PRIVATE FRAME_CLIENT_RESOURCE_THREAD_PREPARATION=1)
     endif()
 endif()
 if(FRAME_MASK_BUILD_STARTUP_AUDIT)
@@ -251,7 +259,7 @@ if(BUILD_TESTING)
             add_test(NAME import_startup_provider_forwarding COMMAND test_import_startup_forwarding)
             if(NOT CMAKE_CROSSCOMPILING)
                 set(client_startup_core_sources receiver/client_startup_runtime.cpp
-                    import/client_connect_observation.cpp import/client_resource_census.cpp
+                    import/client_connect_observation.cpp import/client_resource_census.cpp import/client_resource_thread.cpp
                     import/import_main_preparation.cpp import/import_loader_reader.cpp
                     import/import_module_identity.cpp import/import_startup_gate.cpp
                     import/native_client_birth.cpp import/import_pipe_epoch.cpp
@@ -274,9 +282,16 @@ if(BUILD_TESTING)
                 target_compile_options(test_client_resource_census PRIVATE -Wall -Wextra -Wpedantic)
                 target_link_libraries(test_client_resource_census PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
                 add_test(NAME client_resource_register_census COMMAND test_client_resource_census)
+                add_executable(test_client_resource_thread tests/test_client_resource_thread.cpp
+                    import/client_resource_thread.cpp import/import_startup_gate.cpp
+                    import/native_client_birth.cpp import/import_pipe_epoch.cpp)
+                target_include_directories(test_client_resource_thread PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+                target_compile_options(test_client_resource_thread PRIVATE -Wall -Wextra -Wpedantic)
+                target_link_libraries(test_client_resource_thread PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+                add_test(NAME client_resource_thread_preparation COMMAND test_client_resource_thread)
                 # Exercise actual pthread-owned stack bounds, not ASan's optional
                 # artificial return stack outside that native stack allocation.
-                set_tests_properties(client_resource_register_census PROPERTIES
+                set_tests_properties(client_resource_register_census client_resource_thread_preparation PROPERTIES
                     ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0:detect_leaks=1")
                 # Host controls deliberately contain no native public aliases
                 # or fabricated Ready. Actual ARM aliases are checked separately
@@ -305,6 +320,9 @@ if(BUILD_TESTING)
                 add_test(NAME client_connect_audit_binding COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py --connection
                     --record ${CMAKE_CURRENT_BINARY_DIR}/client-connect-audit-validation.json)
+                add_test(NAME client_resource_thread_audit_binding COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py --resource-thread
+                    --record ${CMAKE_CURRENT_BINARY_DIR}/client-resource-thread-audit-validation.json)
             endif()
             if(NOT CMAKE_CROSSCOMPILING)
                 add_library(import_loader_fixture SHARED tests/test_import_loader_reader.cpp)
