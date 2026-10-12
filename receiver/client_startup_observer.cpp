@@ -10,6 +10,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(FRAME_CLIENT_RESOURCE_CENSUS)
+// Retained, hidden read-only opt-in evidence for offline preparation/staging.
+extern "C" __attribute__((visibility("hidden"),used))
+const std::uint8_t frame_client_resource_census_scope[16]={
+    'F','C','C','E','N','S','0','1',3,0,0,0,0x18,0x2e,0,0};
+#endif
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_init_entry();
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_shutdown_entry();
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_init_entry();
@@ -96,7 +102,10 @@ bool read_envelope(const char* name,std::array<std::uint8_t,kEnvelopeBytes>& byt
 }
 bool decode(const std::array<std::uint8_t,kEnvelopeBytes>& b,frame_import_main::Profiles& profiles,
             frame_import_module::ProfileBlob& client,frame_client_startup::ClientSlot& slot) noexcept {
-#if defined(FRAME_CLIENT_CONNECT_OBSERVATION)
+#if defined(FRAME_CLIENT_RESOURCE_CENSUS)
+    const auto* envelope_magic=frame_client_resource_census_scope;
+    constexpr unsigned envelope_schema=3;
+#elif defined(FRAME_CLIENT_CONNECT_OBSERVATION)
     constexpr auto envelope_magic="FCCONN01";constexpr unsigned envelope_schema=2;
 #else
     constexpr auto envelope_magic="FCSTART1";constexpr unsigned envelope_schema=1;
@@ -188,8 +197,17 @@ void record(Line& line,const frame_client_startup::Record& r) noexcept {
         connect_observed&&r.connection.native_result==0?"true":"false",r.connection.argument_fd,r.connection.native_result,
         r.connection.preserved_errno,unsigned(r.connection.reason));
     line.add(",\"actual_init_token\":%u,\"actual_native_result\":%d,\"errno\":%d,\"gate_refusal\":%u,\"refusal\":%u,"
-             "\"source_frame_proven\":false,\"native_namespace_proven\":false,\"accepted_submit_proven\":false,\"gpu_proven\":false}\n",
+             "\"source_frame_proven\":false,\"native_namespace_proven\":false,\"accepted_submit_proven\":false,\"gpu_proven\":false",
         r.actual_init_token,r.actual_native_result,r.preserved_errno,unsigned(r.gate_refusal),unsigned(r.refusal));
+    if(r.kind==frame_client_startup::Kind::ResourceObserved || r.kind==frame_client_startup::Kind::ResourceRefused) {
+        const auto& c=r.resource;
+        line.add(",\"resource_census\":{\"boundary\":%u,\"phase\":%u,\"native_result_available\":%s,"
+                 "\"native_result\":%d,\"errno\":%d,\"reason\":%u,\"startup_thread_stack_owned\":%s,"
+                 "\"private_bytes_read\":0,\"wire_bytes_read\":0,\"transaction_accepted\":false,\"resource_namespace_associated\":false}",
+            unsigned(c.boundary),unsigned(c.phase),c.native_result_available?"true":"false",
+            c.native_result,c.preserved_errno,unsigned(c.reason),c.startup_thread_stack_owned?"true":"false");
+    }
+    line.add("}\n");
 }
 void* write_background(void*) noexcept {
     const int fd=open_output();if(fd<0){disarm_owned();return nullptr;}
@@ -197,10 +215,14 @@ void* write_background(void*) noexcept {
     Line header;header.add("{\"schema\":1,\"capture\":\"client_startup\",\"pid\":%ld,\"local_process_label\":%llu,\"reviewed_observer_profile\":\"",long(getpid()),static_cast<unsigned long long>(local_process_label));
     header.hex(reviewed_observer);header.add("\",\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120,\"mask_enabled\":false");
 #if defined(FRAME_CLIENT_CONNECT_OBSERVATION)
-    header.add(",\"connect_register_observation\":true,\"connect_private_bytes_read\":0}\n");
+    header.add(",\"connect_register_observation\":true,\"connect_private_bytes_read\":0");
 #else
-    header.add(",\"connect_register_observation\":false}\n");
+    header.add(",\"connect_register_observation\":false");
 #endif
+#if defined(FRAME_CLIENT_RESOURCE_CENSUS)
+    header.add(",\"resource_register_census\":true,\"resource_private_bytes_read\":0");
+#endif
+    header.add("}\n");
     if(!header.valid||!write_owned(fd,header.bytes.data(),header.used)){close(fd);disarm_owned();return nullptr;}bytes=header.used;
     while(owned_process()&&!stopping.load(std::memory_order_acquire)) {
         const auto time=now();if(!started||!time||time<started||time-started>=kDurationNs){end="deadline";break;}
@@ -216,8 +238,10 @@ void* write_background(void*) noexcept {
     // changes loader configuration, rolls back installation or affects pixels.
     if(!owned_process()){close(fd);active.store(false,std::memory_order_release);return nullptr;}
     frame_client_startup::finalize();const auto status=frame_client_startup::status();
-    Line footer;footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%zu,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,\"startup_completed\":%s,\"refusal\":%u,\"finalized\":true}\n",
-        end,records,bytes,static_cast<unsigned long long>(status.queued),static_cast<unsigned long long>(status.drained),status.startup_completed?"true":"false",unsigned(status.refusal));
+    Line footer;footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%zu,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,\"startup_completed\":%s,\"refusal\":%u,\"finalized\":true,"
+        "\"connect_sample_completed\":%s,\"resource_sample_completed\":%s}\n",
+        end,records,bytes,static_cast<unsigned long long>(status.queued),static_cast<unsigned long long>(status.drained),status.startup_completed?"true":"false",unsigned(status.refusal),
+        status.connect_sample_completed?"true":"false",status.resource_sample_completed?"true":"false");
     if(footer.valid&&footer.used<=kOutputBytes-bytes)write_owned(fd,footer.bytes.data(),footer.used);
     close(fd);active.store(false,std::memory_order_release);return nullptr;
 }
@@ -241,6 +265,9 @@ __attribute__((constructor)) void begin_observer() noexcept {
     setup.hidden_mutex_lock_entry=reinterpret_cast<std::uintptr_t>(&frame_import_lock_entry);
     setup.hidden_mutex_unlock_entry=reinterpret_cast<std::uintptr_t>(&frame_import_unlock_entry);
     setup.hidden_connect_entry=reinterpret_cast<std::uintptr_t>(&frame_import_connect_entry);
+#endif
+#if defined(FRAME_CLIENT_RESOURCE_CENSUS)
+    setup.resource_register_census=true;
 #endif
     if(!frame_client_startup::initialize_once(prepared,client,setup)){errno=saved;return;}
     if(!register_child_retirement(prepared)){frame_client_startup::finalize();errno=saved;return;}

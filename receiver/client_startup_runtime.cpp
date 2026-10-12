@@ -1,4 +1,5 @@
 #include "client_startup_runtime.h"
+#include "../import/client_thread_marker.h"
 
 #include <atomic>
 #include <cstring>
@@ -37,6 +38,7 @@ using Registry=frame_import_pipe::Registry;
 namespace audit=frame_import_startup_audit;
 namespace forwarding=frame_import_startup_forwarding;
 namespace connection=frame_client_connect;
+namespace resource=frame_client_resource;
 constexpr unsigned kQueueCapacity=32;
 enum State : unsigned { Empty,Preparing,Prepared,Attached,Starting,Observing,Completed,Refused };
 struct Slot { std::atomic<unsigned> state{0};Record value{}; };
@@ -71,6 +73,13 @@ struct Runtime {
     // They do not inflate every inherited Steam process/thread's static TLS.
     connection::Scope connection_scope{};
     bool connection_scope_ready=false;
+    frame_import_startup::OwnedThreadStack startup_stack{};
+    alignas(resource::Gate)std::array<unsigned char,sizeof(resource::Gate)> resource_storage{};
+    std::atomic<resource::Gate*> resource_gate{nullptr};
+    std::atomic<std::uintptr_t> resource_owner{0};
+    std::atomic<unsigned> resource_sample_completed{0};
+    resource::Scope resource_scope{};
+    bool resource_scope_ready=false;
     Reader* reader=nullptr; // Written/read solely on the startup owner thread.
 };
 Runtime runtime;
@@ -238,6 +247,9 @@ bool start(const frame_import_native::Entry& entry) noexcept {
     if(!stack.current() || runtime.retired.load(std::memory_order_acquire) || losses()) {
         retire(Refusal::Stack);return false;
     }
+    runtime.startup_stack=stack;
+    // A fresh thread reusing a TLS address starts at 0, without this birth mark.
+    frame_client_thread::claim(connection_owner_marker,frame_client_thread::kStartup);
     runtime.reader=new(runtime.reader_storage.data())Reader(runtime.profile,runtime.iterate,
                                                           runtime.setup.local_verification_label);
     frame_import_startup::Prepared prepared{};
@@ -281,6 +293,43 @@ void startup(forwarding::Notification n,void* owner) noexcept {
     else runtime.state.store(Completed,std::memory_order_release);
     value.gate_refusal=gate->refusal();value.refusal=runtime.refusal.load(std::memory_order_acquire);enqueue(value);
 }
+void resource_boundary(frame_import_forwarding::Notification n) noexcept {
+    if(!runtime.setup.resource_register_census ||
+       !runtime.connection_sample_completed.load(std::memory_order_acquire) ||
+       runtime.resource_sample_completed.load(std::memory_order_acquire))return;
+    auto* observer=runtime.resource_gate.load(std::memory_order_acquire);if(!observer)return;
+    if(n.operation!=frame_import_forwarding::Operation::Lock &&
+       n.operation!=frame_import_forwarding::Operation::Unlock)return;
+    const auto owner_id=reinterpret_cast<std::uintptr_t>(&connection_owner_marker);
+    auto sampling_owner=runtime.resource_owner.load(std::memory_order_acquire);
+    if(!sampling_owner) {
+        if(n.operation!=frame_import_forwarding::Operation::Lock ||
+           n.phase!=frame_import_forwarding::Phase::Before ||
+           n.entry.x[30]!=runtime.connection_target.module.load_bias+0x3623c0 ||
+           n.entry.x[0]!=runtime.connection_target.object.pipe ||
+           n.entry.x[21]!=runtime.connection_target.object.pipe)return;
+        if(runtime.resource_owner.compare_exchange_strong(sampling_owner,owner_id,std::memory_order_acq_rel)) {
+            frame_client_thread::claim(connection_owner_marker,frame_client_thread::kResource);sampling_owner=owner_id;
+        }
+    }
+    // Reused thread storage has marker 0 and cannot adopt the old sampler.
+    if(sampling_owner!=owner_id || !frame_client_thread::claimed(connection_owner_marker,frame_client_thread::kResource))return;
+    if(!runtime.resource_scope_ready) {
+        runtime.resource_scope=resource::Scope::prepare_current(
+            frame_client_thread::startup_stack_owned(connection_owner_marker,runtime.startup_stack.current()));
+        runtime.resource_scope_ready=true;
+    }
+    const auto value=observer->observe(n,runtime.resource_scope);
+    if(runtime.resource_scope.complete())runtime.resource_sample_completed.store(1,std::memory_order_release);
+    if(value.kind==resource::Kind::None || !admission_alive())return;
+    auto copied=record(value.kind==resource::Kind::Rejected?Kind::ResourceRefused:Kind::ResourceObserved);
+    copied.entry=value.entry;copied.resource=value;
+    copied.module=runtime.connection_target.module;copied.object=runtime.connection_target.object;
+    if(value.kind==resource::Kind::Rejected) {
+        retire(Refusal::ResourceScope);copied.refusal=runtime.refusal.load(std::memory_order_acquire);
+    }
+    enqueue(copied);
+}
 void libc(frame_import_forwarding::Notification n,void* owner) noexcept {
     if(owner!=&runtime || runtime.finalized.load(std::memory_order_acquire) ||
        runtime.retired.load(std::memory_order_acquire) || losses())return;
@@ -299,6 +348,7 @@ void libc(frame_import_forwarding::Notification n,void* owner) noexcept {
                 copied.entry=n.entry;copied.object=runtime.connection_target.object;
                 copied.module=runtime.connection_target.module;enqueue(copied);return;
             }
+            resource_boundary(n);
             // Claim only one supported native invocation. This TLS address is
             // local sampler bookkeeping, never a socket or source-frame ID.
             // Later native RPC locks, including other caller threads, are not
@@ -313,12 +363,12 @@ void libc(frame_import_forwarding::Notification n,void* owner) noexcept {
                    n.entry.x[19]!=runtime.connection_target.object.pipe ||
                    n.entry.x[30]!=runtime.connection_target.module.load_bias+0x245ea8)return;
                 if(runtime.connection_owner.compare_exchange_strong(sampling_owner,owner_id,std::memory_order_acq_rel)) {
-                    connection_owner_marker=1;sampling_owner=owner_id;
+                    frame_client_thread::claim(connection_owner_marker,frame_client_thread::kConnection);sampling_owner=owner_id;
                 }
             }
             // A later thread reusing the same TLS address starts with marker 0
             // and cannot adopt another thread's unfinished sampler state.
-            if(sampling_owner!=owner_id || connection_owner_marker!=1)return;
+            if(sampling_owner!=owner_id || !frame_client_thread::claimed(connection_owner_marker,frame_client_thread::kConnection))return;
             if(!runtime.connection_scope_ready) {
                 runtime.connection_scope=connection::Scope::prepare_current();runtime.connection_scope_ready=true;
             }
@@ -356,6 +406,10 @@ void libc(frame_import_forwarding::Notification n,void* owner) noexcept {
                 runtime.connection_target={value.module,object};
                 auto* observer=new(runtime.connection_storage.data())connection::Gate(runtime.connection_target);
                 runtime.connection_gate.store(observer,std::memory_order_release);
+                if(runtime.setup.resource_register_census) {
+                    auto* resource_observer=new(runtime.resource_storage.data())resource::Gate(runtime.connection_target);
+                    runtime.resource_gate.store(resource_observer,std::memory_order_release);
+                }
             }
             enqueue(value);
         }else if(gate->refusal()!=frame_import_startup::Refusal::None) {
@@ -390,6 +444,7 @@ bool initialize_once(const frame_import_main::Prepared& prepared,
     for(unsigned i=0;i<4;++i)for(unsigned j=i+1;j<4;++j)if(entries[i]==entries[j])return deny(Refusal::Setup);
     const std::uintptr_t connection_entries[]{setup.hidden_mutex_lock_entry,setup.hidden_mutex_unlock_entry,setup.hidden_connect_entry};
     runtime.connection_opt_in=connection_entries[0]||connection_entries[1]||connection_entries[2];
+    if(setup.resource_register_census && !runtime.connection_opt_in)return deny(Refusal::Setup);
     if(runtime.connection_opt_in) {
         for(unsigned i=0;i<3;++i) {
             if(!within(images[4],connection_entries[i]))return deny(Refusal::Setup);
@@ -511,7 +566,9 @@ Status status() noexcept {
     return {s>=Prepared && s!=Refused,s>=Attached && s!=Refused,
         runtime.gate.load(std::memory_order_acquire)!=nullptr,s==Completed,
         runtime.retired.load(std::memory_order_acquire)!=0,runtime.finalized.load(std::memory_order_acquire)!=0,
-        runtime.refusal.load(std::memory_order_acquire),runtime.queued.load(),runtime.drained.load()};
+        runtime.refusal.load(std::memory_order_acquire),runtime.queued.load(),runtime.drained.load(),
+        runtime.connection_sample_completed.load(std::memory_order_acquire)!=0,
+        runtime.resource_sample_completed.load(std::memory_order_acquire)!=0};
 }
 bool pop(Record& out) noexcept {
     const auto next=runtime.drained.load(std::memory_order_relaxed);

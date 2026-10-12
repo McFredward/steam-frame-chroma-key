@@ -5,6 +5,7 @@
 #include "../import/import_startup_forwarding.h"
 #include "../import/import_startup_gate.h"
 #include "../import/client_connect_observation.h"
+#include "../import/client_resource_census.h"
 
 namespace frame_client_startup {
 
@@ -24,16 +25,18 @@ struct Setup {
     std::uintptr_t hidden_mutex_init_entry=0,hidden_mutex_destroy_entry=0;
     // All zero retains startup-only scope; partial connection opt-in is refused.
     std::uintptr_t hidden_mutex_lock_entry=0,hidden_mutex_unlock_entry=0,hidden_connect_entry=0;
+    bool resource_register_census=false;
 };
 enum class Refusal : unsigned {
     None,Unprepared,MainPreparation,ClientProfile,Setup,Providers,Subscriber,
     Audit,Stack,Gate,ClientName,ClientGeometry,RecordLoss,NotificationLoss,
     InitializationFailure,Shutdown,Unload,Finalized,MutexProvider,ClientBinding,
-    ConnectionScope,ObjectDestroyed,ObjectReinitialized
+    ConnectionScope,ObjectDestroyed,ObjectReinitialized,ResourceScope
 };
 enum class Kind : unsigned {
     Prepared,AuditAttached,InitBefore,ClientMapped,PipeBorn,InitAfter,
-    InitAbandon,Shutdown,Retire,Refused,Loss,MutexBound,ConnectObserved,ConnectRefused
+    InitAbandon,Shutdown,Retire,Refused,Loss,MutexBound,ConnectObserved,ConnectRefused,
+    ResourceObserved,ResourceRefused
 };
 struct Record {
     Kind kind=Kind::Refused;
@@ -55,12 +58,15 @@ struct Record {
     Refusal refusal=Refusal::None;
     // Register-only local invocation evidence, never an FD or namespace lease.
     frame_client_connect::Outcome connection{};
+    frame_client_resource::Outcome resource{};
 };
 struct Status {
     bool prepared=false,audit_attached=false,gate_constructed=false;
     bool startup_completed=false,retired=false,finalized=false;
     Refusal refusal=Refusal::Unprepared;
     std::uint64_t queued=0,drained=0;
+    // Historical sampler outcomes, never descriptor/transaction ownership.
+    bool connect_sample_completed=false,resource_sample_completed=false;
 };
 
 // Explicit root constructor/preinit integration only; there is no constructor,

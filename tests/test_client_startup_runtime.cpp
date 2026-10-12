@@ -32,6 +32,7 @@ int main() {
     const auto empty=runtime::status();
     check(!empty.prepared && !empty.audit_attached && !empty.gate_constructed &&
           !empty.startup_completed && !empty.retired && !empty.finalized,"Runtime activated automatically");
+    check(!empty.connect_sample_completed && !empty.resource_sample_completed,"Empty glue invented completed native samples");
     check(!runtime::registry() && !runtime::pop(record),"Unprepared runtime invented a registry/record");
     check(!frame_import_forwarding::callbacks_registered() &&
           !frame_import_startup_forwarding::providers_prepared(),"Native subscribers activated automatically");
@@ -86,6 +87,7 @@ int main() {
     runtime::finalize();const auto closed=runtime::status();
     check(closed.finalized && closed.retired && !closed.prepared && !closed.gate_constructed,
           "Finalizer did not leave an inert capability");
+    check(!closed.connect_sample_completed && !closed.resource_sample_completed,"Finalization invented native sample success");
     const auto queued=closed.queued;
     request={};inert(request);request.stage=audit::Stage::Bind;inert(request);
     request.stage=audit::Stage::Retire;request.retired_module.observed_open_generation=77;inert(request);

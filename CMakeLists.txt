@@ -15,6 +15,11 @@ option(FRAME_MASK_BUILD_CLIENT_STARTUP
     "Build the uninstalled, source-pinned AArch64 passive client startup observer" OFF)
 option(FRAME_MASK_CLIENT_CONNECT_OBSERVATION
     "Add opt-in register-only supported-connect observations; no socket lifetime or pixels" OFF)
+option(FRAME_MASK_CLIENT_RESOURCE_CENSUS
+    "Census one register-only native import/reference timeline; no private or wire reads" OFF)
+if(FRAME_MASK_CLIENT_RESOURCE_CENSUS AND NOT FRAME_MASK_CLIENT_CONNECT_OBSERVATION)
+    message(FATAL_ERROR "The resource census requires the explicit connect-observation scope")
+endif()
 set(FRAME_MASK_IMPORT_QEMU "" CACHE FILEPATH "Explicit local qemu-aarch64 for optional native ABI checks")
 set(FRAME_MASK_IMPORT_PROVIDERS "" CACHE PATH "Private pinned Frame libc/loader prefix for native ABI checks")
 set(FRAME_MASK_IMPORT_CLIENT_PROFILE "" CACHE FILEPATH "Private prepared client hash/layout profile")
@@ -38,7 +43,7 @@ if(FRAME_MASK_BUILD_CLIENT_STARTUP)
     add_library(frame_client_startup SHARED
         receiver/client_startup_observer.cpp receiver/client_startup_runtime.cpp
         ${client_libc_entries} import/native_startup_entry.S
-        import/client_connect_observation.cpp
+        import/client_connect_observation.cpp import/client_resource_census.cpp
         import/import_forwarding.cpp import/import_startup_forwarding.cpp
         import/import_main_preparation.cpp import/import_loader_reader.cpp
         import/import_module_identity.cpp import/import_startup_gate.cpp
@@ -51,6 +56,12 @@ if(FRAME_MASK_BUILD_CLIENT_STARTUP)
     target_link_libraries(frame_client_startup PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     if(FRAME_MASK_CLIENT_CONNECT_OBSERVATION)
         target_compile_definitions(frame_client_startup PRIVATE FRAME_CLIENT_CONNECT_OBSERVATION=1)
+    endif()
+    if(FRAME_MASK_CLIENT_RESOURCE_CENSUS)
+        target_compile_definitions(frame_client_startup PRIVATE FRAME_CLIENT_RESOURCE_CENSUS=1)
+        # Offline staging authenticates the hidden scope marker in a dedicated
+        # read-only, non-executable segment, independently of code bytes.
+        target_link_options(frame_client_startup PRIVATE -Wl,-z,separate-code)
     endif()
 endif()
 if(FRAME_MASK_BUILD_STARTUP_AUDIT)
@@ -240,7 +251,7 @@ if(BUILD_TESTING)
             add_test(NAME import_startup_provider_forwarding COMMAND test_import_startup_forwarding)
             if(NOT CMAKE_CROSSCOMPILING)
                 set(client_startup_core_sources receiver/client_startup_runtime.cpp
-                    import/client_connect_observation.cpp
+                    import/client_connect_observation.cpp import/client_resource_census.cpp
                     import/import_main_preparation.cpp import/import_loader_reader.cpp
                     import/import_module_identity.cpp import/import_startup_gate.cpp
                     import/native_client_birth.cpp import/import_pipe_epoch.cpp
@@ -256,6 +267,17 @@ if(BUILD_TESTING)
                 target_include_directories(test_client_connect_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
                 target_compile_options(test_client_connect_observation PRIVATE -Wall -Wextra -Wpedantic)
                 add_test(NAME client_connect_register_observation COMMAND test_client_connect_observation)
+                add_executable(test_client_resource_census tests/test_client_resource_census.cpp
+                    import/client_resource_census.cpp import/client_connect_observation.cpp
+                    import/import_startup_gate.cpp import/native_client_birth.cpp import/import_pipe_epoch.cpp)
+                target_include_directories(test_client_resource_census PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+                target_compile_options(test_client_resource_census PRIVATE -Wall -Wextra -Wpedantic)
+                target_link_libraries(test_client_resource_census PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+                add_test(NAME client_resource_register_census COMMAND test_client_resource_census)
+                # Exercise actual pthread-owned stack bounds, not ASan's optional
+                # artificial return stack outside that native stack allocation.
+                set_tests_properties(client_resource_register_census PROPERTIES
+                    ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0:detect_leaks=1")
                 # Host controls deliberately contain no native public aliases
                 # or fabricated Ready. Actual ARM aliases are checked separately
                 # with the explicitly supplied final ELF and pinned providers.
