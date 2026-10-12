@@ -24,12 +24,12 @@ struct Slot {
     std::atomic<std::uintptr_t> bias{0}, begin{0}, end{0};
     std::atomic<std::uint64_t> generation{0};
 };
-Slot slots[4];
+Slot slots[5];
 std::atomic<std::uint64_t> next_generation{1};
 std::atomic<bool> preinit_seen{false}, ready{false}, lost{false}, missed{false};
 std::atomic<bool> bridge_admitted{false};
-std::atomic<unsigned> binding_state[2];
-std::atomic<std::uintptr_t> entry_cache[2], original_cache[2];
+std::atomic<unsigned> binding_state[4];
+std::atomic<std::uintptr_t> entry_cache[4], original_cache[4];
 
 bool same_name(const char* a, const char* b) noexcept {
     if (!a || !b) return false;
@@ -49,6 +49,9 @@ bool in_range(std::uintptr_t rva, const ModulePreparation& module) noexcept {
     return module.rx_rva_begin < module.rx_rva_end &&
            rva >= module.rx_rva_begin && rva < module.rx_rva_end;
 }
+bool mutex_scope(const Preparation& p) noexcept {
+    return p.libc.loader_name || p.native_mutex_init_rva || p.native_mutex_destroy_rva;
+}
 const Preparation* prepared() noexcept {
     const auto* p = preparation();
     if (!p || !p->owned_prepared_files || !p->receiver.loader_name || !p->api.loader_name ||
@@ -56,6 +59,17 @@ const Preparation* prepared() noexcept {
         !in_range(p->init_rva, p->api) || !in_range(p->shutdown_rva, p->api) ||
         p->init_rva == p->shutdown_rva || p->receiver.rx_rva_begin >= p->receiver.rx_rva_end ||
         same_name(p->api.loader_name, p->observer.loader_name)) return nullptr;
+    if (mutex_scope(*p)) {
+        if (!p->client.loader_name || !p->libc.loader_name ||
+            p->client.rx_rva_begin >= p->client.rx_rva_end ||
+            !in_range(p->native_mutex_init_rva,p->libc) ||
+            !in_range(p->native_mutex_destroy_rva,p->libc) ||
+            p->native_mutex_init_rva==p->native_mutex_destroy_rva) return nullptr;
+        const ModulePreparation* modules[]{&p->receiver,&p->api,&p->observer,&p->client,&p->libc};
+        for (unsigned i=0;i<5;++i)
+            for (unsigned j=i+1;j<5;++j)
+                if (same_name(modules[i]->loader_name,modules[j]->loader_name)) return nullptr;
+    }
     return p;
 }
 bool view(unsigned index, ModuleView& output) noexcept {
@@ -66,7 +80,11 @@ bool view(unsigned index, ModuleView& output) noexcept {
     return slot.state.load(std::memory_order_acquire) == Alive && output.observed_open_generation;
 }
 bool views(BoundProvider& output) noexcept {
-    return view(0, output.receiver) && view(1, output.api) && view(2, output.observer) && !lost.load();
+    const auto* p=prepared();
+    if (!p || !view(0,output.receiver) || !view(1,output.api) || !view(2,output.observer) ||
+        (mutex_scope(*p) && !view(4,output.libc)) || lost.load()) return false;
+    (void)view(3,output.client); // Client is naturally absent at initial preinit.
+    return true;
 }
 std::uintptr_t bridge_address(const Preparation& p, const ModuleView& observer) noexcept {
     std::uintptr_t address{};
@@ -86,8 +104,8 @@ AUDIT_EXPORT unsigned int la_objopen(link_map* map, Lmid_t lmid, std::uintptr_t*
     *cookie = 0;
     const auto* p = prepared();
     if (!p || !map || lmid != LM_ID_BASE) return 0;
-    const ModulePreparation* modules[] = {&p->receiver, &p->api, &p->observer, &p->client};
-    for (unsigned index = 0; index < 4; ++index) {
+    const ModulePreparation* modules[] = {&p->receiver, &p->api, &p->observer, &p->client, &p->libc};
+    for (unsigned index = 0; index < 5; ++index) {
         const auto& module = *modules[index];
         if (!module.loader_name || module.rx_rva_begin >= module.rx_rva_end) continue;
         if (!same_name(map->l_name, module.loader_name)) continue;
@@ -103,7 +121,8 @@ AUDIT_EXPORT unsigned int la_objopen(link_map* map, Lmid_t lmid, std::uintptr_t*
         slot.bias.store(map->l_addr); slot.begin.store(begin); slot.end.store(end); slot.generation.store(generation);
         slot.state.store(Alive, std::memory_order_release);
         *cookie = index + 1;
-        return index == 0 ? LA_FLG_BINDFROM : index == 1 ? LA_FLG_BINDTO : 0;
+        return index == 0 || (index == 3 && mutex_scope(*p)) ? LA_FLG_BINDFROM :
+               index == 1 || (index == 4 && mutex_scope(*p)) ? LA_FLG_BINDTO : 0;
     }
     return 0;
 }
@@ -129,18 +148,27 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
     if (!symbol) return 0; // A real loader invocation always supplies this pointer.
     const auto original = symbol->st_value;
     const auto* p = prepared();
-    if (!p || !reference || !definition || !flags || *reference != 1 || *definition != 2 ||
+    if (!p || !reference || !definition || !flags ||
         (*flags & (LA_SYMB_DLSYM | LA_SYMB_ALTVALUE))) return original;
     Function function;
     unsigned index;
-    if (same_name(name, "VR_InitInternal2")) { function = Function::Init; index = 0; }
-    else if (same_name(name, "VR_ShutdownInternal")) { function = Function::Shutdown; index = 1; }
-    else return original;
+    bool mutex=false;
+    if (*reference==1 && *definition==2 && same_name(name,"VR_InitInternal2")) { function=Function::Init;index=0; }
+    else if (*reference==1 && *definition==2 && same_name(name,"VR_ShutdownInternal")) { function=Function::Shutdown;index=1; }
+    else if (mutex_scope(*p) && *reference==4 && *definition==5 && same_name(name,"pthread_mutex_init")) {
+        function=Function::MutexInit;index=2;mutex=true;
+    } else if (mutex_scope(*p) && *reference==4 && *definition==5 && same_name(name,"pthread_mutex_destroy")) {
+        function=Function::MutexDestroy;index=3;mutex=true;
+    } else return original;
     BoundProvider provider{};
     if (!views(provider)) return original;
     std::uintptr_t expected_address{};
-    if (!add(provider.api.bias, index == 0 ? p->init_rva : p->shutdown_rva, expected_address) ||
-        original != expected_address || original < provider.api.rx_begin || original >= provider.api.rx_end) {
+    if (mutex && !view(3,provider.client)) return original;
+    const auto& definition_view=mutex?provider.libc:provider.api;
+    const auto native_rva=mutex?(index==2?p->native_mutex_init_rva:p->native_mutex_destroy_rva):
+                                  (index==0?p->init_rva:p->shutdown_rva);
+    if (!add(definition_view.bias,native_rva,expected_address) ||
+        original!=expected_address || original<definition_view.rx_begin || original>=definition_view.rx_end) {
         loss(); return original;
     }
     if (!preinit_seen.load()) { missed.store(true); return original; }
@@ -169,7 +197,7 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
 }
 
 AUDIT_EXPORT unsigned int la_objclose(std::uintptr_t* cookie) {
-    if (cookie && *cookie >= 1 && *cookie <= 4) {
+    if (cookie && *cookie >= 1 && *cookie <= 5) {
         BridgeRequest request{};
         request.stage = Stage::Retire;
         request.missed_before_preinit = missed.load();
@@ -180,6 +208,8 @@ AUDIT_EXPORT unsigned int la_objclose(std::uintptr_t* cookie) {
             // owned main-observer bridge are still live until callback return.
             (void)view(0, request.provider.receiver);
             (void)view(1, request.provider.api);
+            (void)view(3, request.provider.client);
+            (void)view(4, request.provider.libc);
             const auto address = bridge_address(*p, request.provider.observer);
             if (address) (void)reinterpret_cast<Bridge>(address)(request);
         }
