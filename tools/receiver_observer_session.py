@@ -20,8 +20,8 @@ import stat
 import subprocess
 import time
 
-UNIT = "steamvr.service"
-SCHEMA = "frame-receiver-observer-proposal-v1"
+UNIT = "steam.service"
+SCHEMA = "frame-receiver-observer-proposal-v2"
 LIMIT = 1048576
 RECEIVER = "0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b"
 PREFIX = "FRAME_RECEIVER_"
@@ -99,15 +99,17 @@ def json_bytes(value):
 
 
 class Session:
-    def __init__(self, home, runtime, run=subprocess.run, environment=None):
+    def __init__(self, home, runtime, run=subprocess.run, environment=None, proc_root=Path("/proc")):
         self.home, self.runtime = safe_path(home), safe_path(runtime)
         self.folder = self.home / ".local/share/frame-receiver-observer"
-        self.dropin = self.runtime / "systemd/user/steamvr.service.d/91-frame-receiver-observer.conf"
+        self.dropin = self.runtime / "systemd/user/steam.service.d/91-frame-receiver-observer.conf"
+        self.old_dropin = self.runtime / "systemd/user/steamvr.service.d/91-frame-receiver-observer.conf"
         self.library = self.folder / "libframe_receiver_observer.so"
         self.capture = self.folder / "capture.jsonl"
         self.marker = self.folder / "arm.marker"
         self.run = run
         self.environment = dict(os.environ if environment is None else environment)
+        self.proc = Path(proc_root)
 
     def command(self, *args):
         result = self.run(("systemctl", "--user", *args), check=False, timeout=45,
@@ -238,6 +240,7 @@ class Session:
             raise RuntimeError("Reviewed plan fingerprint mismatch")
         plan = json.loads(raw)
         if (plan.get("schema") != SCHEMA or plan.get("offline_files_supported") is not True
+                or plan.get("receiver_service") != UNIT
                 or plan.get("installed") is not False or plan.get("runtime_authorized") is not False
                 or plan.get("proposed_owned_directory") != str(self.folder)
                 or plan.get("proposed_runtime_dropin_basename") != self.dropin.name
@@ -269,6 +272,9 @@ class Session:
             raise RuntimeError("Private scalar/preload scope and restart readiness acknowledgments required")
         safe_path(self.folder)
         safe_path(self.dropin)
+        safe_path(self.old_dropin)
+        if self.old_dropin.exists() or self.old_dropin.is_symlink():
+            raise RuntimeError("Old SteamVR activation remains; use its original session helper for rollback")
         if self.folder.exists() or self.dropin.exists():
             raise RuntimeError("Existing session or activation refused")
         raw, plan, files, binary = self.plan(path, expected, inputs)
@@ -283,7 +289,8 @@ class Session:
         exclusive(self.folder / "operation.lock", b"")
         exclusive(self.folder / "session.jsonl", b"")
         with self.lock():
-            manifest = {"schema": "receiver-observer-owned-session-v1", "scope_acknowledged": True,
+            manifest = {"schema": "receiver-observer-owned-session-v2", "receiver_service": UNIT,
+                        "scope_acknowledged": True,
                         "plan_sha256": expected, "original_service": original,
                         "original_manager_environment": original_manager,
                         "original_environment_files": original_environment_files, "native_files": files,
@@ -317,7 +324,8 @@ class Session:
         self.private_folder()
         manifest = json.loads(read_regular(self.folder / "owned.json", private=True))
         expected = self.activation()
-        if (manifest.get("schema") != "receiver-observer-owned-session-v1"
+        if (manifest.get("schema") != "receiver-observer-owned-session-v2"
+                or manifest.get("receiver_service") != UNIT
                 or manifest.get("scope_acknowledged") is not True
                 or set(manifest.get("owned_files", {})) != {"libframe_receiver_observer.so",
                     "proposal.json", "receiver_observer_session.py"}
@@ -325,6 +333,134 @@ class Session:
                     "bytes_hex": expected.hex(), "sha256": digest(expected)}):
             raise RuntimeError("Owned activation snapshot is invalid")
         return manifest
+
+    @staticmethod
+    def proc_bytes(path, limit):
+        # Only explicit proc metadata files are read, never mem/map_files.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError("Unexpected proc metadata type")
+            data = stream.read(limit + 1)
+            if len(data) > limit:
+                raise RuntimeError("Proc metadata bound exceeded")
+            return data
+
+    def capture_owner(self, capture):
+        rows = self.proc_bytes(self.proc / "locks", LIMIT).decode("ascii").splitlines()
+        if len(rows) > 8192:
+            raise RuntimeError("Proc lock row bound exceeded")
+        owners = []
+        for row in rows:
+            cols = row.split()
+            if len(cols) != 8 or cols[1:4] != ["FLOCK", "ADVISORY", "WRITE"]:
+                continue
+            device = cols[5].split(":")
+            if len(device) != 3:
+                raise RuntimeError("Unsupported proc lock identity")
+            identity = (int(device[0], 16), int(device[1], 16), int(device[2]))
+            if identity == (os.major(capture.st_dev), os.minor(capture.st_dev), capture.st_ino):
+                if cols[6:] != ["0", "EOF"] or not cols[4].isdigit() or int(cols[4]) <= 0:
+                    raise RuntimeError("Unsupported capture writer lock")
+                owners.append(int(cols[4]))
+        if len(owners) != 1:
+            raise RuntimeError("Capture requires one identified exclusive writer process")
+        return owners[0]
+
+    def receiver_process(self, manifest, capture):
+        pid = self.capture_owner(capture)
+        process = self.proc / str(pid)
+        info = process.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError("Receiver process is not owned by the current user")
+        def started():
+            data = self.proc_bytes(process / "stat", 8192).decode("ascii")
+            end = data.rfind(")")
+            values = data[end + 2:].split()
+            if end < 0 or data.split(" ", 1)[0] != str(pid) or len(values) < 20:
+                raise RuntimeError("Unsupported receiver process stat")
+            return int(values[19])  # Linux proc stat field 22, starttime.
+        start = started()
+        cgroup = self.proc_bytes(process / "cgroup", 8192).decode("ascii")
+        groups = cgroup.splitlines()
+        if not groups or len(groups) > 32 or any(len(row.split(":", 2)) != 3 or
+                UNIT not in Path(row.split(":", 2)[2]).parts for row in groups):
+            raise RuntimeError("Capture writer does not belong to steam.service")
+        exe = os.readlink(process / "exe")
+        if not exe.startswith("/") or Path(exe).name != "vrlink":
+            raise RuntimeError("Capture writer is not the native receiver")
+
+        def native_file(path, expected, identity=None, *, limit=16 * LIMIT):
+            # /proc/PID/exe and /proc/PID/root intentionally follow kernel links
+            # to on-disk ELF files. They are not reads of mapped process memory.
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_size > limit or
+                        (identity is not None and (os.major(before.st_dev), os.minor(before.st_dev),
+                            before.st_ino) != identity)):
+                    raise RuntimeError("Mapped native file identity mismatch")
+                data = stream.read(limit + 1)
+                after = os.fstat(stream.fileno())
+                stable = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+                if (len(data) > limit or stable(before) != stable(after) or len(data) != expected["bytes"]
+                        or digest(data) != expected["sha256"]):
+                    raise RuntimeError("Mapped native file fingerprint mismatch")
+                return (os.major(before.st_dev), os.minor(before.st_dev), before.st_ino)
+        exe_identity = native_file(process / "exe", manifest["native_files"]["receiver"])
+
+        def maps():
+            rows = self.proc_bytes(process / "maps", 524288).decode("utf-8").splitlines()
+            if len(rows) > 4096:
+                raise RuntimeError("Receiver mapping row bound exceeded")
+            files = set()
+            for row in rows:
+                cols = row.split(None, 5)
+                if len(cols) == 6 and cols[5].startswith("/") and not cols[5].endswith(" (deleted)"):
+                    device = cols[3].split(":")
+                    if len(device) != 2:
+                        raise RuntimeError("Unsupported receiver mapping device")
+                    files.add((cols[5], int(device[0], 16), int(device[1], 16), int(cols[4])))
+            return files
+        mappings = maps()
+        selected = {}
+        for role in ("observer", "provider", "loader"):
+            expected = manifest["native_files"][role]
+            names = {Path(expected["path"]).name}
+            if role == "observer":
+                matches = [entry for entry in mappings if entry[0] == str(self.library)]
+            else:
+                names.add("libc.so.6" if role == "provider" else "ld-linux-aarch64.so.1")
+                matches = [entry for entry in mappings if Path(entry[0]).name in names]
+            if len(matches) != 1:
+                raise RuntimeError("Missing or ambiguous actual receiver provider/observer mapping")
+            name, major, minor, inode = matches[0]
+            native_file(process / "root" / name.lstrip("/"), expected, (major, minor, inode),
+                        limit=262144 if role == "observer" else 16 * LIMIT)
+            selected[role] = matches[0]
+        environment = self.proc_bytes(process / "environ", 65536).split(b"\0")
+        values = {}
+        for entry in environment:
+            if not entry:
+                continue
+            key, value = entry.decode("utf-8").split("=", 1)
+            if key == "LD_PRELOAD" or key.startswith(FOREIGN_PREFIXES):
+                if key in values:
+                    raise RuntimeError("Duplicate receiver observer environment")
+                values[key] = value
+        expected_environment = {"LD_PRELOAD": str(self.library), "FRAME_RECEIVER_TRACE_OUTPUT": str(self.capture),
+                                "FRAME_RECEIVER_TRACE_ARM": str(self.marker)}
+        if values != expected_environment:
+            raise RuntimeError("Actual receiver did not inherit the exact observer environment")
+        if (started() != start or self.capture_owner(capture) != pid or
+                self.proc_bytes(process / "cgroup", 8192).decode("ascii") != cgroup or
+                not set(selected.values()).issubset(maps()) or
+                os.readlink(process / "exe") != exe or
+                (os.major((last := (process / "exe").stat()).st_dev), os.minor(last.st_dev),
+                 last.st_ino) != exe_identity):
+            raise RuntimeError("Receiver process/lock/mappings changed during verification")
+        return {"pid": pid, "starttime_ticks": start, "service": UNIT,
+                "executable_sha256": manifest["native_files"]["receiver"]["sha256"],
+                "mapped_file_sha256": {role: manifest["native_files"][role]["sha256"] for role in selected}}
 
     def require_writer(self, manifest):
         safe_path(self.capture)
@@ -372,7 +508,9 @@ class Session:
                     row = json.loads(line)
                     if not isinstance(row, dict) or row.get("kind") != "selection_attempt":
                         raise RuntimeError("Unexpected capture record")
+            process = self.receiver_process(manifest, before)
             writer_locked()
+            return process
 
     def arm(self, *, stream_ready=False):
         if not stream_ready:
@@ -399,10 +537,10 @@ class Session:
                 raise RuntimeError("Service activation environment mismatch")
             if any(k.startswith(FOREIGN_PREFIXES) and k not in expected and v for k, v in actual.items()):
                 raise RuntimeError("Foreign observer environment after activation")
-            self.require_writer(manifest)
+            process = self.require_writer(manifest)
             exclusive(self.marker, b"")
             self.event("arm_requested", capture_accepted=False, stream_ready_acknowledged=True,
-                       accepted_submit=False, source_frame_associated=False)
+                       accepted_submit=False, source_frame_associated=False, receiver_process=process)
 
     def rollback(self, *, restart_ready=False):
         if not restart_ready:
@@ -462,7 +600,7 @@ def main(argv=None):
     parser.add_argument("--observer", type=Path)
     parser.add_argument("--reviewed-environment-file", action="append", default=[], metavar="PATH=SHA256")
     parser.add_argument("--ack-private-scalar-preload", action="store_true")
-    parser.add_argument("--ack-restart-readiness", action="store_true")
+    parser.add_argument("--ack-steam-client-restart-readiness", action="store_true")
     parser.add_argument("--ack-vr-stream-ready", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -484,12 +622,12 @@ def main(argv=None):
                           {"receiver": args.native_receiver, "provider": args.native_provider_libc,
                            "loader": args.native_loader, "observer": args.observer},
                           runtime_scope=args.ack_private_scalar_preload,
-                          restart_ready=args.ack_restart_readiness,
+                          restart_ready=args.ack_steam_client_restart_readiness,
                           reviewed_environment_files=reviewed)
         elif args.mode == "arm":
             session.arm(stream_ready=args.ack_vr_stream_ready)
         else:
-            session.rollback(restart_ready=args.ack_restart_readiness)
+            session.rollback(restart_ready=args.ack_steam_client_restart_readiness)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"Receiver observer session refused: {type(exc).__name__}: {exc}\n")
     print("Manual session operation completed; no frame/GPU association or headset result is claimed.")

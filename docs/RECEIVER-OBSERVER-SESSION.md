@@ -3,15 +3,33 @@
 `tools/receiver_observer_session.py` prepares a reversible user-service session
 for the [protected scalar observer](RECEIVER-OBSERVER-IMPLEMENTATION.md).
 The helper is tested offline; **this document does not authorize installation**.
-The earlier public Vulkan metadata approval does not cover the new private native
-record reads or a receiver preload. Obtain that additional permission and explicit
-restart readiness before running `start`. No mask or shader is activated.
+New sessions require permission for private scalar copies, a **Steam client
+service** preload and restart readiness. The previous concrete approval targeted
+the SteamVR drop-in; it does not authorize this different unit. Restarting the
+Steam client interrupts the Frame interface and stream. No mask or shader is
+activated.
+
+## Corrected launch boundary
+
+The 2026-10-12 hardware attempt produced no capture or private scalar observations.
+The pinned `vrlink` receiver was started through `run_vrlink.sh` by the Steam
+client in `steam.service`, while the schema-v1 preload reached `vrcompositor` in
+`steamvr.service`. Receiver hashes and service activity could not prove that the
+receiver inherited the observer. Its actual mapped libc/loader matched the native
+provider review despite a `Steam/steamrtarm64` library search path.
+
+Schema v2 therefore supports **only `receiver_service:steam.service`**. Never
+overwrite a schema-v1 helper in an active session: use that session's original
+self-contained copied script and its original readiness flag to roll back the
+SteamVR drop-in first. New start refuses any lingering old
+`steamvr.service.d/91-frame-receiver-observer.conf` and any pre-existing session.
+Archive old evidence and remove only reviewed owned files after processes stop.
 
 ## Reviewed inputs
 
 First use `tools/prepare_receiver_observer.py` with the actual native receiver,
 libc, dynamic loader and reviewed production observer. Its
-`frame-receiver-observer-proposal-v1` output remains `runtime_authorized:false`;
+`frame-receiver-observer-proposal-v2` output remains `runtime_authorized:false`;
 `offline_files_supported:true` is only offline file compatibility. A cross-sysroot
 proposal cannot substitute for the Frame's actual native provider namespace.
 
@@ -21,9 +39,9 @@ reviewed proposal. It requires the exact supported `vrlink` hash and basename.
 Use resolved, non-symlink native input paths; activation paths never follow
 symlinks. Review the proposal's own SHA-256 before acknowledging its scope.
 
-The native service has
-`EnvironmentFile=/usr/share/deckard/mesavars.sh`. Review its bytes and SHA-256
-too. `start` requires `--reviewed-environment-file PATH=SHA256` for every file
+Review every EnvironmentFile declared by the actual native Steam client unit,
+including `/usr/share/deckard/mesavars.sh` when listed. `start` requires
+`--reviewed-environment-file PATH=SHA256` for every file
 listed by `systemctl show` (at most four). It accepts bounded ordinary assignment
 lines, comments and simple quoted values, never executes or sources the file,
 and rejects unsupported syntax, changed fingerprints and foreign preload/trace
@@ -34,7 +52,7 @@ values. Unknown EnvironmentFiles syntax fails closed. Native files are read-only
 The sole activation file is:
 
 ```text
-$XDG_RUNTIME_DIR/systemd/user/steamvr.service.d/91-frame-receiver-observer.conf
+$XDG_RUNTIME_DIR/systemd/user/steam.service.d/91-frame-receiver-observer.conf
 ```
 
 The private session is `~/.local/share/frame-receiver-observer` (mode 0700).
@@ -48,7 +66,7 @@ are refused. Existing directories, native unit files and environment files are
 never rewritten or chmodded.
 
 The drop-in supplies only `LD_PRELOAD`, `FRAME_RECEIVER_TRACE_OUTPUT` and
-`FRAME_RECEIVER_TRACE_ARM`. It leaves native ExecStart/ExecStop/health-check
+`FRAME_RECEIVER_TRACE_ARM`. It leaves native ExecStart/ExecStop
 commands, restart policy and environment intact. Inherited nonreceiver children
 only forward mutex operations; only the pinned receiver claims the capture.
 There are no timers, watchdogs, sudo commands, kernel probes or native patches.
@@ -67,10 +85,13 @@ python3 tools/receiver_observer_session.py start \
   --native-loader /resolved/native/ld-linux-aarch64.so.1 \
   --observer /private/build/libframe_receiver_observer.so \
   --reviewed-environment-file /usr/share/deckard/mesavars.sh=<reviewed-sha256> \
-  --ack-private-scalar-preload --ack-restart-readiness
+  --ack-private-scalar-preload --ack-steam-client-restart-readiness
 ```
 
-`start` reloads the user service and requests one explicit SteamVR restart.
+Include the environment-file argument only for each file actually declared by
+`steam.service`; omit it when that unit has no EnvironmentFiles.
+
+`start` reloads the user service and requests one explicit **Steam client restart**.
 The acknowledgment is an operator confirmation of separately granted permission,
 not permission inferred from the proposal. Service activity alone does not prove
 that the receiver observer loaded. A failed explicit activation attempts exact
@@ -89,13 +110,27 @@ production supported header with `writer_liveness:exclusive_flock_v1` and be
 held by an exclusive writer `flock`. The helper verifies that a shared lock
 cannot be acquired before and after its bounded header read. An open descriptor,
 header alone, expired writer, footer, changed inode, symlink or public file never
-authorizes arming. It then exclusively creates an empty mode-0600 marker. A
-private directory and reviewed writer protocol are the ownership boundary; this
-does not independently prove GPU consumption or inspect receiver process memory.
+authorizes arming. It also identifies the one exclusive capture FLOCK owner in
+bounded `/proc/locks` metadata. That user-owned PID must have the pinned
+`/proc/PID/exe`, belong to `steam.service`, map the exact owned observer and
+inherit its three expected environment values. Actual libc and loader are read
+as on-disk files through `/proc/PID/root`, and their device/inode and fingerprints
+must match both `/proc/PID/maps` and the reviewed native proposal. A search path,
+similar library basename or mapping path alone is insufficient.
+
+PID starttime, cgroup, relevant mappings, executable inode and capture-lock owner
+are rechecked before creating the empty mode-0600 arm marker. There is no process
+enumeration: only the capture lock's identified PID is inspected. Bounds are
+1 MiB/8192 rows for lock metadata, 512 KiB/4096 rows for maps, 64 KiB for filtered
+environment metadata, 8 KiB for stat/cgroup, and the existing native file limits.
+Unavailable, ambiguous or changing evidence refuses arming. This reads metadata
+and on-disk ELF bytes only, never `/proc/PID/mem`, map_files, mapped uniform data
+or images. It is an instantaneous receiver/writer verification, not proof of GPU
+consumption or source-frame association.
 
 The writer deadline is 120 seconds from observer startup, with at most 32
 selection attempts and 1 MiB output. If it expires before the stream is ready,
-arming is refused. The deadline stops recording only; it never restarts SteamVR
+arming is refused. The deadline stops recording only; it never restarts Steam
 or automatically removes activation. Roll back manually and arrange a newly
 reviewed session if another run is needed.
 
@@ -106,11 +141,11 @@ if the stream or original terminal exits:
 
 ```bash
 python3 ~/.local/share/frame-receiver-observer/receiver_observer_session.py rollback \
-  --ack-restart-readiness
+  --ack-steam-client-restart-readiness
 ```
 
 Rollback removes **only** an exact matching owned drop-in, reloads the user
-manager, requests one native restart, and compares service/manager/environment
+manager, requests one native **Steam client restart**, and compares service/manager/environment
 files against the original snapshots. A completed restoration is idempotent.
 Changed or foreign activation bytes are preserved and reported for manual review;
 they are never blindly deleted. Missing activation after an interrupted rollback
@@ -129,10 +164,14 @@ coherent eye/UV binding or working Steam Link passthrough.
 
 ## Focused offline evidence
 
-The mocked session suite covers successful start/arm/idempotent rollback, fresh
+The mocked session suite covers successful start/arm/idempotent Steam rollback, fresh
 artifact and plan fingerprints, ABI/path/env guards, native EnvironmentFile
 snapshots, activation-before-restart recovery, foreign-file preservation, writer
-lock/header refusal, interrupted/failed activation, and recovery despite full or
-bounded ledgers. It performs no Frame access, network calls or real systemctl
+lock/header refusal, wrong launch service, absent receiver/observer, actual mapped
+provider hashes, missing inherited environment, inode mismatch, changed PID/lock,
+metadata bounds, old-unit refusal, interrupted/failed activation, and recovery
+despite full or bounded ledgers. It performs no Frame access, network calls or real systemctl
 operations. Receiver C++/preflight evidence is documented separately; these
-Python tests do not replace native provider checks or a headset test.
+Python tests do not replace native provider checks or a headset test. One focused
+Linux host case verifies the real `/proc/locks` FLOCK-owner format and lock release
+using a temporary local fixture; receiver process/mapping cases remain mocked.

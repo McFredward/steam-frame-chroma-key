@@ -23,10 +23,13 @@ class SessionTests(unittest.TestCase):
         self.home.mkdir(mode=0o700)
         self.runtime.mkdir(mode=0o700)
         self.calls, self.writer_fds = [], []
-        self.session = M.Session(self.home, self.runtime, self.command, environment={})
+        self.proc = self.root / "proc"
+        self.proc.mkdir(mode=0o700)
+        self.session = M.Session(self.home, self.runtime, self.command, environment={}, proc_root=self.proc)
         self.files = {}
         self.plan = {"schema": M.SCHEMA, "offline_files_supported": True, "installed": False,
-                     "runtime_authorized": False, "proposed_owned_directory": str(self.session.folder),
+                     "runtime_authorized": False, "receiver_service": M.UNIT,
+                     "proposed_owned_directory": str(self.session.folder),
                      "proposed_runtime_dropin_basename": self.session.dropin.name,
                      "limits": {"selections": 32, "bytes": M.LIMIT, "seconds": 120}}
         for flag in ("image_or_mapped_uniform_reads", "native_binary_patch", "kernel_or_system_image_change",
@@ -42,7 +45,8 @@ class SessionTests(unittest.TestCase):
         self.receiver_patch.start()
         self.plan_path = self.root / "proposal.json"
         self.save_plan()
-        self.original = {"Environment": "NATIVE_SETTING=unchanged", "EnvironmentFiles": "", "DropInPaths": ""}
+        self.original = {"Environment": "STEAM_LAUNCH_WRAPPER_SCOPE=true NATIVE_SETTING=unchanged",
+                         "EnvironmentFiles": "", "DropInPaths": ""}
         self.manager = "NATIVE_ENV=yes\n"
         self.fail_restart = 0
 
@@ -95,7 +99,32 @@ class SessionTests(unittest.TestCase):
         if locked:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.write(fd, json.dumps(header).encode() + b"\n" + extra)
+        self.receiver_fixture()
         return fd
+
+    def receiver_fixture(self, *, service="steam.service", observer=True, pid=737455):
+        """Mock actual run_vrlink.sh -> Steam ancestry; no executable is run."""
+        self.pid = pid
+        self.process = self.proc / str(pid)
+        self.process.mkdir(mode=0o700, exist_ok=True)
+        (self.process / "exe").symlink_to(self.files["receiver"])
+        (self.process / "root").symlink_to("/", target_is_directory=True)
+        (self.process / "stat").write_text(f"{pid} (vrlink) R " + " ".join(["0"] * 18 + ["123", "0"]))
+        (self.process / "cgroup").write_text(f"0::/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/{service}\n")
+        (self.process / "environ").write_bytes(b"\0".join([
+            f"LD_PRELOAD={self.session.library}".encode(),
+            f"FRAME_RECEIVER_TRACE_OUTPUT={self.session.capture}".encode(),
+            f"FRAME_RECEIVER_TRACE_ARM={self.session.marker}".encode(),
+            b"LD_LIBRARY_PATH=/home/steamos/.local/share/Steam/steamrtarm64"]) + b"\0")
+        mappings = []
+        paths = [self.files["provider"], self.files["loader"]]
+        if observer: paths.append(self.session.library)
+        for n, path in enumerate(paths):
+            info = path.stat()
+            mappings.append(f"{1000+n*100:x}-{1050+n*100:x} r-xp 00000000 {os.major(info.st_dev):x}:{os.minor(info.st_dev):x} {info.st_ino} {path}\n")
+        (self.process / "maps").write_text("".join(mappings))
+        info = self.session.capture.stat()
+        (self.proc / "locks").write_text(f"1: FLOCK ADVISORY WRITE {pid} {os.major(info.st_dev):x}:{os.minor(info.st_dev):x}:{info.st_ino} 0 EOF\n")
 
     def test_start_arm_rollback_and_idempotent_recovery(self):
         self.start()
@@ -163,7 +192,9 @@ class SessionTests(unittest.TestCase):
 
     def test_plan_unsafe_scope_or_path(self):
         for key, value in (("native_binary_patch", True), ("proposed_owned_directory", "/foreign"),
-                           ("proposed_runtime_dropin_basename", "different.conf")):
+                           ("proposed_runtime_dropin_basename", "different.conf"),
+                           ("receiver_service", "steamvr.service"),
+                           ("schema", "frame-receiver-observer-proposal-v1")):
             original = self.plan[key]
             self.plan[key] = value
             self.save_plan()
@@ -297,6 +328,113 @@ class SessionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): self.session.rollback(restart_ready=True)
         self.assertEqual(self.session.dropin.read_bytes(), b"foreign\n")
 
+    def test_old_steamvr_activation_is_preserved_and_refuses_new_start(self):
+        M.private_parents(self.session.old_dropin.parent)
+        M.exclusive(self.session.old_dropin, b"old owned session\n")
+        with self.assertRaises(RuntimeError): self.start()
+        self.assertFalse(self.session.folder.exists())
+        self.assertEqual(self.session.old_dropin.read_bytes(), b"old owned session\n")
+        self.assertFalse(self.calls)
+
+    def test_service_active_without_actual_receiver_capture_cannot_arm(self):
+        self.start()
+        with self.assertRaises(FileNotFoundError): self.session.arm(stream_ready=True)
+        self.assertFalse(self.session.marker.exists())
+        self.assertTrue(all("steamvr.service" not in call for call in self.calls))
+
+    def test_matching_locked_header_from_wrong_service_cannot_arm(self):
+        self.start()
+        self.writer()
+        (self.process / "cgroup").write_text("0::/user.slice/steamvr.service\n")
+        with self.assertRaisesRegex(RuntimeError, "steam.service"): self.session.arm(stream_ready=True)
+        self.assertFalse(self.session.marker.exists())
+
+    def test_wrong_executable_or_missing_observer_mapping_cannot_arm(self):
+        self.start()
+        self.writer()
+        (self.process / "exe").unlink()
+        (self.process / "exe").symlink_to(self.files["loader"])
+        with self.assertRaises(RuntimeError): self.session.arm(stream_ready=True)
+        (self.process / "exe").unlink()
+        (self.process / "exe").symlink_to(self.files["receiver"])
+        path = self.process / "maps"
+        path.write_text("\n".join(line for line in path.read_text().splitlines() if str(self.session.library) not in line))
+        with self.assertRaises(RuntimeError): self.session.arm(stream_ready=True)
+
+    def test_actual_provider_and_loader_hashes_are_required_despite_library_path(self):
+        self.start()
+        self.writer()
+        for role in ("provider", "loader"):
+            path = self.files[role]
+            original = path.read_bytes()
+            path.write_bytes(original[:-1] + b"x")
+            with self.assertRaisesRegex(RuntimeError, "fingerprint"):
+                self.session.arm(stream_ready=True)
+            path.write_bytes(original)
+        self.assertFalse(self.session.marker.exists())
+
+    def test_mapping_path_alone_does_not_prove_inode_or_loaded_observer(self):
+        self.start()
+        self.writer()
+        path = self.process / "maps"
+        original = path.read_text()
+        inode = self.session.library.stat().st_ino
+        path.write_text(original.replace(f" {inode} {self.session.library}", f" {inode+1} {self.session.library}"))
+        with self.assertRaisesRegex(RuntimeError, "identity"): self.session.arm(stream_ready=True)
+
+    def test_receiver_without_inherited_preload_cannot_arm(self):
+        self.start()
+        self.writer()
+        (self.process / "environ").write_bytes(b"LD_LIBRARY_PATH=Steam/steamrtarm64\0")
+        with self.assertRaisesRegex(RuntimeError, "inherit"): self.session.arm(stream_ready=True)
+
+    def test_capture_owner_pid_must_be_unique_and_stable(self):
+        self.start()
+        self.writer()
+        path = self.proc / "locks"
+        raw = path.read_text()
+        path.write_text(raw + raw.replace(str(self.pid), str(self.pid+1)))
+        with self.assertRaises(RuntimeError): self.session.arm(stream_ready=True)
+        path.write_text(raw)
+        with mock.patch.object(self.session, "capture_owner", side_effect=[self.pid, self.pid+1]):
+            with self.assertRaisesRegex(RuntimeError, "changed"): self.session.arm(stream_ready=True)
+
+    @unittest.skipUnless(M.platform.system() == "Linux", "Linux flock metadata required")
+    def test_real_host_flock_owner_matches_kernel_proc_format(self):
+        self.start()
+        fd = self.writer()
+        host = M.Session(self.home, self.runtime, self.command, environment={})
+        self.assertEqual(host.capture_owner(self.session.capture.stat()), os.getpid())
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        with self.assertRaises(RuntimeError): host.capture_owner(self.session.capture.stat())
+
+    def test_receiver_starttime_change_cannot_arm(self):
+        self.start()
+        self.writer()
+        original = self.session.proc_bytes
+        calls = 0
+        def changing(path, limit):
+            nonlocal calls
+            raw = original(path, limit)
+            if path == self.process / "stat":
+                calls += 1
+                if calls == 2: return raw.replace(b"123", b"124")
+            return raw
+        with mock.patch.object(self.session, "proc_bytes", changing):
+            with self.assertRaisesRegex(RuntimeError, "changed"): self.session.arm(stream_ready=True)
+
+    def test_missing_or_oversized_proc_metadata_cannot_arm(self):
+        self.start()
+        self.writer()
+        path = self.process / "maps"
+        raw = path.read_bytes()
+        path.write_bytes(b"x" * 524289)
+        with self.assertRaisesRegex(RuntimeError, "bound"): self.session.arm(stream_ready=True)
+        path.write_bytes(raw)
+        (self.proc / "locks").unlink()
+        with self.assertRaises(FileNotFoundError): self.session.arm(stream_ready=True)
+        self.assertFalse(self.session.marker.exists())
+
     def test_unlocked_capture_refused_even_when_header_matches(self):
         self.start()
         self.writer(locked=False)
@@ -395,14 +533,14 @@ class SessionTests(unittest.TestCase):
         with mock.patch.object(M.platform, "system", return_value="Linux"), \
                 mock.patch.object(M.platform, "machine", return_value="x86_64"), \
                 mock.patch.object(M.subprocess, "run") as command:
-            with self.assertRaises(SystemExit): M.main(["rollback", "--ack-restart-readiness"])
+            with self.assertRaises(SystemExit): M.main(["rollback", "--ack-steam-client-restart-readiness"])
             command.assert_not_called()
 
     def test_cli_requires_native_runtime_path(self):
         with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/tmp/not-native"}), \
                 mock.patch.object(M.platform, "system", return_value="Linux"), \
                 mock.patch.object(M.platform, "machine", return_value="aarch64"):
-            with self.assertRaises(SystemExit): M.main(["rollback", "--ack-restart-readiness"])
+            with self.assertRaises(SystemExit): M.main(["rollback", "--ack-steam-client-restart-readiness"])
 
 
 if __name__ == "__main__":
