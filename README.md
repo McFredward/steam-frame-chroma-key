@@ -49,10 +49,12 @@ An [authentic client connection capture](docs/CLIENT-CONNECT-CAPTURE-20261012.md
 now confirms normal headset startup and a successful native receiver connection
 call. Continuous descriptor lifetime and exact resource/video association remain
 separate, incomplete steps; the temporary diagnostic was fully removed afterward.
-The next [register-only resource census](docs/CLIENT-RESOURCE-CENSUS.md) is built
-and checked offline. It uses those same authenticated bindings to observe the
-import/reference boundaries; its concrete runtime capture still requires
-coordinated authorization and does not enable passthrough.
+The [register-only resource census](docs/CLIENT-RESOURCE-CENSUS.md) has now
+[captured all six native import/reference boundaries](docs/CLIENT-RESOURCE-CAPTURE-20261012.md).
+It establishes that the actual resource thread needs its own safe stack
+registration. The bounded kernel peer lookup refused its FD scan limit;
+connection lifetime and resource/video association remain incomplete. The
+diagnostic was fully removed and original Frame state verified afterward.
 These diagnostics change no rendered pixels and do not enable genuine-mask
 passthrough.
 

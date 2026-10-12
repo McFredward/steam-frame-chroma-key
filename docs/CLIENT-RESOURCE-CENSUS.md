@@ -53,8 +53,9 @@ Its dependency-free audit is **69,080 bytes**, SHA-256
 `df61de75e2e82f0c04b2daa148157147a0fe22469c780317a369195c03f3ef36`.
 The prepared offline plan SHA-256 is
 `7613d1eb4305c6f82b1a7f577f04e2f052efe110123e6c5c0bddac91eb4ca905`.
-These files remain private and inactive; the previous restored Frame state is
-unchanged. Existing native references and proprietary bytes are not distributed.
+These files remain private. The coordinated native capture is now complete and
+the diagnostic was fully removed; original Frame state was verified afterward.
+Existing native references and proprietary bytes are not distributed.
 
 Focused software evidence covers:
 
@@ -77,8 +78,10 @@ Focused software evidence covers:
 After a bounded fixture/configuration repair, only its affected controls were
 repeated; unchanged passing evidence was retained. No new complete local gate
 is claimed. [CI at `b360bb2`](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38301181405)
-also passed. These are software and retained-source checks, not a native Frame
-resource capture or working passthrough test.
+also passed. These are software and retained-source checks. The subsequent
+[actual Frame capture](CLIENT-RESOURCE-CAPTURE-20261012.md) separately confirms
+all six register boundaries and a resource caller outside the startup thread's
+prepared stack. Neither result is a working passthrough test.
 
 ## Exact kernel peer snapshot
 
@@ -113,8 +116,10 @@ receipts, verify the original service/native/environment-file hashes and affecte
 readable mappings, and remove only the matching owned inventory. No automatic
 restart or redeployment is scheduled.
 
-The next capture should establish the actual resource calling thread and
-complete register timeline. A later separately authorized fixed-window/wire
-adapter can then use [the concrete source plan](CLIENT-RESOURCE-INTEGRATION-PLAN-20261012.md).
+The completed capture establishes the full register timeline and reports that
+the actual resource thread does not own the startup thread's prepared stack.
+The next step must safely register that real caller outside hot callbacks.
+A later separately authorized fixed-window/wire adapter can then use
+[the concrete source plan](CLIENT-RESOURCE-INTEGRATION-PLAN-20261012.md).
 Native lifetime and exact connection/resource/video/eye/UV/GPU association
 remain separate obligations; the explicit-mask output stays opaque meanwhile.
