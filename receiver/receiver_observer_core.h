@@ -9,10 +9,12 @@ namespace frame_receiver {
 
 constexpr std::size_t kSampleLimit = 32;
 constexpr std::size_t kQueueCapacity = 32;
-constexpr std::uint64_t kSelectedLock = 0x34a50;
-constexpr std::uint64_t kSelectedUnlock = 0x34d74;
-constexpr std::uint64_t kMetadataLock = 0x5200c;
-constexpr std::uint64_t kMetadataUnlock = 0x5203c;
+// Direct caller returns in the exact receiver pinned by receiver_observer.cpp.
+// Selection and metadata moved by different amounts in SteamOS 0.4.5.
+constexpr std::uint64_t kSelectedLock = 0x355f8;
+constexpr std::uint64_t kSelectedUnlock = 0x3591c;
+constexpr std::uint64_t kMetadataLock = 0x538dc;
+constexpr std::uint64_t kMetadataUnlock = 0x5390c;
 
 enum Reason : std::uint32_t {
     None = 0, InvalidPointer = 1, InvalidTuple = 2, NestedSelection = 4,

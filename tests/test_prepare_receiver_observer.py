@@ -39,6 +39,8 @@ class PreparationTests(unittest.TestCase):
         self.assertTrue(plan["offline_files_supported"])
         self.assertEqual(plan["schema"], "frame-receiver-observer-proposal-v2")
         self.assertEqual(plan["receiver_service"], "steam.service")
+        self.assertEqual(plan["selection_caller_returns"], ["0x355f8", "0x3591c"])
+        self.assertEqual(plan["metadata_caller_returns"], ["0x538dc", "0x5390c"])
         for key in ("installed", "runtime_authorized", "image_or_mapped_uniform_reads",
                     "native_binary_patch", "kernel_or_system_image_change",
                     "shader_or_mask_activation", "automatic_restart"):
@@ -76,6 +78,15 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaises(MODULE.CollectionError):
                 MODULE.prepare(pathlib.Path("receiver"), pathlib.Path("libc"), pathlib.Path("observer"),
                                "0" * 64, pathlib.Path("/home/steamos"))
+            symbols.assert_not_called()
+
+    def test_pre_update_receiver_is_refused_before_provider_or_observer_work(self):
+        old = "0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b"
+        with mock.patch.object(MODULE, "artifact", return_value=({"sha256": old}, b"")) as files, \
+                mock.patch.object(MODULE, "dynamic_symbols") as symbols:
+            with self.assertRaisesRegex(MODULE.CollectionError, "Unsupported receiver"):
+                self.prepare_fixture()
+            files.assert_called_once_with(pathlib.Path("receiver"), MODULE.MAX_INPUT_BYTES)
             symbols.assert_not_called()
 
     def test_expected_aarch64_elf_header_is_required(self):

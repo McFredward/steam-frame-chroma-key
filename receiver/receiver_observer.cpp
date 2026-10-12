@@ -34,7 +34,9 @@ __asm__(".symver receiver_libc_unlock,__pthread_mutex_unlock@GLIBC_2.2.5");
 
 namespace {
 using namespace frame_receiver;
-constexpr char kReceiverHash[] = "0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b";
+// SteamOS 0.4.5 receiver: each native boundary was independently re-audited.
+// Earlier receiver revisions deliberately remain unsupported by this build.
+constexpr char kReceiverHash[] = "31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153";
 constexpr std::uint64_t kDeadlineNs = 120ULL * 1000 * 1000 * 1000;
 constexpr std::size_t kByteLimit = 1024 * 1024;
 Observer observer{};

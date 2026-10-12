@@ -18,8 +18,10 @@ import struct
 
 from collect_mask_bridge import CollectionError, run_bounded
 
-RECEIVER_SHA256 = "0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b"
+RECEIVER_SHA256 = "31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153"
 RECEIVER_SERVICE = "steam.service"
+SELECTION_CALLER_RETURNS = ["0x355f8", "0x3591c"]
+METADATA_CALLER_RETURNS = ["0x538dc", "0x5390c"]
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_LIBRARY_BYTES = 256 * 1024
 PROVIDER_SYMBOLS = (
@@ -117,8 +119,8 @@ def prepare(receiver: Path, provider: Path, observer: Path,
         "proposed_runtime_dropin_basename": "91-frame-receiver-observer.conf",
         "activation": "temporary Steam user-service LD_PRELOAD; exact receiver only samples",
         "callbacks": ["pthread_mutex_lock", "pthread_mutex_unlock"],
-        "selection_caller_returns": ["0x34a50", "0x34d74"],
-        "metadata_caller_returns": ["0x5200c", "0x5203c"],
+        "selection_caller_returns": list(SELECTION_CALLER_RETURNS),
+        "metadata_caller_returns": list(METADATA_CALLER_RETURNS),
         "protected_read_fields": ["shared_token_u64", "stored_key_u32",
                                   "content_generation_u64", "metadata_valid_u8",
                                   "metadata_stored_key_u32", "presentation_word_u32"],

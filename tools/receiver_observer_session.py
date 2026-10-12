@@ -23,7 +23,10 @@ import time
 UNIT = "steam.service"
 SCHEMA = "frame-receiver-observer-proposal-v2"
 LIMIT = 1048576
-RECEIVER = "0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b"
+RECEIVER = "31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153"
+# Keep rollback self-contained, while refusing plans from the earlier pin.
+SELECTION_CALLER_RETURNS = ["0x355f8", "0x3591c"]
+METADATA_CALLER_RETURNS = ["0x538dc", "0x5390c"]
 PREFIX = "FRAME_RECEIVER_"
 FOREIGN_PREFIXES = (PREFIX, "FRAME_MASK_TRACE")
 SESSION_MANAGER_PATHS = {"GAMESCOPE_LIMITER_FILE": "gamescope-limiter-",
@@ -327,6 +330,8 @@ class Session:
                 or plan.get("installed") is not False or plan.get("runtime_authorized") is not False
                 or plan.get("proposed_owned_directory") != str(self.folder)
                 or plan.get("proposed_runtime_dropin_basename") != self.dropin.name
+                or plan.get("selection_caller_returns") != SELECTION_CALLER_RETURNS
+                or plan.get("metadata_caller_returns") != METADATA_CALLER_RETURNS
                 or plan.get("limits") != {"selections": 32, "bytes": LIMIT, "seconds": 120}):
             raise RuntimeError("Unsupported proposed scope or paths")
         for flag in ("image_or_mapped_uniform_reads", "native_binary_patch", "kernel_or_system_image_change",

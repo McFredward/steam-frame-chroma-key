@@ -33,6 +33,8 @@ class SessionTests(unittest.TestCase):
                      "runtime_authorized": False, "receiver_service": M.UNIT,
                      "proposed_owned_directory": str(self.session.folder),
                      "proposed_runtime_dropin_basename": self.session.dropin.name,
+                     "selection_caller_returns": list(M.SELECTION_CALLER_RETURNS),
+                     "metadata_caller_returns": list(M.METADATA_CALLER_RETURNS),
                      "limits": {"selections": 32, "bytes": M.LIMIT, "seconds": 120}}
         for flag in ("image_or_mapped_uniform_reads", "native_binary_patch", "kernel_or_system_image_change",
                      "shader_or_mask_activation", "automatic_restart"):
@@ -281,6 +283,22 @@ class SessionTests(unittest.TestCase):
             self.start()
         self.assertFalse(self.session.folder.exists())
 
+    def test_pre_update_receiver_pin_cannot_enable_the_current_observer(self):
+        old = "0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b"
+        # Keep the fake artifact otherwise internally consistent, as in a stale
+        # reviewed native plan. The current pin must refuse before any restart.
+        current = "31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153"
+        self.plan["receiver"]["sha256"] = old
+        self.save_plan()
+        receiver_bytes, digest = self.files["receiver"].read_bytes(), M.digest
+        with mock.patch.object(M, "RECEIVER", current), \
+                mock.patch.object(M, "digest", side_effect=lambda raw: old if raw == receiver_bytes else digest(raw)):
+            with self.assertRaisesRegex(RuntimeError, "Unsupported native receiver"):
+                self.start()
+        self.assertFalse(self.session.folder.exists())
+        self.assertFalse(self.session.dropin.exists())
+        self.assertEqual(self.calls, [])
+
     def test_each_native_fingerprint_is_checked_fresh(self):
         for name in self.files:
             data = self.files[name].read_bytes()
@@ -305,6 +323,8 @@ class SessionTests(unittest.TestCase):
         for key, value in (("native_binary_patch", True), ("proposed_owned_directory", "/foreign"),
                            ("proposed_runtime_dropin_basename", "different.conf"),
                            ("receiver_service", "steamvr.service"),
+                           ("selection_caller_returns", ["0x34a50", "0x34d74"]),
+                           ("metadata_caller_returns", ["0x5200c", "0x5203c"]),
                            ("schema", "frame-receiver-observer-proposal-v1")):
             original = self.plan[key]
             self.plan[key] = value

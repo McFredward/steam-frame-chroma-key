@@ -50,6 +50,17 @@ int main() {
     check(!Observer::selected_address(UINTPTR_MAX)); check(!Observer::metadata_address(0x4240-8));
     check(!Observer::metadata_address((std::uintptr_t{1}<<48)-8));
     {
+        Observer o; o.armed=true; Scope s; Record r;
+        // Historical return addresses must not read any record, including an
+        // invalid pointer, after the current receiver changes its native sites.
+        for (const auto old : {0x34a50ULL, 0x34d74ULL, 0x5200cULL, 0x5203cULL}) {
+            o.after_lock(old, UINTPTR_MAX, 0, s);
+            o.before_unlock(old, UINTPTR_MAX, s);
+        }
+        check(!s.active && !o.counters.claimed.load() && !o.counters.unmatched.load());
+        check(!o.take(r));
+    }
+    {
         Observer o; Scope s; Native n;
         select(o,s,n); check(!s.active); check(!o.counters.claimed.load());
         o.armed=true;
