@@ -27,11 +27,12 @@ FINAL_OBSERVER = None
 FINAL_SHA = None
 API_NAME = '/home/steamos/.local/share/Steam/steamrtarm64/libopenvr_api.so'
 CLIENT_NAME = '/opt/steamvr/bin/linuxarm64/vrclient.so'
+LIBC_NAME = '/usr/lib/libc.so.6'
 FRAME_DIRECTORY = '/home/steamos/.local/share/GloomhavenVR/frame-client-startup'
 
 
 def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
-                     bridge_visibility=0, entry_visibility=2, dynamic_tls=False):
+                     bridge_visibility=0, entry_visibility=2, mutex_visibility=2, dynamic_tls=False):
     """Construct bounded own metadata; no executable native code is included."""
     raw = bytearray(0x4000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
@@ -69,7 +70,7 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
         off = len(statstr)
         statstr += name.encode() + b'\0'
         rva = (0x200, 0x210, 0x230, 0x240)[index]
-        symtab += struct.pack('<IBBHQQ', off, 0x12, entry_visibility, 1, rva, 4)
+        symtab += struct.pack('<IBBHQQ', off, 0x12, entry_visibility if index<2 else mutex_visibility, 1, rva, 4)
     verneed = struct.pack('<HHIII', 1, 1, offsets['libc.so.6'], 16, 0)
     verneed += struct.pack('<IHHII', 0, 0, 2, offsets['GLIBC_2.17'], 0)
     versym = struct.pack('<' + 'H' * len(versions), *versions)
@@ -95,6 +96,7 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(report['bridge_rva'], 0x220)
         self.assertEqual(report['hidden_entries'], dict(zip(tool.ENTRIES, (0x200, 0x210))))
         self.assertEqual(report['public_mutex_aliases'], {'pthread_mutex_init': 0x230, 'pthread_mutex_destroy': 0x240})
+        self.assertEqual(report['hidden_mutex_entries'], dict(zip(tool.MUTEX_ENTRIES, (0x230, 0x240))))
         self.assertEqual(elf.imports(), set(tool.ALIASES))
         self.assertEqual(elf.needed, ['libc.so.6'])
         profile, _ = tool.modules.profile_from_bytes(raw, 5, tool.digest(raw).hex())
@@ -107,7 +109,8 @@ class PreparationTests(unittest.TestCase):
                     ('dlopen', {'extra_export': 'dlopen'}), ('execve', {'extra_export': 'execve'}),
                     ('unexpected ordinary export', {'extra_export': 'unreviewed_callback'}),
                     ('alias address', {'alias_rva': True}), ('bridge visibility', {'bridge_visibility': 2}),
-                    ('public startup entry', {'entry_visibility': 0}), ('dynamic TLS', {'dynamic_tls': True})]
+                    ('public startup entry', {'entry_visibility': 0}), ('public mutex entry', {'mutex_visibility': 0}),
+                    ('dynamic TLS', {'dynamic_tls': True})]
         controls += [(name, {'missing_alias': name}) for name in tool.ALIASES]
         for name, arguments in controls:
             with self.subTest(name=name):
@@ -212,12 +215,19 @@ class PreparationTests(unittest.TestCase):
             folder = Path(temporary)
             for api, client_name in (('same', 'same'), (FRAME_DIRECTORY + '/' + tool.MAIN, 'client')):
                 with self.subTest(api=api), self.assertRaisesRegex(ValueError, 'collision'):
-                    tool.prepare(folder, folder / 'none', '0' * 64, folder / 'new', FRAME_DIRECTORY, api, client_name)
+                    tool.prepare(folder, folder / 'none', '0' * 64, folder / 'new', FRAME_DIRECTORY, api, client_name,
+                                 libc_name=LIBC_NAME)
             (folder / 'exists').mkdir()
             with self.assertRaisesRegex(ValueError, 'new'):
-                tool.prepare(folder, folder / 'none', '0' * 64, folder / 'exists', FRAME_DIRECTORY, API_NAME, CLIENT_NAME)
+                tool.prepare(folder, folder / 'none', '0' * 64, folder / 'exists', FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
+                             libc_name=LIBC_NAME)
             with self.assertRaisesRegex(ValueError, 'borrowed'):
-                tool.prepare(folder, folder / 'none', '0' * 64, folder / 'borrowed-output', FRAME_DIRECTORY, API_NAME, CLIENT_NAME)
+                tool.prepare(folder, folder / 'none', '0' * 64, folder / 'borrowed-output', FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
+                             libc_name=LIBC_NAME)
+            for libc in (None, API_NAME, CLIENT_NAME, FRAME_DIRECTORY + '/' + tool.MAIN):
+                with self.subTest(libc=libc), self.assertRaises(ValueError):
+                    tool.prepare(folder, folder / 'none', '0' * 64, folder / 'new', FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
+                                 libc_name=libc)
 
     def test_private_files_are_bounded_nofollow_and_not_overwritten(self):
         with tempfile.TemporaryDirectory(prefix='client-startup-files-') as temporary:
@@ -248,7 +258,8 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='client-startup-audit-control-') as temporary:
             folder = Path(temporary)
             source = tool.audit_source((0, 500), (0, 600), (0, 700), (0, 800), 0x200,
-                                       'api "\\\N{SNOWMAN}.so', 'client-\N{GRINNING FACE}.so', FRAME_DIRECTORY + '/' + tool.MAIN)
+                                       'api "\\\N{SNOWMAN}.so', 'client-\N{GRINNING FACE}.so', FRAME_DIRECTORY + '/' + tool.MAIN,
+                                       (0, 900), 'libc-\N{SNOWMAN}.so')
             (folder / 'preparation.cpp').write_text(source)
             command = ['aarch64-linux-gnu-g++', '-std=c++17', '-shared', '-O2', '-fPIC', '-nostdlib',
                        '-fno-exceptions', '-fno-rtti', '-fno-builtin', '-mno-outline-atomics', '-fvisibility=hidden',
@@ -261,6 +272,20 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(elf.needed, [])
             self.assertEqual({symbol['name'] for symbol in elf.exported()},
                              {'la_version', 'la_objopen', 'la_preinit', 'la_symbind64', 'la_objclose'})
+            (folder / 'prepared.cpp').write_text(
+                '#include "import/import_startup_audit.h"\n'
+                'int main(){const auto* p=frame_import_startup_audit::preparation();\n'
+                'return !p || !p->owned_prepared_files || p->bridge_rva!=0x200 || '
+                'p->init_rva!=0x5768 || p->shutdown_rva!=0x5330 || '
+                'p->client.rx_rva_end!=800 || p->libc.rx_rva_begin!=0 || p->libc.rx_rva_end!=900 || '
+                'p->native_mutex_init_rva!=0x86a00 || p->native_mutex_destroy_rva!=0x86980;}\n')
+            compiled = tool.recorded_run(['g++', '-std=c++17', '-I', str(ROOT),
+                                         str(ROOT / 'import/import_startup_audit.cpp'), str(folder / 'preparation.cpp'),
+                                         str(folder / 'prepared.cpp'), '-o', str(folder / 'prepared')],
+                                        folder, logs, 'compile_prepared_host_pod', 45)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr[-4096:])
+            result = tool.recorded_run([str(folder / 'prepared')], folder, logs, 'execute_prepared_host_pod', 5)
+            self.assertEqual(result.returncode, 0)
             # Execute a source-only host fixture against the real default weak
             # implementation. No native refs, loader activation or Frame access.
             (folder / 'inactive.cpp').write_text('#include "import/import_startup_audit.h"\n'
@@ -336,12 +361,14 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='client-startup-final-bundle-control-') as temporary:
             output = Path(temporary) / 'reviewable'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
-                                api_file=PRIVATE_API)
+                                libc_name=LIBC_NAME,api_file=PRIVATE_API)
             self.assertEqual(len(list(output.iterdir())), 5)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
             self.assertEqual((output / tool.MAIN).read_bytes(), tool.frozen_read(FINAL_OBSERVER))
             self.assertEqual((output / tool.ENVELOPE).stat().st_size, 11800)
             self.assertIn('not observed link-map lifetimes', plan['loader_name_provenance'])
+            self.assertEqual(plan['audit']['native_mutex_rvas'], {'init':'0x86a00','destroy':'0x86980'})
+            self.assertEqual(plan['libc_slot'], {'exact_loader_name':LIBC_NAME,'rx_rva_begin':0,'rx_rva_end':1637944})
             for entry in plan['inventory']:
                 file = output / entry['name']
                 self.assertEqual(entry['sha256'], tool.digest(file.read_bytes()).hex())
@@ -355,7 +382,7 @@ class PreparationTests(unittest.TestCase):
             before = {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()}
             with self.assertRaises(ValueError):
                 tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
-                             api_file=PRIVATE_API)
+                             libc_name=LIBC_NAME,api_file=PRIVATE_API)
             self.assertEqual(before, {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()})
         self.assertFalse(output.exists())
 
@@ -368,9 +395,10 @@ if __name__ == '__main__':
     parser.add_argument('--observer-sha256')
     parser.add_argument('--api-loader-name', default=API_NAME)
     parser.add_argument('--client-loader-name', default=CLIENT_NAME)
+    parser.add_argument('--libc-loader-name', default=LIBC_NAME)
     args, remaining = parser.parse_known_args()
     PRIVATE_NATIVE, PRIVATE_API, FINAL_OBSERVER, FINAL_SHA = args.native_dir, args.api, args.observer, args.observer_sha256
-    API_NAME, CLIENT_NAME = args.api_loader_name, args.client_loader_name
+    API_NAME, CLIENT_NAME, LIBC_NAME = args.api_loader_name, args.client_loader_name, args.libc_loader_name
     if FINAL_OBSERVER and not FINAL_SHA:
         parser.error('--observer requires its separately reviewed --observer-sha256')
     unittest.main(argv=[sys.argv[0]] + remaining)

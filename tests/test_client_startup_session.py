@@ -66,7 +66,9 @@ class SessionTests(unittest.TestCase):
             "native_profiles": reports, "client_profile": {"file_sha256": pins["client"][1], "profile_sha256": client[-32:].hex()},
             "observer_profile": {"role": 5, "file_sha256": M.digest(main), "profile_sha256": profiles[-1][-32:].hex()},
             "client_slot": {"exact_loader_name": "/native/vrclient.so", "rx_rva_begin": 0, "rx_rva_end": 0x60699a},
-            "observer": {"sha256": M.digest(main)}, "audit": {"sha256": M.digest(audit), "native_api_rvas": dict(M.API_ENTRY_RVAS)},
+            "observer": {"sha256": M.digest(main)}, "audit": {"sha256": M.digest(audit), "native_api_rvas": dict(M.API_ENTRY_RVAS),
+                                                               "native_mutex_rvas": dict(M.MUTEX_ENTRY_RVAS)},
+            "libc_slot": {"exact_loader_name": "/native/libc.so.6", "rx_rva_begin": 0, "rx_rva_end": 1637944},
             "envelope": {"sha256": M.digest(envelope), "reviewed_observer_profile_identity": profiles[-1][-32:].hex()},
             "inventory": []}
         for flag in ("installed", "activated", "runtime_authorized", "frame_access", "network_access",
@@ -140,6 +142,21 @@ class SessionTests(unittest.TestCase):
             self.stage()
         self.assertFalse(self.session.folder.exists())
         self.assertEqual(self.calls, [])
+
+    def test_missing_or_wrong_mutex_route_and_libc_geometry_are_refused(self):
+        audit = dict(self.plan['audit'])
+        slot = dict(self.plan['libc_slot'])
+        for field, value in (('native_mutex_rvas', None), ('native_mutex_rvas', {'init':'0x86980','destroy':'0x86a00'}),
+                             ('exact_loader_name', ''), ('exact_loader_name', 'x' * 512),
+                             ('rx_rva_begin', 1), ('rx_rva_end', 1637943)):
+            self.plan['audit'] = dict(audit)
+            self.plan['libc_slot'] = dict(slot)
+            self.plan['audit' if field == 'native_mutex_rvas' else 'libc_slot'][field] = value
+            self.save_plan()
+            with self.subTest(field=field, value=value), self.assertRaises(RuntimeError):
+                self.stage()
+            self.assertFalse(self.session.folder.exists())
+            self.assertEqual(self.calls, [])
 
     def test_stage_is_inactive_and_only_copies_owned_deliverables(self):
         self.stage();m = self.session.manifest()

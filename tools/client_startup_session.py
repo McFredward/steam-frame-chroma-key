@@ -49,6 +49,7 @@ BLOCKED = {"LD_PRELOAD", "LD_AUDIT", "LD_BIND_NOW", "LD_BIND_NOT", "LD_DEBUG", "
            "LD_PROFILE_OUTPUT", "VK_LOADER_DEBUG", "VK_INSTANCE_LAYERS", "VK_LAYER_PATH", "VK_ADD_LAYER_PATH"}
 MAX_INPUT, CAPTURE_LIMIT = 8 * 1024 * 1024, 65536
 API_ENTRY_RVAS = {"init": "0x5768", "shutdown": "0x5330"}
+MUTEX_ENTRY_RVAS = {"init": "0x86a00", "destroy": "0x86980"}
 
 def blocked(key, value):
     return bool(value) and (key in BLOCKED or key.startswith(PREFIXES))
@@ -156,6 +157,14 @@ class Session(base.Session):
             raise RuntimeError("Plan/artifact report mismatch")
         if plan.get("audit", {}).get("native_api_rvas") != API_ENTRY_RVAS:
             raise RuntimeError("Audit route differs from the canonical Steam-runtime API")
+        if plan.get("audit", {}).get("native_mutex_rvas") != MUTEX_ENTRY_RVAS:
+            raise RuntimeError("Audit mutex route differs from canonical libc")
+        libc_slot = plan.get("libc_slot", {})
+        libc_name = libc_slot.get("exact_loader_name")
+        if (not isinstance(libc_name, str) or not 0 < len(libc_name.encode('utf-8')) < 512 or
+            any(ord(c) < 32 for c in libc_name) or
+            (libc_slot.get("rx_rva_begin"), libc_slot.get("rx_rva_end")) != (0, 1637944)):
+            raise RuntimeError("Explicit libc loader name and canonical RX geometry required")
         self.validate_envelope(payloads[ENVELOPE], plan, files, payloads[MAIN])
         for name, source in ((HELPERS[0], Path(__file__)), (HELPERS[1], Path(base.__file__))):
             data = read_regular(source)
