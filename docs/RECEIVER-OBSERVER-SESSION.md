@@ -46,6 +46,10 @@ before deployment when the receiver changed. Stale receiver pins or proposal
 call sites are refused. Keep an active session's original self-contained
 rollback helper; do not replace it during a port.
 
+The current helper [completed a native 32-record capture](FRAME-RECEIVER-CAPTURE-20261012.md)
+and exact manual restoration after that port. Its receiver/Btrfs guards passed
+on the actual capture writer; the remaining frame/GPU gates were not inferred.
+
 The session helper takes these four files explicitly, rereads their bytes and
 checks hashes, sizes and ELF64 little-endian AArch64 ET_DYN headers against the
 reviewed proposal. It requires the exact supported `vrlink` hash and basename.

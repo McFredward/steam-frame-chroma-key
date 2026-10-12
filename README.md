@@ -35,7 +35,9 @@ and tested offline to inspect bounded, protected selection metadata. Its first
 the receiver starts under the Steam client service; the original SteamVR-only
 activation could not reach it. The [approved Steam-client attempt](docs/FRAME-RECEIVER-STEAM-RUN-20261012.md)
 loaded the observer in the receiver, but a Btrfs file-identity guard refused
-arming. Protected receiver data and exact frame/GPU association are still missing.
+arming. The [later successful receiver capture](docs/FRAME-RECEIVER-CAPTURE-20261012.md)
+now provides 32 valid protected selections without loss. Exact PC source-frame,
+compositor resource/eye and GPU association remain incomplete.
 After a [SteamOS update](docs/FRAME-RECEIVER-UPDATE-20261012.md), the receiver
 observer was revalidated against the current native binary before any new
 deployment; unknown or stale builds remain refused.

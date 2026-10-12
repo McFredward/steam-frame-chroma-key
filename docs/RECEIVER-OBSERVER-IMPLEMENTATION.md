@@ -11,6 +11,12 @@ receiver, but the arm guard refused a Btrfs device-identity difference before
 recording. The source-video and GPU association gates remain unresolved; an
 offline plan or software test cannot grant runtime permission.
 
+The [subsequent SteamOS 0.4.5 run](FRAME-RECEIVER-CAPTURE-20261012.md) passed the
+fresh native and Btrfs guards, captured all 32 valid protected observations
+without loss, and was fully restored. This is runtime receiver-observation
+evidence; it still does not establish accepted submission, source identity or
+GPU association.
+
 ## Build and activation boundary
 
 The Linux shared-library sources are `receiver/receiver_observer.cpp` and

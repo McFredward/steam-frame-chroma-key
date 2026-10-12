@@ -76,5 +76,10 @@ The Btrfs arm correction and verified manual rollback from the preceding session
 remain relevant. This static update audit is not a new native capture or headset
 validation. In particular, previous compositor import addresses, descriptor
 snapshots and UV findings belong to their exact older binary. They do not prove
-the new compositor's live resource/eye binding. The current receiver still needs
-a coordinated runtime capture before its observations can advance that bridge.
+the new compositor's live resource/eye binding. At this audit checkpoint, the
+updated receiver still required a coordinated runtime capture; the subsequent
+run below supplies that separate evidence.
+
+The [subsequent native capture](FRAME-RECEIVER-CAPTURE-20261012.md) supplied 32
+valid protected selections and was fully restored. It is separate hardware
+evidence; the source-frame, compositor namespace and GPU gates remain open.
