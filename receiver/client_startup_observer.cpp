@@ -1,0 +1,189 @@
+#include "client_startup_runtime.h"
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_init_entry();
+extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_shutdown_entry();
+
+
+namespace {
+constexpr std::size_t kEnvelopeBytes=11800,kOutputBytes=64*1024,kRecordLimit=32;
+constexpr std::uint64_t kDurationNs=120ULL*1000*1000*1000;
+std::atomic<bool> stopping{false},active{false};
+pthread_t writer{};
+bool writer_started=false;
+char output_path[1024]{};
+frame_import_main::Digest reviewed_observer{};
+std::uint64_t local_process_label=0;
+std::uint64_t little(const std::uint8_t* data,std::size_t n) noexcept {
+    std::uint64_t value=0;for(std::size_t i=0;i<n;++i)value|=std::uint64_t(data[i])<<(8*i);return value;
+}
+bool path(const char* source,char* target,std::size_t capacity) noexcept {
+    if(!source||source[0]!='/')return false;
+    std::size_t i=0;while(i<capacity && source[i])++i;
+    if(i==0||i==capacity)return false;
+    std::memcpy(target,source,i+1);return true;
+}
+bool stable(const struct stat& a,const struct stat& b) noexcept {
+    return a.st_dev==b.st_dev&&a.st_ino==b.st_ino&&a.st_mode==b.st_mode&&a.st_uid==b.st_uid&&a.st_gid==b.st_gid&&
+        a.st_nlink==b.st_nlink&&a.st_size==b.st_size&&a.st_mtim.tv_sec==b.st_mtim.tv_sec&&a.st_mtim.tv_nsec==b.st_mtim.tv_nsec&&
+        a.st_ctim.tv_sec==b.st_ctim.tv_sec&&a.st_ctim.tv_nsec==b.st_ctim.tv_nsec;
+}
+bool read_envelope(const char* name,std::array<std::uint8_t,kEnvelopeBytes>& bytes) noexcept {
+    const int fd=open(name,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);if(fd<0)return false;
+    struct stat before{},after{};bool good=fstat(fd,&before)==0&&S_ISREG(before.st_mode)&&before.st_uid==geteuid()&&
+        before.st_nlink==1&&(before.st_mode&07777)==0600&&before.st_size==kEnvelopeBytes;
+    std::size_t offset=0;unsigned attempts=0;
+    while(good&&offset<bytes.size()&&attempts++<32) {
+        const auto n=read(fd,bytes.data()+offset,bytes.size()-offset);
+        if(n<=0) {good=false;break;}offset+=static_cast<std::size_t>(n);
+    }
+    good=good&&offset==bytes.size()&&fstat(fd,&after)==0&&stable(before,after);close(fd);return good;
+}
+bool decode(const std::array<std::uint8_t,kEnvelopeBytes>& b,frame_import_main::Profiles& profiles,
+            frame_import_module::ProfileBlob& client,frame_client_startup::ClientSlot& slot) noexcept {
+    if(std::memcmp(b.data(),"FCSTART1",8)!=0||little(b.data()+8,4)!=1||little(b.data()+12,4)!=b.size())return false;
+    std::memcpy(profiles.reviewed_observer_identity.data(),b.data()+16,32);
+    std::memcpy(slot.loader_name.data(),b.data()+48,slot.loader_name.size());
+    std::size_t end=0;while(end<slot.loader_name.size()&&slot.loader_name[end])++end;
+    if(end==0||end==slot.loader_name.size())return false;
+    for(std::size_t i=end;i<slot.loader_name.size();++i)if(slot.loader_name[i])return false;
+    slot.rx_rva_begin=little(b.data()+560,8);slot.rx_rva_end=little(b.data()+568,8);
+    if(slot.rx_rva_begin>=slot.rx_rva_end)return false;
+    for(std::size_t i=0;i<5;++i) {
+        frame_import_main::ProfileBlob blob{};std::memcpy(blob.data(),b.data()+576+i*blob.size(),blob.size());
+        if(!frame_import_main::decode_profile(blob,i==4?profiles.reviewed_observer_identity:frame_import_main::Digest{},profiles.modules[i])||
+           profiles.modules[i].role!=i+1)return false;
+    }
+    std::memcpy(client.data(),b.data()+10736,client.size());frame_import_module::Profile parsed{};
+    if(!frame_import_module::decode_profile(client,parsed))return false;
+    bool exact_rx=false;
+    for(const auto& ph:parsed.segments)
+        if(ph.type==PT_LOAD&&(ph.flags&PF_X)&&parsed.caller_rva>=ph.virtual_address&&parsed.caller_rva-ph.virtual_address<ph.file_size)
+            exact_rx=slot.rx_rva_begin==ph.virtual_address&&slot.rx_rva_end==ph.virtual_address+ph.file_size;
+    return exact_rx;
+}
+std::uint64_t now() noexcept {timespec t{};return clock_gettime(CLOCK_MONOTONIC,&t)==0?
+    std::uint64_t(t.tv_sec)*1000000000ULL+std::uint64_t(t.tv_nsec):0;}
+int open_output() noexcept {
+    char parent[1024]{};std::memcpy(parent,output_path,sizeof(parent));
+    char* slash=std::strrchr(parent,'/');if(!slash||!slash[1])return -1;
+    const char* basename=output_path+(slash-parent)+1;
+    if(slash==parent)slash[1]=0;else *slash=0;
+    const int dir=open(parent,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);if(dir<0)return -1;
+    struct stat s{};int fd=-1;
+    if(fstat(dir,&s)==0&&S_ISDIR(s.st_mode)&&s.st_uid==geteuid()&&!(s.st_mode&022))
+        fd=openat(dir,basename,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+    close(dir);return fd;
+}
+bool write_owned(int fd,const char* bytes,std::size_t size) noexcept {
+    std::size_t sent=0;unsigned attempts=0;
+    while(sent<size&&attempts++<32) {const auto n=write(fd,bytes+sent,size-sent);if(n<=0)return false;sent+=static_cast<std::size_t>(n);}
+    return sent==size;
+}
+struct Line {
+    std::array<char,4096> bytes{};std::size_t used=0;bool valid=true;
+    template<class... A> void add(const char* format,A... args) noexcept {
+        if(!valid)return;
+        int n=0;
+        if constexpr(sizeof...(A)==0)n=std::snprintf(bytes.data()+used,bytes.size()-used,"%s",format);
+        else n=std::snprintf(bytes.data()+used,bytes.size()-used,format,args...);
+        if(n<0||static_cast<std::size_t>(n)>=bytes.size()-used){valid=false;return;}used+=static_cast<std::size_t>(n);
+    }
+    void hex(const std::array<std::uint8_t,32>& digest) noexcept {for(auto c:digest)add("%02x",unsigned(c));}
+    void string(const std::array<char,512>& text) noexcept {
+        add("\"");bool terminated=false;
+        for(unsigned i=0;i<text.size();++i) {
+            const auto c=static_cast<unsigned char>(text[i]);if(!c){terminated=true;break;}
+            if(c=='"'||c=='\\')add("\\%c",c);else if(c<0x20||c>=0x7f)add("\\u%04x",unsigned(c));else add("%c",c);
+        }
+        if(!terminated)valid=false;
+        add("\"");
+    }
+};
+void record(Line& line,const frame_client_startup::Record& r) noexcept {
+    auto u=[](auto value) noexcept {return static_cast<unsigned long long>(value);};
+    line.add("{\"schema\":1,\"kind\":%u,\"ordinal\":%llu,\"local_label\":%llu,\"entry\":{\"sp\":\"%llx\",\"x\":[",
+        unsigned(r.kind),u(r.ordinal),u(r.local_verification_label),u(r.entry.sp));
+    for(unsigned i=0;i<31;++i)line.add("%s\"%llx\"",i?",":"",u(r.entry.x[i]));
+    line.add("]},\"mapped\":{\"bias\":\"%llx\",\"rx_begin\":\"%llx\",\"rx_end\":\"%llx\",\"local_life\":%llu,\"code\":\"",
+        u(r.module.load_bias),u(r.module.code_begin),u(r.module.code_end),u(r.module.module_lifetime_label));line.hex(r.module.code_identity);
+    line.add("\"},\"object\":{\"registry\":\"%llx\",\"pipe\":\"%llx\",\"local_process\":%llu,\"generation\":%llu,\"domain\":%u,\"reason\":%u},\"loader_name\":",
+        u(r.object.registry_identity),u(r.object.pipe),u(r.object.process_generation),u(r.object.object_generation),unsigned(r.object.domain),unsigned(r.object.reason));
+    line.string(r.verified_loader_name);
+    auto view=[&](const char* name,const frame_import_startup_audit::ModuleView& v) noexcept {
+        line.add(",\"%s\":{\"bias\":\"%llx\",\"rx_begin\":\"%llx\",\"rx_end\":\"%llx\",\"audit_open_generation\":%llu}",
+            name,u(v.bias),u(v.rx_begin),u(v.rx_end),u(v.observed_open_generation));
+    };
+    view("audit_receiver",r.audit_bindings.receiver);view("audit_api",r.audit_bindings.api);
+    view("audit_observer",r.audit_bindings.observer);view("retired_module",r.retired_view);
+    line.add(",\"audit_function\":%u,\"audit_original\":\"%llx\"",unsigned(r.audit_bindings.function),u(r.audit_bindings.original));
+    line.add(",\"actual_init_token\":%u,\"actual_native_result\":%d,\"errno\":%d,\"gate_refusal\":%u,\"refusal\":%u,"
+             "\"source_frame_proven\":false,\"native_namespace_proven\":false,\"accepted_submit_proven\":false,\"gpu_proven\":false}\n",
+        r.actual_init_token,r.actual_native_result,r.preserved_errno,unsigned(r.gate_refusal),unsigned(r.refusal));
+}
+void* write_background(void*) noexcept {
+    const int fd=open_output();if(fd<0){frame_client_startup::finalize();active.store(false);return nullptr;}
+    std::size_t bytes=0,records=0;const auto started=now();const char* end="stopped";
+    Line header;header.add("{\"schema\":1,\"capture\":\"client_startup\",\"pid\":%ld,\"local_process_label\":%llu,\"reviewed_observer_profile\":\"",long(getpid()),static_cast<unsigned long long>(local_process_label));
+    header.hex(reviewed_observer);header.add("\",\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120,\"mask_enabled\":false}\n");
+    if(!header.valid||!write_owned(fd,header.bytes.data(),header.used)){close(fd);frame_client_startup::finalize();active.store(false);return nullptr;}bytes=header.used;
+    while(!stopping.load(std::memory_order_acquire)) {
+        const auto time=now();if(!started||!time||time<started||time-started>=kDurationNs){end="deadline";break;}
+        frame_client_startup::Record value{};
+        if(frame_client_startup::pop(value)) {
+            Line line;record(line,value);
+            if(!line.valid||line.used>kOutputBytes-bytes-1024){end="byte_limit";break;}
+            if(!write_owned(fd,line.bytes.data(),line.used)){end="write_error";break;}
+            bytes+=line.used;if(++records==kRecordLimit){end="record_limit";break;}
+        } else {timespec pause{0,10000000};nanosleep(&pause,nullptr);}
+    }
+    // This deadline disarms recording only; it never restarts Steam/SteamVR,
+    // changes loader configuration, rolls back installation or affects pixels.
+    frame_client_startup::finalize();const auto status=frame_client_startup::status();
+    Line footer;footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%zu,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,\"startup_completed\":%s,\"refusal\":%u,\"finalized\":true}\n",
+        end,records,bytes,static_cast<unsigned long long>(status.queued),static_cast<unsigned long long>(status.drained),status.startup_completed?"true":"false",unsigned(status.refusal));
+    if(footer.valid&&footer.used<=kOutputBytes-bytes)write_owned(fd,footer.bytes.data(),footer.used);
+    close(fd);active.store(false,std::memory_order_release);return nullptr;
+}
+__attribute__((constructor)) void begin_observer() noexcept {
+    const auto saved=errno;
+    char envelope_name[1024]{};
+    if(!path(std::getenv("GHVR_FRAME_CLIENT_STARTUP_ENVELOPE"),envelope_name,sizeof(envelope_name))||
+       !path(std::getenv("GHVR_FRAME_CLIENT_STARTUP_OUTPUT"),output_path,sizeof(output_path))){errno=saved;return;}
+    std::array<std::uint8_t,kEnvelopeBytes> bytes{};frame_import_main::Profiles profiles{};
+    frame_import_module::ProfileBlob client{};frame_client_startup::ClientSlot slot{};
+    if(!read_envelope(envelope_name,bytes)||!decode(bytes,profiles,client,slot)){errno=saved;return;}
+    const auto prepared=frame_import_main::prepare(profiles);if(!prepared.ready()){errno=saved;return;}
+    frame_client_startup::Setup setup{};setup.client=slot;
+    local_process_label=static_cast<std::uint64_t>(getpid());setup.process_generation=local_process_label;
+    setup.local_verification_label=1; // A local observer label, not a native/audit/source generation.
+    setup.hidden_init_entry=reinterpret_cast<std::uintptr_t>(&frame_import_vr_init_entry);
+    setup.hidden_shutdown_entry=reinterpret_cast<std::uintptr_t>(&frame_import_vr_shutdown_entry);
+    if(!frame_client_startup::initialize_once(prepared,client,setup)){errno=saved;return;}
+    reviewed_observer=profiles.reviewed_observer_identity;active.store(true,std::memory_order_release);
+    if(pthread_create(&writer,nullptr,write_background,nullptr)==0)writer_started=true;
+    else {frame_client_startup::finalize();active.store(false,std::memory_order_release);}
+    errno=saved;
+}
+__attribute__((destructor)) void finish_observer() noexcept {
+    const auto saved=errno;
+    frame_client_startup::finalize();stopping.store(true,std::memory_order_release);
+    if(writer_started){pthread_join(writer,nullptr);writer_started=false;}
+    active.store(false,std::memory_order_release);errno=saved;
+}
+} // namespace
+extern "C" __attribute__((visibility("default"))) frame_import_startup_audit::BridgeResponse
+frame_client_startup_bridge(frame_import_startup_audit::BridgeRequest request) noexcept {
+    const auto saved=errno;
+    const auto response=active.load(std::memory_order_acquire)?frame_client_startup::bridge(request):frame_import_startup_audit::BridgeResponse{};
+    errno=saved;return response;
+}
