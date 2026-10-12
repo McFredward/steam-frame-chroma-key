@@ -145,30 +145,40 @@ def _check_deadline(deadline):
         raise ConnectionError("Peer discovery deadline exceeded")
 
 
-def _peer_descriptor(right, peer_inode, deadline):
-    """Inspect at most 256 entries in one specified process, never all PIDs."""
+def _validate_peer_fd_limit(max_peer_fds):
+    if type(max_peer_fds) is not int or not 1 <= max_peer_fds <= 4096:
+        raise ConnectionError("max_peer_fds must be an integer in 1..4096")
+
+
+def _peer_descriptor(right, peer_inode, deadline, max_peer_fds=256):
+    """Inspect a bounded FD directory in one specified process, never all PIDs."""
+    _validate_peer_fd_limit(max_peer_fds)
     pid, start_ticks = right
     found = None
     examined = 0
-    with os.scandir(Path("/proc") / str(pid) / "fd") as entries:
-        for entry in entries:
-            _check_deadline(deadline)
-            examined += 1
-            if examined > 256:
-                raise ConnectionError("Known peer process descriptor limit exceeded")
-            if not re.fullmatch(r"[0-9]+", entry.name):
-                raise ConnectionError("Unexpected process descriptor entry")
-            # readlink and fstat contain kernel metadata only, not socket payloads.
-            match = re.fullmatch(r"socket:\[(\d+)\]", os.readlink(entry.path))
-            if match and int(match[1]) == peer_inode:
-                if found is not None:
-                    raise ConnectionError("Ambiguous peer descriptor aliases")
-                found = endpoint(pid, int(entry.name), start_ticks)
-                if found["inode"] != peer_inode:
-                    raise ConnectionError("Peer descriptor changed during discovery")
-    _check_deadline(deadline)
-    if found is None:
-        raise ConnectionError("Kernel peer is not in the specified process")
+    try:
+        with os.scandir(Path("/proc") / str(pid) / "fd") as entries:
+            for entry in entries:
+                _check_deadline(deadline)
+                if examined == max_peer_fds:
+                    raise ConnectionError("Known peer process descriptor limit exceeded")
+                examined += 1
+                if not re.fullmatch(r"[0-9]+", entry.name):
+                    raise ConnectionError("Unexpected process descriptor entry")
+                # readlink and fstat contain kernel metadata only, not socket payloads.
+                match = re.fullmatch(r"socket:\[(\d+)\]", os.readlink(entry.path))
+                if match and int(match[1]) == peer_inode:
+                    if found is not None:
+                        raise ConnectionError("Ambiguous peer descriptor aliases")
+                    found = endpoint(pid, int(entry.name), start_ticks)
+                    if found["inode"] != peer_inode:
+                        raise ConnectionError("Peer descriptor changed during discovery")
+        _check_deadline(deadline)
+        if found is None:
+            raise ConnectionError("Kernel peer is not in the specified process")
+    except (OSError, ValueError, IndexError, ConnectionError) as error:
+        error.right_process_fd_entries_examined = examined
+        raise
     return found, examined
 
 
@@ -197,32 +207,45 @@ def inspect_pair(left, right):
     return _pair_result(before, after, first, again)
 
 
-def inspect_peer(left, right):
+def inspect_peer(left, right, *, max_peer_fds=256):
     """Discover a peer FD in one exact process within a single 2-second budget.
 
     left is (pid, fd, process_start_ticks); right is (pid, process_start_ticks).
+    The API retains its original 256-FD default; an explicit limit in 1..4096
+    supports busier peers without changing the four-query/two-second budget.
+    The whole directory must fit the limit, even if the peer is found early.
     This validates a contemporaneous kernel snapshot only. It does not bind a
     historically captured descriptor, native Registry lease or source frame.
     """
-    deadline = time.monotonic() + 2.0
-    left_before = endpoint(*left)
-    right_identity = _process_identity(*right)
-    _check_deadline(deadline)
-    with KernelQuery(deadline=deadline) as query:
-        left_first = query.get(left_before["inode"])
-        if left_first["uid"] != left_before["uid"]:
-            raise ConnectionError("Kernel socket owner differs from process owner")
-        right_before, examined = _peer_descriptor(right, left_first["peer_inode"], deadline)
-        if any(right_before[key] != value for key, value in right_identity.items()):
-            raise ConnectionError("Peer process changed during discovery")
+    examined = 0
+    try:
+        _validate_peer_fd_limit(max_peer_fds)
+        deadline = time.monotonic() + 2.0
+        left_before = endpoint(*left)
+        right_identity = _process_identity(*right)
         _check_deadline(deadline)
-        right_first = query.get(right_before["inode"])
-        first = [left_first, right_first]
-        again = [query.get(x["inode"], x["cookie"]) for x in first]
-    after = [endpoint(*left), endpoint(right[0], right_before["fd"], right[1])]
-    _check_deadline(deadline)
-    result = _pair_result([left_before, right_before], after, first, again)
+        with KernelQuery(deadline=deadline) as query:
+            left_first = query.get(left_before["inode"])
+            if left_first["uid"] != left_before["uid"]:
+                raise ConnectionError("Kernel socket owner differs from process owner")
+            right_before, examined = _peer_descriptor(right, left_first["peer_inode"], deadline,
+                                                      max_peer_fds=max_peer_fds)
+            if any(right_before[key] != value for key, value in right_identity.items()):
+                raise ConnectionError("Peer process changed during discovery")
+            _check_deadline(deadline)
+            right_first = query.get(right_before["inode"])
+            first = [left_first, right_first]
+            again = [query.get(x["inode"], x["cookie"]) for x in first]
+        after = [endpoint(*left), endpoint(right[0], right_before["fd"], right[1])]
+        _check_deadline(deadline)
+        result = _pair_result([left_before, right_before], after, first, again)
+    except (OSError, ValueError, IndexError, ConnectionError) as error:
+        error.right_process_fd_scan_limit = max_peer_fds
+        if not hasattr(error, "right_process_fd_entries_examined"):
+            error.right_process_fd_entries_examined = examined
+        raise
     result.update({"kind": "unix_peer_discovery_snapshot",
+                   "right_process_fd_scan_limit": max_peer_fds,
                    "right_process_fd_entries_examined": examined,
                    "historical_captured_descriptor_authenticated": False,
                    "native_registry_lease_authenticated": False})

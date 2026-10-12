@@ -349,5 +349,119 @@ os.close(61);listener.close()
         for key,value in receipt.items():
             if isinstance(value,bool):self.assertFalse(value,key)
 
+    def test_configured_fd_budget_real_peer_over_256_entries_and_late_alias(self):
+        import resource
+        if resource.getrlimit(resource.RLIMIT_NOFILE)[0]<384:
+            self.skipTest("A soft FD limit of at least 384 is needed for the busy peer fixture")
+        # Keep the true peer at a low FD, with 300 unrelated later descriptors.
+        # Success must inspect the whole directory, not stop on the early match.
+        code="""
+import json, os, socket, sys
+from pathlib import Path
+listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+address='\\0frame-busy-peer-'+str(os.getpid())
+listener.bind(address);listener.listen(1)
+value=Path('/proc/self/stat').read_text()
+ticks=int(value[value.rindex(')')+2:].split()[19])
+print(json.dumps({'pid':os.getpid(),'ticks':ticks,'address':address}),flush=True)
+accepted,_=listener.accept()
+extra=[os.open('/dev/null',os.O_RDONLY) for _ in range(300)]
+print(json.dumps({'fd':accepted.fileno(),'minimum_entries':len(extra)+5}),flush=True)
+alias=None
+for command in sys.stdin:
+    if command.strip()=='alias':
+        alias=os.dup(accepted.fileno());print(alias,flush=True)
+    else:break
+if alias is not None:os.close(alias)
+for fd in extra:os.close(fd)
+accepted.close();listener.close()
+"""
+        process=subprocess.Popen([sys.executable,"-u","-c",code],stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+        try:
+            server=json.loads(process.stdout.readline());client.connect(server["address"])
+            oracle=json.loads(process.stdout.readline())
+            left=(os.getpid(),client.fileno(),self.ticks);right=(server["pid"],server["ticks"])
+            calls=[];original=connection.KernelQuery.get
+            def observe(query,*args):
+                calls.append(args);return original(query,*args)
+            with patch.object(connection.KernelQuery,"get",observe):
+                with self.assertRaisesRegex(connection.ConnectionError,"descriptor limit") as refusal:
+                    connection.inspect_peer(left,right)
+            self.assertEqual(refusal.exception.right_process_fd_scan_limit,256)
+            self.assertEqual(refusal.exception.right_process_fd_entries_examined,256)
+            self.assertEqual(len(calls),1)
+            calls.clear()
+            started=time.monotonic()
+            with patch.object(connection.KernelQuery,"get",observe):
+                result=connection.inspect_peer(left,right,max_peer_fds=4096)
+            self.assertEqual(result["endpoints"][1]["fd"],oracle["fd"])
+            self.assertEqual(result["right_process_fd_scan_limit"],4096)
+            self.assertGreaterEqual(result["right_process_fd_entries_examined"],oracle["minimum_entries"])
+            self.assertLessEqual(result["right_process_fd_entries_examined"],4096)
+            self.assertLess(time.monotonic()-started,2)
+            self.assertEqual(len(calls),4)
+            cli=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/"tools/inspect_client_connection.py"),
+                                "--left-pid",str(left[0]),"--left-fd",str(left[1]),"--left-start-ticks",str(left[2]),
+                                "--right-pid",str(right[0]),"--right-start-ticks",str(right[1])],
+                               capture_output=True,text=True,timeout=3)
+            self.assertEqual(cli.returncode,0,cli.stdout+cli.stderr)
+            self.assertEqual(json.loads(cli.stdout)["right_process_fd_scan_limit"],4096)
+            process.stdin.write("alias\n");process.stdin.flush()
+            alias_fd=int(process.stdout.readline());self.assertGreater(alias_fd,256)
+            with self.assertRaisesRegex(connection.ConnectionError,"Ambiguous") as refusal:
+                connection.inspect_peer(left,right,max_peer_fds=4096)
+            self.assertGreater(refusal.exception.right_process_fd_entries_examined,256)
+            self.assertEqual(refusal.exception.right_process_fd_scan_limit,4096)
+        finally:
+            client.close()
+            try:process.communicate("quit\n",timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill();process.communicate()
+
+    def test_fd_budget_validation_before_process_reads_or_queries(self):
+        for limit in (0,-1,4097,1<<30,True,False,256.0,"256",None):
+            with self.subTest(limit=limit), \
+                    patch.object(connection,"endpoint",side_effect=AssertionError("must not inspect")), \
+                    patch.object(connection.KernelQuery,"get",side_effect=AssertionError("must not query")):
+                with self.assertRaisesRegex(connection.ConnectionError,"1..4096") as refusal:
+                    connection.inspect_peer(self.a,self.peer,max_peer_fds=limit)
+                self.assertEqual(refusal.exception.right_process_fd_entries_examined,0)
+
+    def test_minimum_fd_budget_and_cli_explicit_refusal_report(self):
+        with self.assertRaisesRegex(connection.ConnectionError,"descriptor limit") as refusal:
+            connection.inspect_peer(self.a,self.peer,max_peer_fds=1)
+        self.assertEqual(refusal.exception.right_process_fd_scan_limit,1)
+        self.assertEqual(refusal.exception.right_process_fd_entries_examined,1)
+        for limit in (1,0,4097):
+            with self.subTest(limit=limit):
+                cli=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/"tools/inspect_client_connection.py"),
+                                    "--left-pid",str(self.a[0]),"--left-fd",str(self.a[1]),
+                                    "--left-start-ticks",str(self.a[2]),"--right-pid",str(self.peer[0]),
+                                    "--right-start-ticks",str(self.peer[1]),"--max-peer-fds",str(limit)],
+                                   capture_output=True,text=True,timeout=3)
+                self.assertEqual(cli.returncode,1,cli.stdout+cli.stderr)
+                receipt=json.loads(cli.stdout)
+                self.assertEqual(receipt["right_process_fd_scan_limit"],limit)
+                self.assertEqual(receipt["right_process_fd_entries_examined"],1 if limit==1 else 0)
+                for key,value in receipt.items():
+                    if isinstance(value,bool):self.assertFalse(value,key)
+
+    def test_large_fd_budget_does_not_extend_scan_deadline(self):
+        original=connection.os.readlink
+        clock=[100.0];reads=0
+        def elapsed(path):
+            nonlocal reads
+            reads+=1;result=original(path)
+            if reads==2:clock[0]+=2.1
+            return result
+        with patch.object(connection.time,"monotonic",side_effect=lambda:clock[0]), \
+                patch.object(connection.os,"readlink",elapsed):
+            with self.assertRaisesRegex(connection.ConnectionError,"deadline") as refusal:
+                connection.inspect_peer(self.a,self.peer,max_peer_fds=4096)
+        self.assertEqual(refusal.exception.right_process_fd_scan_limit,4096)
+        self.assertEqual(refusal.exception.right_process_fd_entries_examined,1)
+
 
 if __name__=="__main__":unittest.main()
