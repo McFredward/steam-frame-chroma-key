@@ -43,11 +43,12 @@ public:
     bool current() const noexcept;
     bool ownership_active() const noexcept;
     bool expired() const noexcept;
+    bool complete() const noexcept;
 private:
     friend class Gate;
     enum class State : unsigned {
         Idle, LockPending, Owned, ConnectPending, SuccessUnlock, FailureUnlock,
-        UnlockPending, Expired
+        UnlockPending, Complete, Expired
     };
     std::uintptr_t owner_ = 0;
     const Gate* gate_owner_ = nullptr;

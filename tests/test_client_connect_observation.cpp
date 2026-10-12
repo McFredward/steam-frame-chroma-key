@@ -93,8 +93,18 @@ int main() {
         check(f.send(Operation::Unlock, Phase::Before, unlock_entry()).kind == Kind::None);
         check(!f.scope.ownership_active()); // Ownership ends before forwarding.
         check(f.send(Operation::Unlock, Phase::After, unlock_entry()).kind == Kind::None);
-        check(!f.scope.expired());
-        check(f.connected().kind == Kind::NativeConnectCall); // New supported invocation.
+        check(!f.scope.expired() && f.scope.complete());
+        // Real startup next uses ordinary RPC/send/read locks on this object.
+        // Completion is terminal sampling, never descriptor lifetime tracking.
+        auto rpc = lock_entry(); rpc.x[30] = bias + 0x3623c0;
+        check(f.send(Operation::Lock, Phase::Before, rpc).kind == Kind::None);
+        check(f.send(Operation::Lock, Phase::After, rpc).kind == Kind::None);
+        check(f.scope.complete() && !f.scope.ownership_active());
+        check(f.send(Operation::Lock, Phase::Before, lock_entry()).kind == Kind::None);
+        check(f.send(Operation::Lock, Phase::After, lock_entry()).kind == Kind::None);
+        check(f.send(Operation::Connect, Phase::Before, connect_entry()).kind == Kind::None);
+        check(f.send(Operation::Connect, Phase::After, connect_entry()).kind == Kind::None);
+        check(f.scope.complete() && !f.scope.ownership_active());
     }
     {
         Fixture f;
@@ -107,6 +117,7 @@ int main() {
         check(f.send(Operation::Unlock, Phase::Before, unlock_entry(false)).kind == Kind::None);
         check(!f.scope.ownership_active());
         check(f.send(Operation::Unlock, Phase::After, unlock_entry(false)).kind == Kind::None);
+        check(f.scope.complete() && !f.scope.ownership_active());
     }
     {
         Fixture f; Scope unprepared;
@@ -183,6 +194,30 @@ int main() {
     {
         Fixture f; f.locked(); auto inner = lock_entry(); inner.x[30] = bias + 0x244ec4;
         f.refused(f.send(Operation::Lock, Phase::Before, inner), Reason::Unsupported);
+    }
+    {
+        Fixture f; f.locked();
+        auto unrelated = lock_entry(); unrelated.x[0] += 16;
+        unrelated.x[30] = bias + 0x123456;
+        check(f.send(Operation::Lock, Phase::Before, unrelated).kind == Kind::None);
+        check(f.send(Operation::Lock, Phase::After, unrelated).kind == Kind::None);
+        check(f.send(Operation::Unlock, Phase::Before, unrelated).kind == Kind::None);
+        check(f.send(Operation::Unlock, Phase::After, unrelated).kind == Kind::None);
+        check(f.scope.ownership_active() && !f.scope.expired());
+        check(f.send(Operation::Connect, Phase::Before, connect_entry()).kind == Kind::None);
+        check(f.send(Operation::Connect, Phase::After, connect_entry()).kind == Kind::NativeConnectCall);
+        check(f.send(Operation::Lock, Phase::Before, unrelated).kind == Kind::None);
+        check(f.send(Operation::Lock, Phase::After, unrelated).kind == Kind::None);
+        check(f.send(Operation::Unlock, Phase::Before, unrelated).kind == Kind::None);
+        check(f.send(Operation::Unlock, Phase::After, unrelated).kind == Kind::None);
+        check(f.scope.ownership_active() && !f.scope.expired());
+        check(f.send(Operation::Unlock, Phase::Before, unlock_entry()).kind == Kind::None);
+        check(f.send(Operation::Unlock, Phase::After, unlock_entry()).kind == Kind::None);
+        check(f.scope.complete());
+    }
+    {
+        Fixture f; f.locked(); auto wrong = unlock_entry(); wrong.x[0] += 16;
+        f.refused(f.send(Operation::Unlock, Phase::Before, wrong), Reason::Unsupported);
     }
     for (unsigned at = 0; at < 6; ++at) {
         Fixture f; f.locked(); auto e = connect_entry();

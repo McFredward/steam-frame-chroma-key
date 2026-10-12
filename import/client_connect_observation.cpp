@@ -68,6 +68,7 @@ bool Scope::current() const noexcept {
 }
 bool Scope::ownership_active() const noexcept { return current() && lock_owned_; }
 bool Scope::expired() const noexcept { return current() && state_ == State::Expired; }
+bool Scope::complete() const noexcept { return current() && state_ == State::Complete; }
 Gate::Gate(Target target) noexcept : target_(target), target_valid_(target_valid(target)) {}
 void Gate::expire(Scope& scope) const noexcept {
     if (!scope.current()) return;
@@ -80,7 +81,11 @@ Outcome Gate::observe(frame_import_forwarding::Notification note, Scope& scope) 
     using State = Scope::State;
     if (!scope.owner_) return receipt(Kind::Rejected, Reason::UnpreparedScope, note);
     if (!scope.current()) return receipt(Kind::Rejected, Reason::WrongThread, note);
-    if (scope.state_ == State::Expired) return {};
+    // This samples one local invocation. Later ordinary RPC locks on the same
+    // object are not reconnect/lifetime evidence and must not turn a completed
+    // sample into a fictitious observation failure. Root retains responsibility
+    // for actual destroy/shutdown/audit/callback loss outside this local sample.
+    if (scope.state_ == State::Expired || scope.state_ == State::Complete) return {};
     const auto reject = [&](Reason reason) noexcept {
         expire(scope); return receipt(Kind::Rejected, reason, note);
     };
@@ -93,6 +98,22 @@ Outcome Gate::observe(frame_import_forwarding::Notification note, Scope& scope) 
         return reject(Reason::Destroyed);
     if (note.phase != Phase::Before && note.phase != Phase::After)
         return reject(Reason::Order);
+
+    // Native logging helpers can use other client mutexes before connect or
+    // between its return and the outer unlock. They do not release this target
+    // mutex. Never ignore the exact source sites or ANY changed/nested callback
+    // while a supported Before is waiting for its matching After.
+    const bool held_interval = scope.state_ == State::Owned ||
+        scope.state_ == State::SuccessUnlock || scope.state_ == State::FailureUnlock;
+    const bool mutex_call = note.operation == Operation::Init ||
+        note.operation == Operation::Destroy || note.operation == Operation::Lock ||
+        note.operation == Operation::Unlock;
+    const bool source_mutex =
+        (note.operation == Operation::Lock && site(e, target_, kLock)) ||
+        (note.operation == Operation::Unlock &&
+         (site(e, target_, kSuccessUnlock) || site(e, target_, kFailureUnlock) ||
+          site(e, target_, kExceptionUnlock)));
+    if (held_interval && mutex_call && !target_argument && !source_mutex) return {};
 
     // Any observed target unlock ends local ownership BEFORE the original
     // provider runs, including unsupported sites and exceptional cleanup.
@@ -163,7 +184,7 @@ Outcome Gate::observe(frame_import_forwarding::Notification note, Scope& scope) 
             auto out = reject(Reason::NativeUnlockFailure); out.native_result = result; return out;
         }
         scope.pending_ = {}; scope.frame_ = 0; scope.argument_fd_ = -1;
-        scope.state_ = State::Idle;
+        scope.state_ = State::Complete;
         return {};
     }
     // An observed connect result waits only for its matching outer unlock.
