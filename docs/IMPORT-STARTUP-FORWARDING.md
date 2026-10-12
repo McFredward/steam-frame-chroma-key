@@ -140,8 +140,27 @@ Neither fixture has yet executed the **combined production audit/veneer/runtime
 path**. Explicit QEMU/provider paths opt this test into CTest; private inputs
 are neither downloaded by the runner nor published by CI.
 
-Root integration must connect real cold preparation and retirement, pin
-the final own ELF/hidden RVAs, verify the actual current launch environment and
+The real constructor/runtime/writer path is now integrated as the opt-in
+`FRAME_MASK_BUILD_CLIENT_STARTUP` ARM64 target. Its sealed cold preparation,
+actual-thread startup Gate, original mutex veneers, selective audit handshake,
+bounded records and manual-session proposal remain uninstalled. The source
+contains no public OpenVR export or forced API dependency. The two public mutex
+aliases share the exact original entry PCs, while their actual-provider
+`__pthread_*@GLIBC_2.17` imports stay distinct. Missing setup is transparent:
+those dispatchers forward unconditionally and their registration atomics are
+constant-initialized, not constructor-dependent.
+
+`tools/run_client_startup_preload.py` executes the final ARM64 observer ELF under
+QEMU with the pinned native libc/loader: three unrelated-process cases (missing,
+invalid and FIFO input), 20 checks each, real public/compatibility-version
+provider mapping, mutex results/errno, inactive bridge and unchanged missing
+OpenVR presence. This is actual final-library forwarding evidence, **not a
+production Ready/native OpenVR or Frame-kernel test**. The complete positive
+audit/veneer/runtime path still requires that native initialization.
+
+`tools/prepare_client_startup_observer.py` now produces only an offline reviewed
+candidate bundle. Loader names are explicitly expected inputs, not observed
+link-map lifetimes. Root must verify the actual current launch environment and
 obtain permission before any changed runtime instrumentation. Native
 constructor discovery, binding absence/presence, startup thread ownership and
 close behavior still require a scoped Frame run. No headset/kernel/GPU proof,

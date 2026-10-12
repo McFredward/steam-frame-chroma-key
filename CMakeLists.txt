@@ -11,6 +11,8 @@ option(FRAME_MASK_BUILD_IMPORT_ENTRY
     "Build uninstalled AArch64 import entry forwarding (no observer activation)" OFF)
 option(FRAME_MASK_BUILD_STARTUP_AUDIT
     "Build an uninstalled startup audit bridge with inactive default preparation" OFF)
+option(FRAME_MASK_BUILD_CLIENT_STARTUP
+    "Build the uninstalled, source-pinned AArch64 passive client startup observer" OFF)
 set(FRAME_MASK_IMPORT_QEMU "" CACHE FILEPATH "Explicit local qemu-aarch64 for optional native ABI checks")
 set(FRAME_MASK_IMPORT_PROVIDERS "" CACHE PATH "Private pinned Frame libc/loader prefix for native ABI checks")
 set(FRAME_MASK_IMPORT_CLIENT_PROFILE "" CACHE FILEPATH "Private prepared client hash/layout profile")
@@ -18,6 +20,27 @@ set(FRAME_MASK_IMPORT_CLIENT_REFERENCE "" CACHE FILEPATH "Private reviewed clien
 if(FRAME_MASK_BUILD_IMPORT_ENTRY AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
     NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$"))
     message(FATAL_ERROR "Import entry forwarding requires the audited Linux AArch64 ABI")
+endif()
+if(FRAME_MASK_BUILD_CLIENT_STARTUP)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+       NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        message(FATAL_ERROR "The client startup observer requires the reviewed Linux AArch64 ABI")
+    endif()
+    find_package(Threads REQUIRED)
+    enable_language(ASM)
+    add_library(frame_client_startup SHARED
+        receiver/client_startup_observer.cpp receiver/client_startup_runtime.cpp
+        import/native_mutex_entry.S import/native_startup_entry.S
+        import/import_forwarding.cpp import/import_startup_forwarding.cpp
+        import/import_main_preparation.cpp import/import_loader_reader.cpp
+        import/import_module_identity.cpp import/import_startup_gate.cpp
+        import/native_client_birth.cpp import/import_pipe_epoch.cpp)
+    target_include_directories(frame_client_startup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(frame_client_startup PRIVATE
+        -Wall -Wextra -Wpedantic -fvisibility=hidden -ftls-model=initial-exec
+        -fexceptions -fno-rtti)
+    target_link_options(frame_client_startup PRIVATE -Wl,--no-undefined)
+    target_link_libraries(frame_client_startup PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 if(FRAME_MASK_BUILD_STARTUP_AUDIT)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -200,6 +223,35 @@ if(BUILD_TESTING)
             target_compile_options(test_import_startup_forwarding PRIVATE -Wall -Wextra -Wpedantic -fexceptions)
             target_link_libraries(test_import_startup_forwarding PRIVATE Threads::Threads)
             add_test(NAME import_startup_provider_forwarding COMMAND test_import_startup_forwarding)
+            if(NOT CMAKE_CROSSCOMPILING)
+                set(client_startup_core_sources receiver/client_startup_runtime.cpp
+                    import/import_main_preparation.cpp import/import_loader_reader.cpp
+                    import/import_module_identity.cpp import/import_startup_gate.cpp
+                    import/native_client_birth.cpp import/import_pipe_epoch.cpp
+                    import/import_forwarding.cpp import/import_startup_forwarding.cpp)
+                add_executable(test_client_startup_runtime tests/test_client_startup_runtime.cpp
+                    ${client_startup_core_sources})
+                target_include_directories(test_client_startup_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+                target_compile_options(test_client_startup_runtime PRIVATE -Wall -Wextra -Wpedantic -fexceptions)
+                target_link_libraries(test_client_startup_runtime PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+                add_test(NAME client_startup_readiness COMMAND test_client_startup_runtime)
+                # Host controls deliberately contain no native public aliases
+                # or fabricated Ready. Actual ARM aliases are checked separately
+                # with the explicitly supplied final ELF and pinned providers.
+                add_library(client_startup_inert_fixture SHARED receiver/client_startup_observer.cpp
+                    ${client_startup_core_sources})
+                target_include_directories(client_startup_inert_fixture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+                target_compile_options(client_startup_inert_fixture PRIVATE
+                    -Wall -Wextra -Wpedantic -fexceptions -fvisibility=hidden -ftls-model=initial-exec)
+                target_link_libraries(client_startup_inert_fixture PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+                add_test(NAME client_startup_inert_preload COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_client_startup_observer.py
+                    --observer $<TARGET_FILE:client_startup_inert_fixture>
+                    --workdir ${CMAKE_CURRENT_BINARY_DIR}/client-startup-controls)
+                add_test(NAME client_startup_offline_preparation COMMAND ${Python3_EXECUTABLE}
+                    -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                    -p test_prepare_client_startup_observer.py)
+            endif()
             if(NOT CMAKE_CROSSCOMPILING)
                 add_test(NAME import_startup_audit_binding COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py
