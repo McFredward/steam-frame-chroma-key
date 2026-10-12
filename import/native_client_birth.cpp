@@ -34,7 +34,7 @@ Facts shape(const frame_import_native::Entry& e,const CodeRegion& code) noexcept
 }
 bool Reader::candidate(const frame_import_native::Entry& e) noexcept {
     return address(e.x[30]) && (e.x[30] & 4095) == (kInitReturn & 4095) &&
-        address(e.x[0]) && e.x[0] % 16 == 0 && e.x[0] == e.x[19] &&
+        address(e.x[0]) && (e.x[0] & 4095) == (kPipeObject & 4095) && e.x[0] == e.x[19] &&
         e.x[0] <= std::numeric_limits<std::uintptr_t>::max()-48 && e.x[1] == e.x[0]+48 &&
         address(e.sp) && e.sp % 16 == 0 && e.x[29] == e.sp;
 }

@@ -79,6 +79,9 @@ bool Gate::before_vr_init(const frame_import_native::Entry& e) noexcept {
 bool Gate::native_init_before(const frame_import_native::Entry& e) noexcept {
     if (!prepared_.stack.current()) return false;
     const auto state=state_.load(std::memory_order_acquire);
+    // The supported HMD constructor first initializes a different embedded
+    // pipe through the same helper/LR. Its source-proven page offset rejects it
+    // before lookup or stack acquisition and leaves the target window active.
     if (!frame_native_client_birth::Reader::candidate(e)) return false;
     if (state==State::Discovering || state==State::NativePending) { retire(Refusal::Recursion); return false; }
     if (state!=State::Active ||

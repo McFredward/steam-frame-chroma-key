@@ -27,8 +27,10 @@ public:
     static Facts decode(const frame_import_native::Entry&,
                         const std::array<std::uint8_t, kPrefixBytes>&,
                         const CodeRegion&) noexcept;
-    // Register-only candidate filter. It neither validates a mapped module nor
-    // permits a read. Unrelated mutex/graphics entries do not invoke lookup.
+    // Register-only target filter. The earlier HMD subobject uses the same
+    // mutex-init return site but a different pipe page offset. A matching page
+    // offset neither validates a mapped module nor permits a read; the full
+    // mapped singleton and exact constructor frames remain mandatory.
     static bool candidate(const frame_import_native::Entry&) noexcept;
 private:
     friend class frame_import_startup::Gate;

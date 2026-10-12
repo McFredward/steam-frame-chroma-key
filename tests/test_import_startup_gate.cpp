@@ -136,13 +136,45 @@ struct Fixture {
         library=::dlopen(path,RTLD_NOW|RTLD_LOCAL);check(library);
         auto* site=::dlsym(library,"fixture_client_init_pc");check(site);
         Dl_info info{};check(::dladdr(site,&info));const auto base=reinterpret_cast<std::uintptr_t>(info.dli_fbase);
-        check(reinterpret_cast<std::uintptr_t>(site)==base+frame_native_client_birth::kInitReturn);
+        check(reinterpret_cast<std::uintptr_t>(site)==base+0x244dbc);
         const auto sp=reinterpret_cast<std::uintptr_t>(native_stack.data());
         native.sp=native.x[29]=sp;native.x[30]=reinterpret_cast<std::uintptr_t>(site);
-        native.x[0]=native.x[19]=base+frame_native_client_birth::kPipeObject;native.x[1]=native.x[0]+48;
+        native.x[0]=native.x[19]=base+0x649ff0;native.x[1]=native.x[0]+48;
         for(const auto& pair:std::array<std::pair<unsigned,std::uint64_t>,5>{{{0,sp+32},{8,base+0x1b957c},{16,base+0x647d78},{32,sp+416},{40,base+0xa9250}}})
             std::memcpy(native_stack.data()+pair.first,&pair.second,8);
         owner.native=native;
+    }
+    void forward_earlier_birth() {
+        const auto base=native.x[30]-0x244dbc;
+        auto earlier=native;
+        earlier.x[0]=earlier.x[19]=base+0x648da0;
+        earlier.x[1]=base+0x648dd0;
+        // Source-proven earlier route: HMD+fe0 is constructed first; its
+        // embedded pipe is another +48 bytes in that distinct object. Its
+        // helper return and caller frames must not spend the target lookup.
+        const auto sp=native.sp;
+        std::array<std::uint8_t,96> target_frames{};
+        std::memcpy(target_frames.data(),native_stack.data(),target_frames.size());
+        for(const auto& pair:std::array<std::pair<unsigned,std::uint64_t>,7>{{
+            {0,sp+32},{8,base+0x3ac5dc},{16,base+0x648d58},
+            {32,sp+80},{40,base+0x1b94f0},{80,sp+464},{88,base+0xa9250}}})
+            std::memcpy(native_stack.data()+pair.first,&pair.second,8);
+        auto* attrs=reinterpret_cast<pthread_mutexattr_t*>(earlier.x[1]);
+        check(pthread_mutexattr_init(attrs)==0);
+        check(pthread_mutexattr_settype(attrs,PTHREAD_MUTEX_RECURSIVE)==0);
+        errno=E2BIG;forbid_allocations=true;
+        check(!gate->native_init_before(earlier));check(errno==E2BIG);
+        const int result=pthread_mutex_init(reinterpret_cast<pthread_mutex_t*>(earlier.x[0]),attrs);
+        check(result==0 && errno==E2BIG);
+        check(!gate->native_init_after(earlier,result).valid());check(errno==E2BIG);
+        forbid_allocations=false;
+        check(gate->refusal()==Refusal::None && gate->lookups()==0);
+        check(owner.lookup_calls==0 && owner.validator_calls==0 && registry.healthy());
+        check(registry.counters.births==0 && registry.counters.pending_reservations==0);
+        MappedClient mapped;check(!gate->mapping(mapped));
+        check(pthread_mutex_destroy(reinterpret_cast<pthread_mutex_t*>(earlier.x[0]))==0);
+        check(pthread_mutexattr_destroy(attrs)==0);
+        std::memcpy(native_stack.data(),target_frames.data(),target_frames.size());
     }
     frame_import_pipe::ObjectToken finish_birth() {
         auto* attrs=reinterpret_cast<pthread_mutexattr_t*>(native.x[1]);check(pthread_mutexattr_init(attrs)==0);
@@ -158,6 +190,26 @@ struct Fixture {
 int main(int argc,char** argv) {
     if(argc!=2){std::fprintf(stderr,"controlled host DSO path required\n");return 77;}
     const auto hash=file_code_hash(argv[1]);
+    { Fixture f(argv[1],hash);f.load_after_before();
+      f.forward_earlier_birth();
+      const auto object=f.finish_birth();check(object.valid());
+      check(f.gate->lookups()==1 && f.owner.lookup_calls==1 && f.owner.validator_calls==1);
+      check(f.registry.counters.births==1 && f.gate->after_vr_init(f.init,91)); }
+    { Fixture f(argv[1],hash);f.load_after_before();
+      auto earlier=f.native;const auto base=earlier.x[30]-0x244dbc;
+      earlier.x[0]=earlier.x[19]=base+0x648da0;earlier.x[1]=base+0x648dd0;
+      void* guard=::mmap(nullptr,4096,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);check(guard!=MAP_FAILED);
+      earlier.sp=earlier.x[29]=reinterpret_cast<std::uintptr_t>(guard);
+      check(!f.gate->native_init_before(earlier) && f.gate->refusal()==Refusal::None);
+      check(f.gate->lookups()==0 && f.owner.lookup_calls==0 && f.owner.validator_calls==0);
+      check(::munmap(guard,4096)==0);f.finish_birth();check(f.gate->after_vr_init(f.init,1)); }
+    { Fixture f(argv[1],hash);f.load_after_before();auto wrong=f.native;
+      // The cheap modulo filter cannot authorize a distinct same-offset pipe.
+      wrong.x[0]+=4096;wrong.x[19]=wrong.x[0];wrong.x[1]=wrong.x[0]+48;
+      check(frame_native_client_birth::Reader::candidate(wrong));
+      check(!f.gate->native_init_before(wrong));
+      check(f.gate->refusal()==Refusal::NativeWindow && f.gate->lookups()==1);
+      check(f.registry.counters.births==0 && !f.registry.healthy()); }
     // The receiver's actual Steam-runtime API replaced the distinct /opt API.
     // A known old hash, old RVA pair or mixed identity never arms startup.
     for(unsigned old=1;old<=3;++old) {
