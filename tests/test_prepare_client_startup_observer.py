@@ -1,0 +1,358 @@
+"""Offline preparation controls; own synthetic ELFs are never runtime authority.
+
+The optional private-input checks authenticate borrowed native metadata, not a
+Frame execution. Compilation fixtures contain only this repository's source.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import struct
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import prepare_client_startup_observer as tool
+
+PRIVATE_NATIVE = None
+FINAL_OBSERVER = None
+FINAL_SHA = None
+API_NAME = '/opt/steamvr/bin/linuxarm64/libopenvr_api.so'
+CLIENT_NAME = '/opt/steamvr/bin/linuxarm64/vrclient.so'
+FRAME_DIRECTORY = '/home/steamos/.local/share/GloomhavenVR/frame-client-startup'
+
+
+def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
+                     bridge_visibility=0, entry_visibility=2, dynamic_tls=False):
+    """Construct bounded own metadata; no executable native code is included."""
+    raw = bytearray(0x4000)
+    ident = b'\x7fELF\x02\x01\x01' + bytes(9)
+    struct.pack_into('<16sHHIQQQIHHHHHH', raw, 0, ident, 3, 183, 1, 0, 64,
+                     0x3800, 0, 64, 56, 2, 64, 8, 0)
+    struct.pack_into('<IIQQQQQQ', raw, 64, 1, 5, 0, 0, 0, len(raw), len(raw), 4096)
+    struct.pack_into('<IIQQQQQQ', raw, 120, 4, 4, 0x180, 0x180, 0x180, 36, 36, 4)
+    struct.pack_into('<III', raw, 0x180, 4, 20, 3)
+    raw[0x18c:0x190] = b'GNU\0'
+    raw[0x190:0x1a4] = bytes(range(20))
+    dynamic = [(tool.BRIDGE, 0x220, 1, bridge_visibility),
+               ('pthread_mutex_init', 0x230 + (4 if alias_rva else 0), 1, 0),
+               ('pthread_mutex_destroy', 0x240, 1, 0)]
+    if extra_export:
+        dynamic.append((extra_export, 0x250, 1, 0))
+    imports = [name.split('@')[0] for name in tool.ALIASES if name != missing_alias]
+    if dynamic_tls:
+        imports.append('__tls_get_addr')
+    dynstr = bytearray(b'\0')
+    offsets = {}
+    for name in [row[0] for row in dynamic] + imports + ['GLIBC_2.17', 'libc.so.6']:
+        offsets[name] = len(dynstr)
+        dynstr += name.encode() + b'\0'
+    dynsym = bytearray(24)
+    versions = [0]
+    for name, rva, binding, visibility in dynamic:
+        dynsym += struct.pack('<IBBHQQ', offsets[name], binding << 4 | 2, visibility, 1, rva, 4)
+        versions.append(1)
+    for name in imports:
+        dynsym += struct.pack('<IBBHQQ', offsets[name], 0x12, 0, 0, 0, 0)
+        versions.append(2)
+    statstr = bytearray(b'\0')
+    symtab = bytearray(24)
+    for index, name in enumerate(tool.ENTRIES + ('frame_import_init_entry', 'frame_import_destroy_entry')):
+        off = len(statstr)
+        statstr += name.encode() + b'\0'
+        rva = (0x200, 0x210, 0x230, 0x240)[index]
+        symtab += struct.pack('<IBBHQQ', off, 0x12, entry_visibility, 1, rva, 4)
+    verneed = struct.pack('<HHIII', 1, 1, offsets['libc.so.6'], 16, 0)
+    verneed += struct.pack('<IHHII', 0, 0, 2, offsets['GLIBC_2.17'], 0)
+    versym = struct.pack('<' + 'H' * len(versions), *versions)
+    dynamic_table = struct.pack('<qQqQ', 1, offsets['libc.so.6'], 0, 0)
+    sections = [(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)]
+    cursor = 0x400
+    for kind, payload, link, entsize in [(3, dynstr, 0, 0), (11, dynsym, 1, 24),
+                                        (3, statstr, 0, 0), (2, symtab, 3, 24),
+                                        (0x6ffffffe, verneed, 1, 0), (0x6fffffff, versym, 2, 2),
+                                        (6, dynamic_table, 1, 16)]:
+        raw[cursor:cursor + len(payload)] = payload
+        sections.append((0, kind, 0, 0, cursor, len(payload), link, 0, 8, entsize))
+        cursor += (len(payload) + 7) & ~7
+    for index, section in enumerate(sections):
+        struct.pack_into('<IIQQQQIIQQ', raw, 0x3800 + 64 * index, *section)
+    return bytes(raw)
+
+
+class PreparationTests(unittest.TestCase):
+    def test_own_observer_metadata_has_exact_reviewed_exports_and_imports(self):
+        raw = observer_fixture()
+        elf, report = tool.validate_observer(raw, tool.digest(raw).hex(), set(tool.ALIASES))
+        self.assertEqual(report['bridge_rva'], 0x220)
+        self.assertEqual(report['hidden_entries'], dict(zip(tool.ENTRIES, (0x200, 0x210))))
+        self.assertEqual(report['public_mutex_aliases'], {'pthread_mutex_init': 0x230, 'pthread_mutex_destroy': 0x240})
+        self.assertEqual(elf.imports(), set(tool.ALIASES))
+        self.assertEqual(elf.needed, ['libc.so.6'])
+        profile, _ = tool.modules.profile_from_bytes(raw, 5, tool.digest(raw).hex())
+        self.assertEqual(len(profile), 2032)
+        self.assertEqual(profile[-32:], tool.digest(profile[:-32]))
+
+    def test_observer_refusals_use_actual_elf_symbols(self):
+        controls = [('VR_InitInternal2', {'extra_export': 'VR_InitInternal2'}),
+                    ('VR_ShutdownInternal', {'extra_export': 'VR_ShutdownInternal'}),
+                    ('dlopen', {'extra_export': 'dlopen'}), ('execve', {'extra_export': 'execve'}),
+                    ('unexpected ordinary export', {'extra_export': 'unreviewed_callback'}),
+                    ('alias address', {'alias_rva': True}), ('bridge visibility', {'bridge_visibility': 2}),
+                    ('public startup entry', {'entry_visibility': 0}), ('dynamic TLS', {'dynamic_tls': True})]
+        controls += [(name, {'missing_alias': name}) for name in tool.ALIASES]
+        for name, arguments in controls:
+            with self.subTest(name=name):
+                raw = observer_fixture(**arguments)
+                with self.assertRaises(ValueError):
+                    tool.validate_observer(raw, tool.digest(raw).hex(), set(tool.ALIASES) | {'__tls_get_addr@GLIBC_2.17'})
+
+    def test_observer_independent_sha_and_native_provider_versions_required(self):
+        raw = observer_fixture()
+        for sha in ('0' * 64, tool.digest(raw).hex().upper(), '', None):
+            with self.subTest(sha=sha), self.assertRaises(ValueError):
+                tool.validate_observer(raw, sha, set(tool.ALIASES))
+        for name in tool.ALIASES:
+            with self.subTest(provider=name), self.assertRaises(ValueError):
+                tool.validate_observer(raw, tool.digest(raw).hex(), set(tool.ALIASES) - {name})
+
+    def test_alias_import_function_abi_and_forced_native_dependency_refused(self):
+        raw = observer_fixture()
+        elf = tool.Elf(raw)
+        dynsym = next(section for section in elf.sections if section[1] == 11)
+        # Null + bridge + two public aliases precede the eight imports.
+        changed = bytearray(raw)
+        changed[dynsym[4] + 24 * 4 + 4] = 0x11  # STT_OBJECT instead of STT_FUNC.
+        with self.assertRaisesRegex(ValueError, 'function import ABI'):
+            tool.validate_observer(bytes(changed), tool.digest(changed).hex(), set(tool.ALIASES))
+        dynamic = next(section for section in elf.sections if section[1] == 6)
+        strings = elf.linked(dynamic)
+        changed = bytearray(raw)
+        # An actual DT_NEEDED entry now requests a native client load. Use an
+        # existing string slot without altering any symbol table references.
+        name = b'libc.so.6\0'
+        offset = changed[strings[4]:strings[4] + strings[5]].index(name)
+        changed[strings[4] + offset:strings[4] + offset + len(name)] = b'vrclient\0\0'
+        with self.assertRaisesRegex(ValueError, 'forces an API/client'):
+            tool.validate_observer(bytes(changed), tool.digest(changed).hex(), set(tool.ALIASES))
+
+    def test_elf_parser_rejects_truncated_and_wrong_table_geometry(self):
+        raw = observer_fixture()
+        mutations = [(18, '<H', 62), (16, '<H', 2), (58, '<H', 63), (54, '<H', 55),
+                     (56, '<H', 17), (60, '<H', 4097), (40, '<Q', len(raw)),
+                     (0x3800 + 64 * 2 + 40, '<I', 999),
+                     (0x3800 + 64 * 6 + 32, '<Q', 2)]
+        for offset, fmt, value in mutations:
+            changed = bytearray(raw)
+            struct.pack_into(fmt, changed, offset, value)
+            with self.subTest(offset=offset, value=value), self.assertRaises((ValueError, struct.error)):
+                tool.Elf(bytes(changed))
+        for length in (0, 63, 127, len(raw) - 1):
+            with self.subTest(length=length), self.assertRaises((ValueError, struct.error)):
+                tool.Elf(raw[:length])
+        with self.assertRaises(ValueError):
+            tool.Elf(bytes(tool.MAX_FILE + 1))
+
+    def test_native_self_consistent_synthetic_profiles_are_not_authority(self):
+        raw = observer_fixture()
+        for role in range(1, 5):
+            with self.subTest(role=role), self.assertRaisesRegex(ValueError, 'native identity'):
+                tool.modules.profile_from_bytes(raw, role)
+        with self.assertRaisesRegex(ValueError, 'Unsupported client'):
+            tool.client.profile_from_bytes(raw)
+        synthetic = []
+        for role in range(1, 6):
+            value = bytearray(2032)
+            struct.pack_into('<4Q', value, 0, 1, role, 183, 3)
+            value[-32:] = tool.digest(value[:-32])
+            synthetic.append(bytes(value))
+        with self.assertRaisesRegex(ValueError, 'independently pinned'):
+            tool.validate_profiles(synthetic, bytes(1064), synthetic[4][-32:])
+
+    def test_schema_offsets_and_exact_non_normalized_utf8_client_name(self):
+        profiles = [bytes([role]) * 2032 for role in range(1, 6)]
+        reviewed = b'x' * 32
+        client = b'c' * 1064
+        name = '/tmp/exact/../raw client-\N{SNOWMAN}.so'
+        result = tool._assemble(profiles, client, reviewed, name, (0, 6318490))
+        self.assertEqual(len(result), 11800)
+        self.assertEqual(result[:16], b'FCSTART1' + struct.pack('<II', 1, 11800))
+        self.assertEqual(result[16:48], reviewed)
+        self.assertEqual(result[48:560], name.encode() + bytes(512 - len(name.encode())))
+        self.assertEqual(struct.unpack_from('<QQ', result, 560), (0, 6318490))
+        self.assertEqual(result[576:10736], b''.join(profiles))
+        self.assertEqual(result[10736:], client)
+        # Raw layout construction is deliberately not the authenticated encoder.
+        with self.assertRaises(ValueError):
+            tool.encode_envelope(profiles, client, reviewed, name, (0, 6318490))
+
+    def test_invalid_name_geometry_paths_and_collisions(self):
+        for value in ('', 'x\0y', 'a\ny', 'x' * 512, '\N{SNOWMAN}' * 171):
+            with self.subTest(name=value), self.assertRaises(ValueError):
+                tool.loader_name(value)
+        for rx in ((1, 1), (2, 1), (-1, 3), (0, 2**64)):
+            with self.subTest(rx=rx), self.assertRaises(ValueError):
+                tool._assemble([bytes(2032)] * 5, bytes(1064), bytes(32), 'client', rx)
+        for value in ('relative', '/tmp/frame', '/home/steamos', '/home/steamos/../other',
+                      '/home/steamos//repeat', '/home/steamos/a\\b', '/home/steamos/a"b', '/home/steamos/a\nb'):
+            with self.subTest(path=value), self.assertRaises(ValueError):
+                tool.user_directory(value, '/home/steamos')
+        self.assertEqual(str(tool.user_directory(FRAME_DIRECTORY, '/home/steamos')), FRAME_DIRECTORY)
+        with self.assertRaises(ValueError):
+            tool.user_directory('/unrestricted', '/')
+        with tempfile.TemporaryDirectory(prefix='client-startup-paths-') as temporary:
+            folder = Path(temporary)
+            for api, client_name in (('same', 'same'), (FRAME_DIRECTORY + '/' + tool.MAIN, 'client')):
+                with self.subTest(api=api), self.assertRaisesRegex(ValueError, 'collision'):
+                    tool.prepare(folder, folder / 'none', '0' * 64, folder / 'new', FRAME_DIRECTORY, api, client_name)
+            (folder / 'exists').mkdir()
+            with self.assertRaisesRegex(ValueError, 'new'):
+                tool.prepare(folder, folder / 'none', '0' * 64, folder / 'exists', FRAME_DIRECTORY, API_NAME, CLIENT_NAME)
+            with self.assertRaisesRegex(ValueError, 'borrowed'):
+                tool.prepare(folder, folder / 'none', '0' * 64, folder / 'borrowed-output', FRAME_DIRECTORY, API_NAME, CLIENT_NAME)
+
+    def test_private_files_are_bounded_nofollow_and_not_overwritten(self):
+        with tempfile.TemporaryDirectory(prefix='client-startup-files-') as temporary:
+            folder = Path(temporary)
+            file = folder / 'own'
+            tool.private_write(file, observer_fixture())
+            self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
+            self.assertEqual(tool.frozen_read(file), observer_fixture())
+            with self.assertRaises(FileExistsError):
+                tool.private_write(file, b'replaced')
+            link = folder / 'link'
+            link.symlink_to(file)
+            with self.assertRaises(OSError):
+                tool.frozen_read(link)
+            fifo = folder / 'fifo'
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(ValueError, 'regular'):
+                tool.frozen_read(fifo)
+            with self.assertRaises(ValueError):
+                tool.frozen_read(file, 64)
+            (folder / 'tiny').write_bytes(b'x')
+            with self.assertRaises(ValueError):
+                tool.frozen_read(folder / 'tiny')
+
+    @unittest.skipUnless(shutil.which('aarch64-linux-gnu-g++') and shutil.which('g++'), 'explicit local compilers unavailable')
+    def test_actual_own_audit_compile_has_no_imports_and_default_is_inactive(self):
+        logs = {}
+        with tempfile.TemporaryDirectory(prefix='client-startup-audit-control-') as temporary:
+            folder = Path(temporary)
+            source = tool.audit_source((0, 500), (0, 600), (0, 700), (0, 800), 0x200,
+                                       'api "\\\N{SNOWMAN}.so', 'client-\N{GRINNING FACE}.so', FRAME_DIRECTORY + '/' + tool.MAIN)
+            (folder / 'preparation.cpp').write_text(source)
+            command = ['aarch64-linux-gnu-g++', '-std=c++17', '-shared', '-O2', '-fPIC', '-nostdlib',
+                       '-fno-exceptions', '-fno-rtti', '-fno-builtin', '-mno-outline-atomics', '-fvisibility=hidden',
+                       '-I', str(ROOT), str(ROOT / 'import/import_startup_audit.cpp'), str(folder / 'preparation.cpp'),
+                       '-Wl,--build-id', '-o', str(folder / 'audit.so')]
+            compiled = tool.recorded_run(command, folder, logs, 'compile_prepared_own_audit', 45)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr[-4096:])
+            elf = tool.Elf(tool.frozen_read(folder / 'audit.so', tool.MAX_AUDIT))
+            self.assertEqual(elf.imports(), set())
+            self.assertEqual(elf.needed, [])
+            self.assertEqual({symbol['name'] for symbol in elf.exported()},
+                             {'la_version', 'la_objopen', 'la_preinit', 'la_symbind64', 'la_objclose'})
+            # Execute a source-only host fixture against the real default weak
+            # implementation. No native refs, loader activation or Frame access.
+            (folder / 'inactive.cpp').write_text('#include "import/import_startup_audit.h"\n'
+                                               'int main(){return frame_import_startup_audit::preparation()!=nullptr;}\n')
+            compiled = tool.recorded_run(['g++', '-std=c++17', '-I', str(ROOT),
+                                         str(ROOT / 'import/import_startup_audit.cpp'), str(folder / 'inactive.cpp'),
+                                         '-o', str(folder / 'inactive')], folder, logs, 'compile_inactive', 45)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr[-4096:])
+            result = tool.recorded_run([str(folder / 'inactive')], folder, logs, 'execute_inactive', 5)
+            self.assertEqual(result.returncode, 0)
+        self.assertFalse(folder.exists())
+
+    def test_private_canonical_profiles_and_mutated_descriptors(self):
+        if PRIVATE_NATIVE is None:
+            self.skipTest('private actual native references not requested')
+        profiles = []
+        for role, (name, _) in tool.modules.NATIVE.items():
+            value, _ = tool.modules.profile_from_bytes(tool.frozen_read(PRIVATE_NATIVE / name), role)
+            profiles.append(value)
+            self.assertEqual(value[-32:], tool.NATIVE_PROFILES[role - 1])
+        own = observer_fixture()
+        fifth, _ = tool.modules.profile_from_bytes(own, 5, tool.digest(own).hex())
+        profiles.append(fifth)
+        client, _ = tool.client.profile_from_bytes(tool.frozen_read(PRIVATE_NATIVE / 'vrclient.so'))
+        rx = tool.Elf(tool.frozen_read(PRIVATE_NATIVE / 'vrclient.so')).rx(tool.client.CALLER_RVA)
+        envelope = tool.encode_envelope(profiles, client, fifth[-32:], CLIENT_NAME, rx)
+        self.assertEqual(envelope[576:10736], b''.join(profiles))
+        for i in range(5):
+            for mode in ('length', 'field', 'self_hash', 'role'):
+                changed = list(profiles)
+                candidate = bytearray(changed[i])
+                if mode == 'length':
+                    candidate = candidate[:-1]
+                elif mode == 'role':
+                    struct.pack_into('<Q', candidate, 8, 6)
+                    candidate[-32:] = tool.digest(candidate[:-32])
+                else:
+                    candidate[128] ^= 1
+                    if mode == 'self_hash':
+                        candidate[-32:] = tool.digest(candidate[:-32])
+                changed[i] = bytes(candidate)
+                with self.subTest(role=i, mode=mode), self.assertRaises(ValueError):
+                    tool.encode_envelope(changed, client, fifth[-32:], CLIENT_NAME, rx)
+        for mode in ('length', 'field', 'self_hash'):
+            candidate = bytearray(client)
+            if mode == 'length':
+                candidate = candidate[:-1]
+            else:
+                candidate[128] ^= 1
+                if mode == 'self_hash':
+                    candidate[-32:] = tool.digest(candidate[:-32])
+            with self.subTest(client=mode), self.assertRaises(ValueError):
+                tool.encode_envelope(profiles, bytes(candidate), fifth[-32:], CLIENT_NAME, rx)
+        with self.assertRaisesRegex(ValueError, 'canonical caller-containing'):
+            tool.encode_envelope(profiles, client, fifth[-32:], CLIENT_NAME, (rx[0], rx[1] - 1))
+
+    def test_full_private_bundle_is_owned_bounded_and_never_activated(self):
+        if FINAL_OBSERVER is None or PRIVATE_NATIVE is None:
+            self.skipTest('final own observer not requested')
+        with tempfile.TemporaryDirectory(prefix='client-startup-final-bundle-control-') as temporary:
+            output = Path(temporary) / 'reviewable'
+            plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME)
+            self.assertEqual(len(list(output.iterdir())), 5)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+            self.assertEqual((output / tool.MAIN).read_bytes(), tool.frozen_read(FINAL_OBSERVER))
+            self.assertEqual((output / tool.ENVELOPE).stat().st_size, 11800)
+            for entry in plan['inventory']:
+                file = output / entry['name']
+                self.assertEqual(entry['sha256'], tool.digest(file.read_bytes()).hex())
+                self.assertEqual(entry['bytes'], file.stat().st_size)
+                self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o600)
+                self.assertFalse(entry['native_bytes'])
+            for field in ('installed', 'activated', 'runtime_authorized', 'frame_access', 'network_access',
+                          'native_binary_or_script_changes', 'source_frame_associated', 'gpu_coherent'):
+                self.assertFalse(plan[field], field)
+            self.assertEqual(json.loads((output / 'deployment-plan.json').read_text()), plan)
+            before = {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()}
+            with self.assertRaises(ValueError):
+                tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME)
+            self.assertEqual(before, {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()})
+        self.assertFalse(output.exists())
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--native-dir', type=Path)
+    parser.add_argument('--observer', type=Path)
+    parser.add_argument('--observer-sha256')
+    parser.add_argument('--api-loader-name', default=API_NAME)
+    parser.add_argument('--client-loader-name', default=CLIENT_NAME)
+    args, remaining = parser.parse_known_args()
+    PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA = args.native_dir, args.observer, args.observer_sha256
+    API_NAME, CLIENT_NAME = args.api_loader_name, args.client_loader_name
+    if FINAL_OBSERVER and not FINAL_SHA:
+        parser.error('--observer requires its separately reviewed --observer-sha256')
+    unittest.main(argv=[sys.argv[0]] + remaining)
