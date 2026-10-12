@@ -1,5 +1,10 @@
 # Next passive client connection adapter
 
+The register-only first step described below has now produced a successful
+[native hardware capture](CLIENT-CONNECT-CAPTURE-20261012.md). The remaining
+private-field, lifecycle and resource-carrier scopes remain deferred; that
+completed invocation does not satisfy their proof or authorization gates.
+
 ## Result and smallest useful scope
 
 The [authentic startup capture](CLIENT-STARTUP-CAPTURE-20261012.md) now proves

@@ -45,6 +45,10 @@ The [compositor import diagnostic preparation](docs/COMPOSITOR-IMPORT-PREPARATIO
 now has bounded offline state, exact entry-layout checks and a read-only kernel
 socket-pair helper. Its production/native-lifetime integration is still pending;
 these components do not enable streamed passthrough.
+An [authentic client connection capture](docs/CLIENT-CONNECT-CAPTURE-20261012.md)
+now confirms normal headset startup and a successful native receiver connection
+call. Continuous descriptor lifetime and exact resource/video association remain
+separate, incomplete steps; the temporary diagnostic was fully removed afterward.
 These diagnostics change no rendered pixels and do not enable genuine-mask
 passthrough.
 

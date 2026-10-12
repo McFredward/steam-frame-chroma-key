@@ -77,6 +77,9 @@ The integrated repair at `38b5b16` also passed
 [CI](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38295295162).
 
 The repaired artifact is documented in
-[CLIENT-CONNECT-OBSERVATION.md](CLIENT-CONNECT-OBSERVATION.md). Its hardware UI
-startup and native connection capture still require a fresh coordinated run.
+[CLIENT-CONNECT-OBSERVATION.md](CLIENT-CONNECT-OBSERVATION.md). A subsequent
+[coordinated hardware run](CLIENT-CONNECT-CAPTURE-20261012.md) confirmed normal
+Frame startup, a visible PC-VR stream and a successful native connection call.
+This supports the narrowed scope repair without proving the earlier failure's
+exact internal instruction chain. The diagnostic was fully removed afterward.
 The Frame remains restored; no automatic redeployment/restart is scheduled.

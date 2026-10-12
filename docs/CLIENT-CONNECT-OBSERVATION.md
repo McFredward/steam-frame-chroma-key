@@ -73,8 +73,11 @@ The CI run for the integrated source checkpoint `4088828` also passed:
 The repaired source checkpoint `38b5b16` passed CI as well, including the
 focused parallel checks, Windows sender cross-build and protocol sanitizers:
 <https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38295295162>.
-This remains software evidence; a working headset startup has not yet been
-confirmed for the repaired artifact.
+This is software evidence. The subsequent
+[authentic hardware capture](CLIENT-CONNECT-CAPTURE-20261012.md) also confirms
+normal headset startup, a visible PC-VR stream and one successful supported
+native connect invocation. It does not establish a live descriptor lease or
+video/UV/GPU association.
 
 The first expanded artifact failed during Steam UI initialization, before any
 receiver or connection capture. It was fully removed and the original service
@@ -82,7 +85,8 @@ and readable process mappings were verified; the maintainer confirmed normal
 Steam startup. The failed variant is superseded, and the current session helper
 rejects its global-interception plan before staging. The cause and evidence limits
 are recorded in [STEAM-START-FAILURE-20261012.md](STEAM-START-FAILURE-20261012.md).
-The repaired bundle is inactive and cannot authorize its own installation.
+The repaired bundle was deployed for that authorized hardware run and has
+since been fully removed. It is inactive and cannot authorize its own installation.
 Fresh native-file/service
 checks, a separately reviewed final bundle/helper inventory and maintainer scope
 and restart readiness are required before deployment.
