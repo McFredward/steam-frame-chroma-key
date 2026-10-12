@@ -136,8 +136,63 @@ void hold_for_close(const ScopedModule& module,void* pointer) noexcept {
     }
     c.done_inside=c.close_done.load(std::memory_order_acquire);
 }
+struct ColdCapture {
+    bool header=false, phdrs=true, writable=false, bss=false, bad_index=false;
+    std::size_t phnum=0, readonly_bytes=0;
+};
+void cold_capture(const ScopedModule& module,void* opaque) noexcept {
+    auto& c=*static_cast<ColdCapture*>(opaque);
+    c.phnum=module.program_header_count();
+    std::array<unsigned char,16> header{};
+    c.header=module.copy(module.base(),header.data(),header.size()) &&
+             header[0]==0x7f && header[1]=='E' && header[2]=='L' && header[3]=='F';
+    for(std::size_t i=0;i<c.phnum;++i) {
+        frame_import_module::ProgramHeader ph{};
+        c.phdrs &= module.program_header(i,ph);
+        if(ph.type!=PT_LOAD) continue;
+        if((ph.flags&PF_R) && !(ph.flags&PF_W)) {
+            c.readonly_bytes+=ph.file_size;
+            unsigned char byte=0;
+            c.phdrs &= module.copy(module.base()+ph.virtual_address,&byte,1);
+        }
+        if((ph.flags&PF_W) && ph.file_size) {
+            unsigned char byte=0;
+            c.writable |= module.copy(module.base()+ph.virtual_address,&byte,1);
+        }
+        if(ph.memory_size>ph.file_size) {
+            unsigned char byte=0;
+            c.bss |= module.copy(module.base()+ph.virtual_address+ph.file_size,&byte,1);
+        }
+    }
+    frame_import_module::ProgramHeader untouched{};untouched.type=0x1234;
+    c.bad_index=module.program_header(c.phnum,untouched) || untouched.type!=0x1234;
+}
+void cold_controls() {
+    const auto function=reinterpret_cast<void*>(&::dl_iterate_phdr);
+    Dl_info info{};expect(dladdr(function,&info)!=0,"actual host libc for cold preflight");
+    frame_import_module::Profile none{};
+    ColdCapture c;
+    Reader cold(none,::dl_iterate_phdr,120);
+    expect(cold.inspect_cold(info,reinterpret_cast<std::uintptr_t>(function),cold_capture,&c)==Refusal::None,
+           "cold preflight supports actual libc PHDR table and readonly ELF metadata");
+    expect(c.header && c.phdrs && c.phnum<=kColdProgramHeaders && c.readonly_bytes<=frame_import_module::kMaxModuleBytes,
+           "cold capability owns only bounded actual readonly file bytes");
+    expect(!c.writable && !c.bss && !c.bad_index,"cold preflight never exposes mutable/BSS/outside headers");
+    Reader strict(none,::dl_iterate_phdr,121);
+    Capture old;old.address=reinterpret_cast<std::uintptr_t>(function);
+    const auto result=strict.inspect(info,old.address,capture,&old);
+    expect(result==(c.phnum>frame_import_module::kMaxSegments ? Refusal::UnsupportedLayout : Refusal::None),
+           "strict inspection retains its original eight-PHDR bound");
+    Reader identity(none,::dl_iterate_phdr,122);
+    expect(!identity.verify(info,old.address).valid(),"cold preflight does not weaken the hardpinned client verifier");
+}
 }
 int main(int argc,char** argv) {
+    if(argc==2 && std::strcmp(argv[1],"--cold-only")==0) {
+        cold_controls();
+        std::cout<<"import loader cold preflight: "<<checks<<" focused controls passed; actual host libc readonly ranges\n";
+        return 0;
+    }
     if(argc!=2 && argc!=3) { std::cerr<<"Usage: loader-reader host-fixture.so [private-profile.bin]\n"; return 2; }
     // The public host lease fixture needs no proprietary input. The optional
     // private reviewed profile also exercises the exact prepared-profile route.

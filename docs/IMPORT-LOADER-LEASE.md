@@ -89,3 +89,13 @@ retention and blocking work. The close-race fixture deliberately delays only its
 offline test visitor to corroborate the lock; production verification has no
 such wait. Host lease checks and private Frame source checks are separate from a
 future on-device runtime identity observation.
+
+Cold main-observer preflight additionally uses `inspect_cold`: at most sixteen
+public PHDRs, a sixteen-MiB mapped virtual span and eight MiB of readonly file
+bytes. This supports the actual receiver/libc ten-header tables and receiver
+BSS extent, as well as ELF/note metadata in separate readonly segments.
+`program_header` copies public metadata only while the callback capability is
+active. Readback still excludes writable data, BSS, gaps and page padding.
+The existing client `verify` and ordinary `inspect` retain their original
+eight-header/eight-MiB/RX-only rules; cold preflight is never a general private
+native-memory reader or an ordinary import/render operation.

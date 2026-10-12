@@ -25,6 +25,10 @@ bool ScopedModule::copy(std::uintptr_t address,void* destination,std::size_t cou
         }
     return false;
 }
+bool ScopedModule::program_header(std::size_t index,frame_import_module::ProgramHeader& out) const noexcept {
+    if(active_module!=this || !active_ || index>=phnum_) return false;
+    out=phdrs_[index];return true;
+}
 bool ScopedModule::read(void* context,std::uintptr_t address,void* out,std::size_t count) noexcept {
     return static_cast<const ScopedModule*>(context)->copy(address,out,count);
 }
@@ -36,6 +40,7 @@ struct Context {
     Visitor visitor;
     void* visitor_owner;
     bool verify;
+    bool cold;
     Result result{};
     static int visit(dl_phdr_info* info,std::size_t size,void* opaque) noexcept {
         auto& self=*static_cast<Context*>(opaque);
@@ -43,7 +48,9 @@ struct Context {
         constexpr auto minimum=offsetof(dl_phdr_info,dlpi_phnum)+sizeof(info->dlpi_phnum);
         if(!info || size<minimum) { self.result.refusal=Refusal::InvalidMetadata; return 1; }
         if(info->dlpi_addr!=self.target) return 0;
-        if(!info->dlpi_phdr || !info->dlpi_phnum || info->dlpi_phnum>frame_import_module::kMaxSegments) {
+        const auto max_headers=self.cold ? kColdProgramHeaders : frame_import_module::kMaxSegments;
+        const auto max_mapped=self.cold ? kColdMappedBytes : frame_import_module::kMaxModuleBytes;
+        if(!info->dlpi_phdr || !info->dlpi_phnum || info->dlpi_phnum>max_headers) {
             self.result.refusal=Refusal::UnsupportedLayout; return 1;
         }
         // glibc owns both this info and l_phdr while its load-write lock is held.
@@ -60,8 +67,8 @@ struct Context {
             module.phdrs_[i]={ph.p_type,ph.p_flags,ph.p_offset,ph.p_vaddr,ph.p_paddr,
                              ph.p_filesz,ph.p_memsz,ph.p_align};
             if(ph.p_type!=PT_LOAD) continue;
-            if(ph.p_memsz<ph.p_filesz || ph.p_vaddr>frame_import_module::kMaxModuleBytes ||
-                ph.p_memsz>frame_import_module::kMaxModuleBytes-ph.p_vaddr ||
+            if(ph.p_memsz<ph.p_filesz || ph.p_vaddr>max_mapped ||
+                ph.p_memsz>max_mapped-ph.p_vaddr ||
                 !(ph.p_flags&PF_R) || (ph.p_flags&PF_X && ph.p_flags&PF_W)) {
                 self.result.refusal=Refusal::UnsupportedLayout; return 1;
             }
@@ -69,9 +76,10 @@ struct Context {
             if(!add(self.target,ph.p_vaddr,begin) || !add(begin,ph.p_filesz,end) || !add(begin,ph.p_memsz,mem_end)) {
                 self.result.refusal=Refusal::UnsupportedLayout; return 1;
             }
-            // Only immutable readable, executable file bytes may be read back.
-            // Mutable RW, BSS, gaps, padding and non-executable RO stay excluded.
-            if(!(ph.p_flags&PF_X) || !ph.p_filesz) continue;
+            // Ordinary client inspection is RX-only. Cold module preflight
+            // additionally needs readonly ELF/note bytes; it never gains RW,
+            // BSS, gaps or padding, or permission for general native reads.
+            if(!ph.p_filesz || (self.cold ? (ph.p_flags&PF_W) : !(ph.p_flags&PF_X))) continue;
             if(ph.p_filesz>frame_import_module::kMaxModuleBytes-total) {
                 self.result.refusal=Refusal::UnsupportedLayout; return 1;
             }
@@ -80,8 +88,13 @@ struct Context {
                 if(begin<module.read_.ranges[j].end && module.read_.ranges[j].begin<end) {
                     self.result.refusal=Refusal::UnsupportedLayout; return 1;
                 }
+            if(module.read_.range_count==frame_import_module::kMaxSegments) {
+                self.result.refusal=Refusal::UnsupportedLayout;return 1;
+            }
             module.read_.ranges[module.read_.range_count++]={begin,end};
-            if(self.caller>=begin && self.caller<end) { module.code_begin_=begin; module.code_end_=end; }
+            if((ph.p_flags&PF_X) && self.caller>=begin && self.caller<end) {
+                module.code_begin_=begin; module.code_end_=end;
+            }
         }
         if(!module.code_begin_ || !module.read_.range_count) {
             self.result.refusal=Refusal::CallerOutsideCode; return 1;
@@ -112,7 +125,7 @@ struct Context {
 } // namespace detail
 Reader::Reader(const frame_import_module::Profile& profile,Iterate iterate,std::uint64_t label) noexcept
     :profile_(profile),iterate_(iterate),label_(label),owner_(owner()) {}
-Result Reader::run(const Dl_info& info,std::uintptr_t caller,Visitor visitor,void* context,bool verify) noexcept {
+Result Reader::run(const Dl_info& info,std::uintptr_t caller,Visitor visitor,void* context,bool verify,bool cold) noexcept {
     Result result;
     if(owner()!=owner_) { result.refusal=Refusal::WrongThread; return result; }
     if(!iterate_ || !label_ || (!verify && !visitor)) return result;
@@ -121,7 +134,7 @@ Result Reader::run(const Dl_info& info,std::uintptr_t caller,Visitor visitor,voi
     consumed_=true;
     const auto target=reinterpret_cast<std::uintptr_t>(info.dli_fbase);
     if(!target || !caller) { result.refusal=Refusal::InvalidTarget; return result; }
-    detail::Context state{profile_,target,caller,label_,visitor,context,verify,{}};
+    detail::Context state{profile_,target,caller,label_,visitor,context,verify,cold,{}};
     state.result.refusal=Refusal::NotFound;
     const int saved=errno;
     const auto native=iterate_(detail::Context::visit,&state);
@@ -137,5 +150,8 @@ Result Reader::run(const Dl_info& info,std::uintptr_t caller,Visitor visitor,voi
 Result Reader::verify(const Dl_info& info,std::uintptr_t caller) noexcept { return run(info,caller,nullptr,nullptr,true); }
 Refusal Reader::inspect(const Dl_info& info,std::uintptr_t caller,Visitor visitor,void* context) noexcept {
     return run(info,caller,visitor,context,false).refusal;
+}
+Refusal Reader::inspect_cold(const Dl_info& info,std::uintptr_t caller,Visitor visitor,void* context) noexcept {
+    return run(info,caller,visitor,context,false,true).refusal;
 }
 } // namespace frame_import_loader
