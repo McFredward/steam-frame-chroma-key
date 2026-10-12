@@ -29,19 +29,24 @@ struct NativeInput {
     frame_import_pipe::Lease lease{};
 };
 struct ImageResult {
+    // device is the existing Journal Device::id; native_device is the original
+    // public VkDevice handle. They are different identity domains.
     std::uint64_t device = 0, image = 0, modifier = 0;
     std::uint32_t format = 0, width = 0, height = 0, depth = 0, layers = 0;
     int result = -1;
     bool modifier_available = false;
+    std::uint64_t native_device = 0;
 };
 struct BindResult {
     std::uint64_t device = 0, image = 0, memory = 0, offset = 0;
     int result = -1;
+    std::uint64_t native_device = 0;
 };
 struct ViewResult {
     std::uint64_t device = 0, image = 0, view = 0;
     std::uint32_t format = 0;
     int result = -1;
+    std::uint64_t native_device = 0;
 };
 
 class Capture;

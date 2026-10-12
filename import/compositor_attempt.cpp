@@ -125,7 +125,7 @@ std::uint64_t Capture::prepare_vulkan(Boundary boundary, const NativeInput& in) 
 bool Capture::image_result(const ImageResult& image) noexcept {
     if (stage_ != Stage::ImagePending) return fail(Refusal::Ordering);
     record_.image_ = image;
-    if (image.result != 0 || !image.device || image.device != public_arguments_[0] ||
+    if (image.result != 0 || !image.device || !image.native_device || image.native_device != public_arguments_[0] ||
         !image.image || !image.format || !image.width ||
         !image.height || !image.depth || !image.layers) return fail(Refusal::PublicMetadata);
     stage_ = Stage::Image; return true;
@@ -134,7 +134,8 @@ bool Capture::bind_result(const BindResult& binding) noexcept {
     if (stage_ != Stage::BindPending) return fail(Refusal::Ordering);
     record_.bind_ = binding;
     if (binding.result != 0 || binding.device != record_.image_.device ||
-        binding.image != record_.image_.image || !binding.memory || binding.device != public_arguments_[0] ||
+        binding.image != record_.image_.image || !binding.memory || binding.native_device != public_arguments_[0] ||
+        binding.native_device != record_.image_.native_device ||
         binding.image != public_arguments_[1] || binding.memory != public_arguments_[2] ||
         binding.offset != public_arguments_[3]) return fail(Refusal::PublicMetadata);
     stage_ = Stage::Bound; return true;
@@ -143,7 +144,8 @@ bool Capture::view_result(const ViewResult& view) noexcept {
     if (stage_ != Stage::ViewPending) return fail(Refusal::Ordering);
     record_.view_ = view;
     if (view.result != 0 || view.device != record_.image_.device || view.image != record_.image_.image ||
-        !view.view || !view.format || view.device != public_arguments_[0]) return fail(Refusal::PublicMetadata);
+        !view.view || !view.format || view.native_device != public_arguments_[0] ||
+        view.native_device != record_.image_.native_device) return fail(Refusal::PublicMetadata);
     stage_ = Stage::Viewed; return true;
 }
 bool Capture::send_lock(const NativeInput& in, int result) noexcept {

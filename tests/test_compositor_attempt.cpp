@@ -50,6 +50,9 @@ using namespace frame_compositor_attempt;
 using Boundary = frame_import_native::Boundary;
 constexpr std::uintptr_t base = 0x100000, bias = 0x500000, pipe = 0x700000, dispatch = base + 1232;
 constexpr std::uint32_t sequence = 0xfedcba98;
+// Deliberately distinct domains: the actual layer uses a public native VkDevice
+// pointer and its own Journal Device::id. Equal small fixture integers hid this.
+constexpr std::uint64_t journal_device = 7, native_device = 0xabc0;
 template<class T> T h(std::uint64_t v) {
     if constexpr (std::is_pointer_v<T>) return reinterpret_cast<T>(static_cast<std::uintptr_t>(v));
     else return static_cast<T>(v);
@@ -68,7 +71,7 @@ struct ValidatorOwner {
         auto& self = *static_cast<ValidatorOwner*>(opaque);
         if (++self.calls == self.close_at) self.registry->close_fd(7);
         if (self.calls == self.destroy_at) {
-            self.journal->destroyImage(1, h<VkImage>(10));
+            self.journal->destroyImage(journal_device, h<VkImage>(10));
             auto ignore = [](auto, const auto&) {};
             while (self.journal->drain(ignore)) {}
         }
@@ -126,7 +129,7 @@ struct Fixture {
         view_info.format = image_info.format; view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         // A preexisting public resource ensures actual generations differ from
         // import-call ordinals as well as the externally assigned tag/cookie.
-        journal->createImage(1, h<VkImage>(99), image_info);
+        journal->createImage(journal_device, h<VkImage>(99), image_info);
     }
     NativeInput input(Boundary boundary, unsigned offset = 0) {
         NativeInput in{}; in.load_bias = bias; in.lease = lease; in.stack = {stack.data(), base, stack.size()};
@@ -137,7 +140,7 @@ struct Fixture {
             e.sp = e.x[29] = dispatch; e.x[0] = e.x[19] = pipe; e.x[25] = 1;
             put(dispatch + 128, std::uint64_t{pipe});
         } else if (boundary == Boundary::Image || boundary == Boundary::Bind || boundary == Boundary::View) {
-            e.sp = base; e.x[29] = base + 96; e.x[0] = 1;
+            e.sp = base; e.x[29] = base + 96; e.x[0] = native_device;
             link(base + 96, base + 752, 0x70bc8); link(base + 752, base + 912, 0x13bbdc);
             link(base + 912, base + 1008, 0x13beb0); link(base + 1008, dispatch, 0x154194);
             put(base + 152, std::uint64_t{0xdeadbeef00000000}); put(base + 1024, std::uint64_t{pipe});
@@ -160,21 +163,21 @@ struct Fixture {
         lease = registry.activate(boundary(true), 7, 7123); check(lease.valid());
         check(capture.early_unlock(input(Boundary::EarlyUnlock), 0));
     }
-    void image() {
+    void image(std::uint64_t observed_device = journal_device) {
         check(capture.prepare_vulkan(Boundary::Image, input(Boundary::Image)) == tag);
-        check(journal->createImageTagged(1, h<VkImage>(10), image_info, tag));
-        check(capture.image_result({1,10,0,static_cast<std::uint32_t>(image_info.format),1152,4608,1,1,0,false}));
+        check(journal->createImageTagged(journal_device, h<VkImage>(10), image_info, tag));
+        check(capture.image_result({observed_device,10,0,static_cast<std::uint32_t>(image_info.format),1152,4608,1,1,0,false,native_device}));
     }
-    void bind() {
-        journal->allocateMemory(1, h<VkDeviceMemory>(20), memory_info);
+    void bind(std::uint64_t observed_device = journal_device) {
+        journal->allocateMemory(journal_device, h<VkDeviceMemory>(20), memory_info);
         check(capture.prepare_vulkan(Boundary::Bind, input(Boundary::Bind)) == tag);
-        journal->bindImageMemory(1, h<VkImage>(10), h<VkDeviceMemory>(20), 0);
-        check(capture.bind_result({1,10,20,0,0}));
+        journal->bindImageMemory(journal_device, h<VkImage>(10), h<VkDeviceMemory>(20), 0);
+        check(capture.bind_result({observed_device,10,20,0,0,native_device}));
     }
-    void view() {
+    void view(std::uint64_t observed_device = journal_device) {
         check(capture.prepare_vulkan(Boundary::View, input(Boundary::View)) == tag);
-        check(journal->createViewTagged(1, h<VkImageView>(30), view_info, tag));
-        check(capture.view_result({1,10,30,static_cast<std::uint32_t>(view_info.format),0}));
+        check(journal->createViewTagged(journal_device, h<VkImageView>(30), view_info, tag));
+        check(capture.view_result({observed_device,10,30,static_cast<std::uint32_t>(view_info.format),0,native_device}));
     }
     void through_view() { begin(); early(); image(); bind(); view(); }
     std::array<std::uint8_t,21> packet() {
@@ -200,7 +203,7 @@ struct Fixture {
         OwnedAttempt a; check(capture.take(a)); check(a.complete()); return a;
     }
     frame_bindings::ImportResourceReceipt receipt() {
-        check(journal->requestImportResourceReceipt(1,h<VkImage>(10),h<VkImageView>(30),tag,cookie));
+        check(journal->requestImportResourceReceipt(journal_device,h<VkImage>(10),h<VkImageView>(30),tag,cookie));
         frame_bindings::ImportResourceReceipt result{}; unsigned count=0;
         struct Collector {
             frame_bindings::ImportResourceReceipt& result; unsigned& count;
@@ -216,9 +219,47 @@ struct Fixture {
 void denials(const frame_import::Record& r) {
     check(!r.native_cross_process_namespace && !r.source_frame_associated && !r.accepted_submit && !r.gpu_consumed_coherent);
 }
+void device_identity_controls() {
+    { Fixture f; const auto a=f.completed(); const auto receipt=f.receipt(); frame_import::Record r;
+      check(a.device()==journal_device && journal_device!=native_device);
+      check(receipt.device==journal_device && f.run(a,receipt,r)==Refusal::None);
+      check(r.image.device==journal_device && r.binding.device==journal_device && r.view.device==journal_device);
+      denials(r); }
+    { Fixture f; f.begin(); f.early();
+      check(f.capture.prepare_vulkan(Boundary::Image,f.input(Boundary::Image))==f.tag);
+      check(!f.capture.image_result({journal_device,10,0,37,1152,4608,1,1,0,false,native_device+1}));
+      check(f.capture.refusal()==Refusal::PublicMetadata); }
+    { Fixture f; f.begin(); f.early(); f.image();
+      check(f.capture.prepare_vulkan(Boundary::Bind,f.input(Boundary::Bind))==f.tag);
+      check(!f.capture.bind_result({journal_device+1,10,20,0,0,native_device})); }
+    { Fixture f; f.begin(); f.early(); f.image();
+      auto in=f.input(Boundary::Bind); in.entry.x[0]=native_device+16;
+      check(f.capture.prepare_vulkan(Boundary::Bind,in)==f.tag);
+      // Equal current entry handles still cannot migrate an existing attempt
+      // to another device after its image was created.
+      check(!f.capture.bind_result({journal_device,10,20,0,0,native_device+16})); }
+    { Fixture f; f.begin(); f.early(); f.image(); f.bind();
+      check(f.capture.prepare_vulkan(Boundary::View,f.input(Boundary::View))==f.tag);
+      check(!f.capture.view_result({journal_device+1,10,30,37,0,native_device})); }
+    { Fixture f; f.begin(); f.early(); f.image(); f.bind();
+      auto in=f.input(Boundary::View); in.entry.x[0]=native_device+16;
+      check(f.capture.prepare_vulkan(Boundary::View,in)==f.tag);
+      check(!f.capture.view_result({journal_device,10,30,37,0,native_device+16})); }
+    { Fixture f; f.begin(); f.early(); f.image(journal_device+1); f.bind(journal_device+1); f.view(journal_device+1);
+      f.writes(); check(f.capture.finish(f.input(Boundary::Finish),0)); OwnedAttempt a;
+      check(f.capture.take(a)); const auto receipt=f.receipt(); frame_import::Record r;
+      // A consistently mislabelled copied Journal ID is refused by the real
+      // receipt's independently owned device identity, not its native handle.
+      check(f.run(a,receipt,r)==Refusal::Receipt && !r.import_reply_complete); }
+}
 }
 
-int main() {
+int main(int argc, char** argv) {
+    device_identity_controls();
+    if(argc==2 && std::strcmp(argv[1],"--device-identity-only")==0) {
+        std::printf("%u focused native-handle/Journal-device identity checks passed; Journal7 and VkDevice0xabc0 are distinct\n",checks);
+        return 0;
+    }
     for (unsigned chunk : {21U, 7U, 1U}) {
         Fixture f; forbid_allocations=true;
         const auto a=f.completed(chunk); forbid_allocations=false;
@@ -253,11 +294,11 @@ int main() {
       check(!f.capture.prepare_vulkan(Boundary::Bind,in)); check(f.capture.refusal()==Refusal::NativeRoute); }
     { Fixture f; f.begin(); f.early(); auto in=f.input(Boundary::Image); in.entry.x[0]=2;
       check(f.capture.prepare_vulkan(Boundary::Image,in));
-      check(!f.capture.image_result({1,10,0,37,1152,4608,1,1,0,false})); }
+      check(!f.capture.image_result({journal_device,10,0,37,1152,4608,1,1,0,false,native_device})); }
     { Fixture f; f.begin(); f.early(); f.image(); auto in=f.input(Boundary::Bind); in.entry.x[2]=21;
-      check(f.capture.prepare_vulkan(Boundary::Bind,in)); check(!f.capture.bind_result({1,10,20,0,0})); }
+      check(f.capture.prepare_vulkan(Boundary::Bind,in)); check(!f.capture.bind_result({journal_device,10,20,0,0,native_device})); }
     { Fixture f; f.begin(); f.early(); check(f.capture.prepare_vulkan(Boundary::Image,f.input(Boundary::Image)));
-      check(!f.capture.image_result({1,10,0,37,1152,4608,1,1,-1,false})); }
+      check(!f.capture.image_result({journal_device,10,0,37,1152,4608,1,1,-1,false,native_device})); }
     { Fixture f; f.through_view(); check(f.capture.send_lock(f.input(Boundary::SendLock),0));
       check(f.capture.prepare_write(f.input(Boundary::Write)));
       check(!f.capture.write_result(f.packet(),20,21));
@@ -293,10 +334,10 @@ int main() {
         frame_import::Record out; check(f.run(a,r,out)!=Refusal::None && !out.import_reply_complete); denials(out);
     }
     { Fixture f; const auto a=f.completed(); auto r=f.receipt();
-      f.journal->destroyImage(1,h<VkImage>(10)); // Not replayed yet: pending destroy must already refuse.
+      f.journal->destroyImage(journal_device,h<VkImage>(10)); // Not replayed yet: pending destroy must already refuse.
       frame_import::Record out; check(f.run(a,r,out)==Refusal::ResourceNotCurrent); }
     { Fixture f; const auto a=f.completed(); const auto r=f.receipt();
-      f.journal->createImage(1,h<VkImage>(777),f.image_info); // Unrelated pending work: defer, then permit after drain.
+      f.journal->createImage(journal_device,h<VkImage>(777),f.image_info); // Unrelated pending work: defer, then permit after drain.
       frame_import::Record out; check(f.run(a,r,out)==Refusal::ResourceNotCurrent);
       auto ignore=[](auto,const auto&) {}; while(f.journal->drain(ignore)) {}
       check(f.run(a,r,out)==Refusal::None && out.import_reply_complete); }
