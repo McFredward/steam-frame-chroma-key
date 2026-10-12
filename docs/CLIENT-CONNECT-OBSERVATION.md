@@ -53,7 +53,12 @@ repairs only affected checks were repeated; unchanged passing controls were
 inherited, not reported as a new full local gate. The actual final main ELF also
 passed three unrelated-process ARM preload cases, 29 checks each, using the pinned
 Frame libc/loader. Those cases prove inert forwarding, not production startup,
-a connected Frame endpoint or native OpenVR execution.
+a connected Frame endpoint or native OpenVR execution. The independent final
+bundle review passed **142** bounded checks on the actual ELF imports/exports,
+audit's compiled immutable initializer and relocations, native provider sizes,
+unchanged DEEPBIND flags, distinct envelope and manual scope/recovery guards.
+The CI run for the integrated source checkpoint `4088828` also passed:
+<https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38290719178>.
 
 No expanded connection scope has yet run on hardware. The prepared bundle is
 inactive and cannot authorize its own installation. Fresh native-file/service
