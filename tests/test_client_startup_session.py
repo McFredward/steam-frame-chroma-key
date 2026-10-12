@@ -138,13 +138,13 @@ class SessionTests(unittest.TestCase):
         self.save_plan()
 
     @staticmethod
-    def census_elf():
+    def census_elf(*,thread=False):
         raw=bytearray(1280)
         struct.pack_into('<16sHHIQQQIHHHHHH',raw,0,b'\x7fELF\x02\x01\x01'+bytes(9),3,183,1,0,64,0x300,0,64,56,1,64,3,0)
         struct.pack_into('<IIQQQQQQ',raw,64,1,4,0,0,0,len(raw),len(raw),4096)
-        strings=b'\0'+M.RESOURCE_SCOPE.encode()+b'\0';raw[0x100:0x100+len(strings)]=strings
+        strings=b'\0'+(M.RESOURCE_THREAD_SCOPE if thread else M.RESOURCE_SCOPE).encode()+b'\0';raw[0x100:0x100+len(strings)]=strings
         struct.pack_into('<IBBHQQ',raw,0x180+24,1,1,2,1,0x250,16)
-        raw[0x250:0x260]=M.RESOURCE_MARKER
+        raw[0x250:0x260]=M.RESOURCE_THREAD_MARKER if thread else M.RESOURCE_MARKER
         struct.pack_into('<IIQQQQIIQQ',raw,0x340,0,3,0,0,0x100,len(strings),0,0,1,0)
         struct.pack_into('<IIQQQQIIQQ',raw,0x380,0,2,0,0,0x180,48,1,0,8,24)
         return bytes(raw)
@@ -172,6 +172,129 @@ class SessionTests(unittest.TestCase):
         self.plan['resource_source_boundaries']=dict(M.RESOURCE_BOUNDARIES)
         self.plan['capture_limits']=dict(M.CAPTURE_LIMITS)
         self.save_plan()
+
+    def resource_thread_plan(self):
+        self.resource_plan()
+        main=self.census_elf(thread=True);self.replace_artifact(M.MAIN,main)
+        profile=self.profile(5,main)
+        raw=bytearray(self.artifacts[M.ENVELOPE].read_bytes());raw[:16]=M.RESOURCE_THREAD_MARKER
+        raw[16:48]=profile[-32:];raw[8704:10736]=profile;self.replace_artifact(M.ENVELOPE,raw)
+        self.plan['envelope'].update(schema=4,reviewed_observer_profile_identity=profile[-32:].hex())
+        self.plan['observer_profile'].update(file_sha256=M.digest(main),profile_sha256=profile[-32:].hex())
+        flags={'resource_thread_preparation':True,'resource_thread_private_bytes_read':0,
+               'resource_thread_start_boundary_rva':M.RESOURCE_THREAD_START_RVA,'native_epoll_wait_rva':M.EPOLL_WAIT_RVA}
+        self.plan.update(flags);self.plan['observer'].update(flags)
+        marker=M.resource_marker(main,thread_preparation=True)
+        self.plan['observer'].update(resource_scope_marker=marker,resource_thread_scope_marker=marker)
+        self.plan['audit']['native_epoll_wait_rva']=M.EPOLL_WAIT_RVA
+        self.save_plan()
+
+    def test_resource_thread_stage_activate_require_all_four_explicit_scopes(self):
+        self.resource_thread_plan()
+        options={'runtime_scope':True,'connect_scope':True,'resource_scope':True,'resource_thread_scope':True}
+        for key in options:
+            partial=dict(options);partial[key]=False
+            with self.subTest(missing_scope=key),self.assertRaises(RuntimeError):self.stage(**partial)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        self.stage(**options);manifest=self.session.manifest()
+        self.assertEqual(manifest['diagnostic_mode'],'resource-thread')
+        self.assertTrue(manifest['resource_register_scope_acknowledged'])
+        self.assertTrue(manifest['resource_thread_scope_acknowledged']);self.assertFalse(manifest['automatic_restart'])
+        activate=dict(options,restart_ready=True)
+        for key in activate:
+            partial=dict(activate);partial[key]=False
+            with self.subTest(activate_missing=key),self.assertRaises(RuntimeError):self.session.activate(**partial)
+            self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),0)
+        self.session.activate(**activate);self.assertEqual(self.restarts(),1)
+        self.session.rollback(restart_ready=True);self.assertEqual(self.restarts(),2)
+
+    def test_resource_thread_start_and_cli_forward_distinct_scope(self):
+        self.resource_thread_plan();self.start(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+        self.assertTrue(self.session.manifest()['resource_thread_scope_acknowledged'])
+        self.session.rollback(restart_ready=True)
+        with mock.patch.object(M,'Session') as session, mock.patch.object(M.platform,'system',return_value='Linux'), \
+             mock.patch.object(M.platform,'machine',return_value='aarch64'), \
+             mock.patch.dict(os.environ,{'XDG_RUNTIME_DIR':f'/run/user/{os.getuid()}'}),mock.patch('builtins.print'):
+            self.assertEqual(M.main(['activate','--ack-startup-diagnostic-scope','--ack-connect-register-diagnostic-scope',
+                                     '--ack-resource-register-census-scope','--ack-resource-thread-preparation-scope',
+                                     '--ack-steam-client-restart-readiness']),0)
+            session.return_value.activate.assert_called_once_with(runtime_scope=True,connect_scope=True,
+                resource_scope=True,resource_thread_scope=True,restart_ready=True)
+
+    def test_resource_thread_cannot_extend_private_reads_or_acceptance(self):
+        changes=(('resource_thread_preparation','true'),('resource_thread_private_bytes_read',8),
+                 ('resource_thread_private_bytes_read',False),('resource_thread_start_boundary_rva','0x328d4'),
+                 ('native_epoll_wait_rva','0xe9e14'),('resource_register_census',False),
+                 ('resource_thread_frame_associated',True),('resource_transaction_accepted',True),
+                 ('capture_limits',{'records':33,'bytes':65536,'seconds':120}))
+        for key,value in changes:
+            self.resource_thread_plan();self.plan[key]=value;self.save_plan()
+            with self.subTest(key=key),self.assertRaises(RuntimeError):
+                self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        for location in ('plan','observer'):
+            for key in ('resource_thread_preparation','resource_thread_private_bytes_read','resource_thread_start_boundary_rva','native_epoll_wait_rva'):
+                self.resource_thread_plan();metadata=self.plan if location=='plan' else self.plan['observer'];metadata.pop(key);self.save_plan()
+                with self.subTest(location=location,missing=key),self.assertRaises(RuntimeError):
+                    self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+                self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        self.resource_thread_plan();self.plan['audit']['native_epoll_wait_rva']='0xe9e14';self.save_plan()
+        with self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+        self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_resource_thread_rejects_old_or_corrupted_artifacts_even_with_updated_fingerprints(self):
+        for offset,value in ((0,ord('X')),(8,3),(12,0)):
+            self.resource_thread_plan();raw=bytearray(self.artifacts[M.ENVELOPE].read_bytes());raw[offset]=value
+            self.replace_artifact(M.ENVELOPE,raw);self.save_plan()
+            with self.subTest(envelope=offset),self.assertRaises(RuntimeError):
+                self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+        for offset,value in ((0x250,ord('X')),(0x258,3),(0x25c,0),(68,5),(0x19c,2)):
+            self.resource_thread_plan();raw=bytearray(self.artifacts[M.MAIN].read_bytes());raw[offset]=value
+            self.replace_artifact(M.MAIN,raw);self.save_plan()
+            with self.subTest(marker=offset),self.assertRaises(RuntimeError):
+                self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        self.resource_thread_plan();self.replace_artifact(M.MAIN,self.census_elf());self.save_plan()
+        with self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+
+    def test_resource_thread_acknowledgment_cannot_broaden_old_modes(self):
+        with self.assertRaises(RuntimeError):self.stage(resource_thread_scope=True)
+        self.connection_plan()
+        with self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_thread_scope=True)
+        self.resource_plan()
+        with self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+        self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_resource_thread_artifact_cannot_be_downgraded_to_legacy_plan_metadata(self):
+        for connection in (False,True):
+            self.resource_thread_plan()
+            for metadata in (self.plan,self.plan['observer']):
+                metadata.update(resource_register_census=False,resource_thread_preparation=False,
+                                resource_thread_start_boundary_rva=None,native_epoll_wait_rva=None)
+            self.plan['connection_register_observation']=connection
+            self.plan['observer'].update(resource_scope_marker=None,resource_thread_scope_marker=None)
+            self.plan['resource_source_boundaries']={}
+            self.plan['audit'].update(native_connection_rvas={'lock':'0x87370','unlock':'0x88f74','connect':'0xebcb0'} if connection else {},native_epoll_wait_rva=None)
+            raw=bytearray(self.artifacts[M.ENVELOPE].read_bytes());raw[:8]=b'FCCONN01' if connection else b'FCSTART1'
+            struct.pack_into('<I',raw,8,2 if connection else 1);self.replace_artifact(M.ENVELOPE,raw)
+            self.plan['envelope']['schema']=2 if connection else 1;self.save_plan()
+            with self.subTest(connection=connection),self.assertRaisesRegex(RuntimeError,'distinct explicit mode'):
+                self.stage(connect_scope=connection)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_resource_thread_activation_rejects_tampered_mode_ack_and_truthy_scope(self):
+        self.resource_thread_plan();self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+        original=self.session.manifest();path=self.session.folder/'owned.json'
+        for key,value in (('diagnostic_mode','resource-census'),('resource_thread_scope_acknowledged',False),
+                          ('resource_thread_scope_acknowledged','true')):
+            changed=dict(original);changed[key]=value;path.write_bytes(M.json_bytes(changed))
+            with self.subTest(key=key),self.assertRaises(RuntimeError):
+                self.session.activate(runtime_scope=True,connect_scope=True,resource_scope=True,resource_thread_scope=True,restart_ready=True)
+            self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),0)
+        path.write_bytes(M.json_bytes(original))
+        with self.assertRaises(RuntimeError):
+            self.session.activate(runtime_scope=True,connect_scope=True,resource_scope=True,resource_thread_scope='true',restart_ready=True)
+        self.session.rollback(restart_ready=True)
 
     def test_resource_stage_and_activation_require_distinct_reviewed_scope(self):
         self.resource_plan()
@@ -217,7 +340,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(M.main(['activate','--ack-startup-diagnostic-scope','--ack-connect-register-diagnostic-scope',
                                      '--ack-resource-register-census-scope','--ack-steam-client-restart-readiness']),0)
             session.return_value.activate.assert_called_once_with(runtime_scope=True,connect_scope=True,
-                                                                   resource_scope=True,restart_ready=True)
+                                                                   resource_scope=True,resource_thread_scope=False,restart_ready=True)
 
     def test_resource_plan_cannot_claim_extra_memory_acceptance_or_other_proof(self):
         changes=(('resource_register_census','true'),('resource_private_bytes_read',8),
