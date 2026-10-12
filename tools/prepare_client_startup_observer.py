@@ -28,6 +28,10 @@ ENVELOPE_BYTES = 11800
 MAX_FILE = modules.MAX_FILE
 MAX_AUDIT = 256 * 1024
 BRIDGE = 'frame_client_startup_bridge'
+RESOURCE_SCOPE = 'frame_client_resource_census_scope'
+RESOURCE_MARKER = b'FCCENS01' + struct.pack('<II', 3, ENVELOPE_BYTES)
+RESOURCE_BOUNDARIES = {'begin': '0x3623c0', 'pending': '0x3624c4', 'reference': '0x362d58'}
+CAPTURE_LIMITS = {'records': 32, 'bytes': 65536, 'seconds': 120}
 ENTRIES = ('frame_import_vr_init_entry', 'frame_import_vr_shutdown_entry')
 MUTEX_ENTRIES = ('frame_import_init_entry', 'frame_import_destroy_entry')
 CONNECTION_ENTRIES = ('frame_import_lock_entry', 'frame_import_unlock_entry', 'frame_import_connect_entry')
@@ -178,7 +182,26 @@ class Elf:
         return value
 
 
-def validate_observer(data,reviewed_sha,provider_exports,*,connection_observation=False):
+def resource_marker(elf):
+    """Authenticate the retained own opt-in object, never native private bytes."""
+    symbols=[s for s in elf.symbols if s['name']==RESOURCE_SCOPE and s['defined']]
+    identities={(s['rva'],s['size']) for s in symbols}
+    if len(identities)!=1 or any(s['type']!=1 or s['visibility'] not in (0,2) or
+                               (s['binding']!=0 and s['visibility']!=2) for s in symbols):
+        raise ValueError('Missing/ambiguous hidden resource census opt-in object')
+    rva,size=next(iter(identities))
+    spans=[ph for ph in elf.phdrs if ph[0]==1 and ph[1]==4 and size==len(RESOURCE_MARKER) and
+           ph[3]<=rva and rva+size<=ph[3]+ph[5]]
+    if len(spans)!=1:raise ValueError('Resource census opt-in is not exact read-only file-backed metadata')
+    offset=spans[0][2]+rva-spans[0][3]
+    if elf.data[offset:offset+size]!=RESOURCE_MARKER:
+        raise ValueError('Resource census opt-in magic/schema/size mismatch')
+    return {'symbol':RESOURCE_SCOPE,'rva':rva,'bytes':size,'sha256':digest(RESOURCE_MARKER).hex()}
+
+
+def validate_observer(data,reviewed_sha,provider_exports,*,connection_observation=False,resource_census=False):
+    if type(connection_observation) is not bool or type(resource_census) is not bool or (resource_census and not connection_observation):
+        raise ValueError('Resource census requires explicit connection observation')
     if not re.fullmatch('[0-9a-f]{64}',reviewed_sha or '') or digest(data).hex()!=reviewed_sha:
         raise ValueError('Main observer differs from separately reviewed SHA-256')
     elf=Elf(data)
@@ -219,10 +242,15 @@ def validate_observer(data,reviewed_sha,provider_exports,*,connection_observatio
     versioned={name for name in imports if '@GLIBC_' in name}
     if not versioned<=provider_exports:raise ValueError('Actual native provider lacks an observer GLIBC import')
     if '__tls_get_addr' in {name.split('@')[0] for name in imports}:raise ValueError('Dynamic TLS in startup observer')
+    marker=resource_marker(elf) if resource_census else None
+    if not resource_census and any(s['name']==RESOURCE_SCOPE for s in elf.symbols):
+        raise ValueError('Resource census ELF requires its explicit offline scope')
     return elf,{'sha256':reviewed_sha,'bytes':len(data),'bridge_rva':bridge['rva'],'hidden_entries':entries,
                 'hidden_mutex_entries':mutex_entries,
                 'hidden_connection_entries':connection_entries,'connection_register_observation':connection_observation,
                 'public_mutex_aliases':mutex_aliases,'audit_only_libc_routing':connection_observation,
+                'resource_register_census':resource_census,'resource_scope_marker':marker,
+                'resource_private_bytes_read':0,'resource_transaction_accepted':False,'resource_namespace_associated':False,
                 'required_aliases':list(ALIASES),'versioned_glibc_imports':sorted(versioned)}
 
 
@@ -256,16 +284,17 @@ def validate_profiles(blobs,client_blob,reviewed):
         raise ValueError('Client profile is not the canonical source descriptor')
 
 
-def _assemble(blobs,client_blob,reviewed,name,rx,*,connection_observation=False):
+def _assemble(blobs,client_blob,reviewed,name,rx,*,connection_observation=False,resource_census=False):
+    if resource_census and not connection_observation:raise ValueError('Resource census requires explicit connection observation')
     raw=loader_name(name)
     if not 0<=rx[0]<rx[1]<2**64:raise ValueError('Client executable interval')
-    magic,schema=(b'FCCONN01',2) if connection_observation else (b'FCSTART1',1)
+    magic,schema=(b'FCCENS01',3) if resource_census else (b'FCCONN01',2) if connection_observation else (b'FCSTART1',1)
     result=magic+struct.pack('<II',schema,ENVELOPE_BYTES)+reviewed+raw+bytes(512-len(raw))+struct.pack('<QQ',*rx)+b''.join(blobs)+client_blob
     if len(result)!=ENVELOPE_BYTES:raise ValueError('Envelope schema size changed')
     return result
 
 
-def encode_envelope(blobs,client_blob,reviewed,name,rx,*,connection_observation=False):
+def encode_envelope(blobs,client_blob,reviewed,name,rx,*,connection_observation=False,resource_census=False):
     validate_profiles(blobs,client_blob,reviewed)
     # Bind the copied ClientSlot geometry to the canonical descriptor itself,
     # not merely to a caller-supplied pair of plausible offsets.
@@ -276,7 +305,7 @@ def encode_envelope(blobs,client_blob,reviewed,name,rx,*,connection_observation=
         if ph[0]==1 and ph[1]&1 and ph[3]<=client.CALLER_RVA<ph[3]+ph[5]:
             spans.append((ph[3],ph[3]+ph[5]))
     if spans!=[tuple(rx)]:raise ValueError('ClientSlot differs from the canonical caller-containing interval')
-    return _assemble(blobs,client_blob,reviewed,name,rx,connection_observation=connection_observation)
+    return _assemble(blobs,client_blob,reviewed,name,rx,connection_observation=connection_observation,resource_census=resource_census)
 
 
 def audit_source(receiver_rx,api_rx,observer_rx,client_rx,bridge,api_name,client_name,observer_path,libc_rx,libc_name,*,connection_observation=False):
@@ -297,7 +326,8 @@ def private_write(path,data):
     with os.fdopen(fd,'wb') as stream:stream.write(data)
 
 
-def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,client_name,*,libc_name=None,home='/home/steamos',compiler='aarch64-linux-gnu-g++',api_file=None,connection_observation=False):
+def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,client_name,*,libc_name=None,home='/home/steamos',compiler='aarch64-linux-gnu-g++',api_file=None,connection_observation=False,resource_census=False):
+    if resource_census and not connection_observation:raise ValueError('Resource census requires explicit connection observation')
     frame=user_directory(frame_directory,home);loader_name(api_name);loader_name(client_name);loader_name(libc_name)
     loader_name(str(frame/MAIN))
     if len({api_name,client_name,libc_name,str(frame/MAIN)})!=4:raise ValueError('Module loader-name collision')
@@ -318,10 +348,10 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
     # Authenticate borrowed native inputs before interpreting extra metadata.
     native_elfs={role:Elf(data) for role,data in inputs.items()}
     providers=export_versions(native_elfs[3])|export_versions(native_elfs[4])
-    main_elf,main_report=validate_observer(main_data,reviewed_sha,providers,connection_observation=connection_observation)
+    main_elf,main_report=validate_observer(main_data,reviewed_sha,providers,connection_observation=connection_observation,resource_census=resource_census)
     rx=Elf(client_data).rx(client.CALLER_RVA)
     reviewed=profiles[4][-32:]
-    envelope=encode_envelope(profiles,client_blob,reviewed,client_name,rx,connection_observation=connection_observation)
+    envelope=encode_envelope(profiles,client_blob,reviewed,client_name,rx,connection_observation=connection_observation,resource_census=resource_census)
     for name,rva,size in (('VR_InitInternal2',0x5768,236),('VR_ShutdownInternal',0x5330,192)):
         actual=native_elfs[2].function(name,True)
         if actual['rva']!=rva or actual['size']!=size:raise ValueError('Native public API schema changed')
@@ -371,7 +401,11 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
               'native_mutex_rvas':{'init':'0x86a00','destroy':'0x86980'},'default_inactive_without_prepared_tu':True},
               'connection_register_observation':connection_observation,
               'connection_private_bytes_read':0,'continuous_connection_owned':False,
-              'envelope':{'bytes':len(envelope),'sha256':digest(envelope).hex(),'schema':2 if connection_observation else 1,'reviewed_observer_profile_identity':reviewed.hex(),'module_count':5},
+              'resource_register_census':resource_census,'resource_private_bytes_read':0,
+              'resource_transaction_accepted':False,'resource_namespace_associated':False,
+              'resource_source_boundaries':RESOURCE_BOUNDARIES if resource_census else {},
+              'capture_limits':dict(CAPTURE_LIMITS),
+              'envelope':{'bytes':len(envelope),'sha256':digest(envelope).hex(),'schema':3 if resource_census else 2 if connection_observation else 1,'reviewed_observer_profile_identity':reviewed.hex(),'module_count':5},
               'client_slot':{'exact_loader_name':client_name,'rx_rva_begin':rx[0],'rx_rva_end':rx[1],'canonical_profile_sha256':client_blob[-32:].hex()},
               'libc_slot':{'exact_loader_name':libc_name,'rx_rva_begin':native_elfs[3].rx()[0],'rx_rva_end':native_elfs[3].rx()[1]},
               'loader_name_provenance':'Explicit expected raw names supplied for offline preparation; not observed link-map lifetimes or deployment authorization',
@@ -383,6 +417,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
               'audit_source_sha256':digest(source.encode()).hex(),'audit_compile_command':command,'logs':logs,
               'scope':['public init/shutdown forwarding','local mapped module identity','source-verified generic native pipe birth',
                        *(['actual supported connect-entry register snapshot and original result under observed native lock; no extra private memory reads'] if connection_observation else []),
+                       *(['actual source begin/pending/reference boundary registers and original results only; no resource transaction or namespace accepted'] if resource_census else []),
                        'copied lifecycle/refusal facts; no pixels, shader replacement, endpoint pairing, mask frame, UV or GPU proof'],
               'before_activation':['Fresh actual runtime provider/receiver hashes and loader names','Separately reviewed final observer source/ELF and fingerprints',
                                    'Exact owned user-directory files; no foreign preload/audit/service override','Explicit permission and coordinated service restart readiness'],
@@ -409,11 +444,12 @@ def main():
     parser.add_argument('--libc-loader-name',required=True,help='Explicit expected raw libc loader name; kernel-map pathname alone is not a link-map proof')
     parser.add_argument('--compiler',default='aarch64-linux-gnu-g++')
     parser.add_argument('--connection-observation',action='store_true',help='Separate offline scope: register-only supported connect calls; never continuous FD ownership')
+    parser.add_argument('--resource-census',action='store_true',help='Additional explicit offline scope: source resource-boundary registers/results only; requires --connection-observation')
     args=parser.parse_args()
     try:
         plan=prepare(args.native_dir,args.observer,args.observer_sha256,args.output,args.frame_directory,args.api_loader_name,args.client_loader_name,
                      libc_name=args.libc_loader_name,home=args.frame_user_home,compiler=args.compiler,api_file=args.api,
-                     connection_observation=args.connection_observation)
+                     connection_observation=args.connection_observation,resource_census=args.resource_census)
     except (OSError,ValueError,struct.error) as error:parser.exit(1,'Offline bundle refused: '+str(error)+'\n')
     print(json.dumps({'prepared':True,'installed':False,'runtime_authorized':False,'envelope_sha256':plan['envelope']['sha256'],
                       'observer_sha256':plan['observer']['sha256'],'audit_sha256':plan['audit']['sha256']}))

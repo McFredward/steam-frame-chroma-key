@@ -31,6 +31,56 @@ SCHEMA = "frame-client-startup-offline-bundle-v1"
 SESSION_SCHEMA = "frame-client-startup-owned-session-v1"
 MAIN, AUDIT, ENVELOPE = "libframe_client_startup.so", "libframe_client_startup_audit.so", "client-startup-envelope.bin"
 HELPERS = ("client_startup_session.py", "receiver_observer_session.py")
+RESOURCE_SCOPE = "frame_client_resource_census_scope"
+RESOURCE_MARKER = b"FCCENS01" + struct.pack("<II", 3, 11800)
+RESOURCE_BOUNDARIES = {"begin":"0x3623c0", "pending":"0x3624c4", "reference":"0x362d58"}
+CAPTURE_LIMITS = {"records":32, "bytes":65536, "seconds":120}
+
+
+def resource_marker(data):
+    """Read bounded own ELF scope metadata without loading or native reads."""
+    if len(data)<64:raise RuntimeError("Resource census ELF metadata missing")
+    h=struct.unpack_from("<16sHHIQQQIHHHHHH",data)
+    if h[0][:7]!=b"\x7fELF\x02\x01\x01" or h[1:4]!=(3,183,1) or h[8:10]!=(64,56) or h[11]!=64:
+        raise RuntimeError("Resource census ELF ABI changed")
+    if not 0<h[10]<=16 or not 0<h[12]<=4096 or h[5]+56*h[10]>len(data) or h[6]+64*h[12]>len(data):
+        raise RuntimeError("Resource census ELF table bounds")
+    phdrs=[struct.unpack_from("<IIQQQQQQ",data,h[5]+56*i) for i in range(h[10])]
+    sections=[struct.unpack_from("<IIQQQQIIQQ",data,h[6]+64*i) for i in range(h[12])]
+    matches=[]
+    for s in sections:
+        if s[1] not in (2,11):continue
+        if s[9]!=24 or s[5]%24 or s[5]//24>65536 or s[4]+s[5]>len(data) or s[6]>=len(sections):
+            raise RuntimeError("Resource census ELF symbol bounds")
+        strings=sections[s[6]]
+        if strings[1]!=3 or strings[4]+strings[5]>len(data):raise RuntimeError("Resource census ELF string bounds")
+        for i in range(s[5]//24):
+            name,info,other,index,rva,size=struct.unpack_from("<IBBHQQ",data,s[4]+24*i)
+            if name>=strings[5]:raise RuntimeError("Resource census ELF string offset")
+            begin=strings[4]+name;end=data.find(b"\0",begin,min(strings[4]+strings[5],begin+512))
+            if end<0:raise RuntimeError("Resource census ELF unterminated symbol")
+            if data[begin:end]!=RESOURCE_SCOPE.encode():continue
+            if not index or info&15!=1 or (info>>4!=0 and other&3!=2) or other&3 not in (0,2):
+                raise RuntimeError("Resource census opt-in is not a hidden object")
+            matches.append((rva,size))
+    if len(set(matches))!=1:raise RuntimeError("Missing/ambiguous resource census opt-in object")
+    rva,size=matches[0]
+    spans=[ph for ph in phdrs if ph[0]==1 and ph[1]==4 and size==16 and ph[3]<=rva and
+           rva+size<=ph[3]+ph[5] and ph[2]+ph[5]<=len(data)]
+    if len(spans)!=1:raise RuntimeError("Resource census opt-in is not read-only file-backed metadata")
+    offset=spans[0][2]+rva-spans[0][3]
+    if data[offset:offset+size]!=RESOURCE_MARKER:raise RuntimeError("Resource census opt-in magic/schema/size mismatch")
+    return {"symbol":RESOURCE_SCOPE,"rva":rva,"bytes":size,"sha256":digest(RESOURCE_MARKER)}
+
+
+def diagnostic_mode(plan):
+    connection=plan.get("connection_register_observation",False)
+    census=plan.get("resource_register_census",False)
+    if type(connection) is not bool or type(census) is not bool or (census and not connection):
+        raise RuntimeError("Resource census requires explicit Boolean connection observation")
+    return "resource-census" if census else "connection" if connection else "startup"
+
+
 NATIVE = {
     "receiver": ("vrlink", "31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153"),
     "api": ("libopenvr_api.so", "4a8723b7134c53ec6c9291d9d2f55ea86349ffd0d227d10ae49a4951ae5395d4"),
@@ -176,9 +226,10 @@ class Session(base.Session):
 
     @staticmethod
     def validate_envelope(data, plan, files, observer):
+        scope=diagnostic_mode(plan)
         mode=plan.get("connection_register_observation",False)
-        if type(mode) is not bool: raise RuntimeError("Connection scope must be explicit Boolean metadata")
-        magic, schema=(b"FCCONN01",2) if mode else (b"FCSTART1",1)
+        census=scope=="resource-census"
+        magic, schema=(b"FCCENS01",3) if census else (b"FCCONN01",2) if mode else (b"FCSTART1",1)
         if mode and (plan.get("connection_private_bytes_read") != 0 or plan.get("continuous_connection_owned") is not False or
                      plan.get("audit",{}).get("native_connection_rvas") != {"lock":"0x87370","unlock":"0x88f74","connect":"0xebcb0"} or
                      plan.get("observer",{}).get("connection_register_observation") is not True or
@@ -187,8 +238,30 @@ class Session(base.Session):
             raise RuntimeError("Connection scope differs from reviewed register-only observation")
         if not mode and plan.get("audit",{}).get("native_connection_rvas",{}):
             raise RuntimeError("Startup-only scope cannot acquire connection providers")
+        resource_keys={"resource_register_census","resource_private_bytes_read","resource_transaction_accepted","resource_namespace_associated"}
+        for metadata,extra in ((plan,{"resource_source_boundaries"}),(plan.get("observer",{}),{"resource_scope_marker"})):
+            if any(key.startswith("resource_") and key not in resource_keys|extra for key in metadata):
+                raise RuntimeError("Resource census cannot acquire extra proof flags")
+            if census:
+                if (metadata.get("resource_register_census") is not True or
+                    type(metadata.get("resource_private_bytes_read")) is not int or metadata["resource_private_bytes_read"]!=0 or
+                    metadata.get("resource_transaction_accepted") is not False or metadata.get("resource_namespace_associated") is not False):
+                    raise RuntimeError("Resource census exceeds reviewed register-only scope")
+            elif (metadata.get("resource_register_census",False) is not False or
+                  type(metadata.get("resource_private_bytes_read",0)) is not int or metadata.get("resource_private_bytes_read",0)!=0 or
+                  metadata.get("resource_transaction_accepted",False) is not False or metadata.get("resource_namespace_associated",False) is not False):
+                raise RuntimeError("Non-census scope cannot acquire resource observation")
+        if census:
+            if (plan.get("resource_source_boundaries")!=RESOURCE_BOUNDARIES or plan.get("capture_limits")!=CAPTURE_LIMITS or
+                any(type(value) is not int for value in plan.get("capture_limits",{}).values()) or
+                plan.get("observer",{}).get("resource_scope_marker")!=resource_marker(observer)):
+                raise RuntimeError("Resource census artifact/boundaries/caps differ from explicit scope")
+        elif plan.get("resource_source_boundaries",{}) or plan.get("observer",{}).get("resource_scope_marker") is not None:
+            raise RuntimeError("Non-census scope cannot acquire resource boundaries")
         if len(data) != 11800 or data[:8] != magic or struct.unpack_from("<II", data, 8) != (schema, 11800):
             raise RuntimeError("Envelope schema changed")
+        if "schema" in plan.get("envelope",{}) and plan["envelope"]["schema"]!=schema:
+            raise RuntimeError("Envelope report schema changed")
         reviewed = data[16:48]
         if reviewed.hex() != plan["envelope"].get("reviewed_observer_profile_identity"):
             raise RuntimeError("Observer profile review identity mismatch")
@@ -221,16 +294,20 @@ class Session(base.Session):
             plan["client_profile"].get("profile_sha256") != CLIENT_PROFILE):
             raise RuntimeError("Client descriptor/fresh file mismatch")
 
-    def stage(self, path, expected, native, artifacts, *, runtime_scope=False, connect_scope=False, reviewed_helpers=None,
+    def stage(self, path, expected, native, artifacts, *, runtime_scope=False, connect_scope=False, resource_scope=False, reviewed_helpers=None,
               reviewed_environment_files=None):
+        if type(resource_scope) is not bool:raise RuntimeError("Resource scope acknowledgment must be an explicit Boolean")
         if not runtime_scope: raise RuntimeError("Separate startup diagnostic scope acknowledgment required")
         self.reject_old_activation();safe_path(self.folder);safe_path(self.dropin)
         if (self.folder.exists() or self.dropin.exists() or self.dropin.is_symlink() or self.pending.exists() or self.pending.is_symlink()):
             raise RuntimeError("Existing session/activation refused")
         files, payloads = self.validate_bundle(path, expected, native, artifacts, reviewed_helpers or {})
-        connection_mode=json.loads(payloads["deployment-plan.json"]).get("connection_register_observation",False)
+        plan=json.loads(payloads["deployment-plan.json"]);scope=diagnostic_mode(plan)
+        connection_mode=plan.get("connection_register_observation",False)
         if connection_mode and not connect_scope:
             raise RuntimeError("Separate register-only connect diagnostic scope acknowledgment required")
+        if (scope=="resource-census" and (resource_scope is not True or runtime_scope is not True or connect_scope is not True)) or (scope!="resource-census" and resource_scope):
+            raise RuntimeError("Separate resource register census scope acknowledgment must match the reviewed mode")
         self.command("is-active", UNIT);original = self.state()
         manager = self.reject_environment(original)
         snapshots = self.native_environment_files(original, reviewed_environment_files or {})
@@ -240,6 +317,7 @@ class Session(base.Session):
             activation = self.activation()
             manifest = {"schema": SESSION_SCHEMA, "unit": UNIT, "scope_acknowledged": True, "plan_sha256": expected,
                 "connect_register_scope_acknowledged":bool(connection_mode and connect_scope),
+                "diagnostic_mode":scope,"resource_register_scope_acknowledged":bool(scope=="resource-census" and resource_scope),
                 "original_service": original, "original_manager_environment": manager, "original_environment_files": snapshots,
                 "native_files": files, "activation": {"path": str(self.dropin), "bytes_hex": activation.hex(), "sha256": digest(activation)},
                 "owned_files": {name: digest(data) for name, data in payloads.items()}, "automatic_restart": False}
@@ -282,13 +360,20 @@ class Session(base.Session):
             if digest(data) != NATIVE[role][1] or digest(data) != info["sha256"] or len(data) != info["bytes"]:
                 raise RuntimeError("Native files changed since reviewed staging")
 
-    def activate(self, *, runtime_scope=False, connect_scope=False, restart_ready=False):
+    def activate(self, *, runtime_scope=False, connect_scope=False, resource_scope=False, restart_ready=False):
+        if type(resource_scope) is not bool:raise RuntimeError("Resource scope acknowledgment must be an explicit Boolean")
         if not runtime_scope or not restart_ready: raise RuntimeError("Scope and coordinated restart readiness required again")
         with self.lock():
             m = self.manifest();self.verify_owned(m);self.reject_old_activation()
-            connection_mode=json.loads(read_regular(self.folder / "deployment-plan.json",private=True)).get("connection_register_observation",False)
+            plan=json.loads(read_regular(self.folder / "deployment-plan.json",private=True));scope=diagnostic_mode(plan)
+            connection_mode=plan.get("connection_register_observation",False)
             if connection_mode and (not connect_scope or m.get("connect_register_scope_acknowledged") is not True):
                 raise RuntimeError("Separate register-only connect scope and its staged acknowledgment required")
+            if (m.get("diagnostic_mode",scope if scope!="resource-census" else None)!=scope or
+                (scope=="resource-census" and (resource_scope is not True or runtime_scope is not True or connect_scope is not True or
+                                             restart_ready is not True or m.get("resource_register_scope_acknowledged") is not True)) or
+                (scope!="resource-census" and (resource_scope or m.get("resource_register_scope_acknowledged",False) is not False))):
+                raise RuntimeError("Separate resource register census scope and exact staged mode required")
             if ((self.folder / "rollback-complete.json").exists() or self.dropin.exists() or self.dropin.is_symlink() or
                     self.pending.exists() or self.pending.is_symlink()):
                 raise RuntimeError("Existing/restored activation cannot be replaced")
@@ -331,10 +416,13 @@ class Session(base.Session):
             raise RuntimeError("Manager environment changed during activation")
         return current
 
-    def start(self, *args, runtime_scope=False, connect_scope=False, restart_ready=False, **kwargs):
+    def start(self, *args, runtime_scope=False, connect_scope=False, resource_scope=False, restart_ready=False, **kwargs):
+        if type(resource_scope) is not bool or (resource_scope and
+            (runtime_scope is not True or connect_scope is not True or restart_ready is not True)):
+            raise RuntimeError("Resource census requires actual scope and restart readiness acknowledgments")
         if not runtime_scope or not restart_ready: raise RuntimeError("Explicit scope and restart readiness required")
-        self.stage(*args, runtime_scope=True, connect_scope=connect_scope, **kwargs)
-        self.activate(runtime_scope=True, connect_scope=connect_scope, restart_ready=True)
+        self.stage(*args, runtime_scope=True, connect_scope=connect_scope, resource_scope=resource_scope, **kwargs)
+        self.activate(runtime_scope=True, connect_scope=connect_scope, resource_scope=resource_scope, restart_ready=True)
 
     def remove_override(self, m):
         owned = bytes.fromhex(m["activation"]["bytes_hex"])
@@ -444,6 +532,7 @@ def main(argv=None):
     p.add_argument("--reviewed-environment-file", action="append", default=[], metavar="PATH=SHA256")
     p.add_argument("--ack-startup-diagnostic-scope", action="store_true")
     p.add_argument("--ack-connect-register-diagnostic-scope", action="store_true")
+    p.add_argument("--ack-resource-register-census-scope", action="store_true")
     p.add_argument("--ack-steam-client-restart-readiness", action="store_true")
     a = p.parse_args(argv)
     try:
@@ -460,6 +549,7 @@ def main(argv=None):
             if len(reviewed) != len(a.reviewed_environment_file): raise RuntimeError("Duplicate EnvironmentFile arguments")
             kwargs = {"runtime_scope": a.ack_startup_diagnostic_scope,
                 "connect_scope":a.ack_connect_register_diagnostic_scope,
+                "resource_scope":a.ack_resource_register_census_scope,
                 "reviewed_helpers": {HELPERS[0]: a.reviewed_session_helper_sha256, HELPERS[1]: a.reviewed_receiver_helper_sha256},
                 "reviewed_environment_files": reviewed}
             if a.mode == "start": kwargs["restart_ready"] = a.ack_steam_client_restart_readiness
@@ -467,9 +557,10 @@ def main(argv=None):
                 {MAIN: a.observer, AUDIT: a.audit, ENVELOPE: a.envelope}, **kwargs)
         elif a.mode == "activate": session.activate(runtime_scope=a.ack_startup_diagnostic_scope,
                                                     connect_scope=a.ack_connect_register_diagnostic_scope,
+                                                    resource_scope=a.ack_resource_register_census_scope,
                                                     restart_ready=a.ack_steam_client_restart_readiness)
         else: session.rollback(restart_ready=a.ack_steam_client_restart_readiness)
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, struct.error, subprocess.SubprocessError) as error:
         p.exit(1, f"Client startup session refused: {type(error).__name__}: {error}\n")
     print("Manual operation completed; native mapping/unload, capture and passthrough are not inferred.")
     return 0

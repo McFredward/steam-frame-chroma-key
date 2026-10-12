@@ -25,6 +25,8 @@ PRIVATE_NATIVE = None
 PRIVATE_API = None
 FINAL_OBSERVER = None
 FINAL_SHA = None
+CONNECTION_OBSERVATION = False
+RESOURCE_CENSUS = False
 API_NAME = '/home/steamos/.local/share/Steam/steamrtarm64/libopenvr_api.so'
 CLIENT_NAME = '/opt/steamvr/bin/linuxarm64/vrclient.so'
 LIBC_NAME = '/usr/lib/libc.so.6'
@@ -33,17 +35,20 @@ FRAME_DIRECTORY = '/home/steamos/.local/share/GloomhavenVR/frame-client-startup'
 
 def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
                      bridge_visibility=0, entry_visibility=2, mutex_visibility=2, dynamic_tls=False,
-                     connection=False, missing_entry=None):
+                     connection=False, missing_entry=None, resource=False):
     """Construct bounded own metadata; no executable native code is included."""
     raw = bytearray(0x4000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
     struct.pack_into('<16sHHIQQQIHHHHHH', raw, 0, ident, 3, 183, 1, 0, 64,
-                     0x3800, 0, 64, 56, 2, 64, 8, 0)
+                     0x3800, 0, 64, 56, 3 if resource else 2, 64, 8, 0)
     struct.pack_into('<IIQQQQQQ', raw, 64, 1, 5, 0, 0, 0, len(raw), len(raw), 4096)
     struct.pack_into('<IIQQQQQQ', raw, 120, 4, 4, 0x180, 0x180, 0x180, 36, 36, 4)
     struct.pack_into('<III', raw, 0x180, 4, 20, 3)
     raw[0x18c:0x190] = b'GNU\0'
     raw[0x190:0x1a4] = bytes(range(20))
+    if resource:
+        struct.pack_into('<IIQQQQQQ',raw,176,1,4,0x3400,0x3400,0x3400,16,16,8)
+        raw[0x3400:0x3410]=tool.RESOURCE_MARKER
     dynamic = [(tool.BRIDGE, 0x220, 1, bridge_visibility)]
     if not connection:
         dynamic += [('pthread_mutex_init', 0x230 + (4 if alias_rva else 0), 1, 0),
@@ -75,6 +80,9 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
         statstr += name.encode() + b'\0'
         rva = (0x200, 0x210, 0x230, 0x240,0x250,0x260,0x270)[index]
         symtab += struct.pack('<IBBHQQ', off, 0x12, entry_visibility if index<2 else mutex_visibility, 1, rva, 4)
+    if resource:
+        off=len(statstr);statstr+=tool.RESOURCE_SCOPE.encode()+b'\0'
+        symtab+=struct.pack('<IBBHQQ',off,1,2,1,0x3400,16)
     verneed = struct.pack('<HHIII', 1, 1, offsets['libc.so.6'], 16, 0)
     verneed += struct.pack('<IHHII', 0, 0, 2, offsets['GLIBC_2.17'], 0)
     versym = struct.pack('<' + 'H' * len(versions), *versions)
@@ -94,6 +102,43 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
 
 
 class PreparationTests(unittest.TestCase):
+    def test_resource_census_requires_explicit_scope_and_retained_exact_elf_marker(self):
+        raw=observer_fixture(connection=True,resource=True)
+        _,report=tool.validate_observer(raw,tool.digest(raw).hex(),set(tool.ALIASES),
+                                       connection_observation=True,resource_census=True)
+        self.assertTrue(report['resource_register_census'])
+        self.assertEqual(report['resource_scope_marker'],{'symbol':tool.RESOURCE_SCOPE,'rva':0x3400,
+                         'bytes':16,'sha256':tool.digest(tool.RESOURCE_MARKER).hex()})
+        self.assertEqual(report['resource_private_bytes_read'],0)
+        self.assertFalse(report['resource_transaction_accepted'])
+        self.assertFalse(report['resource_namespace_associated'])
+        self.assertEqual(len(report['hidden_entries'])+len(report['hidden_mutex_entries'])+len(report['hidden_connection_entries']),7)
+        for connection,census in ((False,True),(True,False),(False,False)):
+            with self.subTest(connection=connection,census=census),self.assertRaises(ValueError):
+                tool.validate_observer(raw,tool.digest(raw).hex(),set(tool.ALIASES),
+                                       connection_observation=connection,resource_census=census)
+        old=observer_fixture(connection=True)
+        with self.assertRaisesRegex(ValueError,'opt-in object'):
+            tool.validate_observer(old,tool.digest(old).hex(),set(tool.ALIASES),
+                                   connection_observation=True,resource_census=True)
+        for offset,value in ((0x3400,ord('X')),(0x3408,2),(0x340c,0),(180,6)):
+            changed=bytearray(raw);changed[offset]=value
+            with self.subTest(corrupt_offset=offset),self.assertRaises(ValueError):
+                tool.validate_observer(bytes(changed),tool.digest(changed).hex(),set(tool.ALIASES),
+                                       connection_observation=True,resource_census=True)
+
+    def test_resource_envelope_keeps_native_profiles_and_requires_connection_scope(self):
+        args=([bytes(2032)]*5,bytes(1064),bytes(32),CLIENT_NAME,(0,0x60699a))
+        connection=tool._assemble(*args,connection_observation=True)
+        census=tool._assemble(*args,connection_observation=True,resource_census=True)
+        self.assertEqual(census[:16],b'FCCENS01'+struct.pack('<II',3,11800))
+        self.assertEqual(census[16:],connection[16:])
+        with self.assertRaisesRegex(ValueError,'explicit connection'):
+            tool._assemble(*args,resource_census=True)
+        with self.assertRaisesRegex(ValueError,'explicit connection'):
+            tool.prepare(Path('/unused'),Path('/unused'),'',Path('/unused'),FRAME_DIRECTORY,API_NAME,CLIENT_NAME,
+                         libc_name=LIBC_NAME,resource_census=True)
+
     def test_connection_scope_requires_explicit_matching_elf(self):
         legacy=observer_fixture();connection=observer_fixture(connection=True)
         with self.assertRaises(ValueError):
@@ -401,7 +446,8 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='client-startup-final-bundle-control-') as temporary:
             output = Path(temporary) / 'reviewable'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
-                                libc_name=LIBC_NAME,api_file=PRIVATE_API)
+                                libc_name=LIBC_NAME,api_file=PRIVATE_API,
+                                connection_observation=CONNECTION_OBSERVATION,resource_census=RESOURCE_CENSUS)
             self.assertEqual(len(list(output.iterdir())), 5)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
             self.assertEqual((output / tool.MAIN).read_bytes(), tool.frozen_read(FINAL_OBSERVER))
@@ -422,7 +468,8 @@ class PreparationTests(unittest.TestCase):
             before = {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()}
             with self.assertRaises(ValueError):
                 tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
-                             libc_name=LIBC_NAME,api_file=PRIVATE_API)
+                             libc_name=LIBC_NAME,api_file=PRIVATE_API,
+                             connection_observation=CONNECTION_OBSERVATION,resource_census=RESOURCE_CENSUS)
             self.assertEqual(before, {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()})
         self.assertFalse(output.exists())
 
@@ -436,8 +483,11 @@ if __name__ == '__main__':
     parser.add_argument('--api-loader-name', default=API_NAME)
     parser.add_argument('--client-loader-name', default=CLIENT_NAME)
     parser.add_argument('--libc-loader-name', default=LIBC_NAME)
+    parser.add_argument('--connection-observation',action='store_true')
+    parser.add_argument('--resource-census',action='store_true')
     args, remaining = parser.parse_known_args()
     PRIVATE_NATIVE, PRIVATE_API, FINAL_OBSERVER, FINAL_SHA = args.native_dir, args.api, args.observer, args.observer_sha256
+    CONNECTION_OBSERVATION,RESOURCE_CENSUS=args.connection_observation,args.resource_census
     API_NAME, CLIENT_NAME, LIBC_NAME = args.api_loader_name, args.client_loader_name, args.libc_loader_name
     if FINAL_OBSERVER and not FINAL_SHA:
         parser.error('--observer requires its separately reviewed --observer-sha256')

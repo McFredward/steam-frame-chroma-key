@@ -137,6 +137,138 @@ class SessionTests(unittest.TestCase):
         self.plan['audit']['native_connection_rvas']={'lock':'0x87370','unlock':'0x88f74','connect':'0xebcb0'}
         self.save_plan()
 
+    @staticmethod
+    def census_elf():
+        raw=bytearray(1280)
+        struct.pack_into('<16sHHIQQQIHHHHHH',raw,0,b'\x7fELF\x02\x01\x01'+bytes(9),3,183,1,0,64,0x300,0,64,56,1,64,3,0)
+        struct.pack_into('<IIQQQQQQ',raw,64,1,4,0,0,0,len(raw),len(raw),4096)
+        strings=b'\0'+M.RESOURCE_SCOPE.encode()+b'\0';raw[0x100:0x100+len(strings)]=strings
+        struct.pack_into('<IBBHQQ',raw,0x180+24,1,1,2,1,0x250,16)
+        raw[0x250:0x260]=M.RESOURCE_MARKER
+        struct.pack_into('<IIQQQQIIQQ',raw,0x340,0,3,0,0,0x100,len(strings),0,0,1,0)
+        struct.pack_into('<IIQQQQIIQQ',raw,0x380,0,2,0,0,0x180,48,1,0,8,24)
+        return bytes(raw)
+
+    def replace_artifact(self,name,data):
+        self.artifacts[name].write_bytes(data)
+        for item in self.plan['inventory']:
+            if item['name']==name:item.update(sha256=M.digest(data),bytes=len(data))
+        report='observer' if name==M.MAIN else 'envelope' if name==M.ENVELOPE else 'audit'
+        self.plan[report]['sha256']=M.digest(data)
+
+    def resource_plan(self):
+        self.connection_plan()
+        main=self.census_elf();self.replace_artifact(M.MAIN,main)
+        profile=self.profile(5,main)
+        raw=bytearray(self.artifacts[M.ENVELOPE].read_bytes());raw[:16]=M.RESOURCE_MARKER
+        raw[16:48]=profile[-32:];raw[8704:10736]=profile
+        self.replace_artifact(M.ENVELOPE,raw)
+        self.plan['envelope'].update(schema=3,reviewed_observer_profile_identity=profile[-32:].hex())
+        self.plan['observer_profile'].update(file_sha256=M.digest(main),profile_sha256=profile[-32:].hex())
+        fields={'resource_register_census':True,'resource_private_bytes_read':0,
+                'resource_transaction_accepted':False,'resource_namespace_associated':False}
+        self.plan.update(fields);self.plan['observer'].update(fields)
+        self.plan['observer']['resource_scope_marker']=M.resource_marker(main)
+        self.plan['resource_source_boundaries']=dict(M.RESOURCE_BOUNDARIES)
+        self.plan['capture_limits']=dict(M.CAPTURE_LIMITS)
+        self.save_plan()
+
+    def test_resource_stage_and_activation_require_distinct_reviewed_scope(self):
+        self.resource_plan()
+        for flags in ({},{'resource_scope':True},{'connect_scope':True}):
+            with self.subTest(flags=flags),self.assertRaises(RuntimeError):self.stage(**flags)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        self.stage(connect_scope=True,resource_scope=True)
+        self.assertEqual(self.session.manifest()['diagnostic_mode'],'resource-census')
+        self.assertTrue(self.session.manifest()['resource_register_scope_acknowledged'])
+        for flags in ({},{'resource_scope':True},{'connect_scope':True},
+                      {'connect_scope':True,'resource_scope':True,'restart_ready':False}):
+            kwargs={'runtime_scope':True,'restart_ready':True};kwargs.update(flags)
+            with self.subTest(flags=flags),self.assertRaises(RuntimeError):self.session.activate(**kwargs)
+            self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),0)
+        self.session.activate(runtime_scope=True,connect_scope=True,resource_scope=True,restart_ready=True)
+        self.assertEqual(self.restarts(),1)
+        self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),2)
+
+    def test_resource_start_forwards_all_scopes_without_implicit_restart(self):
+        self.resource_plan();self.start(connect_scope=True,resource_scope=True)
+        manifest=self.session.manifest()
+        self.assertTrue(manifest['connect_register_scope_acknowledged'])
+        self.assertTrue(manifest['resource_register_scope_acknowledged'])
+        self.assertFalse(manifest['automatic_restart']);self.assertEqual(self.restarts(),1)
+        self.session.rollback(restart_ready=True)
+
+    def test_resource_acknowledgments_must_be_actual_boolean_not_truthy_values(self):
+        self.resource_plan()
+        for flags in ({'resource_scope':'true'},{'runtime_scope':1},{'connect_scope':1}):
+            kwargs={'connect_scope':True,'resource_scope':True};kwargs.update(flags)
+            with self.subTest(flags=flags),self.assertRaises(RuntimeError):self.stage(**kwargs)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        for flags in ({'runtime_scope':1},{'connect_scope':1},{'restart_ready':1}):
+            kwargs={'connect_scope':True,'resource_scope':True};kwargs.update(flags)
+            with self.subTest(start_flags=flags),self.assertRaises(RuntimeError):self.start(**kwargs)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_cli_activation_passes_explicit_resource_scope_without_network_or_service(self):
+        with mock.patch.object(M,'Session') as session, mock.patch.object(M.platform,'system',return_value='Linux'), \
+             mock.patch.object(M.platform,'machine',return_value='aarch64'), \
+             mock.patch.dict(os.environ,{'XDG_RUNTIME_DIR':f'/run/user/{os.getuid()}'}),mock.patch('builtins.print'):
+            self.assertEqual(M.main(['activate','--ack-startup-diagnostic-scope','--ack-connect-register-diagnostic-scope',
+                                     '--ack-resource-register-census-scope','--ack-steam-client-restart-readiness']),0)
+            session.return_value.activate.assert_called_once_with(runtime_scope=True,connect_scope=True,
+                                                                   resource_scope=True,restart_ready=True)
+
+    def test_resource_plan_cannot_claim_extra_memory_acceptance_or_other_proof(self):
+        changes=(('resource_register_census','true'),('resource_private_bytes_read',8),
+                 ('resource_private_bytes_read',False),('resource_transaction_accepted',True),
+                 ('resource_namespace_associated',True),('resource_frame_associated',True),
+                 ('connection_register_observation',False),('capture_limits',{'records':33,'bytes':65536,'seconds':120}),
+                 ('resource_source_boundaries',{'begin':'0x3623c0'}))
+        for key,value in changes:
+            self.resource_plan();self.plan[key]=value;self.save_plan()
+            with self.subTest(key=key),self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        for key in ('resource_register_census','resource_private_bytes_read','resource_transaction_accepted','resource_namespace_associated'):
+            for location in ('plan','observer'):
+                self.resource_plan();metadata=self.plan if location=='plan' else self.plan['observer']
+                metadata.pop(key);self.save_plan()
+                with self.subTest(missing=key,location=location),self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True)
+                self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_resource_artifact_and_envelope_corruption_refused_even_with_refreshed_hashes(self):
+        for offset,value in ((0,ord('X')),(8,2),(12,0)):
+            self.resource_plan();raw=bytearray(self.artifacts[M.ENVELOPE].read_bytes());raw[offset]=value
+            self.replace_artifact(M.ENVELOPE,raw);self.save_plan()
+            with self.subTest(envelope_offset=offset),self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True)
+        for offset,value in ((0x250,ord('X')),(0x258,2),(0x25c,0),(68,6),(0x19c,2)):
+            self.resource_plan();raw=bytearray(self.artifacts[M.MAIN].read_bytes());raw[offset]=value
+            self.replace_artifact(M.MAIN,raw);self.save_plan()
+            with self.subTest(marker_offset=offset),self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_resource_scope_cannot_be_granted_to_old_connection_artifact(self):
+        self.resource_plan();self.replace_artifact(M.MAIN,self.elf(7));self.save_plan()
+        with self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True)
+        self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_extra_resource_ack_cannot_broaden_non_census_modes(self):
+        with self.assertRaises(RuntimeError):self.stage(resource_scope=True)
+        self.connection_plan()
+        with self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True)
+        self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_resource_activation_refuses_tampered_owned_ack_or_mode(self):
+        self.resource_plan();self.stage(connect_scope=True,resource_scope=True)
+        original=self.session.manifest();path=self.session.folder/'owned.json'
+        for key,value in (('diagnostic_mode','connection'),('resource_register_scope_acknowledged',False),
+                          ('resource_register_scope_acknowledged','true')):
+            changed=dict(original);changed[key]=value;path.write_bytes(M.json_bytes(changed))
+            with self.subTest(key=key),self.assertRaises(RuntimeError):
+                self.session.activate(runtime_scope=True,connect_scope=True,resource_scope=True,restart_ready=True)
+            self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),0)
+        path.write_bytes(M.json_bytes(original));self.session.rollback(restart_ready=True)
+
     def test_connection_stage_and_activation_require_distinct_scope(self):
         self.connection_plan()
         with self.assertRaisesRegex(RuntimeError,'Separate register-only'):
