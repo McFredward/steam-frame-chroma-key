@@ -49,6 +49,10 @@ An [authentic client connection capture](docs/CLIENT-CONNECT-CAPTURE-20261012.md
 now confirms normal headset startup and a successful native receiver connection
 call. Continuous descriptor lifetime and exact resource/video association remain
 separate, incomplete steps; the temporary diagnostic was fully removed afterward.
+The next [register-only resource census](docs/CLIENT-RESOURCE-CENSUS.md) is built
+and checked offline. It uses those same authenticated bindings to observe the
+import/reference boundaries; its concrete runtime capture still requires
+coordinated authorization and does not enable passthrough.
 These diagnostics change no rendered pixels and do not enable genuine-mask
 passthrough.
 
