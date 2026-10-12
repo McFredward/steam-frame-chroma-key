@@ -345,6 +345,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
               'native_api_rvas':{'init':'0x5ab8','shutdown':'0x5680'},'default_inactive_without_prepared_tu':True},
               'envelope':{'bytes':len(envelope),'sha256':digest(envelope).hex(),'schema':1,'reviewed_observer_profile_identity':reviewed.hex(),'module_count':5},
               'client_slot':{'exact_loader_name':client_name,'rx_rva_begin':rx[0],'rx_rva_end':rx[1],'canonical_profile_sha256':client_blob[-32:].hex()},
+              'loader_name_provenance':'Explicit expected raw names supplied for offline preparation; not observed link-map lifetimes or deployment authorization',
               'native_profiles':reports[:4],'observer_profile':reports[4],'client_profile':client_report,
               'environment':{'LD_PRELOAD':str(frame/MAIN),'LD_AUDIT':str(frame/AUDIT),'GHVR_FRAME_CLIENT_STARTUP_ENVELOPE':str(frame/ENVELOPE),
                              'GHVR_FRAME_CLIENT_STARTUP_OUTPUT':str(frame/'client-startup.jsonl')},

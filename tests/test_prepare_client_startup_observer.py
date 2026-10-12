@@ -326,6 +326,7 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
             self.assertEqual((output / tool.MAIN).read_bytes(), tool.frozen_read(FINAL_OBSERVER))
             self.assertEqual((output / tool.ENVELOPE).stat().st_size, 11800)
+            self.assertIn('not observed link-map lifetimes', plan['loader_name_provenance'])
             for entry in plan['inventory']:
                 file = output / entry['name']
                 self.assertEqual(entry['sha256'], tool.digest(file.read_bytes()).hex())
