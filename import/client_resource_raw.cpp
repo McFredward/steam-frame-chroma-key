@@ -112,6 +112,45 @@ Outcome Observer::expire(unsigned reason, Scope& s) const noexcept {
     return refuse(ThreadUnavailable | (s.owner_ && s.owner_ != this ? OwnerMismatch : None), s);
 }
 
+bool Observer::can_acquire(const Event& e, const Scope& s) const noexcept {
+    if (s.finished() || s.owner_ != this || !e.current_thread_owned || !e.native_module_current ||
+        e.thread_reason || !e.thread_identity || e.thread_identity != s.thread_identity_ ||
+        !no_acquisition(e)) return false;
+    const auto& r = s.record_;
+    const auto budget = scalar_budget(e.boundary);
+    if (!budget || r.scalar_bytes_copied > kMaxScalarBytes ||
+        budget > kMaxScalarBytes - r.scalar_bytes_copied) return false;
+    if (e.boundary == Boundary::Pending) {
+        return e.phase == Phase::Before && !e.native_result_available &&
+            s.state_ == Scope::State::PendingBefore && r.request_complete && r.reply_complete &&
+            e.entry.x[0] == r.invocation.pipe && e.entry.sp == r.invocation.import_frame &&
+            e.entry.x[29] == e.entry.sp;
+    }
+    if (e.phase != Phase::After || !e.native_result_available ||
+        e.boundary != s.paired_boundary_ || !same_entry(e.entry, s.paired_entry_)) return false;
+    if (e.boundary == Boundary::Begin)
+        return s.state_ == Scope::State::BeginAfter && e.native_result == 0;
+    if (e.boundary == Boundary::Reference)
+        return s.state_ == Scope::State::ReferenceAfter && r.matching_pending &&
+            e.native_result == 0;
+    if (!transfer(e.boundary) || s.state_ != Scope::State::TransferAfter || e.native_result <= 0 ||
+        e.entry.x[2] > kMaxRequestBytes || static_cast<std::uint64_t>(e.native_result) > e.entry.x[2] ||
+        r.writes > kMaxWrites || r.header_reads > kMaxHeaderReads || r.payload_reads > kMaxPayloadReads ||
+        r.writes + r.header_reads + r.payload_reads > kMaxTransfers) return false;
+    const auto offset = e.boundary == Boundary::Write ? r.request_bytes :
+        e.boundary == Boundary::HeaderRead ? r.reply_header_bytes : r.reply_payload_bytes;
+    if (e.entry.x[19] != offset) return false;
+    if (e.boundary == Boundary::Write) {
+        return r.writes && e.entry.x[20] > kHeaderBytes && e.entry.x[20] <= kMaxRequestBytes &&
+            (!s.request_total_ || s.request_total_ == e.entry.x[20]);
+    }
+    return e.boundary == Boundary::HeaderRead ?
+        r.header_reads && r.request_complete && offset < kHeaderBytes &&
+            e.entry.x[2] == kHeaderBytes - offset :
+        r.payload_reads && r.reply_header_bytes == kHeaderBytes && offset < kPayloadBytes &&
+            e.entry.x[2] == kPayloadBytes - offset;
+}
+
 Outcome Observer::observe(const Event& e, Scope& s) const noexcept {
     if (s.finished()) return {};
     auto& r = s.record_;

@@ -135,7 +135,12 @@ struct Fixture {
     }
     Outcome pair(Boundary b, Entry entry, std::int64_t result) {
         const auto input = before(b, entry);
+        auto probe = input;
+        probe.decoded_available = false; probe.scalars = {}; probe.scalar_bytes_copied = 0;
+        check(observer.can_acquire(probe, scope) == (b == Boundary::Pending));
         check(observer.observe(input, scope).kind == Kind::None);
+        probe.phase = Phase::After; probe.native_result_available = true; probe.native_result = result;
+        check(observer.can_acquire(probe, scope) == (b != Boundary::Pending));
         return observer.observe(after(input, result), scope);
     }
     void start() {
@@ -371,6 +376,66 @@ int main() {
         rejected(f, f.observer.observe(input, f.scope), Order); }
     { Fixture f; f.start(); auto input = f.before(Boundary::Write, f.writer(0)); input.boundary = Boundary::AcceptedInit;
         rejected(f, f.observer.observe(input, f.scope), UnsupportedBoundary); }
+    { // Admission itself never decodes, copies, advances a Scope or publishes.
+        Fixture f; auto before = f.before(Boundary::Begin, f.direct(Boundary::Begin));
+        check(!f.observer.can_acquire(before, f.scope));
+        auto probe = before; probe.phase = Phase::After; probe.native_result_available = true;
+        check(!f.observer.can_acquire(probe, f.scope));
+        check(f.observer.observe(before, f.scope).kind == Kind::None);
+        for (unsigned i = 0; i < 3; ++i) check(f.observer.can_acquire(probe, f.scope));
+        check(!f.scope.record().scalar_bytes_copied && !f.scope.record().begin_lock_succeeded);
+        auto wrong = probe; wrong.entry.x[20]++; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.boundary = Boundary::Reference; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.phase = Phase::Before; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.native_result_available = false; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.native_result = EBUSY; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.current_thread_owned = false; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.native_module_current = false; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.thread_reason = 9; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.thread_identity++; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.decoded_available = true; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.scalar_bytes_copied = 32; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.prefix.count = 1; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.prefix.successful_prefix_owned = true; check(!f.observer.can_acquire(wrong, f.scope));
+        Observer other; check(!other.can_acquire(probe, f.scope));
+        check(f.observer.observe(f.after(before, 0), f.scope).kind == Kind::None);
+        check(!f.observer.can_acquire(probe, f.scope)); // Duplicate Begin After.
+        auto pending = f.before(Boundary::Pending, f.direct(Boundary::Pending));
+        pending.decoded_available = false; pending.scalars = {}; pending.scalar_bytes_copied = 0;
+        check(!f.observer.can_acquire(pending, f.scope)); // Wrong source order.
+        auto ref = f.before(Boundary::Reference, f.reference()); ref.phase = Phase::After; ref.native_result_available = true;
+        check(!f.observer.can_acquire(ref, f.scope));
+        auto input = f.before(Boundary::Write, f.writer(0));
+        check(!f.observer.can_acquire(input, f.scope));
+        check(f.observer.observe(input, f.scope).kind == Kind::None);
+        probe = input; probe.phase = Phase::After; probe.native_result_available = true; probe.native_result = f.total;
+        check(f.observer.can_acquire(probe, f.scope));
+        for (std::int64_t result : std::array<std::int64_t, 4>{{-1, 0, 22, std::numeric_limits<std::int64_t>::max()}}) {
+            wrong = probe; wrong.native_result = result; check(!f.observer.can_acquire(wrong, f.scope));
+        }
+        wrong = probe; wrong.entry.x[1]++; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.boundary = Boundary::HeaderRead; check(!f.observer.can_acquire(wrong, f.scope));
+        rejected(f, f.observer.abandon(f.scope), Abandoned);
+        check(!f.observer.can_acquire(probe, f.scope));
+    }
+    { Fixture f; f.start(); f.wire(); auto pending = f.before(Boundary::Pending, f.direct(Boundary::Pending));
+        auto probe = pending; probe.decoded_available = false; probe.scalars = {}; probe.scalar_bytes_copied = 0;
+        check(f.observer.can_acquire(probe, f.scope));
+        auto wrong = probe; wrong.entry.x[0]++; check(!f.observer.can_acquire(wrong, f.scope));
+        wrong = probe; wrong.entry.sp -= 16; wrong.entry.x[29] = wrong.entry.sp;
+        check(!f.observer.can_acquire(wrong, f.scope));
+        check(f.observer.observe(pending, f.scope).kind == Kind::None);
+        check(!f.observer.can_acquire(probe, f.scope)); // Duplicate Pending Before.
+        probe.phase = Phase::After; probe.native_result_available = true;
+        check(!f.observer.can_acquire(probe, f.scope)); // Pending After is reuse only.
+        check(f.observer.observe(f.after(pending, 0), f.scope).kind == Kind::None);
+        auto ref = f.before(Boundary::Reference, f.reference()); check(f.observer.observe(ref, f.scope).kind == Kind::None);
+        probe = ref; probe.phase = Phase::After; probe.native_result_available = true;
+        check(f.observer.can_acquire(probe, f.scope));
+        wrong = probe; wrong.entry.x[24]++; check(!f.observer.can_acquire(wrong, f.scope));
+        matched(f, f.observer.observe(f.after(ref, 0), f.scope));
+        check(!f.observer.can_acquire(probe, f.scope));
+    }
     { // Raw evidence cannot enter the strict carrier without invented leases.
         Fixture f; f.start(); f.wire(); const auto result = f.end(); matched(f, result);
         frame_client_carrier::Observer strict; strict.armed = true; frame_client_carrier::Scope scope;

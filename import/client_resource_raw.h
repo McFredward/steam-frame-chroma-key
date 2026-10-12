@@ -137,6 +137,13 @@ private:
 
 class Observer {
 public:
+    // Pure zero-read admission BEFORE root copies private scalars/wire bytes.
+    // Input must still be undecoded, with no acquisition. This authenticates
+    // the current Scope's ordering and original paired context, never native
+    // memory ownership. False gives no permission to copy; feed the unchanged
+    // event to observe() so its failure becomes a terminal raw-only record.
+    // Pending After only reuses its saved snapshot and is never admitted here.
+    bool can_acquire(const Event&, const Scope&) const noexcept;
     // Exactly one ImportDmabuf timeline per Scope. Terminal scopes never reset
     // and never emit a second record. Before events are undecoded except the
     // final Pending unlock, whose scalars are copied while its lock is owned.
