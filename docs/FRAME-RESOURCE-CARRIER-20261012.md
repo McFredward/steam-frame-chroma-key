@@ -227,3 +227,98 @@ checks. No binaries, disassembly or packet/image capture is tracked. Native
 process mapping, active entry assembly, actual endpoint pairing, accepted
 receiver submission, source-frame/UV/GPU ownership and passthrough are all
 unproven. Keep pixels unchanged and opaque until those independent gates pass.
+
+## Focused follow-up: lifecycle without accept/getsockopt interposition
+
+A narrower source-proven route avoids those missing forwarding aliases for
+fresh native accepted pipes. Public `pthread_mutex_init` and destroy have
+separately verified distinct provider aliases. Their caller context must be
+interpreted correctly: the native platform init helper **tail-branches** to
+public init after restoring its frame and saved registers.
+
+| Public init entry | Compositor | Client library |
+| --- | --- | --- |
+| Actual incoming LR | `0x1722f4` | `0x244dbc` |
+| Pipe constructor | `0x1722e0`, frame 32 | `0x244da8`, frame 32 |
+| Init helper tail branch | `0x187f30` | `0x259c70` |
+| Accepted-pipe constructor's saved LR | `0x172544` | `0x24500c` |
+| Parent accept function frame | 192 bytes | 192 bytes |
+
+At that exact public init entry, `FP = SP` is the **pipe constructor** frame,
+and its saved FP must equal `FP + 32`. Validate its saved LR against the
+accepted constructor caller above. Public arguments are `x0 = pipe`,
+`x1 = pipe + 48`; live native `x19` is that pipe. Because the platform helper
+already restored `x20`, live **`w20` is the actual accepted FD**, and `x23` is
+the newly allocated pipe. The accepted-FD assignment has not happened yet:
+both constructors still initialize the native FD to `-1` before returning;
+their accept callers assign the captured FD afterwards at `0x17254c` and
+`0x245014`.
+
+Therefore successful public init establishes object birth plus a
+**pending accepted-FD binding**, not an already active connection. Activate it
+only at a later source-proven protected pipe boundary which observes that exact
+FD and object generation. Reject negative or conflicting FD, wrong constructor
+route, missing initialization success, intervening destruction/close, stale
+generation, capacity loss or an unmatched assignment. An exception before the
+assignment must leave this binding incomplete. This route observes the actual
+native accept result retained in the active caller, without wrapping `accept`
+or asking the kernel a new question in the callback.
+
+For client pipes created outside this accepted route, init establishes only
+**object birth**. A supported public `connect` at return PC `0x245f9c` can
+establish its local connection generation: the exact native connect function
+`0x245e88` has a 192-byte frame with `FP = SP`, retains the pipe in `x19`,
+closes any previous FD, creates a new socket at `0x245f1c`, assigns that new FD
+at `0x245f20`, then calls public connect. Require an observed object generation,
+argument FD equal to the protected pipe's FD, original connect success and no
+conflicting lifecycle event. Birth alone or a later arbitrary lock on an
+inherited unknown pipe is not enough. Unsupported assignments, unobserved
+duplication/replacement and direct external descriptor operations still
+invalidate the evidence.
+
+Pipe destruction also uses **two tail branches** after releasing its own frame:
+compositor `0x172660 -> 0x185358 -> pthread_mutex_destroy`, and client
+`0x245128 -> 0x257098 -> pthread_mutex_destroy`. Public destroy therefore
+inherits the destructor's *caller* LR, not one universal pipe-destruction LR.
+Conservatively invalidate a tracked object when its mutex address is destroyed;
+do not guess a single saved return site. Public close invalidates every tracked
+binding of that FD before another observed generation can reuse the number.
+
+The minimum direct-alias public set for this narrow accepted-pipe diagnostic
+is mutex init/destroy/lock/unlock, read/write and close, plus the already reviewed
+Vulkan entries; the client connect route additionally uses its verified
+`__connect` alias. This does not establish general Unix-socket lifecycle coverage
+for unknown native/global assignment routes. Every accepted record must remain
+within the exact supported object/connection routes and independently paired
+kernel endpoint epoch.
+
+### Copying native FD and PID under existing protection
+
+At the compositor import's first unlock entry with LR `0x1540b0`, the actual
+pipe remains locked. The source-proven pipe pointer in the native frame
+`+128` can supply native FD **`+172`** and peer PID **`+168`** before the
+original unlock is forwarded. Require successful original lock/unlock, true
+native payload-read result, exact invocation and active object/connection
+generation. Do not read either field later on an output worker.
+
+For a **fresh accepted object**, the constructor's combined 64-bit store at
+`+164` initializes sequence 1 and peer PID 0. The payload reader updates PID
+only after successful native `SO_PEERCRED`. Thus a positive PID observed under
+that first protected unlock is a credential fact acquired since this fresh
+object's birth, avoiding a `getsockopt` wrapper. The native header reader still
+does not provide that fact at begin. The analogous client import final unlock
+with LR `0x3624c4` remains protected and can copy the same offsets from its
+source-proven saved pipe.
+
+**This inference cannot be generalized to reconnects.** Native close/connect
+does not clear peer PID. A failed lookup on a reused object can leave its old
+positive PID, so that value is not proof of fresh credentials for a new epoch.
+Refuse that credential join unless a separately reviewed actual lookup result
+or independently verified current kernel credential/endpoint relation supplies
+it. Copying PID alone also does not provide UID/GID; do not claim those fields
+were observed through this narrow route.
+
+FD/PID are additional precisely scoped protected native scalars and need to be
+listed in the future runtime permission request. This follow-up extends private
+validation to **114 exact native checks**; it does not implement the adapter,
+observe native object birth, or establish continuous socket lifetime on hardware.
