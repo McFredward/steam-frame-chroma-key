@@ -207,11 +207,13 @@ legitimate embedded pipe uses the same mutex return site and consumed the old
 candidate filter's discovery attempt. The bounded register-only rejection and
 independent constructor-order proof are described in
 [CLIENT-STARTUP-NATIVE-INSTANCE-20261012.md](CLIENT-STARTUP-NATIVE-INSTANCE-20261012.md).
-This source-proven repair still needs a new coordinated capture to establish a
-successful target birth. The previous diagnostic was manually removed; the
-native service configuration and affected process mappings were checked after
-the coordinated restart. No PC sender hook, scene-pixel change or GPU proof was
-introduced.
+The subsequent [coordinated native capture](CLIENT-STARTUP-CAPTURE-20261012.md)
+confirms the intended pipe's successful mutex initialization and the original
+public OpenVR init result. Both diagnostics were manually removed; the original
+service configuration and affected process mappings were verified after each
+coordinated restart. This closes the local startup-instance question, without
+establishing continuous connection, namespace, video or GPU ownership. No PC
+sender hook or scene-pixel change was introduced.
 
 `tools/prepare_client_startup_observer.py` now produces only an offline reviewed
 candidate bundle. Loader names are explicitly expected inputs, not observed

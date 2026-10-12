@@ -14,11 +14,12 @@ heap read. Two important native details invalidate tempting shortcuts:
   ignores the parser result. A parsed token alone is insufficient proof that
   this invocation accepted that reply.
 
-The native source route is now established for the retained binaries. There
-is still no runtime observation of this `vrclient.so` mapping or cross-endpoint
-socket pair. Local FD generations plus `SO_PEERCRED` do not uniquely identify
-the two ends of a Unix stream. The complete namespace join must stay unavailable
-until that connection relationship and the exact transaction are established.
+The native source route is established for the retained binaries. The later
+[native startup capture](CLIENT-STARTUP-CAPTURE-20261012.md) confirms the actual
+`vrclient.so` mapping and target pipe birth, but not a cross-endpoint socket
+pair. Local FD generations plus `SO_PEERCRED` do not uniquely identify the two
+ends of a Unix stream. The complete namespace join must stay unavailable until
+that connection relationship and the exact transaction are established.
 This audit performed no Frame connection, runtime inspection, installation,
 native execution, pixel read or rendering change.
 

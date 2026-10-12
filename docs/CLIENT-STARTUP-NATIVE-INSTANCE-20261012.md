@@ -116,5 +116,7 @@ Its small receipts are `source-validation.json` and
 `direct-initializer-paths.json` under the review worktree's ignored
 `build/private-native-instance-review/`. The focused implementation regression
 must exercise the earlier instance followed by the unchanged target, plus a
-wrong absolute instance with the same `0xff0` offset. A scoped future Frame
-capture is still required to demonstrate a successful native target birth.
+wrong absolute instance with the same `0xff0` offset. The subsequent
+[actual startup capture](CLIENT-STARTUP-CAPTURE-20261012.md) now confirms this
+local target birth. Connection, namespace and video/GPU association remain
+separate gates.
