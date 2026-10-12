@@ -21,8 +21,17 @@ not advertised as working Steam Link passthrough.
 * `import/native_import_entry.S` captures the original AArch64 registers/SP
   before a compiler callback and retains explicit unwind rules. Its symbols
   remain hidden, it is not installed or exported as a public interposer, and
-  its real-provider dispatchers are not implemented. Object-model tests do
-  not establish real provider forwarding or cancellation behavior.
+  its Vulkan dispatchers are not implemented. Object-model tests do not
+  establish real AArch64 provider forwarding or cancellation behavior.
+* `import/import_forwarding.*` implements the six libc dispatchers using the
+  actual distinct versioned forwarding aliases. A value-copied notification
+  subscriber can be registered once, outside callbacks; it remains inactive
+  otherwise. Native results, arguments and `errno` are preserved. Real host
+  partial-write and cancellation fixtures pass; the AArch64 forwarding object
+  was separately checked, but its actual target execution remains untested.
+  Suppressed recursive notifications set sticky proof loss rather than silently
+  certifying a trace that missed a lifecycle event. This component reads no
+  private native memory and performs no output or automatic capture activation.
 * The existing asynchronous Vulkan journal now accepts opt-in invocation tags
   at image/view creation and publishes a typed, immutable resource receipt.
   The worker resolves its actual image/allocation/view generations, checks

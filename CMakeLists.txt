@@ -96,6 +96,12 @@ if(BUILD_TESTING)
         target_include_directories(test_native_import_route PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_options(test_native_import_route PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME compositor_import_native_route COMMAND test_native_import_route)
+        add_executable(test_import_forwarding tests/test_import_forwarding.cpp
+            import/import_forwarding.cpp)
+        target_include_directories(test_import_forwarding PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_import_forwarding PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(test_import_forwarding PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+        add_test(NAME compositor_import_libc_forwarding COMMAND test_import_forwarding)
         add_test(NAME compositor_import_entry_abi COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_entry_abi.py
             --source ${CMAKE_CURRENT_SOURCE_DIR}/import/native_import_entry.S)
