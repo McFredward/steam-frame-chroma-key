@@ -88,6 +88,15 @@
     .size \name, .-\name
     .endm
 
+    // The startup wrapper reuses exactly this entry/CFI implementation. The
+    // ordinary import object keeps its original eleven functions unchanged.
+    .ifndef FRAME_STARTUP_ENTRY_BUILD
+    .set FRAME_STARTUP_ENTRY_BUILD, 0
+    .endif
+    .if FRAME_STARTUP_ENTRY_BUILD
+    IMPORT_ENTRY frame_import_vr_init_entry, frame_import_vr_init_dispatch
+    IMPORT_ENTRY frame_import_vr_shutdown_entry, frame_import_vr_shutdown_dispatch
+    .else
     IMPORT_ENTRY frame_import_lock_entry, frame_import_lock_dispatch
     IMPORT_ENTRY frame_import_unlock_entry, frame_import_unlock_dispatch
     IMPORT_ENTRY frame_import_write_entry, frame_import_write_dispatch
@@ -99,5 +108,6 @@
     IMPORT_ENTRY frame_import_close_entry, frame_import_close_dispatch
     IMPORT_ENTRY frame_import_read_entry, frame_import_read_dispatch
     IMPORT_ENTRY frame_import_connect_entry, frame_import_connect_dispatch
+    .endif
 
     .section .note.GNU-stack,"",%progbits

@@ -80,3 +80,12 @@ The optional CMake native-execution test requires both explicit
 `FRAME_MASK_IMPORT_QEMU` and `FRAME_MASK_IMPORT_PROVIDERS` paths. Private provider
 files are neither downloaded automatically nor added to public CI. It retains
 a bounded JSON receipt and removes its completed temporary build directory.
+
+The startup-only object reuses the same assembler macro for two additional
+hidden entries, `frame_import_vr_init_entry` and `frame_import_vr_shutdown_entry`.
+Its 512 machine-byte model executions and twelve mutation controls check the
+same register/CFI contract. The ordinary eleven-entry object's machine bytes,
+unwind table and symbolic dispatch relocations remain identical to the executed
+checkpoint; its unchanged ARM64 fixture was not repeated. The new startup
+entries still require actual provider/wrapper execution and selective binding
+before they can be installed.

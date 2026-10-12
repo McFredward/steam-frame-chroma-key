@@ -453,7 +453,8 @@ def negative_controls(data):
     # Patches modify actual assembled instructions, not the source text. Decode
     # offsets are found from their bytes so no source-layout regex can pass them.
     code = obj.section_data(text)
-    ops = instructions(code[:next(s.size for s in obj.symbols if s.name == "frame_import_lock_entry")])
+    first_name = "frame_import_" + ENTRIES[0] + "_entry"
+    ops = instructions(code[:next(s.size for s in obj.symbols if s.name == first_name)])
     at = lambda target: next(i * 4 for i, op in enumerate(ops) if op == target)
     instruction("frame allocation 240 instead of 256", 0, 0xd103c3ff)
     first_store = at(("stp", 0, 1, 31, 0))
@@ -482,11 +483,11 @@ def negative_controls(data):
     struct.pack_into("<Q", changed, reloc.table_offset, call - 4)
     controls.append(("dispatcher invoked before Entry argument", changed))
     changed = bytearray(data)
-    wrong = next(symbol for symbol in obj.symbols if symbol.name == "frame_import_write_dispatch")
+    wrong = next(symbol for symbol in obj.symbols if symbol.name == "frame_import_" + ENTRIES[-1] + "_dispatch")
     struct.pack_into("<Q", changed, reloc.table_offset + 8, (wrong.index << 32) | reloc.kind)
     controls.append(("wrong dispatcher relocation", changed))
     changed = bytearray(data)
-    symbol = next(symbol for symbol in obj.symbols if symbol.name == "frame_import_lock_entry")
+    symbol = next(symbol for symbol in obj.symbols if symbol.name == first_name)
     changed[symbol.table_offset + 5] = 0
     controls.append(("public entry export", changed))
     cfi = obj.section(".eh_frame")
@@ -523,6 +524,7 @@ def negative_controls(data):
 
 
 def main():
+    global ENTRIES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path,
                         default=Path(__file__).resolve().parents[1] / "import/native_import_entry.S")
@@ -530,7 +532,11 @@ def main():
     parser.add_argument("--compiler", help="assembler driver command; default AARCH64_CC/aarch64-linux-gnu-gcc")
     parser.add_argument("--iterations", type=int, default=256)
     parser.add_argument("--record", type=Path, help="retain a small JSON verification record")
+    parser.add_argument("--startup", action="store_true",
+                        help="check the two startup-only entries from the same shared assembler macro")
     args = parser.parse_args()
+    if args.startup:
+        ENTRIES = ("vr_init", "vr_shutdown")
     require(1 <= args.iterations <= 4096, "iterations outside bounded fixture range")
     command = shlex.split(args.compiler or os.environ.get("AARCH64_CC", "aarch64-linux-gnu-gcc"))
     direct_as = bool(command) and Path(command[0]).name.endswith("-as")
@@ -560,6 +566,9 @@ def main():
                                        '#error "This entry ABI is AArch64-only"', '#endif'],
                         "direct assembly requires an otherwise CPP-free source")
             options = ["-g"] if direct_as else ["-c", "-g"]
+            if args.startup:
+                options += (["--defsym", "FRAME_STARTUP_ENTRY_BUILD=1"] if direct_as else
+                            ["-Wa,--defsym,FRAME_STARTUP_ENTRY_BUILD=1"])
             subprocess.run(command + options + [str(args.source), "-o", str(output)],
                            check=True, timeout=30, capture_output=True)
             obj_data = output.read_bytes()
