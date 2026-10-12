@@ -325,6 +325,17 @@ The narrowed three-binding scope adds **7** direct-byte/hash checks, including
 the source-proven same-pipe handshake lock after the supported call. These are
 focused static checks, not another native hardware capture.
 
+The independent implementation source review verified publication immediately
+after the authentic target birth, before native Init returns; immutable copied
+module metadata; a single global sampler owner and completed state across
+thread-local scopes; strict original Before/After matching; and global target
+destroy/re-init refusal before sampler filters. The re-init guard belongs to the
+libc notification subscriber, not the separate OpenVR Init subscriber. Ordinary
+post-connect target RPCs must not reactivate the completed sampler. The private
+`integration-source-review.json` records the reviewed source hashes, resolved
+findings and proof limits. This is read-only source evidence, not final-artifact
+verification or a successful native connection capture.
+
 New permission is required for the expanded register-only callback set. It
 introduces **zero additional private bytes** beyond the unchanged five startup
 words. The optional two-field acquisition and later carrier stack/wire copies
