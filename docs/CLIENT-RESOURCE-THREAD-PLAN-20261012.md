@@ -204,7 +204,10 @@ with every exact route/window/ownership check still required.
 
 The separately scoped [implementation and exact reviewed artifact](CLIENT-RESOURCE-THREAD-PREPARATION.md)
 are now available. The following contracts describe its integration; actual
-cold decoder-thread ownership on the Frame remains untested.
+cold decoder-thread ownership has since been confirmed at all six first-trace
+boundaries in [the actual Frame capture](CLIENT-RESOURCE-THREAD-CAPTURE-20261012.md),
+with later ownership loss refused. That finite trace supplies no continuous
+thread or socket lease.
 
 Root can implement the bounded cold-bootstrap core and registration in
 `receiver/client_startup_runtime.*`, with a small independently tested helper

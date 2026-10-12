@@ -3,8 +3,8 @@
 ## Implemented boundary
 
 The [actual resource census](CLIENT-RESOURCE-CAPTURE-20261012.md) established
-that resource calls do not own the startup thread's cached stack. The new
-uninstalled adapter prepares the actual decoder worker **once, before its first
+that resource calls do not own the startup thread's cached stack. The opt-in
+adapter prepares the actual decoder worker **once, before its first
 native event wait**, following [110 retained native source checks](CLIENT-RESOURCE-THREAD-PLAN-20261012.md).
 It does not call stack-discovery helpers from resource locks, import callbacks
 or subsequent hot wait iterations.
@@ -100,9 +100,12 @@ by that verified equivalence. The later CMake change only registers the new audi
 does not alter artifact build flags/source. Debug stripping preserved program
 headers and load/executable bytes, apart from ELF section-table bookkeeping.
 
-Unchanged prior census/connect and helper evidence is retained. This is a
-focused integration, not a new complete local gate or successful hardware
-thread registration. Generated fixture/compiler trees and worker checkouts
+Unchanged prior census/connect and helper evidence is retained. These checks are a
+focused integration, not a new complete local gate. The subsequent
+[actual Frame capture](CLIENT-RESOURCE-THREAD-CAPTURE-20261012.md) separately
+confirmed current-thread ownership at all six observed resource boundaries,
+followed by a terminal ownership refusal; it does not prove lifetime continuity. Generated fixture/compiler trees and
+worker checkouts
 were removed after their processes stopped; small receipts and exact current
 deliverables remain private.
 
@@ -117,9 +120,11 @@ test supplies no Frame deployment permission.
 The proposed recording remains **32 records, 64 KiB and 120 seconds**, plus at
 most four external kernel metadata queries in two seconds with a bounded scan
 of one exact compositor process. The deadline ends recording only; no automatic
-rollback or Steam restart is scheduled. Genuine first-wait preparation on the
-Frame is still untested. Fresh native/service checks are mandatory before any
-future deployment.
+rollback or Steam restart is scheduled. Genuine first-wait preparation has now
+been tested in
+[the separately authorized Frame run](CLIENT-RESOURCE-THREAD-CAPTURE-20261012.md).
+The temporary diagnostic was fully removed. Fresh native/service checks remain
+mandatory before any future deployment.
 
 Only the own user-directory inventory and the matching runtime Steam user-service
 override may change. With coordinated rollback readiness, the staged
@@ -129,8 +134,9 @@ verify native/environment/service hashes and affected process mappings, then
 remove only the matching owned files. No game, native binary, system image,
 shader or PC Steam sender modification is part of this proposal.
 
-If hardware confirms current resource-thread ownership, the next separate
-scope can acquire the minimal source-checked sparse transaction fields in
+Hardware confirmed current ownership during the first captured resource trace;
+the next separate scope can acquire the minimal source-checked sparse
+transaction fields in
 [the resource integration plan](CLIENT-RESOURCE-INTEGRATION-PLAN-20261012.md).
 Until exact connection/resource/video/eye/UV/GPU association is established,
 the explicit-mask output remains opaque and streamed genuine-mask passthrough

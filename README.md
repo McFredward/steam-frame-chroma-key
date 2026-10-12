@@ -56,9 +56,12 @@ registration. The bounded kernel peer lookup refused its FD scan limit;
 connection lifetime and resource/video association remain incomplete. The
 diagnostic was fully removed and original Frame state verified afterward.
 An [explicit cold decoder-thread adapter](docs/CLIENT-RESOURCE-THREAD-PREPARATION.md)
-is now built and independently checked offline, including actual ARM native
-event delivery and cancellation. Its separate first-wait preparation still
-requires a coordinated Frame test; it accepts no resource/video/GPU association.
+has now [prepared the real decoder thread](docs/CLIENT-RESOURCE-THREAD-CAPTURE-20261012.md):
+all six captured resource boundaries had current-thread stack ownership. The
+corrected external lookup also observed the current receiver/compositor kernel
+peer pair. A later ownership check safely ended acquisition; neither this
+finite observation nor the later peer snapshot establishes continuous lifetime,
+resource/video or GPU association. The temporary diagnostic was fully removed.
 These diagnostics change no rendered pixels and do not enable genuine-mask
 passthrough.
 
