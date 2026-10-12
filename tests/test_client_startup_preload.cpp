@@ -1,5 +1,7 @@
 // Actual final observer ELF in a deliberately unrelated process. This proves
 // inert loading and real libc alias transparency, never production Ready.
+// The optional connection bundle must leave every unrelated public libc call
+// at its actual native provider; source hooks are admitted audit bindings only.
 #include "import/import_startup_audit.h"
 #include <cerrno>
 #include <cstdio>
@@ -31,15 +33,21 @@ int main(int argc,char** argv) {
     const auto real_destroy=reinterpret_cast<Destroy>(dlvsym(RTLD_DEFAULT,"__pthread_mutex_destroy","GLIBC_2.17"));
     require(init&&destroy&&real_init&&real_destroy,"public and real native providers present");
     Dl_info public_info{},real_info{};
+    const auto* public_provider=connection?argv[2]:argv[1];
     require(dladdr(reinterpret_cast<void*>(init),&public_info)&&public_info.dli_fname&&
-            !std::strcmp(public_info.dli_fname,argv[1]),"public init actually binds to final observer ELF");
+            !std::strcmp(public_info.dli_fname,public_provider),"public init binds only to the expected provider");
     require(dladdr(reinterpret_cast<void*>(destroy),&public_info)&&public_info.dli_fname&&
-            !std::strcmp(public_info.dli_fname,argv[1]),"public destroy actually binds to final observer ELF");
+            !std::strcmp(public_info.dli_fname,public_provider),"public destroy binds only to the expected provider");
     require(dladdr(reinterpret_cast<void*>(real_init),&real_info)&&real_info.dli_fname&&
-            !std::strcmp(real_info.dli_fname,argv[2]),"distinct init actually binds to pinned native libc");
+            !std::strcmp(real_info.dli_fname,argv[2])&&
+            reinterpret_cast<std::uintptr_t>(real_init)-reinterpret_cast<std::uintptr_t>(real_info.dli_fbase)==0x86a00,
+            "distinct init actually binds to exact pinned native libc entry");
     require(dladdr(reinterpret_cast<void*>(real_destroy),&real_info)&&real_info.dli_fname&&
-            !std::strcmp(real_info.dli_fname,argv[2]),"distinct destroy actually binds to pinned native libc");
-    require(init!=real_init&&destroy!=real_destroy,"unversioned public aliases cannot recurse through real providers");
+            !std::strcmp(real_info.dli_fname,argv[2])&&
+            reinterpret_cast<std::uintptr_t>(real_destroy)-reinterpret_cast<std::uintptr_t>(real_info.dli_fbase)==0x86980,
+            "distinct destroy actually binds to exact pinned native libc entry");
+    require(connection?(init==real_init&&destroy==real_destroy):(init!=real_init&&destroy!=real_destroy),
+            "connection bundle never interposes public mutex lifecycle calls");
     if(connection) {
         using Mutex=int(*)(pthread_mutex_t*);
         using Connect=int(*)(int,const struct sockaddr*,socklen_t);
@@ -55,8 +63,8 @@ int main(int argc,char** argv) {
         constexpr std::uintptr_t rvas[]{0x87370,0x88f74,0xebcb0};
         for(unsigned i=0;i<3;++i) {
             Dl_info own{},actual{};
-            require(public_addresses[i]!=native_addresses[i]&&dladdr(reinterpret_cast<void*>(public_addresses[i]),&own)&&
-                    own.dli_fname&&!std::strcmp(own.dli_fname,argv[1]),"exact optional alias actually belongs to final observer");
+            require(public_addresses[i]==native_addresses[i]&&dladdr(reinterpret_cast<void*>(public_addresses[i]),&own)&&
+                    own.dli_fname&&!std::strcmp(own.dli_fname,argv[2]),"optional observer leaves unrelated public call at native libc");
             require(dladdr(reinterpret_cast<void*>(native_addresses[i]),&actual)&&actual.dli_fname&&!std::strcmp(actual.dli_fname,argv[2])&&
                     native_addresses[i]-reinterpret_cast<std::uintptr_t>(actual.dli_fbase)==rvas[i],"exact optional original provider belongs to pinned libc");
         }
@@ -82,15 +90,22 @@ int main(int argc,char** argv) {
     errno=ERANGE;const auto observed_result=init(&observed,&attr),observed_errno=errno;
     errno=ERANGE;const auto native_result=real_init(&native,&attr),native_errno=errno;
     require(observed_result==0&&observed_result==native_result&&observed_errno==native_errno,"original init result and errno unchanged");
-    require(pthread_mutex_lock(&observed)==0&&pthread_mutex_lock(&native)==0,"actual initialized mutexes lock");
+    errno=EOVERFLOW;const auto observed_lock=pthread_mutex_lock(&observed),observed_lock_errno=errno;
+    errno=EOVERFLOW;const auto native_lock=pthread_mutex_lock(&native),native_lock_errno=errno;
+    require(observed_lock==0&&observed_lock==native_lock&&observed_lock_errno==native_lock_errno,
+            "actual initialized mutex lock results and errno remain native");
     errno=ECHILD;const auto busy=destroy(&observed),busy_errno=errno;
     errno=ECHILD;const auto real_busy=real_destroy(&native),real_busy_errno=errno;
     require(busy==EBUSY&&busy==real_busy&&busy_errno==real_busy_errno,"native busy destroy result and errno unchanged");
-    require(pthread_mutex_unlock(&observed)==0&&pthread_mutex_unlock(&native)==0,"original busy mutexes remain usable");
+    errno=ERANGE;const auto observed_unlock=pthread_mutex_unlock(&observed),observed_unlock_errno=errno;
+    errno=ERANGE;const auto native_unlock=pthread_mutex_unlock(&native),native_unlock_errno=errno;
+    require(observed_unlock==0&&observed_unlock==native_unlock&&observed_unlock_errno==native_unlock_errno,
+            "original busy mutex unlock results and errno remain native");
     errno=ENOTTY;const auto done=destroy(&observed),done_errno=errno;
     errno=ENOTTY;const auto real_done=real_destroy(&native),real_done_errno=errno;
     require(done==0&&done==real_done&&done_errno==real_done_errno,"original successful destroy result and errno unchanged");
     require(pthread_mutexattr_destroy(&attr)==0,"owned attributes destroyed");
     std::printf("RESULT={\"checks\":%u,\"actual_final_preload\":true,\"actual_native_libc\":true,"
-                "\"production_ready\":false,\"native_openvr\":false,\"headset\":false}\n",checks);
+                "\"public_libc_interposition\":%s,\"production_ready\":false,\"native_openvr\":false,\"headset\":false}\n",
+                checks,connection?"false":"true");
 }

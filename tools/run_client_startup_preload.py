@@ -24,7 +24,7 @@ def main():
     parser.add_argument('--providers',required=True,type=Path)
     parser.add_argument('--compiler',default='aarch64-linux-gnu-g++')
     parser.add_argument('--record',required=True,type=Path)
-    parser.add_argument('--connection-observation',action='store_true',help='Verify all five entries in the actual final optional ARM ELF')
+    parser.add_argument('--connection-observation',action='store_true',help='Verify the optional ARM observer leaves all five public libc APIs at native providers')
     args=parser.parse_args()
     root=Path(__file__).resolve().parents[1]
     receipt={'status':'failed','frame_access':False,'native_openvr':False,'headset':False,
@@ -72,6 +72,8 @@ def main():
                 expected_checks=29 if args.connection_observation else 21
                 if len(results)!=1 or results[0].get('checks')!=expected_checks or output.exists():
                     raise SystemExit('Incomplete inert/preload or unexpected output evidence: '+name)
+                if args.connection_observation and results[0].get('public_libc_interposition') is not False:
+                    raise SystemExit('Connection observer changed unrelated public libc binding: '+name)
                 receipt['cases'][name]=results[0]
             receipt['status']='passed'
             print(json.dumps({'status':'passed','cases':receipt['cases'],'production_ready':False}))

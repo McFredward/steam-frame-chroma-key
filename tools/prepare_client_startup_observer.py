@@ -185,8 +185,10 @@ def validate_observer(data,reviewed_sha,provider_exports,*,connection_observatio
     forbidden={'dlopen','dlmopen','dlsym','execve','execveat'}
     if any(s['name'].startswith('VR_') or s['name'] in forbidden for s in elf.exported()):
         raise ValueError('Observer invents or interposes an unsupported public API')
-    public={BRIDGE,'pthread_mutex_init','pthread_mutex_destroy'}
-    if connection_observation:public.update(('pthread_mutex_lock','pthread_mutex_unlock','connect'))
+    # The connection bundle is inherited by the complete Steam service. Its
+    # only public entry is our bridge; actual source-client libc calls enter
+    # hidden veneers through the separately admitted audit binding.
+    public={BRIDGE} if connection_observation else {BRIDGE,'pthread_mutex_init','pthread_mutex_destroy'}
     if {s['name'] for s in elf.exported()}!=public:
         raise ValueError('Observer exports an unexpected public entry')
     if any('openvr' in name or 'vrclient' in name for name in elf.needed):
@@ -201,8 +203,7 @@ def validate_observer(data,reviewed_sha,provider_exports,*,connection_observatio
             raise ValueError('Native startup entry is not hidden '+name)
         (entries if name in ENTRIES else mutex_entries if name in MUTEX_ENTRIES else connection_entries)[name]=symbol['rva']
     mutex_aliases={}
-    pairs=[('pthread_mutex_init','frame_import_init_entry'),('pthread_mutex_destroy','frame_import_destroy_entry')]
-    if connection_observation:pairs += [('pthread_mutex_lock','frame_import_lock_entry'),('pthread_mutex_unlock','frame_import_unlock_entry'),('connect','frame_import_connect_entry')]
+    pairs=[] if connection_observation else [('pthread_mutex_init','frame_import_init_entry'),('pthread_mutex_destroy','frame_import_destroy_entry')]
     for public,hidden in pairs:
         alias=elf.function(public,True);target=elf.function(hidden)
         if alias['binding']!=1 or alias['visibility']!=0 or alias['version'] or alias['rva']!=target['rva'] or alias['size']!=target['size']:
@@ -221,7 +222,8 @@ def validate_observer(data,reviewed_sha,provider_exports,*,connection_observatio
     return elf,{'sha256':reviewed_sha,'bytes':len(data),'bridge_rva':bridge['rva'],'hidden_entries':entries,
                 'hidden_mutex_entries':mutex_entries,
                 'hidden_connection_entries':connection_entries,'connection_register_observation':connection_observation,
-                'public_mutex_aliases':mutex_aliases,'required_aliases':list(ALIASES),'versioned_glibc_imports':sorted(versioned)}
+                'public_mutex_aliases':mutex_aliases,'audit_only_libc_routing':connection_observation,
+                'required_aliases':list(ALIASES),'versioned_glibc_imports':sorted(versioned)}
 
 
 def export_versions(elf):

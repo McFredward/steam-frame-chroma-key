@@ -33,7 +33,7 @@ FRAME_DIRECTORY = '/home/steamos/.local/share/GloomhavenVR/frame-client-startup'
 
 def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
                      bridge_visibility=0, entry_visibility=2, mutex_visibility=2, dynamic_tls=False,
-                     connection=False):
+                     connection=False, missing_entry=None):
     """Construct bounded own metadata; no executable native code is included."""
     raw = bytearray(0x4000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
@@ -44,10 +44,10 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
     struct.pack_into('<III', raw, 0x180, 4, 20, 3)
     raw[0x18c:0x190] = b'GNU\0'
     raw[0x190:0x1a4] = bytes(range(20))
-    dynamic = [(tool.BRIDGE, 0x220, 1, bridge_visibility),
-               ('pthread_mutex_init', 0x230 + (4 if alias_rva else 0), 1, 0),
-               ('pthread_mutex_destroy', 0x240, 1, 0)]
-    if connection:dynamic += [('pthread_mutex_lock',0x250,1,0),('pthread_mutex_unlock',0x260,1,0),('connect',0x270,1,0)]
+    dynamic = [(tool.BRIDGE, 0x220, 1, bridge_visibility)]
+    if not connection:
+        dynamic += [('pthread_mutex_init', 0x230 + (4 if alias_rva else 0), 1, 0),
+                    ('pthread_mutex_destroy', 0x240, 1, 0)]
     if extra_export:
         dynamic.append((extra_export, 0x250, 1, 0))
     imports = [name.split('@')[0] for name in tool.ALIASES if name != missing_alias]
@@ -69,6 +69,8 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
     statstr = bytearray(b'\0')
     symtab = bytearray(24)
     for index, name in enumerate(tool.ENTRIES + tool.MUTEX_ENTRIES + (tool.CONNECTION_ENTRIES if connection else ())):
+        if name == missing_entry:
+            continue
         off = len(statstr)
         statstr += name.encode() + b'\0'
         rva = (0x200, 0x210, 0x230, 0x240,0x250,0x260,0x270)[index]
@@ -101,9 +103,19 @@ class PreparationTests(unittest.TestCase):
         _,report=tool.validate_observer(connection,tool.digest(connection).hex(),set(tool.ALIASES),connection_observation=True)
         self.assertTrue(report['connection_register_observation'])
         self.assertEqual(report['hidden_connection_entries'],dict(zip(tool.CONNECTION_ENTRIES,(0x250,0x260,0x270))))
-        self.assertEqual(report['public_mutex_aliases']['connect'],0x270)
-        with self.assertRaises(ValueError):
-            raw=observer_fixture(connection=True,alias_rva=True)
+        self.assertEqual(report['public_mutex_aliases'],{})
+        self.assertTrue(report['audit_only_libc_routing'])
+        self.assertEqual({s['name'] for s in tool.Elf(connection).exported()},{tool.BRIDGE})
+        for name in ('pthread_mutex_init','pthread_mutex_destroy','pthread_mutex_lock','pthread_mutex_unlock','connect'):
+            with self.subTest(global_interposition=name), self.assertRaisesRegex(ValueError,'unexpected public entry'):
+                raw=observer_fixture(connection=True,extra_export=name)
+                tool.validate_observer(raw,tool.digest(raw).hex(),set(tool.ALIASES),connection_observation=True)
+        for name in tool.MUTEX_ENTRIES+tool.CONNECTION_ENTRIES:
+            with self.subTest(missing_hidden_entry=name), self.assertRaisesRegex(ValueError,'Missing/ambiguous'):
+                raw=observer_fixture(connection=True,missing_entry=name)
+                tool.validate_observer(raw,tool.digest(raw).hex(),set(tool.ALIASES),connection_observation=True)
+        with self.assertRaisesRegex(ValueError,'not hidden'):
+            raw=observer_fixture(connection=True,mutex_visibility=0)
             tool.validate_observer(raw,tool.digest(raw).hex(),set(tool.ALIASES),connection_observation=True)
 
     def test_connection_envelope_and_audit_are_distinct_non_activating_scope(self):
