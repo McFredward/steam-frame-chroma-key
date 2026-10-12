@@ -92,5 +92,8 @@
     IMPORT_ENTRY frame_import_image_entry, frame_import_image_dispatch
     IMPORT_ENTRY frame_import_bind_entry, frame_import_bind_dispatch
     IMPORT_ENTRY frame_import_view_entry, frame_import_view_dispatch
+    IMPORT_ENTRY frame_import_init_entry, frame_import_init_dispatch
+    IMPORT_ENTRY frame_import_destroy_entry, frame_import_destroy_dispatch
+    IMPORT_ENTRY frame_import_close_entry, frame_import_close_dispatch
 
     .section .note.GNU-stack,"",%progbits

@@ -27,7 +27,7 @@ struct Fixture {
 Expected expected() { return {kDispatch, kPipe, kSequence}; }
 Entry entry(Boundary stage) {
     Entry e{};
-    constexpr std::uint64_t sites[] = {0x153fc0,0x1540b0,0x2c75ac,0x2c7684,0x2c7804,0x172ea0,0x172c00,0x172fbc};
+    constexpr std::uint64_t sites[] = {0x153fc0,0x1540b0,0x2c75ac,0x2c7684,0x2c7804,0x172ea0,0x172c00,0x172fbc,0x1722f4};
     e.x[30] = kBias + sites[static_cast<unsigned>(stage)];
     return e;
 }
@@ -61,6 +61,23 @@ Entry sender(Fixture& f, Boundary stage) {
 }
 
 int main() {
+    {
+        Fixture f; auto e=entry(Boundary::AcceptedInit);
+        e.sp=e.x[29]=kBase;
+        e.x[0]=e.x[19]=e.x[23]=kPipe; e.x[1]=kPipe+48; e.x[20]=7;
+        f.link(kBase,kBase+32,0x172544);
+        auto out=decode(Boundary::AcceptedInit,e,f.stack(),kBias);
+        require(out.valid() && out.invocation.pipe==kPipe && out.fd==7);
+        require(!out.client_available && !out.invocation.dispatch_frame && !out.native_payload_read);
+        for (auto reg : {0U,1U,19U,23U}) {
+            auto saved=e.x[reg];e.x[reg]+=16;
+            require(!decode(Boundary::AcceptedInit,e,f.stack(),kBias).valid());e.x[reg]=saved;
+        }
+        e.x[20]=0;require(decode(Boundary::AcceptedInit,e,f.stack(),kBias).valid());
+        e.x[20]=UINT64_MAX;require(!decode(Boundary::AcceptedInit,e,f.stack(),kBias).valid());
+        e.x[20]=7;f.put(kBase+8,std::uint64_t{kBias+0x17253c});
+        require(!decode(Boundary::AcceptedInit,e,f.stack(),kBias).valid());
+    }
     for (auto stage : {Boundary::Begin, Boundary::EarlyUnlock}) {
         Fixture f; auto e=entry(stage); e.sp=e.x[29]=kDispatch;
         e.x[0]=e.x[19]=kPipe; e.x[25]=1; f.put(kDispatch+128,std::uint64_t{kPipe});

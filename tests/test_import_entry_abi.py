@@ -129,7 +129,7 @@ class Object:
         return result
 
 
-ENTRIES = ("lock", "unlock", "write", "image", "bind", "view")
+ENTRIES = ("lock", "unlock", "write", "image", "bind", "view", "init", "destroy", "close")
 MASK64 = (1 << 64) - 1
 CALLEE = tuple(range(19, 31))
 
@@ -533,6 +533,14 @@ def main():
     args = parser.parse_args()
     require(1 <= args.iterations <= 4096, "iterations outside bounded fixture range")
     command = shlex.split(args.compiler or os.environ.get("AARCH64_CC", "aarch64-linux-gnu-gcc"))
+    direct_as = bool(command) and Path(command[0]).name.endswith("-as")
+    if not args.compiler and not os.environ.get("AARCH64_CC") and not shutil.which(command[0]):
+        # The fixture contains GNU assembler macros, not C/C++ input. CI needs
+        # only the small cross-binutils package; the architecture guard is the
+        # sole CPP directive and is checked before direct assembly below.
+        if shutil.which("aarch64-linux-gnu-as"):
+            command = ["aarch64-linux-gnu-as"]
+            direct_as = True
     if not args.object and (not command or not shutil.which(command[0])):
         print("AArch64 entry ABI: SKIP; cross assembler unavailable, no native-execution claim")
         return 77
@@ -545,7 +553,14 @@ def main():
         else:
             source_sha = hashlib.sha256(args.source.read_bytes()).hexdigest()
             output = private / "entry.o"
-            subprocess.run(command + ["-c", "-g", str(args.source), "-o", str(output)],
+            if direct_as:
+                directives = [line.strip() for line in args.source.read_text().splitlines()
+                              if line.lstrip().startswith("#")]
+                require(directives == ['#if !defined(__aarch64__)',
+                                       '#error "This entry ABI is AArch64-only"', '#endif'],
+                        "direct assembly requires an otherwise CPP-free source")
+            options = ["-g"] if direct_as else ["-c", "-g"]
+            subprocess.run(command + options + [str(args.source), "-o", str(output)],
                            check=True, timeout=30, capture_output=True)
             obj_data = output.read_bytes()
         verify(obj_data, iterations=args.iterations)

@@ -19,7 +19,7 @@ static_assert(sizeof(Entry) == 256, "AArch64 entry storage contract changed");
 static_assert(offsetof(Entry, sp) == 248, "AArch64 SP slot changed");
 
 enum class Boundary {
-    Begin, EarlyUnlock, Image, Bind, View, SendLock, Write, Finish
+    Begin, EarlyUnlock, Image, Bind, View, SendLock, Write, Finish, AcceptedInit
 };
 enum class Refusal {
     None, UnknownSite, InvalidEntry, OutsideWindow, FrameLink,

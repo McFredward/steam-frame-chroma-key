@@ -8,7 +8,7 @@ namespace {
 constexpr std::uintptr_t kMaxUser = (std::uintptr_t{1} << 48) - 1;
 constexpr std::uint64_t kSites[] = {
     0x153fc0, 0x1540b0, 0x2c75ac, 0x2c7684,
-    0x2c7804, 0x172ea0, 0x172c00, 0x172fbc
+    0x2c7804, 0x172ea0, 0x172c00, 0x172fbc, 0x1722f4
 };
 bool add(std::uintptr_t a, std::size_t b, std::uintptr_t& out) noexcept {
     if (a > kMaxUser || b > kMaxUser - a) return false;
@@ -67,7 +67,20 @@ Scalars decode(Boundary boundary, const Entry& entry, const StackBytes& stack,
     }
     const auto fp = static_cast<std::uintptr_t>(entry.x[29]);
     if (!address(fp) || !address(entry.sp) || stack.size > 1552 || !address(stack.base)) return out;
-    if (boundary == Boundary::Begin || boundary == Boundary::EarlyUnlock) {
+    if (boundary == Boundary::AcceptedInit) {
+        std::uintptr_t parent = 0, attribute = 0;
+        if (fp != entry.sp || !add(fp, 32, parent) ||
+            !link(stack, fp, parent, bias, 0x172544, out.refusal)) return out;
+        if (!address(entry.x[0]) || !add(entry.x[0], 48, attribute) ||
+            entry.x[0] != entry.x[19] || entry.x[0] != entry.x[23] ||
+            entry.x[1] != attribute || entry.x[20] > std::numeric_limits<int>::max()) {
+            out.refusal = Refusal::Arguments; return out;
+        }
+        out.invocation.pipe = entry.x[0];
+        out.fd = static_cast<int>(entry.x[20]);
+        // Native assignment happens after the constructor returns. This is
+        // pending accepted-object birth, not an active socket or credentials.
+    } else if (boundary == Boundary::Begin || boundary == Boundary::EarlyUnlock) {
         if (fp != entry.sp) return out;
         out.invocation.dispatch_frame = fp;
         out.invocation.pipe = entry.x[0];
