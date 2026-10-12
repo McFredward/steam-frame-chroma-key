@@ -19,6 +19,7 @@ import struct
 from collect_mask_bridge import CollectionError, run_bounded
 
 RECEIVER_SHA256 = "0000009e5c7124bb03bfd444f7200304e0bb3ec1ec0cf80f0086a19ec048132b"
+RECEIVER_SERVICE = "steam.service"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_LIBRARY_BYTES = 256 * 1024
 PROVIDER_SYMBOLS = (
@@ -102,7 +103,8 @@ def prepare(receiver: Path, provider: Path, observer: Path,
         raise CollectionError("Expected an absolute, normalized native user home.")
     owned = user_home / ".local/share/frame-receiver-observer"
     return {
-        "schema": "frame-receiver-observer-proposal-v1",
+        "schema": "frame-receiver-observer-proposal-v2",
+        "receiver_service": RECEIVER_SERVICE,
         "offline_files_supported": True,
         "installed": False,
         "runtime_authorized": False,
@@ -113,7 +115,7 @@ def prepare(receiver: Path, provider: Path, observer: Path,
         "observer": observer_info,
         "proposed_owned_directory": str(owned),
         "proposed_runtime_dropin_basename": "91-frame-receiver-observer.conf",
-        "activation": "temporary user-service LD_PRELOAD; exact receiver only samples",
+        "activation": "temporary Steam user-service LD_PRELOAD; exact receiver only samples",
         "callbacks": ["pthread_mutex_lock", "pthread_mutex_unlock"],
         "selection_caller_returns": ["0x34a50", "0x34d74"],
         "metadata_caller_returns": ["0x5200c", "0x5203c"],
@@ -128,6 +130,7 @@ def prepare(receiver: Path, provider: Path, observer: Path,
         "automatic_restart": False,
         "before_installation": [
             "Fresh native receiver/provider fingerprints and executable path.",
+            "Actual receiver belongs to steam.service, not merely steamvr.service.",
             "Known original service environment; refuse foreign preload/drop-in/session.",
             "Explicit permission for private scalar copies and temporary preload.",
             "Restart readiness; verified manual rollback and owned-file inventory.",

@@ -37,6 +37,8 @@ class PreparationTests(unittest.TestCase):
                 mock.patch.object(MODULE, "dynamic_symbols", side_effect=symbols):
             plan = self.prepare_fixture()
         self.assertTrue(plan["offline_files_supported"])
+        self.assertEqual(plan["schema"], "frame-receiver-observer-proposal-v2")
+        self.assertEqual(plan["receiver_service"], "steam.service")
         for key in ("installed", "runtime_authorized", "image_or_mapped_uniform_reads",
                     "native_binary_patch", "kernel_or_system_image_change",
                     "shader_or_mask_activation", "automatic_restart"):

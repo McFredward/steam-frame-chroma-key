@@ -1,12 +1,13 @@
 # Opt-in receiver selected-attempt observer
 
 `receiver/receiver_observer.cpp` implements the narrow observation proposed in
-[the receiver boundary audit](FRAME-RECEIVER-OBSERVER.md). It is an **offline
-implementation**, not installed on the Frame, and does not enable passthrough.
-The earlier runtime approval covered public Vulkan metadata only. Loading this
-observer or reading the native selected records requires the additional reviewed
-permission and reversible deployment plan described in
-[the next adapter proposal](FRAME-NEXT-ADAPTER.md).
+[the receiver boundary audit](FRAME-RECEIVER-OBSERVER.md). It is an opt-in
+diagnostic and does not enable passthrough. The first authorized Frame attempt
+[identified a launcher mismatch](FRAME-RECEIVER-LAUNCH-20261012.md): the library
+loaded in the compositor, while the receiver was launched separately by Steam.
+No protected receiver records were captured. The corrected Steam-client launch
+scope still needs its own permission and restart readiness; an offline plan
+or software test cannot grant that permission.
 
 ## Build and activation boundary
 
@@ -54,6 +55,8 @@ also offline preparation and grants no runtime permission.
 
 `tools/prepare_receiver_observer.py` checks local input fingerprints, AArch64
 ELF headers and versioned imports, then writes an exclusive private **proposal**.
+Proposal v2 explicitly targets `steam.service`, matching the observed native
+receiver launcher. A legacy SteamVR-only proposal cannot authorize that scope.
 It requires both libc and the dynamic loader: legitimate libc exports can be
 weak, and the AArch64 stack guard is supplied by the loader. This preparation
 does not install files, restart a service, read process memory or grant runtime

@@ -30,8 +30,11 @@ snapshots. Neither capture establishes GPU-consumed eye values or source-video
 identity. The next adapters must join [native receiver selection and resource import](docs/FRAME-NEXT-ADAPTER.md)
 with [actual Windows composition and transmitter keys](docs/PC-NEXT-ADAPTER.md).
 An [opt-in receiver observer](docs/RECEIVER-OBSERVER-IMPLEMENTATION.md) is now built
-and tested offline to inspect bounded, protected selection metadata. It remains
-uninstalled and requires a separately approved runtime capture.
+and tested offline to inspect bounded, protected selection metadata. Its first
+[native startup attempt](docs/FRAME-RECEIVER-LAUNCH-20261012.md) established that
+the receiver starts under the Steam client service; the original SteamVR-only
+activation could not reach it. A corrected, separately approved receiver capture
+is still required.
 These diagnostics change no rendered pixels and do not enable genuine-mask
 passthrough.
 
