@@ -200,6 +200,19 @@ observed pipe destruction or a continuous socket/import lifetime. Never promote
 the recorded local birth token into later cross-process or GPU evidence without
 the corresponding source/lifecycle adapter.
 
+The first actual Frame capture now confirms cold preparation, audit attachment,
+the receiver's real Init entry, both deep-bound native mutex providers and the
+authenticated client mapping. It did **not** confirm the target birth: an earlier
+legitimate embedded pipe uses the same mutex return site and consumed the old
+candidate filter's discovery attempt. The bounded register-only rejection and
+independent constructor-order proof are described in
+[CLIENT-STARTUP-NATIVE-INSTANCE-20261012.md](CLIENT-STARTUP-NATIVE-INSTANCE-20261012.md).
+This source-proven repair still needs a new coordinated capture to establish a
+successful target birth. The previous diagnostic was manually removed; the
+native service configuration and affected process mappings were checked after
+the coordinated restart. No PC sender hook, scene-pixel change or GPU proof was
+introduced.
+
 `tools/prepare_client_startup_observer.py` now produces only an offline reviewed
 candidate bundle. Loader names are explicitly expected inputs, not observed
 link-map lifetimes. Root must verify the actual current launch environment and
