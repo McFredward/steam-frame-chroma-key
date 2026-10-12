@@ -28,8 +28,8 @@ Slot slots[5];
 std::atomic<std::uint64_t> next_generation{1};
 std::atomic<bool> preinit_seen{false}, ready{false}, lost{false}, missed{false};
 std::atomic<bool> bridge_admitted{false};
-std::atomic<unsigned> binding_state[4];
-std::atomic<std::uintptr_t> entry_cache[4], original_cache[4];
+std::atomic<unsigned> binding_state[7];
+std::atomic<std::uintptr_t> entry_cache[7], original_cache[7];
 
 bool same_name(const char* a, const char* b) noexcept {
     if (!a || !b) return false;
@@ -52,6 +52,9 @@ bool in_range(std::uintptr_t rva, const ModulePreparation& module) noexcept {
 bool mutex_scope(const Preparation& p) noexcept {
     return p.libc.loader_name || p.native_mutex_init_rva || p.native_mutex_destroy_rva;
 }
+bool connection_scope(const Preparation& p) noexcept {
+    return p.native_mutex_lock_rva || p.native_mutex_unlock_rva || p.native_connect_rva;
+}
 const Preparation* prepared() noexcept {
     const auto* p = preparation();
     if (!p || !p->owned_prepared_files || !p->receiver.loader_name || !p->api.loader_name ||
@@ -69,6 +72,16 @@ const Preparation* prepared() noexcept {
         for (unsigned i=0;i<5;++i)
             for (unsigned j=i+1;j<5;++j)
                 if (same_name(modules[i]->loader_name,modules[j]->loader_name)) return nullptr;
+    }
+    if (connection_scope(*p)) {
+        if (!mutex_scope(*p)) return nullptr;
+        const std::uintptr_t providers[]{p->native_mutex_init_rva,p->native_mutex_destroy_rva,
+            p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_connect_rva};
+        for (unsigned i=0;i<5;++i) {
+            if (!providers[i] || !in_range(providers[i],p->libc)) return nullptr;
+            for (unsigned j=i+1;j<5;++j)
+                if (providers[i]==providers[j]) return nullptr;
+        }
     }
     return p;
 }
@@ -174,14 +187,21 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
         function=Function::MutexInit;index=2;mutex=true;
     } else if (mutex_scope(*p) && *reference==4 && *definition==5 && same_name(name,"pthread_mutex_destroy")) {
         function=Function::MutexDestroy;index=3;mutex=true;
+    } else if (connection_scope(*p) && *reference==4 && *definition==5 && same_name(name,"pthread_mutex_lock")) {
+        function=Function::MutexLock;index=4;mutex=true;
+    } else if (connection_scope(*p) && *reference==4 && *definition==5 && same_name(name,"pthread_mutex_unlock")) {
+        function=Function::MutexUnlock;index=5;mutex=true;
+    } else if (connection_scope(*p) && *reference==4 && *definition==5 && same_name(name,"connect")) {
+        function=Function::Connect;index=6;mutex=true;
     } else return original;
     BoundProvider provider{};
     if (!views(provider)) return original;
     std::uintptr_t expected_address{};
     if (mutex && !view(3,provider.client)) return original;
     const auto& definition_view=mutex?provider.libc:provider.api;
-    const auto native_rva=mutex?(index==2?p->native_mutex_init_rva:p->native_mutex_destroy_rva):
-                                  (index==0?p->init_rva:p->shutdown_rva);
+    const std::uintptr_t native_rvas[]{p->init_rva,p->shutdown_rva,p->native_mutex_init_rva,
+        p->native_mutex_destroy_rva,p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_connect_rva};
+    const auto native_rva=native_rvas[index];
     if (!add(definition_view.bias,native_rva,expected_address) ||
         original!=expected_address || original<definition_view.rx_begin || original>=definition_view.rx_end) {
         loss(); return original;

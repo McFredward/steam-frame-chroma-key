@@ -6,7 +6,9 @@
 // Requests are copied values. The main observer verifies its already prepared
 // actual mappings/providers; this bridge performs no discovery or native reads.
 namespace frame_import_startup_audit {
-enum class Function : std::uint8_t { None, Init, Shutdown, MutexInit, MutexDestroy };
+enum class Function : std::uint8_t {
+    None, Init, Shutdown, MutexInit, MutexDestroy, MutexLock, MutexUnlock, Connect
+};
 enum class Stage : std::uint8_t { Prepare, Bind, Retire, Loss };
 struct ModuleView {
     std::uintptr_t bias = 0, rx_begin = 0, rx_end = 0;
@@ -54,6 +56,11 @@ struct Preparation {
     // including RTLD_NOW|RTLD_DEEPBIND, remain unchanged.
     ModulePreparation libc{};
     std::uintptr_t native_mutex_init_rva = 0, native_mutex_destroy_rva = 0;
+    // Optional register-only connect observation. These append-only fields
+    // require the complete mutex scope above and all three distinct providers.
+    // They do not authorize native memory reads or prove FD ownership/lifetime.
+    std::uintptr_t native_mutex_lock_rva = 0, native_mutex_unlock_rva = 0,
+                   native_connect_rva = 0;
 };
 
 // A hidden weak default returns nullptr (inactive). A separate prepared own-

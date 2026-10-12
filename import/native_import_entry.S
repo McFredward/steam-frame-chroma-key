@@ -96,10 +96,13 @@
     .ifndef FRAME_MUTEX_ENTRY_BUILD
     .set FRAME_MUTEX_ENTRY_BUILD, 0
     .endif
+    .ifndef FRAME_CONNECTION_ENTRY_BUILD
+    .set FRAME_CONNECTION_ENTRY_BUILD, 0
+    .endif
     .if FRAME_STARTUP_ENTRY_BUILD
     IMPORT_ENTRY frame_import_vr_init_entry, frame_import_vr_init_dispatch
     IMPORT_ENTRY frame_import_vr_shutdown_entry, frame_import_vr_shutdown_dispatch
-    .elseif FRAME_MUTEX_ENTRY_BUILD
+    .elseif FRAME_MUTEX_ENTRY_BUILD || FRAME_CONNECTION_ENTRY_BUILD
     IMPORT_ENTRY frame_import_init_entry, frame_import_init_dispatch
     IMPORT_ENTRY frame_import_destroy_entry, frame_import_destroy_dispatch
     // Public aliases share the original entry PC. A C wrapper would change
@@ -110,6 +113,20 @@
     .global pthread_mutex_destroy
     .type pthread_mutex_destroy, %function
     .set pthread_mutex_destroy, frame_import_destroy_entry
+    .if FRAME_CONNECTION_ENTRY_BUILD
+    IMPORT_ENTRY frame_import_lock_entry, frame_import_lock_dispatch
+    IMPORT_ENTRY frame_import_unlock_entry, frame_import_unlock_dispatch
+    IMPORT_ENTRY frame_import_connect_entry, frame_import_connect_dispatch
+    .global pthread_mutex_lock
+    .type pthread_mutex_lock, %function
+    .set pthread_mutex_lock, frame_import_lock_entry
+    .global pthread_mutex_unlock
+    .type pthread_mutex_unlock, %function
+    .set pthread_mutex_unlock, frame_import_unlock_entry
+    .global connect
+    .type connect, %function
+    .set connect, frame_import_connect_entry
+    .endif
     .else
     IMPORT_ENTRY frame_import_lock_entry, frame_import_lock_dispatch
     IMPORT_ENTRY frame_import_unlock_entry, frame_import_unlock_dispatch

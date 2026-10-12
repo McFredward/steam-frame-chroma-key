@@ -413,7 +413,7 @@ def verify(data, iterations=256, seed=0x4652414d45):
         alias, original = symbols[public], symbols[hidden]
         require(alias.binding == 1 and alias.kind == 2 and alias.visibility == 0 and
                 (alias.section, alias.value, alias.size) == (original.section, original.value, original.size),
-                "public mutex alias does not share the exact true-entry PC/extent")
+                "public alias does not share the exact true-entry PC/extent")
     relocations = obj.relocations(text)
     require(len(relocations) == len(ENTRIES), "unexpected text relocation count")
     unwind = unwind_tables(obj)
@@ -552,6 +552,8 @@ def main():
                         help="check the two startup-only entries from the same shared assembler macro")
     modes.add_argument("--mutex", action="store_true",
                        help="check the two mutex entries and exact public aliases from the same macro")
+    modes.add_argument("--connection", action="store_true",
+                       help="check the five opt-in client-connect entries and exact public aliases")
     args = parser.parse_args()
     if args.startup:
         ENTRIES = ("vr_init", "vr_shutdown")
@@ -559,6 +561,13 @@ def main():
         ENTRIES = ("init", "destroy")
         PUBLIC_ALIASES = {"pthread_mutex_init": "frame_import_init_entry",
                           "pthread_mutex_destroy": "frame_import_destroy_entry"}
+    if args.connection:
+        ENTRIES = ("init", "destroy", "lock", "unlock", "connect")
+        PUBLIC_ALIASES = {"pthread_mutex_init": "frame_import_init_entry",
+                          "pthread_mutex_destroy": "frame_import_destroy_entry",
+                          "pthread_mutex_lock": "frame_import_lock_entry",
+                          "pthread_mutex_unlock": "frame_import_unlock_entry",
+                          "connect": "frame_import_connect_entry"}
     require(1 <= args.iterations <= 4096, "iterations outside bounded fixture range")
     command = shlex.split(args.compiler or os.environ.get("AARCH64_CC", "aarch64-linux-gnu-gcc"))
     direct_as = bool(command) and Path(command[0]).name.endswith("-as")
@@ -588,8 +597,9 @@ def main():
                                        '#error "This entry ABI is AArch64-only"', '#endif'],
                         "direct assembly requires an otherwise CPP-free source")
             options = ["-g"] if direct_as else ["-c", "-g"]
-            if args.startup or args.mutex:
-                define = "FRAME_STARTUP_ENTRY_BUILD=1" if args.startup else "FRAME_MUTEX_ENTRY_BUILD=1"
+            if args.startup or args.mutex or args.connection:
+                define = "FRAME_STARTUP_ENTRY_BUILD=1" if args.startup else \
+                         "FRAME_CONNECTION_ENTRY_BUILD=1" if args.connection else "FRAME_MUTEX_ENTRY_BUILD=1"
                 options += (["--defsym", define] if direct_as else ["-Wa,--defsym," + define])
             subprocess.run(command + options + [str(args.source), "-o", str(output)],
                            check=True, timeout=30, capture_output=True)
@@ -603,7 +613,8 @@ def main():
             "randomized_machine_byte_executions": len(ENTRIES) * args.iterations,
             "negative_controls": controls,
             "elf_hidden_entries": True,
-            "public_mutex_aliases": sorted(PUBLIC_ALIASES),
+            "public_mutex_aliases": sorted(name for name in PUBLIC_ALIASES if name.startswith("pthread_mutex_")),
+            "public_connection_aliases": sorted(name for name in PUBLIC_ALIASES if name == "connect"),
             "dispatch_relocations": True,
             "active_stack_cfi_each_instruction": True,
             "dispatcher_model": "AAPCS64 legal caller-saved clobbers; low d8..d15 preserved",
