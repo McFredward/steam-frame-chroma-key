@@ -41,6 +41,10 @@ compositor resource/eye and GPU association remain incomplete.
 After a [SteamOS update](docs/FRAME-RECEIVER-UPDATE-20261012.md), the receiver
 observer was revalidated against the current native binary before any new
 deployment; unknown or stale builds remain refused.
+The [compositor import diagnostic preparation](docs/COMPOSITOR-IMPORT-PREPARATION.md)
+now has bounded offline state, exact entry-layout checks and a read-only kernel
+socket-pair helper. Its production/native-lifetime integration is still pending;
+these components do not enable streamed passthrough.
 These diagnostics change no rendered pixels and do not enable genuine-mask
 passthrough.
 

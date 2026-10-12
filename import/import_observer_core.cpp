@@ -8,11 +8,17 @@ namespace {
 
 bool valid_base_route(const Route& r) noexcept {
     return r.process_generation && r.anchor_frame && r.anchor_frame % 16 == 0 &&
-        r.pipe_identity && r.socket_generation && r.socket_fd >= 0 && r.peer_pid &&
+        r.pipe_identity && r.socket_generation && r.socket_fd >= 0 &&
         r.native_route_verified && r.active_anchor_verified &&
-        r.socket_lifetime_verified &&
-        r.peer_credentials_verified && r.same_native_connection_verified &&
-        !r.foreign_namespace;
+        r.socket_lifetime_verified && r.same_native_connection_verified;
+}
+
+bool peer_owned(const Route& r) noexcept {
+    return r.peer_pid && r.peer_credentials_verified && !r.foreign_namespace;
+}
+
+bool peer_absent(const Route& r) noexcept {
+    return !r.peer_pid && !r.peer_credentials_verified && r.foreign_namespace;
 }
 
 bool client_absent(const Route& r) noexcept {
@@ -28,7 +34,7 @@ bool equal_base_route(const Route& a, const Route& b) noexcept {
     return a.process_generation == b.process_generation &&
         a.anchor_frame == b.anchor_frame && a.pipe_identity == b.pipe_identity &&
         a.socket_generation == b.socket_generation &&
-        a.request_sequence == b.request_sequence && a.peer_pid == b.peer_pid &&
+        a.request_sequence == b.request_sequence &&
         a.socket_fd == b.socket_fd;
 }
 
@@ -109,6 +115,11 @@ bool Observer::begin(const BeginProof& proof, Scope& scope) noexcept {
     if (proof.lock_result != 0 || !valid_base_route(proof.route))
         scope.record.reason |= InvalidRoute;
     if (!client_absent(proof.route)) scope.record.reason |= UnexpectedClient;
+    // The header reader does not query SO_PEERCRED. For a first request the
+    // native credential query occurs during the later payload read. A prior
+    // credential copy may only be reused for this observed continuous socket.
+    if (peer_owned(proof.route)) scope.peer_attached = true;
+    else if (!peer_absent(proof.route)) scope.record.reason |= MissingPeer;
     counters.active.fetch_add(1, std::memory_order_seq_cst);
     return true;
 }
@@ -125,6 +136,23 @@ bool Observer::route(const EventProof& proof, std::uint64_t site, Scope& scope) 
         return false;
     }
     if (!equal_base_route(scope.record.route, proof.route)) {
+        scope.record.reason |= ChangedRoute;
+        return false;
+    }
+    if (!peer_owned(proof.route)) {
+        scope.record.reason |= MissingPeer;
+        return false;
+    }
+    if (!scope.peer_attached) {
+        if (site != kEarlyUnlockSite && site != kImageSite) {
+            scope.record.reason |= MissingPeer;
+            return false;
+        }
+        scope.record.route.peer_pid = proof.route.peer_pid;
+        scope.record.route.peer_credentials_verified = true;
+        scope.record.route.foreign_namespace = false;
+        scope.peer_attached = true;
+    } else if (scope.record.route.peer_pid != proof.route.peer_pid) {
         scope.record.reason |= ChangedRoute;
         return false;
     }
@@ -158,6 +186,11 @@ bool Observer::route(const EventProof& proof, std::uint64_t site, Scope& scope) 
 
 void Observer::candidate(const EventProof& proof, const ImageCandidate& image,
                          Scope& scope) noexcept {
+    if (scope.active && scope.observer_identity == reinterpret_cast<std::uintptr_t>(this) &&
+        !scope.early_unlock_seen) {
+        scope.record.reason |= MissingEarlyUnlock;
+        return;
+    }
     if (!route(proof, kImageSite, scope)) return;
     scope.record.route.client_identity = proof.route.client_identity;
     scope.record.route.client_generation = proof.route.client_generation;
@@ -202,10 +235,15 @@ void Observer::view(const EventProof& proof, const View& view, Scope& scope) noe
     scope.record.view = view;
 }
 
-void Observer::early_unlock(const EventProof& proof, Scope& scope) noexcept {
+void Observer::early_unlock(const EventProof& proof, int native_unlock_result,
+                            bool native_payload_read, Scope& scope) noexcept {
     // Native 0x1540b0 releases the pipe before the actual handler and Vulkan
     // creation. Lifetime is established by active native frames, not that lock.
-    (void)route(proof, kEarlyUnlockSite, scope);
+    if (!scope.active) return;
+    if (scope.early_unlock_seen) scope.record.reason |= InvalidRoute;
+    if (native_unlock_result != 0) scope.record.reason |= InvalidRoute;
+    if (!native_payload_read) scope.record.reason |= PayloadReadFailed;
+    if (route(proof, kEarlyUnlockSite, scope)) scope.early_unlock_seen = true;
 }
 
 void Observer::written(const WriteProof& proof,
@@ -284,6 +322,7 @@ void Observer::finish(const FinishProof& proof, Scope& scope) noexcept {
         scope.record.reason |= InvalidFinish;
     if (!proof.native_send_success) scope.record.reason |= NativeSendFailed;
     if (!scope.client_attached) scope.record.reason |= MissingClient;
+    if (!scope.peer_attached) scope.record.reason |= MissingPeer;
     if (scope.image_count != 1) scope.record.reason |= MissingImage;
     if (scope.binding_count != 1) scope.record.reason |= MissingBinding;
     if (scope.view_count != 1) scope.record.reason |= MissingView;

@@ -79,18 +79,30 @@ struct Fixture {
         image_view.owned_public_scalars_verified = true;
         observer.armed = true;
     }
-    Route provisional_route() const {
+    Route peer_route() const {
         Route provisional = route;
         provisional.client_identity = provisional.client_generation = 0;
         provisional.client_identity_available = provisional.client_ownership_verified = false;
         return provisional;
     }
+    Route provisional_route() const {
+        Route provisional = peer_route();
+        provisional.peer_pid = 0;
+        provisional.peer_credentials_verified = false;
+        provisional.foreign_namespace = true;
+        return provisional;
+    }
     EventProof event(std::uint64_t site) const {
-        return {site == kEarlyUnlockSite ? provisional_route() : route, site};
+        return {site == kEarlyUnlockSite ? peer_route() : route, site};
     }
     bool begin() { return observer.begin({provisional_route(), kBeginSite, 0}, scope); }
-    void gpu() {
+    void candidate() {
+        if (scope.active && !scope.early_unlock_seen)
+            observer.early_unlock(event(kEarlyUnlockSite), 0, true, scope);
         observer.candidate(event(kImageSite), image, scope);
+    }
+    void gpu() {
+        candidate();
         observer.bind(event(kBindSite), binding, scope);
         observer.view(event(kViewSite), image_view, scope);
     }
@@ -147,7 +159,7 @@ int main() {
         f.observer.armed = false;
         check(!f.begin());
         check(!f.scope.active && !f.observer.counters.claimed);
-        f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        f.candidate();
         f.observer.armed = true;
         for (const auto old : {0x153418ULL, 0x137dd0ULL, 0x70ad0ULL, 0ULL})
             check(!f.observer.begin({f.route, old, 0}, f.scope));
@@ -158,8 +170,11 @@ int main() {
         check(f.scope.depth == 1 && !f.scope.record.reason);
         check(!f.scope.client_attached && !f.scope.record.client_identity_available);
         check(!f.scope.record.route.client_identity && !f.scope.record.route.client_generation);
-        f.observer.early_unlock(f.event(kEarlyUnlockSite), f.scope);
+        check(!f.scope.peer_attached && !f.scope.record.route.peer_pid);
+        check(!f.scope.record.route.peer_credentials_verified && f.scope.record.route.foreign_namespace);
+        f.observer.early_unlock(f.event(kEarlyUnlockSite), 0, true, f.scope);
         check(f.scope.active && !f.observer.counters.completed);
+        check(f.scope.peer_attached && f.scope.record.route.peer_pid==f.route.peer_pid);
         f.gpu();
         check(f.scope.client_attached && f.scope.record.route.client_identity == 51);
         check(f.scope.record.route.client_generation == 3 && f.scope.record.client_identity_available);
@@ -180,15 +195,48 @@ int main() {
     {
         Fixture f;
         check(f.begin());
-        f.observer.early_unlock(f.event(kEarlyUnlockSite), f.scope);
+        f.observer.early_unlock(f.event(kEarlyUnlockSite), 0, true, f.scope);
         check(!f.scope.client_attached && !f.scope.record.reason);
-        f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        f.candidate();
         check(f.scope.client_attached && f.scope.record.route.client_identity == f.route.client_identity);
         // The native object is now allowed to be released. Later event proofs
         // carry its owned scalar copy; no native pointer exists in this fixture.
         f.observer.bind(f.event(kBindSite), f.binding, f.scope);
         f.observer.view(f.event(kViewSite), f.image_view, f.scope);
         f.write(21); f.finish(); check(f.take().import_reply_complete);
+    }
+    // First-request SO_PEERCRED is also a later payload-read fact. A successful
+    // initial lock or native header read cannot manufacture it in Begin.
+    for (unsigned failure=0; failure<5; ++failure) {
+        Fixture f; check(f.begin());
+        auto read = f.event(kEarlyUnlockSite);
+        if (failure==0) read.route.peer_pid=0;
+        if (failure==1) read.route.peer_credentials_verified=false;
+        if (failure==2) read.route.foreign_namespace=true;
+        f.observer.early_unlock(read, failure==3 ? 1 : 0, failure!=4, f.scope);
+        f.gpu(); f.write(21);
+        rejected(f, failure<3 ? MissingPeer : failure==3 ? InvalidRoute : PayloadReadFailed);
+    }
+    {
+        Fixture f; check(f.begin());
+        f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        rejected(f, MissingEarlyUnlock);
+    }
+    for (auto stage : {kBindSite,kViewSite,kWriteSite,kFinishSite}) {
+        Fixture f; check(f.begin()); f.gpu();
+        ++f.route.peer_pid;
+        if (stage==kBindSite) f.observer.bind(f.event(stage), f.binding, f.scope);
+        if (stage==kViewSite) f.observer.view(f.event(stage), f.image_view, f.scope);
+        if (stage==kWriteSite) f.write(21);
+        rejected(f, ChangedRoute);
+    }
+    {
+        Fixture f;
+        // A previously observed peer is admissible only with the same already
+        // established, live socket epoch; no first-request future credential.
+        check(f.observer.begin({f.peer_route(),kBeginSite,0}, f.scope));
+        check(f.scope.peer_attached);
+        f.gpu(); f.write(21); f.finish(); check(f.take().import_reply_complete);
     }
     for (unsigned missing = 0; missing < 3; ++missing) {
         Fixture f; check(f.begin());
@@ -209,9 +257,9 @@ int main() {
     }
     for (unsigned duplicate = 0; duplicate < 2; ++duplicate) {
         Fixture f; check(f.begin());
-        f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        f.candidate();
         if (duplicate) ++f.route.client_identity;
-        f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        f.candidate();
         check(f.scope.record.route.client_identity == 51);
         rejected(f, DuplicateClientAttachment);
     }
@@ -227,19 +275,19 @@ int main() {
     }
     {
         Fixture f; check(f.begin());
-        f.observer.early_unlock({f.route, kEarlyUnlockSite}, f.scope);
+        f.observer.early_unlock({f.route, kEarlyUnlockSite}, 0, true, f.scope);
         rejected(f, UnexpectedClient);
     }
     {
         Fixture f; check(f.begin()); f.gpu();
-        f.observer.early_unlock(f.event(kEarlyUnlockSite), f.scope);
+        f.observer.early_unlock(f.event(kEarlyUnlockSite), 0, true, f.scope);
         rejected(f, UnexpectedClient);
     }
     // Each post-creation phase must carry the same protected client copy.
     for (unsigned phase = 0; phase < 4; ++phase) {
         for (unsigned changed = 0; changed < 5; ++changed) {
             Fixture f; check(f.begin());
-            f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+            f.candidate();
             if (phase > 0) f.observer.bind(f.event(kBindSite), f.binding, f.scope);
             if (phase > 1) f.observer.view(f.event(kViewSite), f.image_view, f.scope);
             if (phase > 2) f.write(21);
@@ -291,19 +339,21 @@ int main() {
         case 4: provisional.client_generation = 1; break;
         case 5: provisional.socket_generation = 0; break;
         case 6: provisional.socket_fd = -1; break;
-        case 7: provisional.peer_pid = 0; break;
+        case 7: provisional.peer_pid = 6000; break; // No credential proof yet.
         case 8: provisional.native_route_verified = false; break;
         case 9: provisional.active_anchor_verified = false; break;
         case 10: provisional.client_identity_available = true; break;
         case 11: provisional.client_ownership_verified = true; break;
         case 12: provisional.socket_lifetime_verified = false; break;
-        case 13: provisional.peer_credentials_verified = false; break;
+        case 13: provisional.peer_credentials_verified = true; break; // Missing actual PID.
         case 14: provisional.same_native_connection_verified = false; break;
-        case 15: provisional.foreign_namespace = true; break;
+        case 15: provisional.foreign_namespace = false; break; // Missing actual credentials.
         default: break;
         }
         check(f.observer.begin({provisional, kBeginSite, which == 16 ? 1 : 0}, f.scope));
-        f.gpu(); f.write(kReplyBytes); rejected(f, which == 4 || which == 10 || which == 11 ? UnexpectedClient : InvalidRoute);
+        f.gpu(); f.write(kReplyBytes); rejected(f,
+            which == 4 || which == 10 || which == 11 ? UnexpectedClient :
+            which == 7 || which == 13 || which == 15 ? MissingPeer : InvalidRoute);
     }
     // Reused frame address alone never permits a changed native invocation.
     for (unsigned which = 0; which < 9; ++which) {
@@ -336,7 +386,7 @@ int main() {
         default: break;
         }
         f.gpu();
-        if (which == 9) f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        if (which == 9) f.candidate();
         f.write(kReplyBytes); rejected(f, which == 9 ? MultipleImages : InvalidImage);
     }
     for (unsigned which = 0; which < 8; ++which) {
@@ -373,7 +423,7 @@ int main() {
     }
     for (unsigned missing = 0; missing < 3; ++missing) {
         Fixture f; check(f.begin());
-        if (missing != 0) f.observer.candidate(f.event(kImageSite), f.image, f.scope);
+        if (missing != 0) f.candidate();
         if (missing != 0 && missing != 1) f.observer.bind(f.event(kBindSite), f.binding, f.scope);
         f.write(kReplyBytes);
         rejected(f, missing == 0 ? MissingImage : missing == 1 ? MissingBinding : MissingView);
@@ -556,7 +606,7 @@ int main() {
                     f.packet[4 + byte] = static_cast<std::uint8_t>(f.route.request_sequence >> (8 * byte));
                 Scope scope{};
                 if (!o.begin({f.provisional_route(), kBeginSite, 0}, scope)) std::abort();
-                o.early_unlock(f.event(kEarlyUnlockSite), scope);
+                o.early_unlock(f.event(kEarlyUnlockSite), 0, true, scope);
                 o.candidate(f.event(kImageSite), f.image, scope);
                 o.bind(f.event(kBindSite), f.binding, scope);
                 o.view(f.event(kViewSite), f.image_view, scope);

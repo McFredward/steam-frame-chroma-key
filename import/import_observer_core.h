@@ -33,7 +33,9 @@ enum Reason : std::uint64_t {
     SocketInvalidated = 1ULL << 18, ResourceRetired = 1ULL << 19,
     InvalidFinish = 1ULL << 20, DepthOverflow = 1ULL << 21,
     ObserverMismatch = 1ULL << 22, MissingClient = 1ULL << 23,
-    DuplicateClientAttachment = 1ULL << 24, UnexpectedClient = 1ULL << 25
+    DuplicateClientAttachment = 1ULL << 24, UnexpectedClient = 1ULL << 25,
+    MissingPeer = 1ULL << 26, PayloadReadFailed = 1ULL << 27,
+    MissingEarlyUnlock = 1ULL << 28
 };
 
 // These are adapter-established ownership facts, not guesses made by the core.
@@ -130,7 +132,8 @@ struct Scope {
     std::uint64_t packet_identity = 0;
     std::uintptr_t packet_base = 0, observer_identity = 0;
     std::uint32_t depth = 0, image_count = 0, binding_count = 0, view_count = 0;
-    bool active = false, excluded = false, client_attached = false;
+    bool active = false, excluded = false, client_attached = false, peer_attached = false;
+    bool early_unlock_seen = false;
 };
 
 struct Counters {
@@ -158,7 +161,8 @@ public:
     void invalidate_socket(Scope&) noexcept;
     void retire_image(std::uint64_t image, std::uint64_t generation, Scope&) noexcept;
     // The first pipe unlock precedes image creation. It is NOT completion.
-    void early_unlock(const EventProof&, Scope&) noexcept;
+    void early_unlock(const EventProof&, int native_unlock_result,
+                      bool native_payload_read, Scope&) noexcept;
     bool take(Record&) noexcept;
     bool publish(const Record&) noexcept;
     bool quiescent(const std::atomic<std::uint64_t>& callbacks) const noexcept;

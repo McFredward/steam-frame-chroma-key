@@ -84,6 +84,25 @@ if(BUILD_TESTING)
     add_test(NAME mask_module_guard COMMAND test_mask_module_guard)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(UNIX)
+        add_executable(test_import_observer tests/test_import_observer.cpp
+            import/import_observer_core.cpp)
+        target_include_directories(test_import_observer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_import_observer PRIVATE -Wall -Wextra -Wpedantic)
+        find_package(Threads REQUIRED)
+        target_link_libraries(test_import_observer PRIVATE Threads::Threads)
+        add_test(NAME compositor_import_core COMMAND test_import_observer)
+        add_executable(test_native_import_route tests/test_native_import_route.cpp
+            import/native_import_route.cpp)
+        target_include_directories(test_native_import_route PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_native_import_route PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME compositor_import_native_route COMMAND test_native_import_route)
+        add_test(NAME compositor_import_entry_abi COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_entry_abi.py
+            --source ${CMAKE_CURRENT_SOURCE_DIR}/import/native_import_entry.S)
+        set_tests_properties(compositor_import_entry_abi PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME unix_connection_snapshot COMMAND ${Python3_EXECUTABLE}
+            -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            -p test_inspect_unix_connection.py)
         add_test(NAME receiver_observer_preparation COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests
             -p test_prepare_receiver_observer.py)
@@ -111,6 +130,11 @@ if(BUILD_TESTING)
             target_link_libraries(test_${suite} PRIVATE Threads::Threads)
             add_test(NAME ${suite} COMMAND test_${suite})
         endforeach()
+        add_executable(test_import_resource_receipt tests/test_import_resource_receipt.cpp)
+        target_include_directories(test_import_resource_receipt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(test_import_resource_receipt PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(test_import_resource_receipt PRIVATE Threads::Threads)
+        add_test(NAME compositor_import_resource_receipt COMMAND test_import_resource_receipt)
         add_executable(binding_throughput_fixture tests/binding_throughput_fixture.cpp)
         target_include_directories(binding_throughput_fixture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
         target_compile_options(binding_throughput_fixture PRIVATE -Wall -Wextra -Wpedantic)
