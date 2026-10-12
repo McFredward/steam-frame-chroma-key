@@ -130,6 +130,7 @@ class Object:
 
 
 ENTRIES = ("lock", "unlock", "write", "image", "bind", "view", "init", "destroy", "close", "read", "connect")
+PUBLIC_ALIASES = {}
 MASK64 = (1 << 64) - 1
 CALLEE = tuple(range(19, 31))
 
@@ -406,7 +407,13 @@ def verify(data, iterations=256, seed=0x4652414d45):
     code = obj.section_data(text)
     symbols = {symbol.name: symbol for symbol in obj.symbols if symbol.binding != 0}
     wanted = {f"frame_import_{name}_{suffix}" for name in ENTRIES for suffix in ("entry", "dispatch")}
+    wanted.update(PUBLIC_ALIASES)
     require(set(symbols) == wanted, "unexpected externally bound API/hook symbol")
+    for public, hidden in PUBLIC_ALIASES.items():
+        alias, original = symbols[public], symbols[hidden]
+        require(alias.binding == 1 and alias.kind == 2 and alias.visibility == 0 and
+                (alias.section, alias.value, alias.size) == (original.section, original.value, original.size),
+                "public mutex alias does not share the exact true-entry PC/extent")
     relocations = obj.relocations(text)
     require(len(relocations) == len(ENTRIES), "unexpected text relocation count")
     unwind = unwind_tables(obj)
@@ -490,6 +497,14 @@ def negative_controls(data):
     symbol = next(symbol for symbol in obj.symbols if symbol.name == first_name)
     changed[symbol.table_offset + 5] = 0
     controls.append(("public entry export", changed))
+    for public in PUBLIC_ALIASES:
+        alias = next(symbol for symbol in obj.symbols if symbol.name == public)
+        changed = bytearray(data)
+        struct.pack_into("<Q", changed, alias.table_offset + 8, alias.value + 4)
+        controls.append((public + " alias changes source entry PC", changed))
+        changed = bytearray(data)
+        changed[alias.table_offset + 5] = 2
+        controls.append((public + " alias unexpectedly hidden", changed))
     cfi = obj.section(".eh_frame")
     cfi_data = obj.section_data(cfi)
     position = cfi_data.find(bytes((0x80 | 19, 13)))
@@ -524,7 +539,7 @@ def negative_controls(data):
 
 
 def main():
-    global ENTRIES
+    global ENTRIES, PUBLIC_ALIASES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path,
                         default=Path(__file__).resolve().parents[1] / "import/native_import_entry.S")
@@ -532,11 +547,18 @@ def main():
     parser.add_argument("--compiler", help="assembler driver command; default AARCH64_CC/aarch64-linux-gnu-gcc")
     parser.add_argument("--iterations", type=int, default=256)
     parser.add_argument("--record", type=Path, help="retain a small JSON verification record")
-    parser.add_argument("--startup", action="store_true",
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--startup", action="store_true",
                         help="check the two startup-only entries from the same shared assembler macro")
+    modes.add_argument("--mutex", action="store_true",
+                       help="check the two mutex entries and exact public aliases from the same macro")
     args = parser.parse_args()
     if args.startup:
         ENTRIES = ("vr_init", "vr_shutdown")
+    if args.mutex:
+        ENTRIES = ("init", "destroy")
+        PUBLIC_ALIASES = {"pthread_mutex_init": "frame_import_init_entry",
+                          "pthread_mutex_destroy": "frame_import_destroy_entry"}
     require(1 <= args.iterations <= 4096, "iterations outside bounded fixture range")
     command = shlex.split(args.compiler or os.environ.get("AARCH64_CC", "aarch64-linux-gnu-gcc"))
     direct_as = bool(command) and Path(command[0]).name.endswith("-as")
@@ -566,9 +588,9 @@ def main():
                                        '#error "This entry ABI is AArch64-only"', '#endif'],
                         "direct assembly requires an otherwise CPP-free source")
             options = ["-g"] if direct_as else ["-c", "-g"]
-            if args.startup:
-                options += (["--defsym", "FRAME_STARTUP_ENTRY_BUILD=1"] if direct_as else
-                            ["-Wa,--defsym,FRAME_STARTUP_ENTRY_BUILD=1"])
+            if args.startup or args.mutex:
+                define = "FRAME_STARTUP_ENTRY_BUILD=1" if args.startup else "FRAME_MUTEX_ENTRY_BUILD=1"
+                options += (["--defsym", define] if direct_as else ["-Wa,--defsym," + define])
             subprocess.run(command + options + [str(args.source), "-o", str(output)],
                            check=True, timeout=30, capture_output=True)
             obj_data = output.read_bytes()
@@ -581,6 +603,7 @@ def main():
             "randomized_machine_byte_executions": len(ENTRIES) * args.iterations,
             "negative_controls": controls,
             "elf_hidden_entries": True,
+            "public_mutex_aliases": sorted(PUBLIC_ALIASES),
             "dispatch_relocations": True,
             "active_stack_cfi_each_instruction": True,
             "dispatcher_model": "AAPCS64 legal caller-saved clobbers; low d8..d15 preserved",

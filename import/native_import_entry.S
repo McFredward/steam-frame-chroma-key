@@ -93,9 +93,23 @@
     .ifndef FRAME_STARTUP_ENTRY_BUILD
     .set FRAME_STARTUP_ENTRY_BUILD, 0
     .endif
+    .ifndef FRAME_MUTEX_ENTRY_BUILD
+    .set FRAME_MUTEX_ENTRY_BUILD, 0
+    .endif
     .if FRAME_STARTUP_ENTRY_BUILD
     IMPORT_ENTRY frame_import_vr_init_entry, frame_import_vr_init_dispatch
     IMPORT_ENTRY frame_import_vr_shutdown_entry, frame_import_vr_shutdown_dispatch
+    .elseif FRAME_MUTEX_ENTRY_BUILD
+    IMPORT_ENTRY frame_import_init_entry, frame_import_init_dispatch
+    IMPORT_ENTRY frame_import_destroy_entry, frame_import_destroy_dispatch
+    // Public aliases share the original entry PC. A C wrapper would change
+    // the native caller LR needed by the source-pinned constructor gate.
+    .global pthread_mutex_init
+    .type pthread_mutex_init, %function
+    .set pthread_mutex_init, frame_import_init_entry
+    .global pthread_mutex_destroy
+    .type pthread_mutex_destroy, %function
+    .set pthread_mutex_destroy, frame_import_destroy_entry
     .else
     IMPORT_ENTRY frame_import_lock_entry, frame_import_lock_dispatch
     IMPORT_ENTRY frame_import_unlock_entry, frame_import_unlock_dispatch
