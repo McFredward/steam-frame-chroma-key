@@ -105,27 +105,21 @@
     .elseif FRAME_MUTEX_ENTRY_BUILD || FRAME_CONNECTION_ENTRY_BUILD
     IMPORT_ENTRY frame_import_init_entry, frame_import_init_dispatch
     IMPORT_ENTRY frame_import_destroy_entry, frame_import_destroy_dispatch
-    // Public aliases share the original entry PC. A C wrapper would change
-    // the native caller LR needed by the source-pinned constructor gate.
+    // The legacy two-entry build retains its public aliases. The optional
+    // connection observer is audit-only: none of its five hidden entries may
+    // interpose unrelated Steam, browser or plugin calls process-wide.
+    .if !FRAME_CONNECTION_ENTRY_BUILD
     .global pthread_mutex_init
     .type pthread_mutex_init, %function
     .set pthread_mutex_init, frame_import_init_entry
     .global pthread_mutex_destroy
     .type pthread_mutex_destroy, %function
     .set pthread_mutex_destroy, frame_import_destroy_entry
+    .endif
     .if FRAME_CONNECTION_ENTRY_BUILD
     IMPORT_ENTRY frame_import_lock_entry, frame_import_lock_dispatch
     IMPORT_ENTRY frame_import_unlock_entry, frame_import_unlock_dispatch
     IMPORT_ENTRY frame_import_connect_entry, frame_import_connect_dispatch
-    .global pthread_mutex_lock
-    .type pthread_mutex_lock, %function
-    .set pthread_mutex_lock, frame_import_lock_entry
-    .global pthread_mutex_unlock
-    .type pthread_mutex_unlock, %function
-    .set pthread_mutex_unlock, frame_import_unlock_entry
-    .global connect
-    .type connect, %function
-    .set connect, frame_import_connect_entry
     .endif
     .else
     IMPORT_ENTRY frame_import_lock_entry, frame_import_lock_dispatch

@@ -131,6 +131,7 @@ class Object:
 
 ENTRIES = ("lock", "unlock", "write", "image", "bind", "view", "init", "destroy", "close", "read", "connect")
 PUBLIC_ALIASES = {}
+FORBIDDEN_PUBLIC_ALIASES = set()
 MASK64 = (1 << 64) - 1
 CALLEE = tuple(range(19, 31))
 
@@ -406,6 +407,8 @@ def verify(data, iterations=256, seed=0x4652414d45):
     require(stack.flags == 0 and stack.size == 0, "executable/nonempty GNU stack note")
     code = obj.section_data(text)
     symbols = {symbol.name: symbol for symbol in obj.symbols if symbol.binding != 0}
+    require(not FORBIDDEN_PUBLIC_ALIASES.intersection(symbol.name for symbol in obj.symbols),
+            "audit-only connection object defines a forbidden public libc name")
     wanted = {f"frame_import_{name}_{suffix}" for name in ENTRIES for suffix in ("entry", "dispatch")}
     wanted.update(PUBLIC_ALIASES)
     require(set(symbols) == wanted, "unexpected externally bound API/hook symbol")
@@ -497,6 +500,20 @@ def negative_controls(data):
     symbol = next(symbol for symbol in obj.symbols if symbol.name == first_name)
     changed[symbol.table_offset + 5] = 0
     controls.append(("public entry export", changed))
+    for public in sorted(FORBIDDEN_PUBLIC_ALIASES):
+        # Replace an existing function's actual ELF name/visibility with a
+        # public libc entry. This is a valid, bounded symbol-table mutation,
+        # not a source regex; the explicit no-interposition rule must reject it.
+        table = obj.section(".symtab")
+        strings = obj.sections[table.link]
+        name_offset = unpack("<I", data, symbol.table_offset)[0]
+        require(len(public) <= len(symbol.name), "public-name mutation exceeds owned string")
+        changed = bytearray(data)
+        replacement = public.encode("ascii") + b"\0"
+        begin = strings.offset + name_offset
+        changed[begin:begin + len(replacement)] = replacement
+        changed[symbol.table_offset + 5] = 0
+        controls.append((public + " unexpectedly globally interposed", changed))
     for public in PUBLIC_ALIASES:
         alias = next(symbol for symbol in obj.symbols if symbol.name == public)
         changed = bytearray(data)
@@ -539,7 +556,7 @@ def negative_controls(data):
 
 
 def main():
-    global ENTRIES, PUBLIC_ALIASES
+    global ENTRIES, PUBLIC_ALIASES, FORBIDDEN_PUBLIC_ALIASES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path,
                         default=Path(__file__).resolve().parents[1] / "import/native_import_entry.S")
@@ -553,7 +570,7 @@ def main():
     modes.add_argument("--mutex", action="store_true",
                        help="check the two mutex entries and exact public aliases from the same macro")
     modes.add_argument("--connection", action="store_true",
-                       help="check the five opt-in client-connect entries and exact public aliases")
+                       help="check the five audit-only client-connect entries and absence of public libc aliases")
     args = parser.parse_args()
     if args.startup:
         ENTRIES = ("vr_init", "vr_shutdown")
@@ -563,11 +580,8 @@ def main():
                           "pthread_mutex_destroy": "frame_import_destroy_entry"}
     if args.connection:
         ENTRIES = ("init", "destroy", "lock", "unlock", "connect")
-        PUBLIC_ALIASES = {"pthread_mutex_init": "frame_import_init_entry",
-                          "pthread_mutex_destroy": "frame_import_destroy_entry",
-                          "pthread_mutex_lock": "frame_import_lock_entry",
-                          "pthread_mutex_unlock": "frame_import_unlock_entry",
-                          "connect": "frame_import_connect_entry"}
+        FORBIDDEN_PUBLIC_ALIASES = {"pthread_mutex_init", "pthread_mutex_destroy",
+                                    "pthread_mutex_lock", "pthread_mutex_unlock", "connect"}
     require(1 <= args.iterations <= 4096, "iterations outside bounded fixture range")
     command = shlex.split(args.compiler or os.environ.get("AARCH64_CC", "aarch64-linux-gnu-gcc"))
     direct_as = bool(command) and Path(command[0]).name.endswith("-as")
@@ -615,6 +629,7 @@ def main():
             "elf_hidden_entries": True,
             "public_mutex_aliases": sorted(name for name in PUBLIC_ALIASES if name.startswith("pthread_mutex_")),
             "public_connection_aliases": sorted(name for name in PUBLIC_ALIASES if name == "connect"),
+            "forbidden_public_aliases_absent": sorted(FORBIDDEN_PUBLIC_ALIASES),
             "dispatch_relocations": True,
             "active_stack_cfi_each_instruction": True,
             "dispatcher_model": "AAPCS64 legal caller-saved clobbers; low d8..d15 preserved",

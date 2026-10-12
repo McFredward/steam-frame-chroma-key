@@ -527,7 +527,7 @@ CONNECTION_OBSERVER = r'''
 #include <sys/socket.h>
 using namespace frame_import_startup_audit;
 static std::uintptr_t native[5],labels[5],args[5][3],libc_bias;
-static unsigned before[5],after[5],events[5],bind_mask,retired_mask,losses,prepares;
+static unsigned before[5],after[5],events[5],bind_mask,retired_mask,losses,prepares,unscoped_notifications,nonclient_checks;
 static int results[5],errors[5];
 static bool retired,bad_entry;
 extern "C" void fixture_connection_label(unsigned n,std::uintptr_t pc){if(n>=5)std::abort();labels[n]=pc;}
@@ -536,7 +536,7 @@ static unsigned operation(frame_import_forwarding::Operation value) {
     switch(value){case O::Init:return 0;case O::Destroy:return 1;case O::Lock:return 2;case O::Unlock:return 3;case O::Connect:return 4;default:return 5;}
 }
 static void notify(frame_import_forwarding::Notification value,void*) noexcept {
-    const auto n=operation(value.operation);if(n>=5||value.entry.x[30]!=labels[n])return;
+    const auto n=operation(value.operation);if(n>=5||value.entry.x[30]!=labels[n]){++unscoped_notifications;return;}
     if(retired){if(value.phase==frame_import_forwarding::Phase::Before)retired_mask|=1u<<n;return;}
     if(value.phase==frame_import_forwarding::Phase::Before){++before[n];for(unsigned i=0;i<3;++i)args[n][i]=value.entry.x[i];}
     else{++after[n];results[n]=static_cast<int>(static_cast<std::uint32_t>(value.result_bits));errors[n]=value.preserved_errno;}
@@ -548,16 +548,11 @@ ENTRY(init) ENTRY(destroy) ENTRY(lock) ENTRY(unlock) ENTRY(connect)
 // Own-source host controls use the same actual link-time provider dispatchers;
 // only ARM uses the production register-saving assembly.
 #define SNAPSHOT(N,A,B,C) frame_import_native::Entry e{};e.x[0]=(A);e.x[1]=(B);e.x[2]=(C);e.x[30]=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));return static_cast<int>(frame_import_##N##_dispatch(&e));
-extern "C" int pthread_mutex_init(pthread_mutex_t* m,const pthread_mutexattr_t* a) noexcept {SNAPSHOT(init,reinterpret_cast<std::uintptr_t>(m),reinterpret_cast<std::uintptr_t>(a),0)}
-extern "C" int pthread_mutex_destroy(pthread_mutex_t* m) noexcept {SNAPSHOT(destroy,reinterpret_cast<std::uintptr_t>(m),0,0)}
-extern "C" int pthread_mutex_lock(pthread_mutex_t* m) noexcept {SNAPSHOT(lock,reinterpret_cast<std::uintptr_t>(m),0,0)}
-extern "C" int pthread_mutex_unlock(pthread_mutex_t* m) noexcept {SNAPSHOT(unlock,reinterpret_cast<std::uintptr_t>(m),0,0)}
-extern "C" int connect(int fd,const sockaddr* a,socklen_t size){SNAPSHOT(connect,static_cast<std::uint32_t>(fd),reinterpret_cast<std::uintptr_t>(a),size)}
-#define frame_import_init_entry pthread_mutex_init
-#define frame_import_destroy_entry pthread_mutex_destroy
-#define frame_import_lock_entry pthread_mutex_lock
-#define frame_import_unlock_entry pthread_mutex_unlock
-#define frame_import_connect_entry connect
+extern "C" __attribute__((visibility("hidden"))) int frame_import_init_entry(pthread_mutex_t* m,const pthread_mutexattr_t* a) noexcept {SNAPSHOT(init,reinterpret_cast<std::uintptr_t>(m),reinterpret_cast<std::uintptr_t>(a),0)}
+extern "C" __attribute__((visibility("hidden"))) int frame_import_destroy_entry(pthread_mutex_t* m) noexcept {SNAPSHOT(destroy,reinterpret_cast<std::uintptr_t>(m),0,0)}
+extern "C" __attribute__((visibility("hidden"))) int frame_import_lock_entry(pthread_mutex_t* m) noexcept {SNAPSHOT(lock,reinterpret_cast<std::uintptr_t>(m),0,0)}
+extern "C" __attribute__((visibility("hidden"))) int frame_import_unlock_entry(pthread_mutex_t* m) noexcept {SNAPSHOT(unlock,reinterpret_cast<std::uintptr_t>(m),0,0)}
+extern "C" __attribute__((visibility("hidden"))) int frame_import_connect_entry(int fd,const sockaddr* a,socklen_t size){SNAPSHOT(connect,static_cast<std::uint32_t>(fd),reinterpret_cast<std::uintptr_t>(a),size)}
 #endif
 static std::uintptr_t entries[5]{reinterpret_cast<std::uintptr_t>(&frame_import_init_entry),reinterpret_cast<std::uintptr_t>(&frame_import_destroy_entry),
     reinterpret_cast<std::uintptr_t>(&frame_import_lock_entry),reinterpret_cast<std::uintptr_t>(&frame_import_unlock_entry),reinterpret_cast<std::uintptr_t>(&frame_import_connect_entry)};
@@ -595,7 +590,25 @@ extern "C" std::uintptr_t fixture_connection_probe(unsigned n) {
     if(n<5)return before[n];
     if(n<10)return after[n-5];
     if(n<15)return events[n-10];
-    switch(n){case 15:return native[0];case 16:return bind_mask;case 17:return retired_mask;case 18:return losses;case 19:return prepares;default:return 0;}
+    switch(n){case 15:return native[0];case 16:return bind_mask;case 17:return retired_mask;case 18:return losses;case 19:return prepares;case 20:return unscoped_notifications;case 21:return nonclient_checks;default:return 0;}
+}
+extern "C" void fixture_connection_nonclient() {
+    // These public calls originate from the unrelated observer DSO, before
+    // and after client dlopen. Client-only audit redirection must not touch
+    // their actual providers or send notifications to the sampling callback.
+    const std::uintptr_t actual[]{reinterpret_cast<std::uintptr_t>(&pthread_mutex_init),
+        reinterpret_cast<std::uintptr_t>(&pthread_mutex_destroy),reinterpret_cast<std::uintptr_t>(&pthread_mutex_lock),
+        reinterpret_cast<std::uintptr_t>(&pthread_mutex_unlock),reinterpret_cast<std::uintptr_t>(&connect)};
+    for(unsigned i=0;i<5;++i)if(actual[i]!=native[i])std::abort();
+    pthread_mutex_t mutex;
+    sockaddr address{};address.sa_family=AF_UNIX;
+    errno=43;if(pthread_mutex_init(&mutex,nullptr)||errno!=43)std::abort();
+    errno=47;if(pthread_mutex_lock(&mutex)||errno!=47)std::abort();
+    if(connect(-1,&address,sizeof(address))!=-1||errno!=EBADF)std::abort();
+    errno=53;if(pthread_mutex_unlock(&mutex)||errno!=53)std::abort();
+    errno=59;if(pthread_mutex_destroy(&mutex)||errno!=59)std::abort();
+    if(unscoped_notifications)std::abort();
+    ++nonclient_checks;
 }
 '''
 CONNECTION_MAIN = r'''
@@ -605,21 +618,25 @@ CONNECTION_MAIN = r'''
 #include <cstdint>
 #include <dlfcn.h>
 extern "C" std::uintptr_t fixture_connection_probe(unsigned);
+extern "C" void fixture_connection_nonclient();
 static void* early;
 #ifdef DEEP_EARLY
 __attribute__((constructor)) static void initialize(){early=dlopen(CLIENT_FILE,RTLD_NOW|RTLD_DEEPBIND);if(!early)std::abort();}
 #endif
 int main(int argc,char** argv) {
     if(argc>1&&!std::strcmp(argv[1],"provider")){Dl_info d{};if(!dladdr(reinterpret_cast<void*>(fixture_connection_probe(15)),&d))return 9;std::printf("%s\n",d.dli_fname);return 0;}
+    fixture_connection_nonclient();
     void* handle=dlopen(std::getenv("FIXTURE_FOREIGN_CLIENT")?FOREIGN_FILE:CLIENT_FILE,RTLD_NOW|RTLD_DEEPBIND);
     if(!handle){std::fprintf(stderr,"DLOPEN: %s\n",dlerror());return 3;}
     if(early){dlclose(early);early=nullptr;}dlclose(handle);
+    fixture_connection_nonclient();
+    if(fixture_connection_probe(20)||fixture_connection_probe(21)!=2)return 6;
     const unsigned expected=argc>1?std::strtoul(argv[1],nullptr,10):0;
     unsigned observed=0;
     for(unsigned n=0;n<5;++n){if(fixture_connection_probe(n+10)!=1||fixture_connection_probe(n)!=fixture_connection_probe(n+5)||fixture_connection_probe(n)!=((expected>>n)&1u))return 4;
         if(fixture_connection_probe(n))observed|=1u<<n;}
     if(argc>2&&!std::strcmp(argv[2],"loss")&&fixture_connection_probe(18)!=1)return 5;
-    std::printf("RESULT={\"observed_provider_mask\":%u,\"bindings_mask\":%llu,\"retired_forwarded_mask\":%llu,\"loss_events\":%llu,\"native_results_errno\":true,\"dlsym_native_unchanged\":true,\"caller_pc_exact\":%s}\n",observed,
+    std::printf("RESULT={\"observed_provider_mask\":%u,\"bindings_mask\":%llu,\"retired_forwarded_mask\":%llu,\"loss_events\":%llu,\"native_results_errno\":true,\"dlsym_native_unchanged\":true,\"nonclient_all_five_native\":true,\"unscoped_notifications\":0,\"caller_pc_exact\":%s}\n",observed,
         static_cast<unsigned long long>(fixture_connection_probe(16)),static_cast<unsigned long long>(fixture_connection_probe(17)),static_cast<unsigned long long>(fixture_connection_probe(18)),observed?"true":"false");
 }
 '''
@@ -662,6 +679,13 @@ def run_deepbind(args,helper,report,clean):
                 if qemu:obs_args += [str(ROOT/'import/native_connection_entry.S')]
             elif qemu:obs_args += [str(ROOT/'import/native_mutex_entry.S'),str(ROOT/'import/import_forwarding.cpp')]
             compile_one('observer',obs_args+['-pthread','-ldl','-o',str(observer)])
+            if args.connection:
+                defined_names={line.split()[-1].split('@')[0] for line in
+                    subprocess.check_output(['nm','-D','--defined-only',str(observer)],text=True).splitlines()
+                    if line.split()}
+                forbidden={'pthread_mutex_init','pthread_mutex_destroy','pthread_mutex_lock','pthread_mutex_unlock','connect'}
+                if defined_names & forbidden:raise SystemExit('Audit-only observer exports a public libc provider')
+                data['public_libc_aliases_absent']=sorted(forbidden)
             compile_one('api',common+['-shared','-fPIC',str(api_cpp),'-o',str(api)])
             exe=common+['-rdynamic','-Wl,-z,lazy','-DCLIENT_FILE='+json.dumps(str(client)),
                         '-DFOREIGN_FILE='+json.dumps(str(foreign)),str(main_cpp),'-L',str(folder),
@@ -761,6 +785,8 @@ def run_deepbind(args,helper,report,clean):
                 cases[label]=json.loads(value.stdout.split('RESULT=')[1])
                 if args.connection:
                     result=cases[label]
+                    if not result['nonclient_all_five_native'] or result['unscoped_notifications']:
+                        raise SystemExit('Unrelated native callers were interposed by the audit-only observer')
                     if label=='connection_redirect' and result['bindings_mask']!=31:
                         raise SystemExit('Not all five legitimate bindings were admitted')
                     if label=='connection_zero_defaults' and result['bindings_mask']!=3:
