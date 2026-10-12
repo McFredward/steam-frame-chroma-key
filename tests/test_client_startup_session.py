@@ -4,6 +4,7 @@ Only these tests substitute canonical hashes with synthetic ELF/profile pins.
 The production manager has no fixture or bypass command-line option.
 """
 import errno
+import copy
 import importlib.util
 import json
 import os
@@ -138,13 +139,13 @@ class SessionTests(unittest.TestCase):
         self.save_plan()
 
     @staticmethod
-    def census_elf(*,thread=False):
+    def census_elf(*,thread=False,raw_transaction=False):
         raw=bytearray(1280)
         struct.pack_into('<16sHHIQQQIHHHHHH',raw,0,b'\x7fELF\x02\x01\x01'+bytes(9),3,183,1,0,64,0x300,0,64,56,1,64,3,0)
         struct.pack_into('<IIQQQQQQ',raw,64,1,4,0,0,0,len(raw),len(raw),4096)
-        strings=b'\0'+(M.RESOURCE_THREAD_SCOPE if thread else M.RESOURCE_SCOPE).encode()+b'\0';raw[0x100:0x100+len(strings)]=strings
+        strings=b'\0'+(M.RESOURCE_RAW_SCOPE if raw_transaction else M.RESOURCE_THREAD_SCOPE if thread else M.RESOURCE_SCOPE).encode()+b'\0';raw[0x100:0x100+len(strings)]=strings
         struct.pack_into('<IBBHQQ',raw,0x180+24,1,1,2,1,0x250,16)
-        raw[0x250:0x260]=M.RESOURCE_THREAD_MARKER if thread else M.RESOURCE_MARKER
+        raw[0x250:0x260]=M.RESOURCE_RAW_MARKER if raw_transaction else M.RESOURCE_THREAD_MARKER if thread else M.RESOURCE_MARKER
         struct.pack_into('<IIQQQQIIQQ',raw,0x340,0,3,0,0,0x100,len(strings),0,0,1,0)
         struct.pack_into('<IIQQQQIIQQ',raw,0x380,0,2,0,0,0x180,48,1,0,8,24)
         return bytes(raw)
@@ -167,7 +168,7 @@ class SessionTests(unittest.TestCase):
         self.plan['observer_profile'].update(file_sha256=M.digest(main),profile_sha256=profile[-32:].hex())
         fields={'resource_register_census':True,'resource_private_bytes_read':0,
                 'resource_transaction_accepted':False,'resource_namespace_associated':False}
-        self.plan.update(fields);self.plan['observer'].update(fields)
+        self.plan.update(copy.deepcopy(fields));self.plan['observer'].update(copy.deepcopy(fields))
         self.plan['observer']['resource_scope_marker']=M.resource_marker(main)
         self.plan['resource_source_boundaries']=dict(M.RESOURCE_BOUNDARIES)
         self.plan['capture_limits']=dict(M.CAPTURE_LIMITS)
@@ -188,6 +189,119 @@ class SessionTests(unittest.TestCase):
         self.plan['observer'].update(resource_scope_marker=marker,resource_thread_scope_marker=marker)
         self.plan['audit']['native_epoll_wait_rva']=M.EPOLL_WAIT_RVA
         self.save_plan()
+
+    def resource_raw_plan(self):
+        self.resource_thread_plan()
+        main=self.census_elf(thread=True,raw_transaction=True);self.replace_artifact(M.MAIN,main)
+        profile=self.profile(5,main)
+        envelope=bytearray(self.artifacts[M.ENVELOPE].read_bytes());envelope[:16]=M.RESOURCE_RAW_MARKER
+        envelope[16:48]=profile[-32:];envelope[8704:10736]=profile;self.replace_artifact(M.ENVELOPE,envelope)
+        self.plan['envelope'].update(schema=5,reviewed_observer_profile_identity=profile[-32:].hex())
+        self.plan['observer_profile'].update(file_sha256=M.digest(main),profile_sha256=profile[-32:].hex())
+        fields={'resource_raw_transaction':True,'resource_raw_limits':dict(M.RESOURCE_RAW_LIMITS),
+                'resource_raw_source_boundaries':dict(M.RESOURCE_RAW_BOUNDARIES),'native_resource_raw_rvas':dict(M.RESOURCE_RAW_RVAS)}
+        self.plan.update(copy.deepcopy(fields));self.plan['observer'].update(copy.deepcopy(fields))
+        marker=M.resource_marker(main,raw_transaction=True)
+        self.plan['observer'].update(resource_scope_marker=marker,resource_thread_scope_marker=marker,resource_raw_scope_marker=marker)
+        self.plan['audit']['native_resource_raw_rvas']=dict(M.RESOURCE_RAW_RVAS)
+        self.save_plan()
+
+    def test_raw_stage_activate_require_all_five_explicit_scopes_and_manual_rollback(self):
+        self.resource_raw_plan()
+        options={'runtime_scope':True,'connect_scope':True,'resource_scope':True,'resource_thread_scope':True,'resource_raw_scope':True}
+        for key in options:
+            changed=dict(options);changed[key]=False
+            with self.subTest(missing=key),self.assertRaises(RuntimeError):self.stage(**changed)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        self.stage(**options);manifest=self.session.manifest()
+        self.assertEqual(manifest['diagnostic_mode'],'resource-raw')
+        self.assertTrue(manifest['resource_raw_scope_acknowledged']);self.assertFalse(manifest['automatic_restart'])
+        activate=dict(options,restart_ready=True)
+        for key in activate:
+            changed=dict(activate);changed[key]=False
+            with self.subTest(activate_missing=key),self.assertRaises(RuntimeError):self.session.activate(**changed)
+            self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),0)
+        self.session.activate(**activate);self.assertEqual(self.restarts(),1)
+        self.session.rollback(restart_ready=True);self.assertEqual(self.restarts(),2)
+
+    def test_raw_exact_budgets_boundaries_provider_and_no_extra_proof_flags(self):
+        options={'connect_scope':True,'resource_scope':True,'resource_thread_scope':True,'resource_raw_scope':True}
+        for location in ('plan','observer'):
+            for key in ('resource_raw_transaction','resource_raw_limits','resource_raw_source_boundaries','native_resource_raw_rvas'):
+                self.resource_raw_plan();metadata=self.plan if location=='plan' else self.plan['observer'];metadata.pop(key);self.save_plan()
+                with self.subTest(location=location,missing=key),self.assertRaises(RuntimeError):self.stage(**options)
+                self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+            for key in M.RESOURCE_RAW_LIMITS:
+                for value in (M.RESOURCE_RAW_LIMITS[key]+1,False,float(M.RESOURCE_RAW_LIMITS[key])):
+                    self.resource_raw_plan();metadata=self.plan if location=='plan' else self.plan['observer']
+                    metadata['resource_raw_limits'][key]=value;self.save_plan()
+                    with self.subTest(location=location,limit=key,value=value),self.assertRaises(RuntimeError):self.stage(**options)
+            for key,value in (('resource_raw_transaction','true'),('resource_raw_transaction',1),
+                              ('resource_raw_transaction_accepted',True),('resource_transaction_accepted',True),
+                              ('resource_raw_private_read_extra',8),('resource_namespace_associated',True)):
+                self.resource_raw_plan();metadata=self.plan if location=='plan' else self.plan['observer'];metadata[key]=value;self.save_plan()
+                with self.subTest(location=location,flag=key),self.assertRaises(RuntimeError):self.stage(**options)
+        for location in ('plan','observer','audit'):
+            self.resource_raw_plan();metadata=self.plan if location=='plan' else self.plan[location]
+            metadata['native_resource_raw_rvas']['read']='0xdf334';self.save_plan()
+            with self.subTest(provider=location),self.assertRaises(RuntimeError):self.stage(**options)
+        self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_raw_marker_and_envelope_reject_corruption_unknown_scope_or_mode_downgrade(self):
+        options={'connect_scope':True,'resource_scope':True,'resource_thread_scope':True,'resource_raw_scope':True}
+        for offset,value in ((0x250,ord('X')),(0x258,4),(0x25c,0),(68,5)):
+            self.resource_raw_plan();candidate=bytearray(self.artifacts[M.MAIN].read_bytes());candidate[offset]=value
+            self.replace_artifact(M.MAIN,candidate);self.save_plan()
+            with self.subTest(marker=offset),self.assertRaises(RuntimeError):self.stage(**options)
+        for offset,value in ((0,ord('X')),(8,4),(12,0)):
+            self.resource_raw_plan();candidate=bytearray(self.artifacts[M.ENVELOPE].read_bytes());candidate[offset]=value
+            self.replace_artifact(M.ENVELOPE,candidate);self.save_plan()
+            with self.subTest(envelope=offset),self.assertRaises(RuntimeError):self.stage(**options)
+        self.resource_raw_plan();candidate=self.artifacts[M.MAIN].read_bytes().replace(M.RESOURCE_RAW_SCOPE.encode(),b'frame_client_resource_new_scope')
+        self.replace_artifact(M.MAIN,candidate);self.save_plan()
+        with self.assertRaises(RuntimeError):self.stage(**options)
+        self.resource_raw_plan();self.plan['resource_raw_transaction']=False;self.save_plan()
+        with self.assertRaises(RuntimeError):self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True)
+        self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_raw_scope_acknowledgment_cannot_extend_old_modes_or_be_truthy_nonbool(self):
+        for builder,options in ((lambda:None,{}),(self.connection_plan,{'connect_scope':True}),
+                                (self.resource_plan,{'connect_scope':True,'resource_scope':True}),
+                                (self.resource_thread_plan,{'connect_scope':True,'resource_scope':True,'resource_thread_scope':True})):
+            builder()
+            with self.assertRaises(RuntimeError):self.stage(resource_raw_scope=True,**options)
+        self.resource_raw_plan()
+        for value in (1,'true',None):
+            with self.subTest(value=value),self.assertRaises(RuntimeError):
+                self.stage(connect_scope=True,resource_scope=True,resource_thread_scope=True,resource_raw_scope=value)
+        self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
+    def test_raw_start_cli_and_staged_manifest_require_distinct_scope(self):
+        self.resource_raw_plan();self.start(connect_scope=True,resource_scope=True,resource_thread_scope=True,resource_raw_scope=True)
+        self.assertTrue(self.session.manifest()['resource_raw_scope_acknowledged'])
+        self.session.rollback(restart_ready=True)
+        with mock.patch.object(M,'Session') as session, mock.patch.object(M.platform,'system',return_value='Linux'), \
+             mock.patch.object(M.platform,'machine',return_value='aarch64'), \
+             mock.patch.dict(os.environ,{'XDG_RUNTIME_DIR':f'/run/user/{os.getuid()}'}),mock.patch('builtins.print'):
+            self.assertEqual(M.main(['activate','--ack-startup-diagnostic-scope','--ack-connect-register-diagnostic-scope',
+                '--ack-resource-register-census-scope','--ack-resource-thread-preparation-scope',
+                '--ack-resource-raw-transaction-scope','--ack-steam-client-restart-readiness']),0)
+            session.return_value.activate.assert_called_once_with(runtime_scope=True,connect_scope=True,
+                resource_scope=True,resource_thread_scope=True,resource_raw_scope=True,restart_ready=True)
+
+    def test_raw_activation_rejects_missing_or_tampered_staged_scope_without_restart(self):
+        options={'runtime_scope':True,'connect_scope':True,'resource_scope':True,'resource_thread_scope':True,'resource_raw_scope':True}
+        self.resource_raw_plan();self.stage(**options)
+        path=self.session.folder/'owned.json';original=json.loads(path.read_text())
+        for key,value in (('resource_raw_scope_acknowledged',False),('resource_raw_scope_acknowledged','true'),
+                          ('resource_raw_scope_acknowledged',1),('diagnostic_mode','resource-thread')):
+            manifest=dict(original);manifest[key]=value;path.write_bytes(M.json_bytes(manifest))
+            with self.subTest(key=key,value=value),self.assertRaises(RuntimeError):
+                self.session.activate(**options,restart_ready=True)
+            self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),0)
+        manifest=dict(original);manifest.pop('resource_raw_scope_acknowledged');path.write_bytes(M.json_bytes(manifest))
+        with self.assertRaises(RuntimeError):self.session.activate(**options,restart_ready=True)
+        self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),0)
 
     def test_resource_thread_stage_activate_require_all_four_explicit_scopes(self):
         self.resource_thread_plan()
@@ -219,7 +333,7 @@ class SessionTests(unittest.TestCase):
                                      '--ack-resource-register-census-scope','--ack-resource-thread-preparation-scope',
                                      '--ack-steam-client-restart-readiness']),0)
             session.return_value.activate.assert_called_once_with(runtime_scope=True,connect_scope=True,
-                resource_scope=True,resource_thread_scope=True,restart_ready=True)
+                resource_scope=True,resource_thread_scope=True,resource_raw_scope=False,restart_ready=True)
 
     def test_resource_thread_cannot_extend_private_reads_or_acceptance(self):
         changes=(('resource_thread_preparation','true'),('resource_thread_private_bytes_read',8),
@@ -340,7 +454,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(M.main(['activate','--ack-startup-diagnostic-scope','--ack-connect-register-diagnostic-scope',
                                      '--ack-resource-register-census-scope','--ack-steam-client-restart-readiness']),0)
             session.return_value.activate.assert_called_once_with(runtime_scope=True,connect_scope=True,
-                                                                   resource_scope=True,resource_thread_scope=False,restart_ready=True)
+                                                                   resource_scope=True,resource_thread_scope=False,resource_raw_scope=False,restart_ready=True)
 
     def test_resource_plan_cannot_claim_extra_memory_acceptance_or_other_proof(self):
         changes=(('resource_register_census','true'),('resource_private_bytes_read',8),

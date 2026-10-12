@@ -32,6 +32,15 @@ RESOURCE_SCOPE = 'frame_client_resource_census_scope'
 RESOURCE_MARKER = b'FCCENS01' + struct.pack('<II', 3, ENVELOPE_BYTES)
 RESOURCE_THREAD_SCOPE = 'frame_client_resource_thread_scope'
 RESOURCE_THREAD_MARKER = b'FCSTAK01' + struct.pack('<II', 4, ENVELOPE_BYTES)
+RESOURCE_RAW_SCOPE = 'frame_client_resource_raw_scope'
+RESOURCE_RAW_MARKER = b'FCRAW001' + struct.pack('<II', 5, ENVELOPE_BYTES)
+RESOURCE_RAW_ENTRIES = ('frame_import_read_entry', 'frame_import_write_entry')
+RESOURCE_RAW_RVAS = {'read':'0xdf330','write':'0xdfee0'}
+RESOURCE_RAW_BOUNDARIES = {
+    'begin':'0x3623c0','write':'0x2456c8','header_read':'0x245334',
+    'payload_read':'0x245460','pending':'0x3624c4','reference':'0x362d58'}
+RESOURCE_RAW_LIMITS = {'transactions':1,'transfers_total':24,'transfers_per_kind':8,
+                       'request_bytes':512,'scalar_bytes':2068,'wire_metadata_bytes':33,'private_bytes':2101}
 RESOURCE_THREAD_ENTRY = 'frame_client_startup_epoll_wait_entry'
 RESOURCE_THREAD_START_RVA = '0x328d0'
 EPOLL_WAIT_RVA = '0xe9e10'
@@ -188,10 +197,12 @@ class Elf:
         return value
 
 
-def resource_marker(elf,*,thread_preparation=False):
+def resource_marker(elf,*,thread_preparation=False,raw_transaction=False):
     """Authenticate the retained own opt-in object, never native private bytes."""
-    name=RESOURCE_THREAD_SCOPE if thread_preparation else RESOURCE_SCOPE
-    marker=RESOURCE_THREAD_MARKER if thread_preparation else RESOURCE_MARKER
+    name=RESOURCE_RAW_SCOPE if raw_transaction else RESOURCE_THREAD_SCOPE if thread_preparation else RESOURCE_SCOPE
+    marker=RESOURCE_RAW_MARKER if raw_transaction else RESOURCE_THREAD_MARKER if thread_preparation else RESOURCE_MARKER
+    if any(s['name'].startswith('frame_client_resource_') and s['name'].endswith('_scope') and s['name']!=name for s in elf.symbols):
+        raise ValueError('Artifact contains a conflicting resource scope marker')
     symbols=[s for s in elf.symbols if s['name']==name and s['defined']]
     identities={(s['rva'],s['size']) for s in symbols}
     if len(identities)!=1 or any(s['type']!=1 or s['visibility'] not in (0,2) or
@@ -207,17 +218,19 @@ def resource_marker(elf,*,thread_preparation=False):
     return {'symbol':name,'rva':rva,'bytes':size,'sha256':digest(marker).hex()}
 
 
-def validate_modes(connection_observation,resource_census,resource_thread_preparation):
-    if any(type(value) is not bool for value in (connection_observation,resource_census,resource_thread_preparation)):
+def validate_modes(connection_observation,resource_census,resource_thread_preparation,resource_raw_transaction=False):
+    if any(type(value) is not bool for value in (connection_observation,resource_census,resource_thread_preparation,resource_raw_transaction)):
         raise ValueError('Observation modes require explicit Boolean scope')
     if resource_census and not connection_observation:
         raise ValueError('Resource census requires explicit connection observation')
     if resource_thread_preparation and not resource_census:
         raise ValueError('Resource thread preparation requires explicit census and connection observation')
+    if resource_raw_transaction and not resource_thread_preparation:
+        raise ValueError('Raw resource transaction requires explicit thread, census and connection observation')
 
 
-def validate_observer(data,reviewed_sha,provider_exports,*,connection_observation=False,resource_census=False,resource_thread_preparation=False):
-    validate_modes(connection_observation,resource_census,resource_thread_preparation)
+def validate_observer(data,reviewed_sha,provider_exports,*,connection_observation=False,resource_census=False,resource_thread_preparation=False,resource_raw_transaction=False):
+    validate_modes(connection_observation,resource_census,resource_thread_preparation,resource_raw_transaction)
     if not re.fullmatch('[0-9a-f]{64}',reviewed_sha or '') or digest(data).hex()!=reviewed_sha:
         raise ValueError('Main observer differs from separately reviewed SHA-256')
     elf=Elf(data)
@@ -235,12 +248,16 @@ def validate_observer(data,reviewed_sha,provider_exports,*,connection_observatio
     bridge=elf.function(BRIDGE,True)
     if bridge['binding']!=1 or bridge['visibility']!=0 or bridge['version']:
         raise ValueError('Own bridge is not an exported unversioned default-visible function')
-    entries={};mutex_entries={};connection_entries={};thread_entries={}
-    for name in ENTRIES+MUTEX_ENTRIES+(CONNECTION_ENTRIES if connection_observation else ())+(RESOURCE_THREAD_ENTRY,) * resource_thread_preparation:
+    entries={};mutex_entries={};connection_entries={};thread_entries={};raw_entries={}
+    required_entries=ENTRIES+MUTEX_ENTRIES+(CONNECTION_ENTRIES if connection_observation else ())+(RESOURCE_THREAD_ENTRY,) * resource_thread_preparation+(RESOURCE_RAW_ENTRIES if resource_raw_transaction else ())
+    for name in required_entries:
         symbol=elf.function(name)
         if any(s['name']==name for s in elf.exported()) or not any(s['name']==name and (s['binding']==0 or s['visibility']==2) for s in elf.symbols):
             raise ValueError('Native startup entry is not hidden '+name)
-        (entries if name in ENTRIES else mutex_entries if name in MUTEX_ENTRIES else thread_entries if name==RESOURCE_THREAD_ENTRY else connection_entries)[name]=symbol['rva']
+        (entries if name in ENTRIES else mutex_entries if name in MUTEX_ENTRIES else thread_entries if name==RESOURCE_THREAD_ENTRY else raw_entries if name in RESOURCE_RAW_ENTRIES else connection_entries)[name]=symbol['rva']
+    if resource_raw_transaction:
+        actual_entries={s['name'] for s in elf.symbols if s['defined'] and s['type']==2 and s['name'].endswith('_entry') and s['name'].startswith(('frame_import_','frame_client_startup_'))}
+        if actual_entries!=set(required_entries):raise ValueError('Raw resource artifact must have exactly ten reviewed hidden entries')
     mutex_aliases={}
     pairs=[] if connection_observation else [('pthread_mutex_init','frame_import_init_entry'),('pthread_mutex_destroy','frame_import_destroy_entry')]
     for public,hidden in pairs:
@@ -260,7 +277,9 @@ def validate_observer(data,reviewed_sha,provider_exports,*,connection_observatio
     versioned={name for name in imports if '@GLIBC_' in name}
     if not versioned<=provider_exports:raise ValueError('Actual native provider lacks an observer GLIBC import')
     if '__tls_get_addr' in {name.split('@')[0] for name in imports}:raise ValueError('Dynamic TLS in startup observer')
-    marker=resource_marker(elf,thread_preparation=resource_thread_preparation) if resource_census else None
+    marker=resource_marker(elf,thread_preparation=resource_thread_preparation,raw_transaction=resource_raw_transaction) if resource_census else None
+    if not resource_raw_transaction and any(s['name'] in (RESOURCE_RAW_SCOPE,*RESOURCE_RAW_ENTRIES) for s in elf.symbols):
+        raise ValueError('Raw resource ELF requires its distinct explicit offline scope')
     if not resource_census and any(s['name']==RESOURCE_SCOPE for s in elf.symbols):
         raise ValueError('Resource census ELF requires its explicit offline scope')
     if not resource_thread_preparation and any(s['name'] in (RESOURCE_THREAD_SCOPE,RESOURCE_THREAD_ENTRY) for s in elf.symbols):
@@ -276,6 +295,12 @@ def validate_observer(data,reviewed_sha,provider_exports,*,connection_observatio
                 'resource_thread_scope_marker':marker if resource_thread_preparation else None,
                 'native_epoll_wait_rva':EPOLL_WAIT_RVA if resource_thread_preparation else None,
                 'hidden_resource_thread_entries':thread_entries,
+                'resource_raw_transaction':resource_raw_transaction,
+                'resource_raw_scope_marker':marker if resource_raw_transaction else None,
+                'resource_raw_limits':dict(RESOURCE_RAW_LIMITS) if resource_raw_transaction else {},
+                'resource_raw_source_boundaries':dict(RESOURCE_RAW_BOUNDARIES) if resource_raw_transaction else {},
+                'hidden_resource_raw_entries':raw_entries,
+                'native_resource_raw_rvas':dict(RESOURCE_RAW_RVAS) if resource_raw_transaction else {},
                 'required_aliases':list(required),'versioned_glibc_imports':sorted(versioned)}
 
 
@@ -309,17 +334,17 @@ def validate_profiles(blobs,client_blob,reviewed):
         raise ValueError('Client profile is not the canonical source descriptor')
 
 
-def _assemble(blobs,client_blob,reviewed,name,rx,*,connection_observation=False,resource_census=False,resource_thread_preparation=False):
-    validate_modes(connection_observation,resource_census,resource_thread_preparation)
+def _assemble(blobs,client_blob,reviewed,name,rx,*,connection_observation=False,resource_census=False,resource_thread_preparation=False,resource_raw_transaction=False):
+    validate_modes(connection_observation,resource_census,resource_thread_preparation,resource_raw_transaction)
     raw=loader_name(name)
     if not 0<=rx[0]<rx[1]<2**64:raise ValueError('Client executable interval')
-    magic,schema=(b'FCSTAK01',4) if resource_thread_preparation else (b'FCCENS01',3) if resource_census else (b'FCCONN01',2) if connection_observation else (b'FCSTART1',1)
+    magic,schema=(b'FCRAW001',5) if resource_raw_transaction else (b'FCSTAK01',4) if resource_thread_preparation else (b'FCCENS01',3) if resource_census else (b'FCCONN01',2) if connection_observation else (b'FCSTART1',1)
     result=magic+struct.pack('<II',schema,ENVELOPE_BYTES)+reviewed+raw+bytes(512-len(raw))+struct.pack('<QQ',*rx)+b''.join(blobs)+client_blob
     if len(result)!=ENVELOPE_BYTES:raise ValueError('Envelope schema size changed')
     return result
 
 
-def encode_envelope(blobs,client_blob,reviewed,name,rx,*,connection_observation=False,resource_census=False,resource_thread_preparation=False):
+def encode_envelope(blobs,client_blob,reviewed,name,rx,*,connection_observation=False,resource_census=False,resource_thread_preparation=False,resource_raw_transaction=False):
     validate_profiles(blobs,client_blob,reviewed)
     # Bind the copied ClientSlot geometry to the canonical descriptor itself,
     # not merely to a caller-supplied pair of plausible offsets.
@@ -331,11 +356,15 @@ def encode_envelope(blobs,client_blob,reviewed,name,rx,*,connection_observation=
             spans.append((ph[3],ph[3]+ph[5]))
     if spans!=[tuple(rx)]:raise ValueError('ClientSlot differs from the canonical caller-containing interval')
     return _assemble(blobs,client_blob,reviewed,name,rx,connection_observation=connection_observation,resource_census=resource_census,
-                     resource_thread_preparation=resource_thread_preparation)
+                     resource_thread_preparation=resource_thread_preparation,resource_raw_transaction=resource_raw_transaction)
 
 
-def audit_source(receiver_rx,api_rx,observer_rx,client_rx,bridge,api_name,client_name,observer_path,libc_rx,libc_name,*,connection_observation=False,resource_thread_preparation=False):
+def audit_source(receiver_rx,api_rx,observer_rx,client_rx,bridge,api_name,client_name,observer_path,libc_rx,libc_name,*,connection_observation=False,resource_thread_preparation=False,resource_raw_transaction=False):
+    if any(type(value) is not bool for value in (connection_observation,resource_thread_preparation,resource_raw_transaction)):
+        raise ValueError('Audit observation modes require explicit Boolean scope')
     if resource_thread_preparation and not connection_observation:raise ValueError('Resource thread audit requires connection observation')
+    if type(resource_raw_transaction) is not bool or (resource_raw_transaction and not resource_thread_preparation):
+        raise ValueError('Raw resource audit requires explicit thread preparation')
     loader_name(api_name);loader_name(client_name);loader_name(libc_name)
     # Octal UTF-8 bytes preserve the exact public loader name, including names
     # JSON would represent as surrogate escapes invalid in a C++ literal.
@@ -346,7 +375,8 @@ def audit_source(receiver_rx,api_rx,observer_rx,client_rx,bridge,api_name,client
             ','.join((module('',receiver_rx),module(api_name,api_rx),module(observer_path,observer_rx)))+
             f',{bridge},0x5768,0x5330,true,'+module(client_name,client_rx)+','+module(libc_name,libc_rx)+
             ',0x86a00,0x86980'+(',0x87370,0x88f74,0xebcb0' if connection_observation else '')+
-            (',0xe9e10' if resource_thread_preparation else '')+'};\nreturn &p;\n}\n}\n')
+            (',0xe9e10' if resource_thread_preparation else '')+
+            (',0xdf330,0xdfee0' if resource_raw_transaction else '')+'};\nreturn &p;\n}\n}\n')
 
 
 def private_write(path,data):
@@ -354,8 +384,8 @@ def private_write(path,data):
     with os.fdopen(fd,'wb') as stream:stream.write(data)
 
 
-def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,client_name,*,libc_name=None,home='/home/steamos',compiler='aarch64-linux-gnu-g++',api_file=None,connection_observation=False,resource_census=False,resource_thread_preparation=False):
-    validate_modes(connection_observation,resource_census,resource_thread_preparation)
+def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,client_name,*,libc_name=None,home='/home/steamos',compiler='aarch64-linux-gnu-g++',api_file=None,connection_observation=False,resource_census=False,resource_thread_preparation=False,resource_raw_transaction=False):
+    validate_modes(connection_observation,resource_census,resource_thread_preparation,resource_raw_transaction)
     frame=user_directory(frame_directory,home);loader_name(api_name);loader_name(client_name);loader_name(libc_name)
     loader_name(str(frame/MAIN))
     if len({api_name,client_name,libc_name,str(frame/MAIN)})!=4:raise ValueError('Module loader-name collision')
@@ -377,21 +407,22 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
     native_elfs={role:Elf(data) for role,data in inputs.items()}
     providers=export_versions(native_elfs[3])|export_versions(native_elfs[4])
     main_elf,main_report=validate_observer(main_data,reviewed_sha,providers,connection_observation=connection_observation,resource_census=resource_census,
-                                           resource_thread_preparation=resource_thread_preparation)
+                                           resource_thread_preparation=resource_thread_preparation,resource_raw_transaction=resource_raw_transaction)
     rx=Elf(client_data).rx(client.CALLER_RVA)
     reviewed=profiles[4][-32:]
     envelope=encode_envelope(profiles,client_blob,reviewed,client_name,rx,connection_observation=connection_observation,resource_census=resource_census,
-                             resource_thread_preparation=resource_thread_preparation)
+                             resource_thread_preparation=resource_thread_preparation,resource_raw_transaction=resource_raw_transaction)
     for name,rva,size in (('VR_InitInternal2',0x5768,236),('VR_ShutdownInternal',0x5330,192)):
         actual=native_elfs[2].function(name,True)
         if actual['rva']!=rva or actual['size']!=size:raise ValueError('Native public API schema changed')
     native_functions=[('pthread_mutex_init',0x86a00,556),('pthread_mutex_destroy',0x86980,56)]
     if connection_observation:native_functions += [('pthread_mutex_lock',0x87370,760),('pthread_mutex_unlock',0x88f74,20),('connect',0xebcb0,208)]
+    if resource_raw_transaction:native_functions += [('read',0xdf330,204),('write',0xdfee0,204)]
     for name,rva,size in native_functions:
         actual=native_elfs[3].function(name,True);alias=native_elfs[3].function('__'+name,True)
         if (actual['rva'],actual['size'],actual['version'])!=(rva,size,'GLIBC_2.17') or \
            (alias['rva'],alias['size'],alias['version'])!=(rva,size,'GLIBC_2.17'):
-            raise ValueError('Native public mutex alias schema changed')
+            raise ValueError('Native public forwarding alias schema changed')
     if resource_thread_preparation:
         actual=native_elfs[3].function('epoll_wait',True)
         if (actual['rva'],actual['size'],actual['version'])!=(0xe9e10,20,'GLIBC_2.17'):
@@ -400,7 +431,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
         raise ValueError('Receiver startup dependency changed')
     source=audit_source(native_elfs[1].rx(),native_elfs[2].rx(),main_elf.rx(),rx,main_report['bridge_rva'],api_name,client_name,
                         str(frame/MAIN),native_elfs[3].rx(),libc_name,connection_observation=connection_observation,
-                        resource_thread_preparation=resource_thread_preparation)
+                        resource_thread_preparation=resource_thread_preparation,resource_raw_transaction=resource_raw_transaction)
     logs={};compiler_args=shlex.split(compiler)
     if not compiler_args:raise ValueError('Explicit cross compiler required')
     with tempfile.TemporaryDirectory(prefix='frame-client-startup-packaging-') as temporary:
@@ -434,6 +465,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
               'native_api_rvas':{'init':'0x5768','shutdown':'0x5330'},
               'native_connection_rvas':CONNECTION_RVAS if connection_observation else {},
               'native_epoll_wait_rva':EPOLL_WAIT_RVA if resource_thread_preparation else None,
+              'native_resource_raw_rvas':dict(RESOURCE_RAW_RVAS) if resource_raw_transaction else {},
               'native_mutex_rvas':{'init':'0x86a00','destroy':'0x86980'},'default_inactive_without_prepared_tu':True},
               'connection_register_observation':connection_observation,
               'connection_private_bytes_read':0,'continuous_connection_owned':False,
@@ -443,8 +475,12 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
               'resource_thread_preparation':resource_thread_preparation,'resource_thread_private_bytes_read':0,
               'resource_thread_start_boundary_rva':RESOURCE_THREAD_START_RVA if resource_thread_preparation else None,
               'native_epoll_wait_rva':EPOLL_WAIT_RVA if resource_thread_preparation else None,
+              'resource_raw_transaction':resource_raw_transaction,
+              'resource_raw_limits':dict(RESOURCE_RAW_LIMITS) if resource_raw_transaction else {},
+              'resource_raw_source_boundaries':dict(RESOURCE_RAW_BOUNDARIES) if resource_raw_transaction else {},
+              'native_resource_raw_rvas':dict(RESOURCE_RAW_RVAS) if resource_raw_transaction else {},
               'capture_limits':dict(CAPTURE_LIMITS),
-              'envelope':{'bytes':len(envelope),'sha256':digest(envelope).hex(),'schema':4 if resource_thread_preparation else 3 if resource_census else 2 if connection_observation else 1,'reviewed_observer_profile_identity':reviewed.hex(),'module_count':5},
+              'envelope':{'bytes':len(envelope),'sha256':digest(envelope).hex(),'schema':5 if resource_raw_transaction else 4 if resource_thread_preparation else 3 if resource_census else 2 if connection_observation else 1,'reviewed_observer_profile_identity':reviewed.hex(),'module_count':5},
               'client_slot':{'exact_loader_name':client_name,'rx_rva_begin':rx[0],'rx_rva_end':rx[1],'canonical_profile_sha256':client_blob[-32:].hex()},
               'libc_slot':{'exact_loader_name':libc_name,'rx_rva_begin':native_elfs[3].rx()[0],'rx_rva_end':native_elfs[3].rx()[1]},
               'loader_name_provenance':'Explicit expected raw names supplied for offline preparation; not observed link-map lifetimes or deployment authorization',
@@ -458,6 +494,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
                        *(['actual supported connect-entry register snapshot and original result under observed native lock; no extra private memory reads'] if connection_observation else []),
                        *(['actual source begin/pending/reference boundary registers and original results only; no resource transaction or namespace accepted'] if resource_census else []),
                        *(['one-time decoder-thread stack preparation at the first admitted native receiver event wait; no accepted resource transaction, extra private or pixel reads'] if resource_thread_preparation else []),
+                       *(['one source-checked raw transaction: at most 2068 sparse stack-scalar bytes plus 33 header/token wire-metadata bytes; request payload counted only; no lifecycle lease, accepted namespace/frame/GPU proof'] if resource_raw_transaction else []),
                        'copied lifecycle/refusal facts; no pixels, shader replacement, endpoint pairing, mask frame, UV or GPU proof'],
               'before_activation':['Fresh actual runtime provider/receiver hashes and loader names','Separately reviewed final observer source/ELF and fingerprints',
                                    'Exact owned user-directory files; no foreign preload/audit/service override','Explicit permission and coordinated service restart readiness'],
@@ -486,12 +523,13 @@ def main():
     parser.add_argument('--connection-observation',action='store_true',help='Separate offline scope: register-only supported connect calls; never continuous FD ownership')
     parser.add_argument('--resource-census',action='store_true',help='Additional explicit offline scope: source resource-boundary registers/results only; requires --connection-observation')
     parser.add_argument('--resource-thread-preparation',action='store_true',help='Separate offline scope: one-time decoder-thread preparation; requires --resource-census and --connection-observation')
+    parser.add_argument('--resource-raw-transaction',action='store_true',help='Separate offline scope: one bounded raw transaction with sparse scalar and header/token copies; requires all preceding resource scopes')
     args=parser.parse_args()
     try:
         plan=prepare(args.native_dir,args.observer,args.observer_sha256,args.output,args.frame_directory,args.api_loader_name,args.client_loader_name,
                      libc_name=args.libc_loader_name,home=args.frame_user_home,compiler=args.compiler,api_file=args.api,
                      connection_observation=args.connection_observation,resource_census=args.resource_census,
-                     resource_thread_preparation=args.resource_thread_preparation)
+                     resource_thread_preparation=args.resource_thread_preparation,resource_raw_transaction=args.resource_raw_transaction)
     except (OSError,ValueError,struct.error) as error:parser.exit(1,'Offline bundle refused: '+str(error)+'\n')
     print(json.dumps({'prepared':True,'installed':False,'runtime_authorized':False,'envelope_sha256':plan['envelope']['sha256'],
                       'observer_sha256':plan['observer']['sha256'],'audit_sha256':plan['audit']['sha256']}))

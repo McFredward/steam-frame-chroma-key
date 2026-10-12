@@ -28,6 +28,7 @@ FINAL_SHA = None
 CONNECTION_OBSERVATION = False
 RESOURCE_CENSUS = False
 RESOURCE_THREAD_PREPARATION = False
+RESOURCE_RAW_TRANSACTION = False
 API_NAME = '/home/steamos/.local/share/Steam/steamrtarm64/libopenvr_api.so'
 CLIENT_NAME = '/opt/steamvr/bin/linuxarm64/vrclient.so'
 LIBC_NAME = '/usr/lib/libc.so.6'
@@ -36,20 +37,21 @@ FRAME_DIRECTORY = '/home/steamos/.local/share/GloomhavenVR/frame-client-startup'
 
 def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
                      bridge_visibility=0, entry_visibility=2, mutex_visibility=2, dynamic_tls=False,
-                     connection=False, missing_entry=None, resource=False, thread=False):
+                     connection=False, missing_entry=None, resource=False, thread=False, raw_transaction=False,
+                     extra_hidden=None,extra_scope=None):
     """Construct bounded own metadata; no executable native code is included."""
     raw = bytearray(0x4000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
     struct.pack_into('<16sHHIQQQIHHHHHH', raw, 0, ident, 3, 183, 1, 0, 64,
-                     0x3800, 0, 64, 56, 3 if resource or thread else 2, 64, 8, 0)
+                     0x3800, 0, 64, 56, 3 if resource or thread or raw_transaction else 2, 64, 8, 0)
     struct.pack_into('<IIQQQQQQ', raw, 64, 1, 5, 0, 0, 0, len(raw), len(raw), 4096)
     struct.pack_into('<IIQQQQQQ', raw, 120, 4, 4, 0x180, 0x180, 0x180, 36, 36, 4)
     struct.pack_into('<III', raw, 0x180, 4, 20, 3)
     raw[0x18c:0x190] = b'GNU\0'
     raw[0x190:0x1a4] = bytes(range(20))
-    if resource or thread:
+    if resource or thread or raw_transaction:
         struct.pack_into('<IIQQQQQQ',raw,176,1,4,0x3400,0x3400,0x3400,16,16,8)
-        raw[0x3400:0x3410]=tool.RESOURCE_THREAD_MARKER if thread else tool.RESOURCE_MARKER
+        raw[0x3400:0x3410]=tool.RESOURCE_RAW_MARKER if raw_transaction else tool.RESOURCE_THREAD_MARKER if thread else tool.RESOURCE_MARKER
     dynamic = [(tool.BRIDGE, 0x220, 1, bridge_visibility)]
     if not connection:
         dynamic += [('pthread_mutex_init', 0x230 + (4 if alias_rva else 0), 1, 0),
@@ -76,16 +78,21 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
     statstr = bytearray(b'\0')
     symtab = bytearray(24)
     for index, name in enumerate(tool.ENTRIES + tool.MUTEX_ENTRIES + (tool.CONNECTION_ENTRIES if connection else ())+
-                                 ((tool.RESOURCE_THREAD_ENTRY,) if thread else ())):
+                                 ((tool.RESOURCE_THREAD_ENTRY,) if thread else ())+
+                                 (tool.RESOURCE_RAW_ENTRIES if raw_transaction else ())):
         if name == missing_entry:
             continue
         off = len(statstr)
         statstr += name.encode() + b'\0'
-        rva = (0x200, 0x210, 0x230, 0x240,0x250,0x260,0x270,0x280)[index]
+        rva = (0x200, 0x210, 0x230, 0x240,0x250,0x260,0x270,0x280,0x290,0x2a0)[index]
         symtab += struct.pack('<IBBHQQ', off, 0x12, entry_visibility if index<2 else mutex_visibility, 1, rva, 4)
-    if resource or thread:
-        off=len(statstr);statstr+=(tool.RESOURCE_THREAD_SCOPE if thread else tool.RESOURCE_SCOPE).encode()+b'\0'
+    if resource or thread or raw_transaction:
+        off=len(statstr);statstr+=(tool.RESOURCE_RAW_SCOPE if raw_transaction else tool.RESOURCE_THREAD_SCOPE if thread else tool.RESOURCE_SCOPE).encode()+b'\0'
         symtab+=struct.pack('<IBBHQQ',off,1,2,1,0x3400,16)
+    for name,kind,rva,size in ((extra_hidden,2,0x2b0,4),(extra_scope,1,0x3400,16)):
+        if name:
+            off=len(statstr);statstr+=name.encode()+b'\0'
+            symtab+=struct.pack('<IBBHQQ',off,0x10|kind,2,1,rva,size)
     verneed = struct.pack('<HHIII', 1, 1, offsets['libc.so.6'], 16, 0)
     verneed += struct.pack('<IHHII', 0, 0, 2, offsets['GLIBC_2.17'], 0)
     versym = struct.pack('<' + 'H' * len(versions), *versions)
@@ -105,6 +112,104 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
 
 
 class PreparationTests(unittest.TestCase):
+    def test_raw_requires_all_four_scopes_exact_marker_and_ten_hidden_entries(self):
+        options={'connection_observation':True,'resource_census':True,'resource_thread_preparation':True,'resource_raw_transaction':True}
+        providers=set(tool.ALIASES)|{tool.EPOLL_WAIT_IMPORT}
+        raw=observer_fixture(connection=True,thread=True,raw_transaction=True)
+        _,report=tool.validate_observer(raw,tool.digest(raw).hex(),providers,**options)
+        self.assertEqual(report['resource_raw_scope_marker']['symbol'],tool.RESOURCE_RAW_SCOPE)
+        self.assertEqual(report['hidden_resource_raw_entries'],dict(zip(tool.RESOURCE_RAW_ENTRIES,(0x290,0x2a0))))
+        self.assertEqual(report['resource_raw_limits'],tool.RESOURCE_RAW_LIMITS)
+        self.assertEqual(report['native_resource_raw_rvas'],{'read':'0xdf330','write':'0xdfee0'})
+        self.assertEqual(report['resource_raw_source_boundaries'],tool.RESOURCE_RAW_BOUNDARIES)
+        self.assertFalse(report['resource_transaction_accepted']);self.assertFalse(report['resource_namespace_associated'])
+        self.assertEqual({s['name'] for s in tool.Elf(raw).exported()},{tool.BRIDGE})
+        for key in options:
+            for invalid in (False,1,'true',None):
+                changed=dict(options);changed[key]=invalid
+                with self.subTest(scope=key,value=invalid),self.assertRaises(ValueError):
+                    tool.validate_observer(raw,tool.digest(raw).hex(),providers,**changed)
+        for missing in (*tool.RESOURCE_RAW_ENTRIES,tool.RESOURCE_THREAD_ENTRY):
+            candidate=observer_fixture(connection=True,thread=True,raw_transaction=True,missing_entry=missing)
+            with self.subTest(missing=missing),self.assertRaises(ValueError):
+                tool.validate_observer(candidate,tool.digest(candidate).hex(),providers,**options)
+        for extra in ('read','write'):
+            candidate=observer_fixture(connection=True,thread=True,raw_transaction=True,extra_export=extra)
+            with self.subTest(public=extra),self.assertRaises(ValueError):
+                tool.validate_observer(candidate,tool.digest(candidate).hex(),providers,**options)
+        for extra in ({'extra_hidden':'frame_import_unknown_entry'},
+                      {'extra_scope':tool.RESOURCE_THREAD_SCOPE},
+                      {'extra_scope':'frame_client_resource_unknown_scope'}):
+            candidate=observer_fixture(connection=True,thread=True,raw_transaction=True,**extra)
+            with self.subTest(extra=extra),self.assertRaises(ValueError):
+                tool.validate_observer(candidate,tool.digest(candidate).hex(),providers,**options)
+        for offset,value in ((0x3400,ord('X')),(0x3408,4),(0x340c,0),(180,5)):
+            candidate=bytearray(raw);candidate[offset]=value
+            with self.subTest(corrupt=offset),self.assertRaises(ValueError):
+                tool.validate_observer(bytes(candidate),tool.digest(candidate).hex(),providers,**options)
+
+    def test_raw_schema_preserves_profiles_and_exact_audit_transport_tail(self):
+        args=([bytes(2032)]*5,bytes(1064),bytes(32),CLIENT_NAME,(0,0x60699a))
+        thread=tool._assemble(*args,connection_observation=True,resource_census=True,resource_thread_preparation=True)
+        raw=tool._assemble(*args,connection_observation=True,resource_census=True,resource_thread_preparation=True,resource_raw_transaction=True)
+        self.assertEqual(raw[:16],tool.RESOURCE_RAW_MARKER);self.assertEqual(raw[16:],thread[16:])
+        for omitted in ('connection_observation','resource_census','resource_thread_preparation'):
+            options={'connection_observation':True,'resource_census':True,'resource_thread_preparation':True};options.pop(omitted)
+            with self.subTest(omitted=omitted),self.assertRaises(ValueError):tool._assemble(*args,resource_raw_transaction=True,**options)
+        audit_args=((0,2),(0,3),(0,4),(0,5),1,API_NAME,CLIENT_NAME,FRAME_DIRECTORY+'/'+tool.MAIN,(0,6),LIBC_NAME)
+        thread_source=tool.audit_source(*audit_args,connection_observation=True,resource_thread_preparation=True)
+        raw_source=tool.audit_source(*audit_args,connection_observation=True,resource_thread_preparation=True,resource_raw_transaction=True)
+        self.assertEqual(raw_source,thread_source.replace('0xe9e10};','0xe9e10,0xdf330,0xdfee0};'))
+        for options in ({},{'connection_observation':True}):
+            with self.assertRaises(ValueError):tool.audit_source(*audit_args,resource_raw_transaction=True,**options)
+        for key in ('connection_observation','resource_thread_preparation','resource_raw_transaction'):
+            options={'connection_observation':True,'resource_thread_preparation':True,'resource_raw_transaction':True}
+            options[key]=1
+            with self.subTest(truthy_scope=key),self.assertRaises(ValueError):tool.audit_source(*audit_args,**options)
+
+    def test_raw_mode_cannot_relabel_old_marker_or_provider_aliases(self):
+        options={'connection_observation':True,'resource_census':True,'resource_thread_preparation':True,'resource_raw_transaction':True}
+        providers=set(tool.ALIASES)|{tool.EPOLL_WAIT_IMPORT}
+        for candidate in (observer_fixture(connection=True,resource=True),observer_fixture(connection=True,thread=True)):
+            with self.assertRaises(ValueError):tool.validate_observer(candidate,tool.digest(candidate).hex(),providers,**options)
+        for alias in ('__read@GLIBC_2.17','__write@GLIBC_2.17'):
+            candidate=observer_fixture(connection=True,thread=True,raw_transaction=True,missing_alias=alias)
+            with self.subTest(alias=alias),self.assertRaises(ValueError):tool.validate_observer(candidate,tool.digest(candidate).hex(),providers,**options)
+        candidate=observer_fixture(connection=True,thread=True,raw_transaction=True)
+        for alias in ('__read@GLIBC_2.17','__write@GLIBC_2.17'):
+            with self.subTest(provider=alias),self.assertRaises(ValueError):
+                tool.validate_observer(candidate,tool.digest(candidate).hex(),providers-{alias},**options)
+
+    @unittest.skipUnless(shutil.which('aarch64-linux-gnu-g++') and shutil.which('g++') and
+                         'native_read_rva' in (ROOT/'import/import_startup_audit.h').read_text(),
+                         'new actual raw audit header/providers not integrated in this isolated worktree yet')
+    def test_raw_generated_audit_tail_compiles_with_actual_owned_source(self):
+        logs={}
+        with tempfile.TemporaryDirectory(prefix='client-startup-raw-audit-control-') as temporary:
+            folder=Path(temporary)
+            source=tool.audit_source((0,500),(0,600),(0,700),(0,800),0x200,API_NAME,CLIENT_NAME,
+                                    FRAME_DIRECTORY+'/'+tool.MAIN,(0,900),LIBC_NAME,
+                                    connection_observation=True,resource_thread_preparation=True,resource_raw_transaction=True)
+            (folder/'preparation.cpp').write_text(source)
+            command=['aarch64-linux-gnu-g++','-std=c++17','-O2','-shared','-fPIC','-nostdlib','-fvisibility=hidden',
+                     '-fno-exceptions','-fno-rtti','-fno-builtin','-mno-outline-atomics','-I',str(ROOT),
+                     str(ROOT/'import/import_startup_audit.cpp'),str(folder/'preparation.cpp'),'-o',str(folder/'audit.so')]
+            result=tool.recorded_run(command,folder,logs,'raw_actual_audit_compile',45)
+            self.assertEqual(result.returncode,0,result.stderr[-4096:])
+            elf=tool.Elf(tool.frozen_read(folder/'audit.so',tool.MAX_AUDIT))
+            self.assertEqual(elf.imports(),set());self.assertEqual(elf.needed,[])
+            self.assertEqual({s['name'] for s in elf.exported()}, {'la_version','la_objopen','la_preinit','la_symbind64','la_objclose'})
+            (folder/'pod.cpp').write_text('#include "import/import_startup_audit.h"\n'
+                'int main(){using namespace frame_import_startup_audit;const auto*p=preparation();'
+                'return !p||sizeof(Preparation)!=216||p->native_epoll_wait_rva!=0xe9e10||'
+                'p->native_read_rva!=0xdf330||p->native_write_rva!=0xdfee0;}\n')
+            result=tool.recorded_run(['g++','-std=c++17','-I',str(ROOT),str(ROOT/'import/import_startup_audit.cpp'),
+                str(folder/'preparation.cpp'),str(folder/'pod.cpp'),'-o',str(folder/'pod')],folder,logs,'raw_actual_host_pod_compile',45)
+            self.assertEqual(result.returncode,0,result.stderr[-4096:])
+            result=tool.recorded_run([str(folder/'pod')],folder,logs,'raw_actual_host_pod_execute',5)
+            self.assertEqual(result.returncode,0)
+        self.assertFalse(folder.exists())
+
     def test_resource_thread_requires_all_scopes_and_exact_distinct_marker_entry_provider(self):
         raw=observer_fixture(connection=True,thread=True)
         options={'connection_observation':True,'resource_census':True,'resource_thread_preparation':True}
@@ -493,7 +598,7 @@ class PreparationTests(unittest.TestCase):
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
                                 libc_name=LIBC_NAME,api_file=PRIVATE_API,
                                 connection_observation=CONNECTION_OBSERVATION,resource_census=RESOURCE_CENSUS,
-                                resource_thread_preparation=RESOURCE_THREAD_PREPARATION)
+                                resource_thread_preparation=RESOURCE_THREAD_PREPARATION,resource_raw_transaction=RESOURCE_RAW_TRANSACTION)
             self.assertEqual(len(list(output.iterdir())), 5)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
             self.assertEqual((output / tool.MAIN).read_bytes(), tool.frozen_read(FINAL_OBSERVER))
@@ -516,7 +621,7 @@ class PreparationTests(unittest.TestCase):
                 tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
                              libc_name=LIBC_NAME,api_file=PRIVATE_API,
                              connection_observation=CONNECTION_OBSERVATION,resource_census=RESOURCE_CENSUS,
-                             resource_thread_preparation=RESOURCE_THREAD_PREPARATION)
+                             resource_thread_preparation=RESOURCE_THREAD_PREPARATION,resource_raw_transaction=RESOURCE_RAW_TRANSACTION)
             self.assertEqual(before, {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()})
         self.assertFalse(output.exists())
 
@@ -533,10 +638,12 @@ if __name__ == '__main__':
     parser.add_argument('--connection-observation',action='store_true')
     parser.add_argument('--resource-census',action='store_true')
     parser.add_argument('--resource-thread-preparation',action='store_true')
+    parser.add_argument('--resource-raw-transaction',action='store_true')
     args, remaining = parser.parse_known_args()
     PRIVATE_NATIVE, PRIVATE_API, FINAL_OBSERVER, FINAL_SHA = args.native_dir, args.api, args.observer, args.observer_sha256
     CONNECTION_OBSERVATION,RESOURCE_CENSUS=args.connection_observation,args.resource_census
     RESOURCE_THREAD_PREPARATION=args.resource_thread_preparation
+    RESOURCE_RAW_TRANSACTION=args.resource_raw_transaction
     API_NAME, CLIENT_NAME, LIBC_NAME = args.api_loader_name, args.client_loader_name, args.libc_loader_name
     if FINAL_OBSERVER and not FINAL_SHA:
         parser.error('--observer requires its separately reviewed --observer-sha256')

@@ -213,6 +213,23 @@ gates. None of these stages requires a native PC Steam sender patch.
 
 ## Deployment and manual recovery boundary
 
+Offline packaging now has a distinct `--resource-raw-transaction` opt-in which
+requires all three preceding connection/census/thread options. It checks the
+single hidden read-only raw marker, ten hidden entry veneers, sole public bridge
+and actual pinned public/alias provider pairs: read `0xdf330`, write `0xdfee0`,
+each 204 bytes at `GLIBC_2.17`. Alias and public names resolve to the same native
+PC; they are distinct names, not different provider addresses. The generated
+216-byte audit preparation appends these two RVAs after the cold-thread tail.
+
+The session mode is `resource-raw`. Stage/start/activate require
+`--ack-resource-raw-transaction-scope` alongside the four preceding scope
+acknowledgements; activation additionally requires coordinated restart readiness.
+The owned manifest records this fifth scope explicitly. Old modes reject a raw
+ELF or transport routing even when its plan is downgraded, and the raw mode
+refuses altered byte/call limits, provider RVAs, scope markers or proof flags.
+These packaging controls do not establish that a raw runtime trace is complete
+or authorize installation on the Frame.
+
 After implementation and focused review, generate fresh exact artifact hashes,
 sizes and native/provider pins, plus the reviewed mode and limits above. Obtain
 explicit approval for the additional private scalar and 33 wire-metadata bytes;
