@@ -70,6 +70,11 @@ artifact fails that acceptance criterion. Selective native client binding still
 redirects all five intended calls, preserving arguments, LR, results and flags.
 The CI run for the integrated source checkpoint `4088828` also passed:
 <https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38290719178>.
+The repaired source checkpoint `38b5b16` passed CI as well, including the
+focused parallel checks, Windows sender cross-build and protocol sanitizers:
+<https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38295295162>.
+This remains software evidence; a working headset startup has not yet been
+confirmed for the repaired artifact.
 
 The first expanded artifact failed during Steam UI initialization, before any
 receiver or connection capture. It was fully removed and the original service

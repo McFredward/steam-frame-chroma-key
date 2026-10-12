@@ -73,6 +73,8 @@ each), native selective audit controls and independent final artifact/bundle
 review (147 checks) pass. Passing unchanged evidence was reused rather than
 rerunning a full local gate after each bounded repair. No new private field,
 packet, pixel, shader, mask or PC Steam sender modification was introduced.
+The integrated repair at `38b5b16` also passed
+[CI](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38295295162).
 
 The repaired artifact is documented in
 [CLIENT-CONNECT-OBSERVATION.md](CLIENT-CONNECT-OBSERVATION.md). Its hardware UI
