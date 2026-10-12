@@ -33,13 +33,13 @@ MAIN, AUDIT, ENVELOPE = "libframe_client_startup.so", "libframe_client_startup_a
 HELPERS = ("client_startup_session.py", "receiver_observer_session.py")
 NATIVE = {
     "receiver": ("vrlink", "31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153"),
-    "api": ("libopenvr_api.so", "a07163c436b3d791a0aa2442029d2ef0ba40a772ebf1dc6006d610c3a7934ee2"),
+    "api": ("libopenvr_api.so", "4a8723b7134c53ec6c9291d9d2f55ea86349ffd0d227d10ae49a4951ae5395d4"),
     "libc": ("libc.so.6", "be7ee393429d493c4d3b996ed25cbb02fabb2896a77efe6d57e5993ead5bbb3b"),
     "loader": ("ld-linux-aarch64.so.1", "2ddc56a02f476765a21e31d69144e68bee933950fe613747d54b87a2369a037e"),
     "client": ("vrclient.so", "19b2b9a2b512eb2cb25f0de9c60c20c6b82c78f29384e2fcec4487c507a4e8b0"),
 }
 PROFILE_PINS = ("2f5ccf52a5ebbb4b7d36a9508451247bd370b03c0c1b3a4d4b18dcb9322b655c",
-    "e5513ef3746d6bffe1eb9b22b08ce5c964cbc870c2644cd8abfaf44ba7bc445c",
+    "9ef296865d2583cd8136303727db150f6e4a349ffe7b175e3e0f651adfb81dcf",
     "48edb257be746f755a00ff564c6db4284526b15ffc7e6bad5b8d6723b1891512",
     "51af1fa58396e7a1ab48760ce90d90e919db3e42653504ad550eb54e129a7405")
 CLIENT_PROFILE = "1da2390f9d65a5271f0750d9d5558e90716c35629f2f39583ba5aeef2d451b71"
@@ -48,6 +48,7 @@ PREFIXES = ("FRAME_RECEIVER_", "FRAME_MASK_TRACE", "FRAME_IMPORT_", "FRAME_CLIEN
 BLOCKED = {"LD_PRELOAD", "LD_AUDIT", "LD_BIND_NOW", "LD_BIND_NOT", "LD_DEBUG", "LD_DEBUG_OUTPUT", "LD_PROFILE",
            "LD_PROFILE_OUTPUT", "VK_LOADER_DEBUG", "VK_INSTANCE_LAYERS", "VK_LAYER_PATH", "VK_ADD_LAYER_PATH"}
 MAX_INPUT, CAPTURE_LIMIT = 8 * 1024 * 1024, 65536
+API_ENTRY_RVAS = {"init": "0x5768", "shutdown": "0x5330"}
 
 def blocked(key, value):
     return bool(value) and (key in BLOCKED or key.startswith(PREFIXES))
@@ -153,6 +154,8 @@ class Session(base.Session):
             plan.get("audit", {}).get("sha256") != digest(payloads[AUDIT]) or
             plan.get("envelope", {}).get("sha256") != digest(payloads[ENVELOPE])):
             raise RuntimeError("Plan/artifact report mismatch")
+        if plan.get("audit", {}).get("native_api_rvas") != API_ENTRY_RVAS:
+            raise RuntimeError("Audit route differs from the canonical Steam-runtime API")
         self.validate_envelope(payloads[ENVELOPE], plan, files, payloads[MAIN])
         for name, source in ((HELPERS[0], Path(__file__)), (HELPERS[1], Path(base.__file__))):
             data = read_regular(source)

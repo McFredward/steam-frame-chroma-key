@@ -17,7 +17,7 @@ constexpr std::array<std::uint8_t,32> digest(const char* hex) {
     return out;
 }
 constexpr auto receiver_identity=digest("31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153");
-constexpr auto api_identity=digest("a07163c436b3d791a0aa2442029d2ef0ba40a772ebf1dc6006d610c3a7934ee2");
+constexpr auto api_identity=digest("4a8723b7134c53ec6c9291d9d2f55ea86349ffd0d227d10ae49a4951ae5395d4");
 bool point(const PreparedImage& image,std::uintptr_t offset) noexcept {
     return image.bias && image.bias%4096==0 && offset<=std::numeric_limits<std::uintptr_t>::max()-image.bias &&
         image.code_begin<image.code_end && image.bias+offset>=image.code_begin && image.bias+offset<image.code_end;
@@ -43,8 +43,8 @@ bool OwnedThreadStack::current() const noexcept { return owner_ && owner_==curre
 Gate::Gate(Prepared p,frame_import_pipe::Registry& registry) noexcept : prepared_(p),registry_(registry) {
     if (p.stack.current() && p.client==InitialClient::NotLoadedAtPreflight && p.process_generation &&
         p.receiver.file_identity==receiver_identity && p.api.file_identity==api_identity &&
-        point(p.receiver,0x2ae94) && point(p.api,0x5ab8) && point(p.api,0x5680) &&
-        p.native_init_provider==p.api.bias+0x5ab8 && p.native_shutdown_provider==p.api.bias+0x5680 &&
+        point(p.receiver,0x2ae94) && point(p.api,0x5768) && point(p.api,0x5330) &&
+        p.native_init_provider==p.api.bias+0x5768 && p.native_shutdown_provider==p.api.bias+0x5330 &&
         nonzero(p.client_code_identity) && p.lookup && p.validate && p.validator_owner && registry.healthy()) {
         reason_.store(Refusal::None); state_.store(State::Prepared);
     }

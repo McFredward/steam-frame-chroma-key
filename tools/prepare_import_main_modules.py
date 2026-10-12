@@ -19,7 +19,9 @@ MAX_NOTES = 4
 PROFILE_BYTES = 2032
 NATIVE = {
     1: ("vrlink", "31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153"),
-    2: ("libopenvr_api.so", "a07163c436b3d791a0aa2442029d2ef0ba40a772ebf1dc6006d610c3a7934ee2"),
+    # The receiver actually binds the Steam-runtime API. The distinct /opt
+    # SteamVR copy is deliberately not an alternative accepted role-2 input.
+    2: ("libopenvr_api.so", "4a8723b7134c53ec6c9291d9d2f55ea86349ffd0d227d10ae49a4951ae5395d4"),
     3: ("libc.so.6", "be7ee393429d493c4d3b996ed25cbb02fabb2896a77efe6d57e5993ead5bbb3b"),
     4: ("ld-linux-aarch64.so.1", "2ddc56a02f476765a21e31d69144e68bee933950fe613747d54b87a2369a037e"),
 }
@@ -118,6 +120,7 @@ def read_owned(path):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--native-dir", type=Path)
+    p.add_argument("--api", type=Path, help="Explicit private Steam-runtime API file; the role-2 hard pin remains required")
     p.add_argument("--observer", type=Path)
     p.add_argument("--observer-sha")
     p.add_argument("--fixture", type=Path)
@@ -126,7 +129,11 @@ def main():
     try:
         if bool(args.fixture) == bool(args.native_dir):
             raise ValueError("Choose either a native set or one explicit host fixture")
-        inputs = [(6, args.fixture, None)] if args.fixture else [(role, args.native_dir / name, None) for role, (name, _) in NATIVE.items()]
+        if args.api and not args.native_dir:
+            raise ValueError("An explicit API override requires the native set")
+        inputs = [(6, args.fixture, None)] if args.fixture else [
+            (role, args.api if role == 2 and args.api else args.native_dir / name, None)
+            for role, (name, _) in NATIVE.items()]
         if args.observer:
             inputs.append((5, args.observer, args.observer_sha))
         args.output.mkdir(mode=0o700, parents=True, exist_ok=True)

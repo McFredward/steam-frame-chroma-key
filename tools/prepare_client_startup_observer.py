@@ -37,7 +37,7 @@ AUDIT = 'libframe_client_startup_audit.so'
 ENVELOPE = 'client-startup-envelope.bin'
 NATIVE_PROFILES = tuple(bytes.fromhex(value) for value in (
     '2f5ccf52a5ebbb4b7d36a9508451247bd370b03c0c1b3a4d4b18dcb9322b655c',
-    'e5513ef3746d6bffe1eb9b22b08ce5c964cbc870c2644cd8abfaf44ba7bc445c',
+    '9ef296865d2583cd8136303727db150f6e4a349ffe7b175e3e0f651adfb81dcf',
     '48edb257be746f755a00ff564c6db4284526b15ffc7e6bad5b8d6723b1891512',
     '51af1fa58396e7a1ab48760ce90d90e919db3e42653504ad550eb54e129a7405'))
 CLIENT_PROFILE = bytes.fromhex('1da2390f9d65a5271f0750d9d5558e90716c35629f2f39583ba5aeef2d451b71')
@@ -276,7 +276,7 @@ def audit_source(receiver_rx,api_rx,observer_rx,client_rx,bridge,api_name,client
     return ('#include "import/import_startup_audit.h"\nnamespace frame_import_startup_audit {\n'
             'const Preparation* preparation() noexcept {\nstatic const Preparation p = {'+
             ','.join((module('',receiver_rx),module(api_name,api_rx),module(observer_path,observer_rx)))+
-            f',{bridge},0x5ab8,0x5680,true,'+module(client_name,client_rx)+'};\nreturn &p;\n}\n}\n')
+            f',{bridge},0x5768,0x5330,true,'+module(client_name,client_rx)+'};\nreturn &p;\n}\n}\n')
 
 
 def private_write(path,data):
@@ -284,14 +284,17 @@ def private_write(path,data):
     with os.fdopen(fd,'wb') as stream:stream.write(data)
 
 
-def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,client_name,*,home='/home/steamos',compiler='aarch64-linux-gnu-g++'):
+def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,client_name,*,home='/home/steamos',compiler='aarch64-linux-gnu-g++',api_file=None):
     frame=user_directory(frame_directory,home);loader_name(api_name);loader_name(client_name)
     loader_name(str(frame/MAIN))
     if api_name==client_name or str(frame/MAIN) in (api_name,client_name):raise ValueError('Module loader-name collision')
     if output.exists() or output.is_symlink():raise ValueError('Offline output must be new; never overwrite a reviewed bundle')
     if native_dir.resolve() in output.resolve().parents or output.resolve()==native_dir.resolve():
         raise ValueError('Do not publish into borrowed native references')
-    inputs={role:frozen_read(native_dir/name) for role,(name,_) in modules.NATIVE.items()}
+    if api_file is not None and api_file.resolve().parent in output.resolve().parents:
+        raise ValueError('Do not publish into borrowed API references')
+    inputs={role:frozen_read(api_file if role==2 and api_file is not None else native_dir/name)
+            for role,(name,_) in modules.NATIVE.items()}
     client_data=frozen_read(native_dir/'vrclient.so');main_data=frozen_read(observer)
     profiles=[];reports=[]
     for role in range(1,6):
@@ -306,7 +309,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
     rx=Elf(client_data).rx(client.CALLER_RVA)
     reviewed=profiles[4][-32:]
     envelope=encode_envelope(profiles,client_blob,reviewed,client_name,rx)
-    for name,rva,size in (('VR_InitInternal2',0x5ab8,236),('VR_ShutdownInternal',0x5680,192)):
+    for name,rva,size in (('VR_InitInternal2',0x5768,236),('VR_ShutdownInternal',0x5330,192)):
         actual=native_elfs[2].function(name,True)
         if actual['rva']!=rva or actual['size']!=size:raise ValueError('Native public API schema changed')
     if 'libopenvr_api.so' not in native_elfs[1].needed or 'vrclient.so' in native_elfs[1].needed:
@@ -342,7 +345,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
         plan={'schema':'frame-client-startup-offline-bundle-v1','prepared':True,'installed':False,'activated':False,'runtime_authorized':False,
               'frame_access':False,'network_access':False,'native_binary_or_script_changes':False,'source_frame_associated':False,'gpu_coherent':False,
               'frame_directory':str(frame),'frame_user_home':home,'directory_mode':'0700','observer':main_report,'audit':{'bytes':len(audit_data),'sha256':digest(audit_data).hex(),'imports':[],
-              'native_api_rvas':{'init':'0x5ab8','shutdown':'0x5680'},'default_inactive_without_prepared_tu':True},
+              'native_api_rvas':{'init':'0x5768','shutdown':'0x5330'},'default_inactive_without_prepared_tu':True},
               'envelope':{'bytes':len(envelope),'sha256':digest(envelope).hex(),'schema':1,'reviewed_observer_profile_identity':reviewed.hex(),'module_count':5},
               'client_slot':{'exact_loader_name':client_name,'rx_rva_begin':rx[0],'rx_rva_end':rx[1],'canonical_profile_sha256':client_blob[-32:].hex()},
               'loader_name_provenance':'Explicit expected raw names supplied for offline preparation; not observed link-map lifetimes or deployment authorization',
@@ -368,6 +371,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--native-dir',type=Path,required=True)
+    parser.add_argument('--api',type=Path,help='Explicit private Steam-runtime API file; the role-2 hard pin remains required')
     parser.add_argument('--observer',type=Path,required=True)
     parser.add_argument('--observer-sha256',required=True)
     parser.add_argument('--output',type=Path,required=True)
@@ -379,7 +383,7 @@ def main():
     args=parser.parse_args()
     try:
         plan=prepare(args.native_dir,args.observer,args.observer_sha256,args.output,args.frame_directory,args.api_loader_name,args.client_loader_name,
-                     home=args.frame_user_home,compiler=args.compiler)
+                     home=args.frame_user_home,compiler=args.compiler,api_file=args.api)
     except (OSError,ValueError,struct.error) as error:parser.exit(1,'Offline bundle refused: '+str(error)+'\n')
     print(json.dumps({'prepared':True,'installed':False,'runtime_authorized':False,'envelope_sha256':plan['envelope']['sha256'],
                       'observer_sha256':plan['observer']['sha256'],'audit_sha256':plan['audit']['sha256']}))

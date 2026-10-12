@@ -22,6 +22,8 @@ SPEC.loader.exec_module(M)
 
 class SessionTests(unittest.TestCase):
     def setUp(self):
+        self.production_api_pin = M.NATIVE['api'][1]
+        self.production_api_profile_pin = M.PROFILE_PINS[1]
         self.temp = tempfile.TemporaryDirectory(prefix="client-startup-session-fixture-")
         self.root = Path(self.temp.name)
         self.home, self.runtime = self.root / "home", self.root / "runtime"
@@ -64,7 +66,7 @@ class SessionTests(unittest.TestCase):
             "native_profiles": reports, "client_profile": {"file_sha256": pins["client"][1], "profile_sha256": client[-32:].hex()},
             "observer_profile": {"role": 5, "file_sha256": M.digest(main), "profile_sha256": profiles[-1][-32:].hex()},
             "client_slot": {"exact_loader_name": "/native/vrclient.so", "rx_rva_begin": 0, "rx_rva_end": 0x60699a},
-            "observer": {"sha256": M.digest(main)}, "audit": {"sha256": M.digest(audit)},
+            "observer": {"sha256": M.digest(main)}, "audit": {"sha256": M.digest(audit), "native_api_rvas": dict(M.API_ENTRY_RVAS)},
             "envelope": {"sha256": M.digest(envelope), "reviewed_observer_profile_identity": profiles[-1][-32:].hex()},
             "inventory": []}
         for flag in ("installed", "activated", "runtime_authorized", "frame_access", "network_access",
@@ -124,6 +126,20 @@ class SessionTests(unittest.TestCase):
         for kwargs in ({"runtime_scope": False}, {"restart_ready": False}):
             with self.assertRaises(RuntimeError): self.start(**kwargs)
         self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls, [])
+
+    def test_production_api_identity_remains_the_single_steam_runtime_pin(self):
+        self.assertEqual(self.production_api_pin,
+                         '4a8723b7134c53ec6c9291d9d2f55ea86349ffd0d227d10ae49a4951ae5395d4')
+        self.assertEqual(self.production_api_profile_pin,
+                         '9ef296865d2583cd8136303727db150f6e4a349ffe7b175e3e0f651adfb81dcf')
+
+    def test_old_opt_runtime_rvas_refused_before_creating_a_session(self):
+        self.plan['audit']['native_api_rvas'] = {'init': '0x5ab8', 'shutdown': '0x5680'}
+        self.save_plan()
+        with self.assertRaisesRegex(RuntimeError, 'canonical Steam-runtime API'):
+            self.stage()
+        self.assertFalse(self.session.folder.exists())
+        self.assertEqual(self.calls, [])
 
     def test_stage_is_inactive_and_only_copies_owned_deliverables(self):
         self.stage();m = self.session.manifest()

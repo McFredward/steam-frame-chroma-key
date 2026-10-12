@@ -122,8 +122,8 @@ struct Fixture {
     Fixture(const char* path,const std::array<std::uint8_t,32>& hash):path(path) {
         owner.expected_hash=hash;
         prepared.receiver={receiver_bias,receiver_bias,receiver_bias+0x240000,digest("31addef0c9553d3770b5570487699e96d70271d4073cd6c03b080fdee6ae2153")};
-        prepared.api={api_bias,api_bias,api_bias+0x30000,digest("a07163c436b3d791a0aa2442029d2ef0ba40a772ebf1dc6006d610c3a7934ee2")};
-        prepared.native_init_provider=api_bias+0x5ab8;prepared.native_shutdown_provider=api_bias+0x5680;
+        prepared.api={api_bias,api_bias,api_bias+0x30000,digest("4a8723b7134c53ec6c9291d9d2f55ea86349ffd0d227d10ae49a4951ae5395d4")};
+        prepared.native_init_provider=api_bias+0x5768;prepared.native_shutdown_provider=api_bias+0x5330;
         prepared.client_code_identity=hash;prepared.stack=stack_bounds();prepared.client=InitialClient::NotLoadedAtPreflight;
         prepared.process_generation=500;prepared.lookup=lookup;prepared.validate=validate;prepared.validator_owner=&owner;
         gate=std::make_unique<Gate>(prepared,registry);owner.gate=gate.get();control=&owner;
@@ -158,6 +158,17 @@ struct Fixture {
 int main(int argc,char** argv) {
     if(argc!=2){std::fprintf(stderr,"controlled host DSO path required\n");return 77;}
     const auto hash=file_code_hash(argv[1]);
+    // The receiver's actual Steam-runtime API replaced the distinct /opt API.
+    // A known old hash, old RVA pair or mixed identity never arms startup.
+    for(unsigned old=1;old<=3;++old) {
+        Fixture f(argv[1],hash);
+        auto prepared=f.prepared;
+        if(old&1) prepared.api.file_identity=digest("a07163c436b3d791a0aa2442029d2ef0ba40a772ebf1dc6006d610c3a7934ee2");
+        if(old&2) {prepared.native_init_provider=api_bias+0x5ab8;prepared.native_shutdown_provider=api_bias+0x5680;}
+        Gate refused(prepared,f.registry);
+        check(refused.refusal()==Refusal::Unprepared);
+        check(!refused.before_vr_init(f.init)&&refused.lookups()==0&&f.registry.counters.births==0);
+    }
     { Fixture f(argv[1],hash);auto wrong=f.init;wrong.x[30]+=4;
       check(!f.gate->before_vr_init(wrong));check(!f.gate->after_vr_init(wrong,1));check(f.gate->lookups()==0);
       f.load_after_before();auto unrelated=f.native;unrelated.x[30]+=4;

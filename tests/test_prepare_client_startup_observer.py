@@ -22,9 +22,10 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import prepare_client_startup_observer as tool
 
 PRIVATE_NATIVE = None
+PRIVATE_API = None
 FINAL_OBSERVER = None
 FINAL_SHA = None
-API_NAME = '/opt/steamvr/bin/linuxarm64/libopenvr_api.so'
+API_NAME = '/home/steamos/.local/share/Steam/steamrtarm64/libopenvr_api.so'
 CLIENT_NAME = '/opt/steamvr/bin/linuxarm64/vrclient.so'
 FRAME_DIRECTORY = '/home/steamos/.local/share/GloomhavenVR/frame-client-startup'
 
@@ -277,9 +278,22 @@ class PreparationTests(unittest.TestCase):
             self.skipTest('private actual native references not requested')
         profiles = []
         for role, (name, _) in tool.modules.NATIVE.items():
-            value, _ = tool.modules.profile_from_bytes(tool.frozen_read(PRIVATE_NATIVE / name), role)
+            path = PRIVATE_API if role == 2 and PRIVATE_API is not None else PRIVATE_NATIVE / name
+            value, _ = tool.modules.profile_from_bytes(tool.frozen_read(path), role)
             profiles.append(value)
             self.assertEqual(value[-32:], tool.NATIVE_PROFILES[role - 1])
+            if role == 2:
+                api = tool.Elf(tool.frozen_read(path))
+                self.assertEqual((api.function('VR_InitInternal2', True)['rva'],
+                                  api.function('VR_InitInternal2', True)['size']), (0x5768, 236))
+                self.assertEqual((api.function('VR_ShutdownInternal', True)['rva'],
+                                  api.function('VR_ShutdownInternal', True)['size']), (0x5330, 192))
+                self.assertEqual(value[-32:].hex(), '9ef296865d2583cd8136303727db150f6e4a349ffe7b175e3e0f651adfb81dcf')
+        # The explicitly selected new API never turns the older opt-runtime
+        # copy into an alternative accepted provider.
+        if PRIVATE_API is not None:
+            with self.assertRaisesRegex(ValueError, 'native identity'):
+                tool.modules.profile_from_bytes(tool.frozen_read(PRIVATE_NATIVE / 'libopenvr_api.so'), 2)
         own = observer_fixture()
         fifth, _ = tool.modules.profile_from_bytes(own, 5, tool.digest(own).hex())
         profiles.append(fifth)
@@ -321,7 +335,8 @@ class PreparationTests(unittest.TestCase):
             self.skipTest('final own observer not requested')
         with tempfile.TemporaryDirectory(prefix='client-startup-final-bundle-control-') as temporary:
             output = Path(temporary) / 'reviewable'
-            plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME)
+            plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
+                                api_file=PRIVATE_API)
             self.assertEqual(len(list(output.iterdir())), 5)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
             self.assertEqual((output / tool.MAIN).read_bytes(), tool.frozen_read(FINAL_OBSERVER))
@@ -339,7 +354,8 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(json.loads((output / 'deployment-plan.json').read_text()), plan)
             before = {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()}
             with self.assertRaises(ValueError):
-                tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME)
+                tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, FRAME_DIRECTORY, API_NAME, CLIENT_NAME,
+                             api_file=PRIVATE_API)
             self.assertEqual(before, {file.name: tool.digest(file.read_bytes()) for file in output.iterdir()})
         self.assertFalse(output.exists())
 
@@ -347,12 +363,13 @@ class PreparationTests(unittest.TestCase):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--native-dir', type=Path)
+    parser.add_argument('--api', type=Path)
     parser.add_argument('--observer', type=Path)
     parser.add_argument('--observer-sha256')
     parser.add_argument('--api-loader-name', default=API_NAME)
     parser.add_argument('--client-loader-name', default=CLIENT_NAME)
     args, remaining = parser.parse_known_args()
-    PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA = args.native_dir, args.observer, args.observer_sha256
+    PRIVATE_NATIVE, PRIVATE_API, FINAL_OBSERVER, FINAL_SHA = args.native_dir, args.api, args.observer, args.observer_sha256
     API_NAME, CLIENT_NAME = args.api_loader_name, args.client_loader_name
     if FINAL_OBSERVER and not FINAL_SHA:
         parser.error('--observer requires its separately reviewed --observer-sha256')

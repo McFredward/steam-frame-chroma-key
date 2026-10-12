@@ -17,7 +17,7 @@ constexpr Digest from_hex(const char* text) noexcept {
 }
 constexpr std::array<Digest,4> kNative{{
     from_hex("2f5ccf52a5ebbb4b7d36a9508451247bd370b03c0c1b3a4d4b18dcb9322b655c"),
-    from_hex("e5513ef3746d6bffe1eb9b22b08ce5c964cbc870c2644cd8abfaf44ba7bc445c"),
+    from_hex("9ef296865d2583cd8136303727db150f6e4a349ffe7b175e3e0f651adfb81dcf"),
     from_hex("48edb257be746f755a00ff564c6db4284526b15ffc7e6bad5b8d6723b1891512"),
     from_hex("51af1fa58396e7a1ab48760ce90d90e919db3e42653504ad550eb54e129a7405")}};
 std::uint64_t little(const std::uint8_t* data,std::size_t n) noexcept {
@@ -213,7 +213,7 @@ Prepared prepare(const Profiles& profiles) noexcept {
     auto self=verify_loaded(profiles.modules[4],profiles.reviewed_observer_identity,reinterpret_cast<std::uintptr_t>(&prepare));
     if(!api.valid()||!loader.valid())return finish(Refusal::ProviderMismatch);
     if(!self.valid())return finish(Refusal::SelfUnavailable);
-    if(init!=api.image.bias+0x5ab8||shutdown!=api.image.bias+0x5680||tls!=loader.image.bias+0x10180)
+    if(init!=api.image.bias+0x5768||shutdown!=api.image.bias+0x5330||tls!=loader.image.bias+0x10180)
         return finish(Refusal::ProviderMismatch);
     Dl_info second{};
     if(!out.lookup_(reinterpret_cast<const void*>(shutdown),&second)||reinterpret_cast<std::uintptr_t>(second.dli_fbase)!=api.image.bias)
