@@ -195,7 +195,7 @@ def abi_check(folder, logs, env):
         # for that step and the existing cross-binutils for actual ARM assembly;
         # CI need not install a full cross compiler for a source/CFI control.
         expanded = target.with_suffix('.s')
-        result = common.recorded_run(['gcc', '-E', '-P', '-x', 'assembler-with-cpp',
+        result = common.recorded_run(['gcc', '-E', '-P', '-x', 'assembler-with-cpp', '-D__aarch64__=1',
             *definitions, str(source), '-o', str(expanded)], folder, logs, label+'_preprocess', 30, env)
         if result.returncode:
             return result
