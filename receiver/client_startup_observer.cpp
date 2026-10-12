@@ -14,6 +14,11 @@ extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_init_
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_vr_shutdown_entry();
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_init_entry();
 extern "C" __attribute__((weak,visibility("hidden"))) void frame_import_destroy_entry();
+#if defined(FRAME_CLIENT_CONNECT_OBSERVATION)
+extern "C" __attribute__((visibility("hidden"))) void frame_import_lock_entry();
+extern "C" __attribute__((visibility("hidden"))) void frame_import_unlock_entry();
+extern "C" __attribute__((visibility("hidden"))) void frame_import_connect_entry();
+#endif
 // glibc's public pthread_atfork ABI uses its own libpthread_nonshared wrapper
 // on the reviewed build. Validate the real registration provider cold, too.
 extern "C" int __register_atfork(void(*)(void),void(*)(void),void(*)(void),void*) noexcept;
@@ -91,7 +96,12 @@ bool read_envelope(const char* name,std::array<std::uint8_t,kEnvelopeBytes>& byt
 }
 bool decode(const std::array<std::uint8_t,kEnvelopeBytes>& b,frame_import_main::Profiles& profiles,
             frame_import_module::ProfileBlob& client,frame_client_startup::ClientSlot& slot) noexcept {
-    if(std::memcmp(b.data(),"FCSTART1",8)!=0||little(b.data()+8,4)!=1||little(b.data()+12,4)!=b.size())return false;
+#if defined(FRAME_CLIENT_CONNECT_OBSERVATION)
+    constexpr auto envelope_magic="FCCONN01";constexpr unsigned envelope_schema=2;
+#else
+    constexpr auto envelope_magic="FCSTART1";constexpr unsigned envelope_schema=1;
+#endif
+    if(std::memcmp(b.data(),envelope_magic,8)!=0||little(b.data()+8,4)!=envelope_schema||little(b.data()+12,4)!=b.size())return false;
     std::memcpy(profiles.reviewed_observer_identity.data(),b.data()+16,32);
     std::memcpy(slot.loader_name.data(),b.data()+48,slot.loader_name.size());
     std::size_t end=0;while(end<slot.loader_name.size()&&slot.loader_name[end])++end;
@@ -169,6 +179,14 @@ void record(Line& line,const frame_client_startup::Record& r) noexcept {
     view("audit_observer",r.audit_bindings.observer);view("audit_libc",r.audit_bindings.libc);
     view("audit_client",r.audit_bindings.client);view("retired_module",r.retired_view);
     line.add(",\"audit_function\":%u,\"audit_original\":\"%llx\"",unsigned(r.audit_bindings.function),u(r.audit_bindings.original));
+    const bool connect_observed=r.connection.kind==frame_client_connect::Kind::NativeConnectCall;
+    line.add(",\"connection\":{\"kind\":%u,\"supported_connect_observed\":%s,\"native_connect_succeeded\":%s,"
+             "\"argument_fd\":%d,\"native_result\":%d,\"errno\":%d,\"reason\":%u,"
+             "\"continuous_connection_owned\":false,\"local_socket_lifetime_observed\":false,\"credentials_observed\":false,"
+             "\"native_cross_process_namespace\":false,\"private_bytes_read\":0}",
+        unsigned(r.connection.kind),connect_observed?"true":"false",
+        connect_observed&&r.connection.native_result==0?"true":"false",r.connection.argument_fd,r.connection.native_result,
+        r.connection.preserved_errno,unsigned(r.connection.reason));
     line.add(",\"actual_init_token\":%u,\"actual_native_result\":%d,\"errno\":%d,\"gate_refusal\":%u,\"refusal\":%u,"
              "\"source_frame_proven\":false,\"native_namespace_proven\":false,\"accepted_submit_proven\":false,\"gpu_proven\":false}\n",
         r.actual_init_token,r.actual_native_result,r.preserved_errno,unsigned(r.gate_refusal),unsigned(r.refusal));
@@ -177,7 +195,12 @@ void* write_background(void*) noexcept {
     const int fd=open_output();if(fd<0){disarm_owned();return nullptr;}
     std::size_t bytes=0,records=0;const auto started=now();const char* end="stopped";
     Line header;header.add("{\"schema\":1,\"capture\":\"client_startup\",\"pid\":%ld,\"local_process_label\":%llu,\"reviewed_observer_profile\":\"",long(getpid()),static_cast<unsigned long long>(local_process_label));
-    header.hex(reviewed_observer);header.add("\",\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120,\"mask_enabled\":false}\n");
+    header.hex(reviewed_observer);header.add("\",\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120,\"mask_enabled\":false");
+#if defined(FRAME_CLIENT_CONNECT_OBSERVATION)
+    header.add(",\"connect_register_observation\":true,\"connect_private_bytes_read\":0}\n");
+#else
+    header.add(",\"connect_register_observation\":false}\n");
+#endif
     if(!header.valid||!write_owned(fd,header.bytes.data(),header.used)){close(fd);disarm_owned();return nullptr;}bytes=header.used;
     while(owned_process()&&!stopping.load(std::memory_order_acquire)) {
         const auto time=now();if(!started||!time||time<started||time-started>=kDurationNs){end="deadline";break;}
@@ -214,6 +237,11 @@ __attribute__((constructor)) void begin_observer() noexcept {
     setup.hidden_shutdown_entry=reinterpret_cast<std::uintptr_t>(&frame_import_vr_shutdown_entry);
     setup.hidden_mutex_init_entry=reinterpret_cast<std::uintptr_t>(&frame_import_init_entry);
     setup.hidden_mutex_destroy_entry=reinterpret_cast<std::uintptr_t>(&frame_import_destroy_entry);
+#if defined(FRAME_CLIENT_CONNECT_OBSERVATION)
+    setup.hidden_mutex_lock_entry=reinterpret_cast<std::uintptr_t>(&frame_import_lock_entry);
+    setup.hidden_mutex_unlock_entry=reinterpret_cast<std::uintptr_t>(&frame_import_unlock_entry);
+    setup.hidden_connect_entry=reinterpret_cast<std::uintptr_t>(&frame_import_connect_entry);
+#endif
     if(!frame_client_startup::initialize_once(prepared,client,setup)){errno=saved;return;}
     if(!register_child_retirement(prepared)){frame_client_startup::finalize();errno=saved;return;}
     reviewed_observer=profiles.reviewed_observer_identity;active.store(true,std::memory_order_release);

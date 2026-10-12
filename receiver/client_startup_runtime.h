@@ -4,6 +4,7 @@
 #include "../import/import_forwarding.h"
 #include "../import/import_startup_forwarding.h"
 #include "../import/import_startup_gate.h"
+#include "../import/client_connect_observation.h"
 
 namespace frame_client_startup {
 
@@ -21,15 +22,18 @@ struct Setup {
     std::uintptr_t hidden_init_entry=0,hidden_shutdown_entry=0;
     ClientSlot client{};
     std::uintptr_t hidden_mutex_init_entry=0,hidden_mutex_destroy_entry=0;
+    // All zero retains startup-only scope; partial connection opt-in is refused.
+    std::uintptr_t hidden_mutex_lock_entry=0,hidden_mutex_unlock_entry=0,hidden_connect_entry=0;
 };
 enum class Refusal : unsigned {
     None,Unprepared,MainPreparation,ClientProfile,Setup,Providers,Subscriber,
     Audit,Stack,Gate,ClientName,ClientGeometry,RecordLoss,NotificationLoss,
-    InitializationFailure,Shutdown,Unload,Finalized,MutexProvider,ClientBinding
+    InitializationFailure,Shutdown,Unload,Finalized,MutexProvider,ClientBinding,
+    ConnectionScope,ObjectDestroyed,ObjectReinitialized
 };
 enum class Kind : unsigned {
     Prepared,AuditAttached,InitBefore,ClientMapped,PipeBorn,InitAfter,
-    InitAbandon,Shutdown,Retire,Refused,Loss,MutexBound
+    InitAbandon,Shutdown,Retire,Refused,Loss,MutexBound,ConnectObserved,ConnectRefused
 };
 struct Record {
     Kind kind=Kind::Refused;
@@ -49,6 +53,8 @@ struct Record {
     int actual_native_result=0,preserved_errno=0;
     frame_import_startup::Refusal gate_refusal=frame_import_startup::Refusal::None;
     Refusal refusal=Refusal::None;
+    // Register-only local invocation evidence, never an FD or namespace lease.
+    frame_client_connect::Outcome connection{};
 };
 struct Status {
     bool prepared=false,audit_attached=false,gate_constructed=false;

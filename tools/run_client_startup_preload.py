@@ -24,6 +24,7 @@ def main():
     parser.add_argument('--providers',required=True,type=Path)
     parser.add_argument('--compiler',default='aarch64-linux-gnu-g++')
     parser.add_argument('--record',required=True,type=Path)
+    parser.add_argument('--connection-observation',action='store_true',help='Verify all five entries in the actual final optional ARM ELF')
     args=parser.parse_args()
     root=Path(__file__).resolve().parents[1]
     receipt={'status':'failed','frame_access':False,'native_openvr':False,'headset':False,
@@ -64,10 +65,12 @@ def main():
                 command=[str(qemu),'-L',str(prefix)]
                 for key,value in values.items():command+=['-E',key+'='+value]
                 command += [str(executable),str(observer),str(prefix/'lib/libc.so.6')]
+                if args.connection_observation:command += ['--connection']
                 result=common.recorded_run(command,folder,receipt['logs'],name,15,clean)
                 if result.returncode:raise SystemExit(name+' failed: '+result.stdout[-3000:]+result.stderr[-3000:])
                 results=[json.loads(line[7:]) for line in result.stdout.splitlines() if line.startswith('RESULT=')]
-                if len(results)!=1 or results[0].get('checks')!=20 or output.exists():
+                expected_checks=29 if args.connection_observation else 21
+                if len(results)!=1 or results[0].get('checks')!=expected_checks or output.exists():
                     raise SystemExit('Incomplete inert/preload or unexpected output evidence: '+name)
                 receipt['cases'][name]=results[0]
             receipt['status']='passed'

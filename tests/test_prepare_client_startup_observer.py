@@ -32,7 +32,8 @@ FRAME_DIRECTORY = '/home/steamos/.local/share/GloomhavenVR/frame-client-startup'
 
 
 def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
-                     bridge_visibility=0, entry_visibility=2, mutex_visibility=2, dynamic_tls=False):
+                     bridge_visibility=0, entry_visibility=2, mutex_visibility=2, dynamic_tls=False,
+                     connection=False):
     """Construct bounded own metadata; no executable native code is included."""
     raw = bytearray(0x4000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
@@ -46,6 +47,7 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
     dynamic = [(tool.BRIDGE, 0x220, 1, bridge_visibility),
                ('pthread_mutex_init', 0x230 + (4 if alias_rva else 0), 1, 0),
                ('pthread_mutex_destroy', 0x240, 1, 0)]
+    if connection:dynamic += [('pthread_mutex_lock',0x250,1,0),('pthread_mutex_unlock',0x260,1,0),('connect',0x270,1,0)]
     if extra_export:
         dynamic.append((extra_export, 0x250, 1, 0))
     imports = [name.split('@')[0] for name in tool.ALIASES if name != missing_alias]
@@ -66,10 +68,10 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
         versions.append(2)
     statstr = bytearray(b'\0')
     symtab = bytearray(24)
-    for index, name in enumerate(tool.ENTRIES + ('frame_import_init_entry', 'frame_import_destroy_entry')):
+    for index, name in enumerate(tool.ENTRIES + tool.MUTEX_ENTRIES + (tool.CONNECTION_ENTRIES if connection else ())):
         off = len(statstr)
         statstr += name.encode() + b'\0'
-        rva = (0x200, 0x210, 0x230, 0x240)[index]
+        rva = (0x200, 0x210, 0x230, 0x240,0x250,0x260,0x270)[index]
         symtab += struct.pack('<IBBHQQ', off, 0x12, entry_visibility if index<2 else mutex_visibility, 1, rva, 4)
     verneed = struct.pack('<HHIII', 1, 1, offsets['libc.so.6'], 16, 0)
     verneed += struct.pack('<IHHII', 0, 0, 2, offsets['GLIBC_2.17'], 0)
@@ -90,6 +92,32 @@ def observer_fixture(*, extra_export=None, missing_alias=None, alias_rva=False,
 
 
 class PreparationTests(unittest.TestCase):
+    def test_connection_scope_requires_explicit_matching_elf(self):
+        legacy=observer_fixture();connection=observer_fixture(connection=True)
+        with self.assertRaises(ValueError):
+            tool.validate_observer(connection,tool.digest(connection).hex(),set(tool.ALIASES))
+        with self.assertRaises(ValueError):
+            tool.validate_observer(legacy,tool.digest(legacy).hex(),set(tool.ALIASES),connection_observation=True)
+        _,report=tool.validate_observer(connection,tool.digest(connection).hex(),set(tool.ALIASES),connection_observation=True)
+        self.assertTrue(report['connection_register_observation'])
+        self.assertEqual(report['hidden_connection_entries'],dict(zip(tool.CONNECTION_ENTRIES,(0x250,0x260,0x270))))
+        self.assertEqual(report['public_mutex_aliases']['connect'],0x270)
+        with self.assertRaises(ValueError):
+            raw=observer_fixture(connection=True,alias_rva=True)
+            tool.validate_observer(raw,tool.digest(raw).hex(),set(tool.ALIASES),connection_observation=True)
+
+    def test_connection_envelope_and_audit_are_distinct_non_activating_scope(self):
+        legacy=tool._assemble([bytes(2032)]*5,bytes(1064),bytes(32),CLIENT_NAME,(0,0x60699a))
+        conn=tool._assemble([bytes(2032)]*5,bytes(1064),bytes(32),CLIENT_NAME,(0,0x60699a),connection_observation=True)
+        self.assertEqual(len(conn),11800)
+        self.assertEqual(conn[:16],b'FCCONN01'+struct.pack('<II',2,11800))
+        self.assertEqual(conn[16:],legacy[16:])
+        args=((0,2),(0,3),(0,4),(0,5),1,API_NAME,CLIENT_NAME,FRAME_DIRECTORY+'/'+tool.MAIN,(0,6),LIBC_NAME)
+        self.assertNotIn('0x87370',tool.audit_source(*args))
+        source=tool.audit_source(*args,connection_observation=True)
+        self.assertIn('0x87370,0x88f74,0xebcb0',source)
+        self.assertNotIn('0xda610',source)
+
     def test_own_observer_metadata_has_exact_reviewed_exports_and_imports(self):
         raw = observer_fixture()
         elf, report = tool.validate_observer(raw, tool.digest(raw).hex(), set(tool.ALIASES))

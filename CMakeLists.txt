@@ -13,6 +13,8 @@ option(FRAME_MASK_BUILD_STARTUP_AUDIT
     "Build an uninstalled startup audit bridge with inactive default preparation" OFF)
 option(FRAME_MASK_BUILD_CLIENT_STARTUP
     "Build the uninstalled, source-pinned AArch64 passive client startup observer" OFF)
+option(FRAME_MASK_CLIENT_CONNECT_OBSERVATION
+    "Add opt-in register-only supported-connect observations; no socket lifetime or pixels" OFF)
 set(FRAME_MASK_IMPORT_QEMU "" CACHE FILEPATH "Explicit local qemu-aarch64 for optional native ABI checks")
 set(FRAME_MASK_IMPORT_PROVIDERS "" CACHE PATH "Private pinned Frame libc/loader prefix for native ABI checks")
 set(FRAME_MASK_IMPORT_CLIENT_PROFILE "" CACHE FILEPATH "Private prepared client hash/layout profile")
@@ -28,9 +30,15 @@ if(FRAME_MASK_BUILD_CLIENT_STARTUP)
     endif()
     find_package(Threads REQUIRED)
     enable_language(ASM)
+    if(FRAME_MASK_CLIENT_CONNECT_OBSERVATION)
+        set(client_libc_entries import/native_connection_entry.S)
+    else()
+        set(client_libc_entries import/native_mutex_entry.S)
+    endif()
     add_library(frame_client_startup SHARED
         receiver/client_startup_observer.cpp receiver/client_startup_runtime.cpp
-        import/native_mutex_entry.S import/native_startup_entry.S
+        ${client_libc_entries} import/native_startup_entry.S
+        import/client_connect_observation.cpp
         import/import_forwarding.cpp import/import_startup_forwarding.cpp
         import/import_main_preparation.cpp import/import_loader_reader.cpp
         import/import_module_identity.cpp import/import_startup_gate.cpp
@@ -41,6 +49,9 @@ if(FRAME_MASK_BUILD_CLIENT_STARTUP)
         -fexceptions -fno-rtti)
     target_link_options(frame_client_startup PRIVATE -Wl,--no-undefined)
     target_link_libraries(frame_client_startup PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    if(FRAME_MASK_CLIENT_CONNECT_OBSERVATION)
+        target_compile_definitions(frame_client_startup PRIVATE FRAME_CLIENT_CONNECT_OBSERVATION=1)
+    endif()
 endif()
 if(FRAME_MASK_BUILD_STARTUP_AUDIT)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -211,6 +222,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_entry_abi.py
             --source ${CMAKE_CURRENT_SOURCE_DIR}/import/native_import_entry.S --mutex)
         set_tests_properties(import_startup_mutex_entry_abi PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME client_connect_entry_abi COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_entry_abi.py
+            --source ${CMAKE_CURRENT_SOURCE_DIR}/import/native_import_entry.S --connection)
+        set_tests_properties(client_connect_entry_abi PROPERTIES SKIP_RETURN_CODE 77)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(test_import_module_identity tests/test_import_module_identity.cpp
                 import/import_module_identity.cpp)
@@ -225,6 +240,7 @@ if(BUILD_TESTING)
             add_test(NAME import_startup_provider_forwarding COMMAND test_import_startup_forwarding)
             if(NOT CMAKE_CROSSCOMPILING)
                 set(client_startup_core_sources receiver/client_startup_runtime.cpp
+                    import/client_connect_observation.cpp
                     import/import_main_preparation.cpp import/import_loader_reader.cpp
                     import/import_module_identity.cpp import/import_startup_gate.cpp
                     import/native_client_birth.cpp import/import_pipe_epoch.cpp
@@ -235,6 +251,11 @@ if(BUILD_TESTING)
                 target_compile_options(test_client_startup_runtime PRIVATE -Wall -Wextra -Wpedantic -fexceptions)
                 target_link_libraries(test_client_startup_runtime PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
                 add_test(NAME client_startup_readiness COMMAND test_client_startup_runtime)
+                add_executable(test_client_connect_observation tests/test_client_connect_observation.cpp
+                    import/client_connect_observation.cpp)
+                target_include_directories(test_client_connect_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+                target_compile_options(test_client_connect_observation PRIVATE -Wall -Wextra -Wpedantic)
+                add_test(NAME client_connect_register_observation COMMAND test_client_connect_observation)
                 # Host controls deliberately contain no native public aliases
                 # or fabricated Ready. Actual ARM aliases are checked separately
                 # with the explicitly supplied final ELF and pinned providers.
@@ -259,6 +280,9 @@ if(BUILD_TESTING)
                 add_test(NAME import_startup_deepbind_binding COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py --deepbind
                     --record ${CMAKE_CURRENT_BINARY_DIR}/import-startup-deepbind-validation.json)
+                add_test(NAME client_connect_audit_binding COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_import_startup_audit.py --connection
+                    --record ${CMAKE_CURRENT_BINARY_DIR}/client-connect-audit-validation.json)
             endif()
             if(NOT CMAKE_CROSSCOMPILING)
                 add_library(import_loader_fixture SHARED tests/test_import_loader_reader.cpp)

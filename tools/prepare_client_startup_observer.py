@@ -30,6 +30,8 @@ MAX_AUDIT = 256 * 1024
 BRIDGE = 'frame_client_startup_bridge'
 ENTRIES = ('frame_import_vr_init_entry', 'frame_import_vr_shutdown_entry')
 MUTEX_ENTRIES = ('frame_import_init_entry', 'frame_import_destroy_entry')
+CONNECTION_ENTRIES = ('frame_import_lock_entry', 'frame_import_unlock_entry', 'frame_import_connect_entry')
+CONNECTION_RVAS = {'lock':'0x87370','unlock':'0x88f74','connect':'0xebcb0'}
 ALIASES = tuple('__' + name + '@GLIBC_2.17' for name in
                 ('pthread_mutex_init','pthread_mutex_destroy','pthread_mutex_lock','pthread_mutex_unlock',
                  'write','close','read','connect'))
@@ -176,28 +178,32 @@ class Elf:
         return value
 
 
-def validate_observer(data,reviewed_sha,provider_exports):
+def validate_observer(data,reviewed_sha,provider_exports,*,connection_observation=False):
     if not re.fullmatch('[0-9a-f]{64}',reviewed_sha or '') or digest(data).hex()!=reviewed_sha:
         raise ValueError('Main observer differs from separately reviewed SHA-256')
     elf=Elf(data)
     forbidden={'dlopen','dlmopen','dlsym','execve','execveat'}
     if any(s['name'].startswith('VR_') or s['name'] in forbidden for s in elf.exported()):
         raise ValueError('Observer invents or interposes an unsupported public API')
-    if {s['name'] for s in elf.exported()}!={BRIDGE,'pthread_mutex_init','pthread_mutex_destroy'}:
+    public={BRIDGE,'pthread_mutex_init','pthread_mutex_destroy'}
+    if connection_observation:public.update(('pthread_mutex_lock','pthread_mutex_unlock','connect'))
+    if {s['name'] for s in elf.exported()}!=public:
         raise ValueError('Observer exports an unexpected public entry')
     if any('openvr' in name or 'vrclient' in name for name in elf.needed):
         raise ValueError('Observer forces an API/client dependency')
     bridge=elf.function(BRIDGE,True)
     if bridge['binding']!=1 or bridge['visibility']!=0 or bridge['version']:
         raise ValueError('Own bridge is not an exported unversioned default-visible function')
-    entries={};mutex_entries={}
-    for name in ENTRIES+MUTEX_ENTRIES:
+    entries={};mutex_entries={};connection_entries={}
+    for name in ENTRIES+MUTEX_ENTRIES+(CONNECTION_ENTRIES if connection_observation else ()):
         symbol=elf.function(name)
         if any(s['name']==name for s in elf.exported()) or not any(s['name']==name and (s['binding']==0 or s['visibility']==2) for s in elf.symbols):
             raise ValueError('Native startup entry is not hidden '+name)
-        (entries if name in ENTRIES else mutex_entries)[name]=symbol['rva']
+        (entries if name in ENTRIES else mutex_entries if name in MUTEX_ENTRIES else connection_entries)[name]=symbol['rva']
     mutex_aliases={}
-    for public,hidden in (('pthread_mutex_init','frame_import_init_entry'),('pthread_mutex_destroy','frame_import_destroy_entry')):
+    pairs=[('pthread_mutex_init','frame_import_init_entry'),('pthread_mutex_destroy','frame_import_destroy_entry')]
+    if connection_observation:pairs += [('pthread_mutex_lock','frame_import_lock_entry'),('pthread_mutex_unlock','frame_import_unlock_entry'),('connect','frame_import_connect_entry')]
+    for public,hidden in pairs:
         alias=elf.function(public,True);target=elf.function(hidden)
         if alias['binding']!=1 or alias['visibility']!=0 or alias['version'] or alias['rva']!=target['rva'] or alias['size']!=target['size']:
             raise ValueError('Public mutex entry is not an exact native-entry alias')
@@ -214,6 +220,7 @@ def validate_observer(data,reviewed_sha,provider_exports):
     if '__tls_get_addr' in {name.split('@')[0] for name in imports}:raise ValueError('Dynamic TLS in startup observer')
     return elf,{'sha256':reviewed_sha,'bytes':len(data),'bridge_rva':bridge['rva'],'hidden_entries':entries,
                 'hidden_mutex_entries':mutex_entries,
+                'hidden_connection_entries':connection_entries,'connection_register_observation':connection_observation,
                 'public_mutex_aliases':mutex_aliases,'required_aliases':list(ALIASES),'versioned_glibc_imports':sorted(versioned)}
 
 
@@ -247,15 +254,16 @@ def validate_profiles(blobs,client_blob,reviewed):
         raise ValueError('Client profile is not the canonical source descriptor')
 
 
-def _assemble(blobs,client_blob,reviewed,name,rx):
+def _assemble(blobs,client_blob,reviewed,name,rx,*,connection_observation=False):
     raw=loader_name(name)
     if not 0<=rx[0]<rx[1]<2**64:raise ValueError('Client executable interval')
-    result=b'FCSTART1'+struct.pack('<II',1,ENVELOPE_BYTES)+reviewed+raw+bytes(512-len(raw))+struct.pack('<QQ',*rx)+b''.join(blobs)+client_blob
+    magic,schema=(b'FCCONN01',2) if connection_observation else (b'FCSTART1',1)
+    result=magic+struct.pack('<II',schema,ENVELOPE_BYTES)+reviewed+raw+bytes(512-len(raw))+struct.pack('<QQ',*rx)+b''.join(blobs)+client_blob
     if len(result)!=ENVELOPE_BYTES:raise ValueError('Envelope schema size changed')
     return result
 
 
-def encode_envelope(blobs,client_blob,reviewed,name,rx):
+def encode_envelope(blobs,client_blob,reviewed,name,rx,*,connection_observation=False):
     validate_profiles(blobs,client_blob,reviewed)
     # Bind the copied ClientSlot geometry to the canonical descriptor itself,
     # not merely to a caller-supplied pair of plausible offsets.
@@ -266,10 +274,10 @@ def encode_envelope(blobs,client_blob,reviewed,name,rx):
         if ph[0]==1 and ph[1]&1 and ph[3]<=client.CALLER_RVA<ph[3]+ph[5]:
             spans.append((ph[3],ph[3]+ph[5]))
     if spans!=[tuple(rx)]:raise ValueError('ClientSlot differs from the canonical caller-containing interval')
-    return _assemble(blobs,client_blob,reviewed,name,rx)
+    return _assemble(blobs,client_blob,reviewed,name,rx,connection_observation=connection_observation)
 
 
-def audit_source(receiver_rx,api_rx,observer_rx,client_rx,bridge,api_name,client_name,observer_path,libc_rx,libc_name):
+def audit_source(receiver_rx,api_rx,observer_rx,client_rx,bridge,api_name,client_name,observer_path,libc_rx,libc_name,*,connection_observation=False):
     loader_name(api_name);loader_name(client_name);loader_name(libc_name)
     # Octal UTF-8 bytes preserve the exact public loader name, including names
     # JSON would represent as surrogate escapes invalid in a C++ literal.
@@ -279,7 +287,7 @@ def audit_source(receiver_rx,api_rx,observer_rx,client_rx,bridge,api_name,client
             'const Preparation* preparation() noexcept {\nstatic const Preparation p = {'+
             ','.join((module('',receiver_rx),module(api_name,api_rx),module(observer_path,observer_rx)))+
             f',{bridge},0x5768,0x5330,true,'+module(client_name,client_rx)+','+module(libc_name,libc_rx)+
-            ',0x86a00,0x86980};\nreturn &p;\n}\n}\n')
+            ',0x86a00,0x86980'+(',0x87370,0x88f74,0xebcb0' if connection_observation else '')+'};\nreturn &p;\n}\n}\n')
 
 
 def private_write(path,data):
@@ -287,7 +295,7 @@ def private_write(path,data):
     with os.fdopen(fd,'wb') as stream:stream.write(data)
 
 
-def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,client_name,*,libc_name=None,home='/home/steamos',compiler='aarch64-linux-gnu-g++',api_file=None):
+def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,client_name,*,libc_name=None,home='/home/steamos',compiler='aarch64-linux-gnu-g++',api_file=None,connection_observation=False):
     frame=user_directory(frame_directory,home);loader_name(api_name);loader_name(client_name);loader_name(libc_name)
     loader_name(str(frame/MAIN))
     if len({api_name,client_name,libc_name,str(frame/MAIN)})!=4:raise ValueError('Module loader-name collision')
@@ -308,14 +316,16 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
     # Authenticate borrowed native inputs before interpreting extra metadata.
     native_elfs={role:Elf(data) for role,data in inputs.items()}
     providers=export_versions(native_elfs[3])|export_versions(native_elfs[4])
-    main_elf,main_report=validate_observer(main_data,reviewed_sha,providers)
+    main_elf,main_report=validate_observer(main_data,reviewed_sha,providers,connection_observation=connection_observation)
     rx=Elf(client_data).rx(client.CALLER_RVA)
     reviewed=profiles[4][-32:]
-    envelope=encode_envelope(profiles,client_blob,reviewed,client_name,rx)
+    envelope=encode_envelope(profiles,client_blob,reviewed,client_name,rx,connection_observation=connection_observation)
     for name,rva,size in (('VR_InitInternal2',0x5768,236),('VR_ShutdownInternal',0x5330,192)):
         actual=native_elfs[2].function(name,True)
         if actual['rva']!=rva or actual['size']!=size:raise ValueError('Native public API schema changed')
-    for name,rva,size in (('pthread_mutex_init',0x86a00,556),('pthread_mutex_destroy',0x86980,56)):
+    native_functions=[('pthread_mutex_init',0x86a00,556),('pthread_mutex_destroy',0x86980,56)]
+    if connection_observation:native_functions += [('pthread_mutex_lock',0x87370,760),('pthread_mutex_unlock',0x88f74,20),('connect',0xebcb0,208)]
+    for name,rva,size in native_functions:
         actual=native_elfs[3].function(name,True);alias=native_elfs[3].function('__'+name,True)
         if (actual['rva'],actual['size'],actual['version'])!=(rva,size,'GLIBC_2.17') or \
            (alias['rva'],alias['size'],alias['version'])!=(rva,size,'GLIBC_2.17'):
@@ -323,7 +333,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
     if 'libopenvr_api.so' not in native_elfs[1].needed or 'vrclient.so' in native_elfs[1].needed:
         raise ValueError('Receiver startup dependency changed')
     source=audit_source(native_elfs[1].rx(),native_elfs[2].rx(),main_elf.rx(),rx,main_report['bridge_rva'],api_name,client_name,
-                        str(frame/MAIN),native_elfs[3].rx(),libc_name)
+                        str(frame/MAIN),native_elfs[3].rx(),libc_name,connection_observation=connection_observation)
     logs={};compiler_args=shlex.split(compiler)
     if not compiler_args:raise ValueError('Explicit cross compiler required')
     with tempfile.TemporaryDirectory(prefix='frame-client-startup-packaging-') as temporary:
@@ -355,8 +365,11 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
               'frame_access':False,'network_access':False,'native_binary_or_script_changes':False,'source_frame_associated':False,'gpu_coherent':False,
               'frame_directory':str(frame),'frame_user_home':home,'directory_mode':'0700','observer':main_report,'audit':{'bytes':len(audit_data),'sha256':digest(audit_data).hex(),'imports':[],
               'native_api_rvas':{'init':'0x5768','shutdown':'0x5330'},
+              'native_connection_rvas':CONNECTION_RVAS if connection_observation else {},
               'native_mutex_rvas':{'init':'0x86a00','destroy':'0x86980'},'default_inactive_without_prepared_tu':True},
-              'envelope':{'bytes':len(envelope),'sha256':digest(envelope).hex(),'schema':1,'reviewed_observer_profile_identity':reviewed.hex(),'module_count':5},
+              'connection_register_observation':connection_observation,
+              'connection_private_bytes_read':0,'continuous_connection_owned':False,
+              'envelope':{'bytes':len(envelope),'sha256':digest(envelope).hex(),'schema':2 if connection_observation else 1,'reviewed_observer_profile_identity':reviewed.hex(),'module_count':5},
               'client_slot':{'exact_loader_name':client_name,'rx_rva_begin':rx[0],'rx_rva_end':rx[1],'canonical_profile_sha256':client_blob[-32:].hex()},
               'libc_slot':{'exact_loader_name':libc_name,'rx_rva_begin':native_elfs[3].rx()[0],'rx_rva_end':native_elfs[3].rx()[1]},
               'loader_name_provenance':'Explicit expected raw names supplied for offline preparation; not observed link-map lifetimes or deployment authorization',
@@ -367,6 +380,7 @@ def prepare(native_dir,observer,reviewed_sha,output,frame_directory,api_name,cli
                                                     'scope':'This metadata receipt is not a deployed artifact'},
               'audit_source_sha256':digest(source.encode()).hex(),'audit_compile_command':command,'logs':logs,
               'scope':['public init/shutdown forwarding','local mapped module identity','source-verified generic native pipe birth',
+                       *(['actual supported connect-entry register snapshot and original result under observed native lock; no extra private memory reads'] if connection_observation else []),
                        'copied lifecycle/refusal facts; no pixels, shader replacement, endpoint pairing, mask frame, UV or GPU proof'],
               'before_activation':['Fresh actual runtime provider/receiver hashes and loader names','Separately reviewed final observer source/ELF and fingerprints',
                                    'Exact owned user-directory files; no foreign preload/audit/service override','Explicit permission and coordinated service restart readiness'],
@@ -392,10 +406,12 @@ def main():
     parser.add_argument('--client-loader-name',required=True)
     parser.add_argument('--libc-loader-name',required=True,help='Explicit expected raw libc loader name; kernel-map pathname alone is not a link-map proof')
     parser.add_argument('--compiler',default='aarch64-linux-gnu-g++')
+    parser.add_argument('--connection-observation',action='store_true',help='Separate offline scope: register-only supported connect calls; never continuous FD ownership')
     args=parser.parse_args()
     try:
         plan=prepare(args.native_dir,args.observer,args.observer_sha256,args.output,args.frame_directory,args.api_loader_name,args.client_loader_name,
-                     libc_name=args.libc_loader_name,home=args.frame_user_home,compiler=args.compiler,api_file=args.api)
+                     libc_name=args.libc_loader_name,home=args.frame_user_home,compiler=args.compiler,api_file=args.api,
+                     connection_observation=args.connection_observation)
     except (OSError,ValueError,struct.error) as error:parser.exit(1,'Offline bundle refused: '+str(error)+'\n')
     print(json.dumps({'prepared':True,'installed':False,'runtime_authorized':False,'envelope_sha256':plan['envelope']['sha256'],
                       'observer_sha256':plan['observer']['sha256'],'audit_sha256':plan['audit']['sha256']}))

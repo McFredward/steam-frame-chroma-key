@@ -176,7 +176,16 @@ class Session(base.Session):
 
     @staticmethod
     def validate_envelope(data, plan, files, observer):
-        if len(data) != 11800 or data[:8] != b"FCSTART1" or struct.unpack_from("<II", data, 8) != (1, 11800):
+        mode=plan.get("connection_register_observation",False)
+        if type(mode) is not bool: raise RuntimeError("Connection scope must be explicit Boolean metadata")
+        magic, schema=(b"FCCONN01",2) if mode else (b"FCSTART1",1)
+        if mode and (plan.get("connection_private_bytes_read") != 0 or plan.get("continuous_connection_owned") is not False or
+                     plan.get("audit",{}).get("native_connection_rvas") != {"lock":"0x87370","unlock":"0x88f74","connect":"0xebcb0"} or
+                     plan.get("observer",{}).get("connection_register_observation") is not True):
+            raise RuntimeError("Connection scope differs from reviewed register-only observation")
+        if not mode and plan.get("audit",{}).get("native_connection_rvas",{}):
+            raise RuntimeError("Startup-only scope cannot acquire connection providers")
+        if len(data) != 11800 or data[:8] != magic or struct.unpack_from("<II", data, 8) != (schema, 11800):
             raise RuntimeError("Envelope schema changed")
         reviewed = data[16:48]
         if reviewed.hex() != plan["envelope"].get("reviewed_observer_profile_identity"):
@@ -210,13 +219,16 @@ class Session(base.Session):
             plan["client_profile"].get("profile_sha256") != CLIENT_PROFILE):
             raise RuntimeError("Client descriptor/fresh file mismatch")
 
-    def stage(self, path, expected, native, artifacts, *, runtime_scope=False, reviewed_helpers=None,
+    def stage(self, path, expected, native, artifacts, *, runtime_scope=False, connect_scope=False, reviewed_helpers=None,
               reviewed_environment_files=None):
         if not runtime_scope: raise RuntimeError("Separate startup diagnostic scope acknowledgment required")
         self.reject_old_activation();safe_path(self.folder);safe_path(self.dropin)
         if (self.folder.exists() or self.dropin.exists() or self.dropin.is_symlink() or self.pending.exists() or self.pending.is_symlink()):
             raise RuntimeError("Existing session/activation refused")
         files, payloads = self.validate_bundle(path, expected, native, artifacts, reviewed_helpers or {})
+        connection_mode=json.loads(payloads["deployment-plan.json"]).get("connection_register_observation",False)
+        if connection_mode and not connect_scope:
+            raise RuntimeError("Separate register-only connect diagnostic scope acknowledgment required")
         self.command("is-active", UNIT);original = self.state()
         manager = self.reject_environment(original)
         snapshots = self.native_environment_files(original, reviewed_environment_files or {})
@@ -225,6 +237,7 @@ class Session(base.Session):
         with self.lock():
             activation = self.activation()
             manifest = {"schema": SESSION_SCHEMA, "unit": UNIT, "scope_acknowledged": True, "plan_sha256": expected,
+                "connect_register_scope_acknowledged":bool(connection_mode and connect_scope),
                 "original_service": original, "original_manager_environment": manager, "original_environment_files": snapshots,
                 "native_files": files, "activation": {"path": str(self.dropin), "bytes_hex": activation.hex(), "sha256": digest(activation)},
                 "owned_files": {name: digest(data) for name, data in payloads.items()}, "automatic_restart": False}
@@ -267,10 +280,13 @@ class Session(base.Session):
             if digest(data) != NATIVE[role][1] or digest(data) != info["sha256"] or len(data) != info["bytes"]:
                 raise RuntimeError("Native files changed since reviewed staging")
 
-    def activate(self, *, runtime_scope=False, restart_ready=False):
+    def activate(self, *, runtime_scope=False, connect_scope=False, restart_ready=False):
         if not runtime_scope or not restart_ready: raise RuntimeError("Scope and coordinated restart readiness required again")
         with self.lock():
             m = self.manifest();self.verify_owned(m);self.reject_old_activation()
+            connection_mode=json.loads(read_regular(self.folder / "deployment-plan.json",private=True)).get("connection_register_observation",False)
+            if connection_mode and (not connect_scope or m.get("connect_register_scope_acknowledged") is not True):
+                raise RuntimeError("Separate register-only connect scope and its staged acknowledgment required")
             if ((self.folder / "rollback-complete.json").exists() or self.dropin.exists() or self.dropin.is_symlink() or
                     self.pending.exists() or self.pending.is_symlink()):
                 raise RuntimeError("Existing/restored activation cannot be replaced")
@@ -313,9 +329,10 @@ class Session(base.Session):
             raise RuntimeError("Manager environment changed during activation")
         return current
 
-    def start(self, *args, runtime_scope=False, restart_ready=False, **kwargs):
+    def start(self, *args, runtime_scope=False, connect_scope=False, restart_ready=False, **kwargs):
         if not runtime_scope or not restart_ready: raise RuntimeError("Explicit scope and restart readiness required")
-        self.stage(*args, runtime_scope=True, **kwargs);self.activate(runtime_scope=True, restart_ready=True)
+        self.stage(*args, runtime_scope=True, connect_scope=connect_scope, **kwargs)
+        self.activate(runtime_scope=True, connect_scope=connect_scope, restart_ready=True)
 
     def remove_override(self, m):
         owned = bytes.fromhex(m["activation"]["bytes_hex"])
@@ -424,6 +441,7 @@ def main(argv=None):
     p.add_argument("--reviewed-session-helper-sha256");p.add_argument("--reviewed-receiver-helper-sha256")
     p.add_argument("--reviewed-environment-file", action="append", default=[], metavar="PATH=SHA256")
     p.add_argument("--ack-startup-diagnostic-scope", action="store_true")
+    p.add_argument("--ack-connect-register-diagnostic-scope", action="store_true")
     p.add_argument("--ack-steam-client-restart-readiness", action="store_true")
     a = p.parse_args(argv)
     try:
@@ -439,12 +457,14 @@ def main(argv=None):
             reviewed = dict(entry.rsplit("=", 1) for entry in a.reviewed_environment_file)
             if len(reviewed) != len(a.reviewed_environment_file): raise RuntimeError("Duplicate EnvironmentFile arguments")
             kwargs = {"runtime_scope": a.ack_startup_diagnostic_scope,
+                "connect_scope":a.ack_connect_register_diagnostic_scope,
                 "reviewed_helpers": {HELPERS[0]: a.reviewed_session_helper_sha256, HELPERS[1]: a.reviewed_receiver_helper_sha256},
                 "reviewed_environment_files": reviewed}
             if a.mode == "start": kwargs["restart_ready"] = a.ack_steam_client_restart_readiness
             getattr(session, a.mode)(a.reviewed_plan, a.reviewed_plan_sha256, native,
                 {MAIN: a.observer, AUDIT: a.audit, ENVELOPE: a.envelope}, **kwargs)
         elif a.mode == "activate": session.activate(runtime_scope=a.ack_startup_diagnostic_scope,
+                                                    connect_scope=a.ack_connect_register_diagnostic_scope,
                                                     restart_ready=a.ack_steam_client_restart_readiness)
         else: session.rollback(restart_ready=a.ack_steam_client_restart_readiness)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:

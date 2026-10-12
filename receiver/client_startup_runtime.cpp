@@ -10,12 +10,21 @@
 // Versioned aliases are resolved in MAIN at load time, not by the audit DSO.
 extern "C" int frame_client_startup_native_mutex_init(pthread_mutex_t*,const pthread_mutexattr_t*);
 extern "C" int frame_client_startup_native_mutex_destroy(pthread_mutex_t*);
+extern "C" int frame_client_startup_native_mutex_lock(pthread_mutex_t*);
+extern "C" int frame_client_startup_native_mutex_unlock(pthread_mutex_t*);
+extern "C" int frame_client_startup_native_connect(int,const struct sockaddr*,unsigned);
 #if defined(__aarch64__)
 __asm__(".symver frame_client_startup_native_mutex_init,__pthread_mutex_init@GLIBC_2.17");
 __asm__(".symver frame_client_startup_native_mutex_destroy,__pthread_mutex_destroy@GLIBC_2.17");
+__asm__(".symver frame_client_startup_native_mutex_lock,__pthread_mutex_lock@GLIBC_2.17");
+__asm__(".symver frame_client_startup_native_mutex_unlock,__pthread_mutex_unlock@GLIBC_2.17");
+__asm__(".symver frame_client_startup_native_connect,__connect@GLIBC_2.17");
 #elif defined(__x86_64__)
 __asm__(".symver frame_client_startup_native_mutex_init,__pthread_mutex_init@GLIBC_2.2.5");
 __asm__(".symver frame_client_startup_native_mutex_destroy,__pthread_mutex_destroy@GLIBC_2.2.5");
+__asm__(".symver frame_client_startup_native_mutex_lock,__pthread_mutex_lock@GLIBC_2.2.5");
+__asm__(".symver frame_client_startup_native_mutex_unlock,__pthread_mutex_unlock@GLIBC_2.2.5");
+__asm__(".symver frame_client_startup_native_connect,__connect@GLIBC_2.2.5");
 #else
 #error "Startup runtime supports audited ARM64 and inert x86-64 fixtures only"
 #endif
@@ -27,6 +36,7 @@ using Reader=frame_import_loader::Reader;
 using Registry=frame_import_pipe::Registry;
 namespace audit=frame_import_startup_audit;
 namespace forwarding=frame_import_startup_forwarding;
+namespace connection=frame_client_connect;
 constexpr unsigned kQueueCapacity=32;
 enum State : unsigned { Empty,Preparing,Prepared,Attached,Starting,Observing,Completed,Refused };
 struct Slot { std::atomic<unsigned> state{0};Record value{}; };
@@ -42,6 +52,8 @@ struct Runtime {
     frame_import_loader::Iterate iterate=nullptr;
     std::uintptr_t native_init=0,native_shutdown=0;
     std::uintptr_t native_mutex_init=0,native_mutex_destroy=0;
+    std::array<std::uintptr_t,3> native_connection{};
+    bool connection_opt_in=false;
     audit::ModuleView audit_libc{},audit_client{};
     audit::BoundProvider audit_prepared{};
     std::atomic<unsigned> client_binding{0};
@@ -50,9 +62,17 @@ struct Runtime {
     alignas(Gate)std::array<unsigned char,sizeof(Gate)> gate_storage{};
     std::atomic<Registry*> registry{nullptr};
     std::atomic<Gate*> gate{nullptr};
+    alignas(connection::Gate)std::array<unsigned char,sizeof(connection::Gate)> connection_storage{};
+    connection::Target connection_target{}; // Immutable before release publication.
+    std::atomic<connection::Gate*> connection_gate{nullptr};
+    std::atomic<std::uintptr_t> connection_owner{0};
+    std::atomic<unsigned> connection_sample_completed{0};
     Reader* reader=nullptr; // Written/read solely on the startup owner thread.
 };
 Runtime runtime;
+thread_local connection::Scope connection_scope __attribute__((tls_model("initial-exec"))){};
+thread_local bool connection_scope_ready __attribute__((tls_model("initial-exec")))=false;
+thread_local unsigned char connection_owner_marker __attribute__((tls_model("initial-exec")))=0;
 static_assert(std::atomic<unsigned>::is_always_lock_free &&
               std::atomic<std::uint64_t>::is_always_lock_free &&
               std::atomic<Gate*>::is_always_lock_free,"Native callbacks require lock-free publication");
@@ -180,6 +200,20 @@ bool mutex_providers(const frame_import_main::Prepared& prepared) noexcept {
     }
     runtime.native_mutex_init=functions[0];runtime.native_mutex_destroy=functions[1];return true;
 }
+bool connection_providers(const frame_import_main::Prepared& prepared) noexcept {
+    const auto libc=prepared.images()[2];
+    const std::uintptr_t functions[]{reinterpret_cast<std::uintptr_t>(&frame_client_startup_native_mutex_lock),
+        reinterpret_cast<std::uintptr_t>(&frame_client_startup_native_mutex_unlock),
+        reinterpret_cast<std::uintptr_t>(&frame_client_startup_native_connect)};
+    constexpr std::uintptr_t rvas[]{0x87370,0x88f74,0xebcb0};
+    for(unsigned i=0;i<3;++i) {
+        Dl_info info{};std::uintptr_t expected=0;
+        if(!add(libc.bias,rvas[i],expected)||functions[i]!=expected||!within(libc,functions[i])||
+           !prepared.lookup()(reinterpret_cast<const void*>(functions[i]),&info)||
+           reinterpret_cast<std::uintptr_t>(info.dli_fbase)!=libc.bias)return false;
+        runtime.native_connection[i]=functions[i];
+    }return true;
+}
 bool start(const frame_import_native::Entry& entry) noexcept {
     const auto& receiver=runtime.images[0];std::uintptr_t site=0;
     if(!add(receiver.bias,0x2ae94,site) || entry.x[30]!=site || static_cast<std::uint32_t>(entry.x[1])!=1)return false;
@@ -247,7 +281,56 @@ void startup(forwarding::Notification n,void* owner) noexcept {
 }
 void libc(frame_import_forwarding::Notification n,void* owner) noexcept {
     if(owner!=&runtime || runtime.finalized.load(std::memory_order_acquire) ||
-       runtime.retired.load(std::memory_order_acquire) || n.operation!=frame_import_forwarding::Operation::Init || losses())return;
+       runtime.retired.load(std::memory_order_acquire) || losses())return;
+    if(runtime.connection_opt_in && n.operation==frame_import_forwarding::Operation::Init &&
+       n.phase==frame_import_forwarding::Phase::Before && runtime.connection_gate.load(std::memory_order_acquire) &&
+       n.entry.x[0]==runtime.connection_target.object.pipe) {
+        retire(Refusal::ObjectReinitialized);auto copied=record(Kind::ConnectRefused);
+        copied.entry=n.entry;copied.object=runtime.connection_target.object;
+        copied.module=runtime.connection_target.module;enqueue(copied);return;
+    }
+    if(runtime.connection_opt_in && n.operation!=frame_import_forwarding::Operation::Init) {
+        if(auto* observer=runtime.connection_gate.load(std::memory_order_acquire)) {
+            if(n.operation==frame_import_forwarding::Operation::Destroy &&
+               n.phase==frame_import_forwarding::Phase::Before && n.entry.x[0]==runtime.connection_target.object.pipe) {
+                retire(Refusal::ObjectDestroyed);auto copied=record(Kind::ConnectRefused);
+                copied.entry=n.entry;copied.object=runtime.connection_target.object;
+                copied.module=runtime.connection_target.module;enqueue(copied);return;
+            }
+            // Claim only one supported native invocation. This TLS address is
+            // local sampler bookkeeping, never a socket or source-frame ID.
+            // Later native RPC locks, including other caller threads, are not
+            // part of this historical call observation and stay unchanged.
+            if(runtime.connection_sample_completed.load(std::memory_order_acquire))return;
+            const auto owner_id=reinterpret_cast<std::uintptr_t>(&connection_owner_marker);
+            auto sampling_owner=runtime.connection_owner.load(std::memory_order_acquire);
+            if(!sampling_owner) {
+                if(n.operation!=frame_import_forwarding::Operation::Lock ||
+                   n.phase!=frame_import_forwarding::Phase::Before ||
+                   n.entry.x[0]!=runtime.connection_target.object.pipe ||
+                   n.entry.x[19]!=runtime.connection_target.object.pipe ||
+                   n.entry.x[30]!=runtime.connection_target.module.load_bias+0x245ea8)return;
+                if(runtime.connection_owner.compare_exchange_strong(sampling_owner,owner_id,std::memory_order_acq_rel))sampling_owner=owner_id;
+            }
+            if(sampling_owner!=owner_id)return;
+            if(!connection_scope_ready) {
+                connection_scope=connection::Scope::prepare_current();connection_scope_ready=true;
+            }
+            const auto value=observer->observe(n,connection_scope);
+            if(connection_scope.complete())runtime.connection_sample_completed.store(1,std::memory_order_release);
+            if(value.kind!=connection::Kind::None && admission_alive()) {
+                auto copied=record(value.kind==connection::Kind::Rejected?Kind::ConnectRefused:Kind::ConnectObserved);
+                copied.entry=value.entry;copied.connection=value;
+                copied.module=runtime.connection_target.module;
+                copied.object=runtime.connection_target.object;
+                if(value.kind==connection::Kind::Rejected) {
+                    retire(Refusal::ConnectionScope);copied.refusal=runtime.refusal.load(std::memory_order_acquire);
+                }
+                enqueue(copied);
+            }
+        }return;
+    }
+    if(n.operation!=frame_import_forwarding::Operation::Init)return;
     auto* gate=runtime.gate.load(std::memory_order_acquire);if(!gate)return;
     if(n.phase==frame_import_forwarding::Phase::Before) {
         gate->native_init_before(n.entry);
@@ -261,7 +344,14 @@ void libc(frame_import_forwarding::Notification n,void* owner) noexcept {
         const auto object=gate->native_init_after(n.entry,actual);
         if(object.valid()) {
             auto value=record(Kind::PipeBorn);value.entry=n.entry;value.object=object;
-            value.actual_native_result=actual;value.preserved_errno=n.preserved_errno;gate->mapping(value.module);enqueue(value);
+            value.actual_native_result=actual;value.preserved_errno=n.preserved_errno;
+            if(!gate->mapping(value.module)){retire(Refusal::Gate);return;}
+            if(runtime.connection_opt_in && admission_alive()) {
+                runtime.connection_target={value.module,object};
+                auto* observer=new(runtime.connection_storage.data())connection::Gate(runtime.connection_target);
+                runtime.connection_gate.store(observer,std::memory_order_release);
+            }
+            enqueue(value);
         }else if(gate->refusal()!=frame_import_startup::Refusal::None) {
             retire(Refusal::Gate);auto value=record(Kind::Refused);value.entry=n.entry;
             value.gate_refusal=gate->refusal();enqueue(value);
@@ -292,6 +382,16 @@ bool initialize_once(const frame_import_main::Prepared& prepared,
     const std::uintptr_t entries[]{setup.hidden_init_entry,setup.hidden_shutdown_entry,
         setup.hidden_mutex_init_entry,setup.hidden_mutex_destroy_entry};
     for(unsigned i=0;i<4;++i)for(unsigned j=i+1;j<4;++j)if(entries[i]==entries[j])return deny(Refusal::Setup);
+    const std::uintptr_t connection_entries[]{setup.hidden_mutex_lock_entry,setup.hidden_mutex_unlock_entry,setup.hidden_connect_entry};
+    runtime.connection_opt_in=connection_entries[0]||connection_entries[1]||connection_entries[2];
+    if(runtime.connection_opt_in) {
+        for(unsigned i=0;i<3;++i) {
+            if(!within(images[4],connection_entries[i]))return deny(Refusal::Setup);
+            for(const auto entry:entries)if(connection_entries[i]==entry)return deny(Refusal::Setup);
+            for(unsigned j=i+1;j<3;++j)if(connection_entries[i]==connection_entries[j])return deny(Refusal::Setup);
+        }
+        if(!connection_providers(prepared))return deny(Refusal::MutexProvider);
+    }
     bool profile_rx=false;
     for(const auto& segment:runtime.profile.segments)
         if(segment.type==PT_LOAD && (segment.flags&PF_X) &&
@@ -356,10 +456,19 @@ audit::BridgeResponse bridge(audit::BridgeRequest request) noexcept {
         if(!enqueue(value)||!admission_alive())return {};
         return {true,0};
     }
+    const auto function=request.provider.function;
+    const bool connection_function=function==audit::Function::MutexLock||function==audit::Function::MutexUnlock||function==audit::Function::Connect;
     if(request.stage==audit::Stage::Bind&&
-       (request.provider.function==audit::Function::MutexInit||request.provider.function==audit::Function::MutexDestroy)) {
+       (function==audit::Function::MutexInit||function==audit::Function::MutexDestroy||connection_function)) {
         const auto& p=request.provider;std::uintptr_t begin=0,end=0;
         const bool init=p.function==audit::Function::MutexInit;
+        unsigned connection_index=0;
+        if(connection_function) {
+            if(!runtime.connection_opt_in)return {};
+            connection_index=function==audit::Function::MutexLock?0:function==audit::Function::MutexUnlock?1:2;
+        }
+        const auto native=connection_function?runtime.native_connection[connection_index]:
+                          init?runtime.native_mutex_init:runtime.native_mutex_destroy;
         // This callback authenticates ONLY cached scalar provider/lifetime
         // views. Actual client code and stack words are verified later by the
         // source constructor Gate under its real MAIN loader lease.
@@ -367,7 +476,7 @@ audit::BridgeResponse bridge(audit::BridgeRequest request) noexcept {
         if((state!=Observing&&state!=Completed)||!same_view(runtime.audit_libc,p.libc)||
            !same_view(runtime.audit_prepared.receiver,p.receiver)||!same_view(runtime.audit_prepared.api,p.api)||
            !same_view(runtime.audit_prepared.observer,p.observer)||!p.client.observed_open_generation||
-           p.original!=(init?runtime.native_mutex_init:runtime.native_mutex_destroy)||
+           p.original!=native||
            !add(p.client.bias,runtime.setup.client.rx_rva_begin,begin)||
            !add(p.client.bias,runtime.setup.client.rx_rva_end,end)||
            p.client.rx_begin!=begin||p.client.rx_end!=end)return {};
@@ -379,7 +488,10 @@ audit::BridgeResponse bridge(audit::BridgeRequest request) noexcept {
         }
         auto value=record(Kind::MutexBound);value.audit_bindings=p;
         if(!enqueue(value)||!admission_alive())return {};
-        return {true,init?runtime.setup.hidden_mutex_init_entry:runtime.setup.hidden_mutex_destroy_entry};
+        const std::uintptr_t connection_entries[]{runtime.setup.hidden_mutex_lock_entry,
+            runtime.setup.hidden_mutex_unlock_entry,runtime.setup.hidden_connect_entry};
+        return {true,connection_function?connection_entries[connection_index]:
+                     init?runtime.setup.hidden_mutex_init_entry:runtime.setup.hidden_mutex_destroy_entry};
     }
     if(request.stage!=audit::Stage::Bind || runtime.state.load(std::memory_order_acquire)<Attached ||
        !forwarding::provider_matches(request.provider))return {};

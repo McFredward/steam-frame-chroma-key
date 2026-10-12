@@ -44,6 +44,9 @@ int main() {
     request.provider.libc={0x1000,0x2000,0x3000,71};
     request.provider.client={0x4000,0x4000,0x60699a,72};inert(request);
     request.provider.function=audit::Function::MutexDestroy;inert(request);
+    request.provider.function=audit::Function::MutexLock;inert(request);
+    request.provider.function=audit::Function::MutexUnlock;inert(request);
+    request.provider.function=audit::Function::Connect;inert(request);
     request.stage=audit::Stage::Retire;request.retired_module={0x1000,0x2000,0x3000,55};inert(request);
     request.stage=audit::Stage::Loss;inert(request);
 

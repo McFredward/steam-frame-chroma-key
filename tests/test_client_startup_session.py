@@ -124,6 +124,44 @@ class SessionTests(unittest.TestCase):
 
     def restarts(self): return sum("restart" in c for c in self.calls)
 
+    def connection_plan(self):
+        path=self.artifacts[M.ENVELOPE];raw=bytearray(path.read_bytes())
+        raw[:8]=b'FCCONN01';struct.pack_into('<I',raw,8,2);path.write_bytes(raw)
+        sha=M.digest(raw);self.plan['envelope']['sha256']=sha
+        for item in self.plan['inventory']:
+            if item['name']==M.ENVELOPE:item['sha256']=sha
+        self.plan.update(connection_register_observation=True,connection_private_bytes_read=0,continuous_connection_owned=False)
+        self.plan['observer']['connection_register_observation']=True
+        self.plan['audit']['native_connection_rvas']={'lock':'0x87370','unlock':'0x88f74','connect':'0xebcb0'}
+        self.save_plan()
+
+    def test_connection_stage_and_activation_require_distinct_scope(self):
+        self.connection_plan()
+        with self.assertRaisesRegex(RuntimeError,'Separate register-only'):
+            self.stage()
+        self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+        self.stage(connect_scope=True)
+        with self.assertRaisesRegex(RuntimeError,'Separate register-only'):
+            self.session.activate(runtime_scope=True,restart_ready=True)
+        self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),0)
+        self.session.activate(runtime_scope=True,connect_scope=True,restart_ready=True)
+        self.assertEqual(self.restarts(),1)
+        self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.dropin.exists());self.assertEqual(self.restarts(),2)
+
+    def test_connection_start_forwards_scope_but_never_claims_lifetime(self):
+        self.connection_plan();self.start(connect_scope=True)
+        self.assertTrue(self.session.manifest()['connect_register_scope_acknowledged'])
+        self.assertEqual(self.restarts(),1)
+        self.session.rollback(restart_ready=True)
+
+    def test_connection_scope_cannot_claim_extra_memory_or_lifetime(self):
+        for key,value in (('connection_private_bytes_read',8),('continuous_connection_owned',True),('connection_register_observation','true')):
+            self.connection_plan();self.plan[key]=value;self.save_plan()
+            with self.subTest(key=key),self.assertRaises(RuntimeError):
+                self.stage(connect_scope=True)
+            self.assertFalse(self.session.folder.exists());self.assertEqual(self.calls,[])
+
     def test_missing_scope_and_readiness_cannot_create_any_session(self):
         for kwargs in ({"runtime_scope": False}, {"restart_ready": False}):
             with self.assertRaises(RuntimeError): self.start(**kwargs)
