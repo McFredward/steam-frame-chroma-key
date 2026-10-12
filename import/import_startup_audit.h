@@ -7,7 +7,7 @@
 // actual mappings/providers; this bridge performs no discovery or native reads.
 namespace frame_import_startup_audit {
 enum class Function : std::uint8_t { None, Init, Shutdown, MutexInit, MutexDestroy };
-enum class Stage : std::uint8_t { Prepare, Bind, Retire };
+enum class Stage : std::uint8_t { Prepare, Bind, Retire, Loss };
 struct ModuleView {
     std::uintptr_t bias = 0, rx_begin = 0, rx_end = 0;
     // An observed la_objopen lifetime, not a video frame or trusted file hash.

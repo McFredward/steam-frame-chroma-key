@@ -84,7 +84,8 @@ extern "C" __attribute__((visibility("hidden"))) void fixture_owned_shutdown() {
 extern "C" __attribute__((visibility("hidden"))) BridgeResponse fixture_bridge(BridgeRequest request) noexcept {
     const int saved = errno;
     BridgeResponse result{};
-    if (request.stage == Stage::Retire) { ++retires; }
+    if (request.stage == Stage::Loss) { /* No new binding after sticky loss. */ }
+    else if (request.stage == Stage::Retire) { ++retires; }
     else if (request.stage == Stage::Prepare) {
         ++prepares;
         if (owner && original_init && original_shutdown && !request.missed_before_preinit) {
@@ -241,6 +242,341 @@ int main() {
 '''
 
 
+DEEP_CLIENT = r'''
+#include <cerrno>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <cstdint>
+extern "C" void fixture_deep_labels(std::uintptr_t,std::uintptr_t);
+extern "C" void fixture_deep_event(unsigned,std::uintptr_t,std::uintptr_t,int,int);
+extern "C" int fixture_call_mutex_init(pthread_mutex_t*,const pthread_mutexattr_t*);
+extern "C" int fixture_call_mutex_destroy(pthread_mutex_t*);
+extern "C" void fixture_mutex_init_return();
+extern "C" void fixture_mutex_destroy_return();
+#if defined(__aarch64__)
+__asm__(R"(
+.text
+.global fixture_call_mutex_init
+.hidden fixture_call_mutex_init
+.type fixture_call_mutex_init,%function
+fixture_call_mutex_init:
+stp x29,x30,[sp,#-16]!
+mov x29,sp
+bl pthread_mutex_init
+.global fixture_mutex_init_return
+fixture_mutex_init_return:
+ldp x29,x30,[sp],#16
+ret
+.global fixture_call_mutex_destroy
+.hidden fixture_call_mutex_destroy
+.type fixture_call_mutex_destroy,%function
+fixture_call_mutex_destroy:
+stp x29,x30,[sp,#-16]!
+mov x29,sp
+bl pthread_mutex_destroy
+.global fixture_mutex_destroy_return
+fixture_mutex_destroy_return:
+ldp x29,x30,[sp],#16
+ret
+)");
+#else
+__asm__(R"(
+.text
+.global fixture_call_mutex_init
+.hidden fixture_call_mutex_init
+.type fixture_call_mutex_init,@function
+fixture_call_mutex_init:
+push %rbp
+mov %rsp,%rbp
+call pthread_mutex_init@PLT
+.global fixture_mutex_init_return
+fixture_mutex_init_return:
+pop %rbp
+ret
+.global fixture_call_mutex_destroy
+.hidden fixture_call_mutex_destroy
+.type fixture_call_mutex_destroy,@function
+fixture_call_mutex_destroy:
+push %rbp
+mov %rsp,%rbp
+call pthread_mutex_destroy@PLT
+.global fixture_mutex_destroy_return
+fixture_mutex_destroy_return:
+pop %rbp
+ret
+)");
+#endif
+static pthread_mutex_t mutex;
+static pthread_mutexattr_t attr;
+__attribute__((constructor)) static void initialize() {
+    fixture_deep_labels(reinterpret_cast<std::uintptr_t>(&fixture_mutex_init_return),reinterpret_cast<std::uintptr_t>(&fixture_mutex_destroy_return));
+    if(pthread_mutexattr_init(&attr)||pthread_mutexattr_settype(&attr,PTHREAD_MUTEX_RECURSIVE))std::abort();
+    errno=23;const int result=fixture_call_mutex_init(&mutex,&attr);const int saved=errno;
+    const auto queried=dlsym(RTLD_NEXT,"pthread_mutex_init");
+    fixture_deep_event(1,reinterpret_cast<std::uintptr_t>(&mutex),reinterpret_cast<std::uintptr_t>(&attr),result,saved);
+    fixture_deep_event(3,reinterpret_cast<std::uintptr_t>(queried),0,0,0);
+    if(result||pthread_mutex_lock(&mutex)||pthread_mutex_lock(&mutex)||pthread_mutex_unlock(&mutex)||pthread_mutex_unlock(&mutex))std::abort();
+}
+__attribute__((destructor)) static void finalize() {
+    errno=31;const int result=fixture_call_mutex_destroy(&mutex);const int saved=errno;
+    fixture_deep_event(2,reinterpret_cast<std::uintptr_t>(&mutex),0,result,saved);pthread_mutexattr_destroy(&attr);
+}
+'''
+DEEP_OBSERVER = r'''
+#include "import/import_startup_audit.h"
+#include "import/import_forwarding.h"
+#include <cerrno>
+#include <cstdlib>
+#include <cstdint>
+#include <dlfcn.h>
+#include <pthread.h>
+using namespace frame_import_startup_audit;
+static std::uintptr_t expected_init,expected_destroy,native_init,native_destroy;
+static unsigned init_before,init_after,destroy_before,destroy_after,binds,prepare_count;
+static std::uintptr_t init_arg,init_attr,destroy_arg,libc_bias;
+static int init_result,destroy_result,init_errno,destroy_errno;
+static bool reject_hidden,retired;
+static unsigned loss_events,retired_destroy_calls,retired_init_calls;
+extern "C" void fixture_deep_labels(std::uintptr_t a,std::uintptr_t b){expected_init=a;expected_destroy=b;}
+#if defined(__aarch64__)
+extern "C" __attribute__((visibility("hidden"))) void frame_import_init_entry();
+extern "C" __attribute__((visibility("hidden"))) void frame_import_destroy_entry();
+static void notify(frame_import_forwarding::Notification value,void*) noexcept {
+    if(retired){
+        if(value.phase==frame_import_forwarding::Phase::Before&&value.entry.x[30]==expected_destroy&&value.operation==frame_import_forwarding::Operation::Destroy)++retired_destroy_calls;
+        if(value.phase==frame_import_forwarding::Phase::Before&&value.entry.x[30]==expected_init&&value.operation==frame_import_forwarding::Operation::Init)++retired_init_calls;
+        return;
+    }
+    const auto pc=value.entry.x[30];const bool before=value.phase==frame_import_forwarding::Phase::Before;
+    if(pc==expected_init&&value.operation==frame_import_forwarding::Operation::Init) {
+        if(before){++init_before;init_arg=value.entry.x[0];init_attr=value.entry.x[1];}
+        else{++init_after;init_result=static_cast<int>(value.result_bits);init_errno=value.preserved_errno;}
+    }
+    if(pc==expected_destroy&&value.operation==frame_import_forwarding::Operation::Destroy) {
+        if(before){++destroy_before;destroy_arg=value.entry.x[0];}
+        else{++destroy_after;destroy_result=static_cast<int>(value.result_bits);destroy_errno=value.preserved_errno;}
+    }
+}
+#define INIT_ENTRY frame_import_init_entry
+#define DESTROY_ENTRY frame_import_destroy_entry
+#else
+extern "C" int host_real_mutex_init(pthread_mutex_t*,const pthread_mutexattr_t*);
+extern "C" int host_real_mutex_destroy(pthread_mutex_t*);
+__asm__(".symver host_real_mutex_init,__pthread_mutex_init@GLIBC_2.2.5");
+__asm__(".symver host_real_mutex_destroy,__pthread_mutex_destroy@GLIBC_2.2.5");
+extern "C" int pthread_mutex_init(pthread_mutex_t* m,const pthread_mutexattr_t* a) noexcept {
+    const auto pc=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
+    if(pc==expected_init&&retired)++retired_init_calls;
+    if(pc==expected_init&&!retired){++init_before;init_arg=reinterpret_cast<std::uintptr_t>(m);init_attr=reinterpret_cast<std::uintptr_t>(a);}
+    const int result=host_real_mutex_init(m,a);
+    if(pc==expected_init&&!retired){++init_after;init_result=result;init_errno=errno;}return result;
+}
+extern "C" int pthread_mutex_destroy(pthread_mutex_t* m) noexcept {
+    const auto pc=reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
+    if(pc==expected_destroy&&retired)++retired_destroy_calls;
+    if(pc==expected_destroy&&!retired){++destroy_before;destroy_arg=reinterpret_cast<std::uintptr_t>(m);}
+    const int result=host_real_mutex_destroy(m);
+    if(pc==expected_destroy&&!retired){++destroy_after;destroy_result=result;destroy_errno=errno;}return result;
+}
+#define INIT_ENTRY pthread_mutex_init
+#define DESTROY_ENTRY pthread_mutex_destroy
+#endif
+__attribute__((constructor)) static void initialize() {
+    const auto saved=errno;
+    native_init=reinterpret_cast<std::uintptr_t>(dlsym(RTLD_NEXT,"pthread_mutex_init"));
+    native_destroy=reinterpret_cast<std::uintptr_t>(dlsym(RTLD_NEXT,"pthread_mutex_destroy"));
+    Dl_info a{},b{};
+    if(!native_init||!native_destroy||!dladdr(reinterpret_cast<void*>(native_init),&a)||!dladdr(reinterpret_cast<void*>(native_destroy),&b)||a.dli_fbase!=b.dli_fbase)std::abort();
+    libc_bias=reinterpret_cast<std::uintptr_t>(a.dli_fbase);
+    reject_hidden=std::getenv("FIXTURE_BAD_MUTEX_ENTRY")!=nullptr;
+#if defined(__aarch64__)
+    if(!frame_import_forwarding::register_callbacks_before_threads({notify,nullptr},frame_import_forwarding::InitializationGate::OwnedPreparedContext))std::abort();
+#endif
+    errno=saved;
+}
+extern "C" __attribute__((visibility("hidden"))) BridgeResponse fixture_deep_bridge(BridgeRequest r) noexcept {
+    BridgeResponse result{};
+    if(r.stage==Stage::Loss){retired=true;++loss_events;return result;}
+    if(r.stage==Stage::Prepare) {
+        ++prepare_count;
+        result.ready=!r.missed_before_preinit&&r.provider.libc.bias==libc_bias&&r.provider.libc.observed_open_generation!=0;
+    } else if(r.stage==Stage::Bind) {
+        const auto selected=r.provider.function==Function::MutexInit?native_init:native_destroy;
+        if(r.provider.function!=Function::MutexInit&&r.provider.function!=Function::MutexDestroy)return result;
+        ++binds;
+        result.ready=r.provider.original==selected&&r.provider.libc.bias==libc_bias&&
+            r.provider.client.observed_open_generation&&r.provider.libc.observed_open_generation&&
+            r.provider.client.observed_open_generation!=r.provider.libc.observed_open_generation&&
+            r.provider.client.rx_begin<r.provider.client.rx_end;
+        result.hidden_entry=reject_hidden?selected:r.provider.function==Function::MutexInit?
+            reinterpret_cast<std::uintptr_t>(&INIT_ENTRY):reinterpret_cast<std::uintptr_t>(&DESTROY_ENTRY);
+    }
+    return result;
+}
+extern "C" std::uintptr_t fixture_deep_probe(unsigned n) {
+    switch(n){case 0:return init_before;case 1:return init_after;case 2:return destroy_before;case 3:return destroy_after;
+        case 4:return init_arg;case 5:return init_attr;case 6:return destroy_arg;case 7:return init_result;
+        case 8:return destroy_result;case 9:return init_errno;case 10:return destroy_errno;case 11:return binds;
+        case 12:return native_init;case 13:return expected_init;case 14:return expected_destroy;case 15:return prepare_count;case 16:return loss_events;case 17:return retired_destroy_calls;case 18:return retired_init_calls;default:return 0;}
+}
+'''
+DEEP_MAIN = r'''
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <dlfcn.h>
+#include <pthread.h>
+extern "C" std::uintptr_t fixture_deep_probe(unsigned);
+static unsigned init_events,destroy_events;
+static std::uintptr_t init_arg,init_attr,destroy_arg,dynamic_init;
+static void* early;
+extern "C" void fixture_deep_event(unsigned kind,std::uintptr_t a,std::uintptr_t b,int result,int saved) {
+    if(kind==1){++init_events;init_arg=a;init_attr=b;if(result||saved!=23)std::abort();}
+    if(kind==2){++destroy_events;destroy_arg=a;if(result||saved!=31)std::abort();}
+    if(kind==3)dynamic_init=a;
+}
+#ifdef DEEP_EARLY
+__attribute__((constructor)) static void initialize(){early=dlopen(CLIENT_FILE,RTLD_NOW|RTLD_DEEPBIND);if(!early)std::abort();}
+#endif
+int main(int argc,char** argv) {
+    if(argc>1&&!std::strcmp(argv[1],"provider")) {
+        Dl_info d{};if(!dladdr(reinterpret_cast<void*>(fixture_deep_probe(12)),&d))return 9;
+        std::printf("%s\n",d.dli_fname);return 0;
+    }
+    void* handle=dlopen(std::getenv("FIXTURE_FOREIGN_CLIENT")?FOREIGN_FILE:CLIENT_FILE,RTLD_NOW|RTLD_DEEPBIND);
+    if(!handle){std::fprintf(stderr,"DLOPEN: %s\n",dlerror());return 3;}
+    if(early){dlclose(early);early=nullptr;}
+    const bool expected=argc>1&&!std::strcmp(argv[1],"redirect");
+    const bool partial=argc>1&&!std::strncmp(argv[1],"partial_",8);
+    const bool expected_destroy=expected;
+    if(init_events!=1||dynamic_init!=fixture_deep_probe(12)||
+       reinterpret_cast<std::uintptr_t>(dlsym(handle,"fixture_mutex_init_return"))!=fixture_deep_probe(13)||
+       reinterpret_cast<std::uintptr_t>(dlsym(handle,"fixture_mutex_destroy_return"))!=fixture_deep_probe(14))return 4;
+    if(fixture_deep_probe(0)!=(expected?1u:0u)||fixture_deep_probe(1)!=(expected?1u:0u))return 5;
+    if(expected&&(fixture_deep_probe(4)!=init_arg||fixture_deep_probe(5)!=init_attr||fixture_deep_probe(7)||fixture_deep_probe(9)!=23))return 6;
+    dlclose(handle);
+    if(destroy_events!=1||fixture_deep_probe(2)!=(expected_destroy?1u:0u)||fixture_deep_probe(3)!=(expected_destroy?1u:0u))return 7;
+    if(expected_destroy&&(fixture_deep_probe(6)!=destroy_arg||fixture_deep_probe(8)||fixture_deep_probe(10)!=31))return 8;
+    if(partial&&(fixture_deep_probe(16)!=1||fixture_deep_probe(!std::strcmp(argv[1],"partial_destroy")?17:18)!=1))return 10;
+    std::printf("RESULT={\"mutex_redirected\":%s,\"prior_mutex_binding_retained\":%s,\"loss_events\":%llu,\"bindings\":%llu,\"initializers\":%u,\"finalizers\":%u,\"native_results_errno\":true,\"dlsym_native_unchanged\":true,\"caller_pc_exact\":%s}\n",
+        expected?"true":"false",partial?"true":"false",static_cast<unsigned long long>(fixture_deep_probe(16)),static_cast<unsigned long long>(fixture_deep_probe(11)),init_events,destroy_events,expected?"true":"false");
+    return 0;
+}
+'''
+DEEP_CASES = ('deepbind_preload_only','deepbind_redirect','deepbind_wrong_client',
+              'deepbind_wrong_native_rva','deepbind_partial_optin','deepbind_early_client',
+              'deepbind_bad_owned_entry','deepbind_dlsym')
+
+def run_deepbind(args,helper,report,clean):
+    architectures=[] if args.native_only else [('host','g++',None)]
+    if args.qemu:
+        prefix=args.providers.resolve(strict=True)
+        for name,pin in helper.PINNED.items():
+            if sha(prefix/'lib'/name)!=pin:raise SystemExit('Private provider mismatch')
+        architectures.append(('aarch64','aarch64-linux-gnu-g++',args.qemu.resolve(strict=True)))
+        report['providers']={name:sha(prefix/'lib'/name) for name in helper.PINNED}
+        report['qemu_sha256']=sha(args.qemu.resolve(strict=True))
+    for arch,compiler,qemu in architectures:
+        logs={};cases={};data={'logs':logs,'cases':cases};report['architectures'][arch]=data
+        with tempfile.TemporaryDirectory(prefix='frame-deepbind-audit-'+arch+'-') as name:
+            folder=Path(name);folder.chmod(0o700)
+            common=[compiler,'-std=c++17','-O2','-g','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I',str(ROOT)]
+            def compile_one(label,command):
+                value=helper.recorded_run(command,folder,logs,label+'_compile',45,clean)
+                if value.returncode:raise SystemExit(value.stderr)
+            client,foreign,observer,api,main,early=[folder/n for n in ('libclient.so','libforeign.so','libobserver.so','libapi.so','main','early')]
+            client_cpp,observer_cpp,main_cpp,api_cpp=[folder/n for n in ('client.cpp','observer.cpp','main.cpp','api.cpp')]
+            client_cpp.write_text(DEEP_CLIENT);observer_cpp.write_text(DEEP_OBSERVER)
+            main_cpp.write_text(DEEP_MAIN)
+            api_cpp.write_text('#include <cstdint>\nextern "C" std::uint32_t VR_InitInternal2(void*,std::uint32_t,const char*){return 0;}\nextern "C" void VR_ShutdownInternal(){}\n')
+            compile_one('client',common+['-shared','-fPIC',str(client_cpp),'-pthread','-ldl','-o',str(client)])
+            compile_one('foreign',common+['-shared','-fPIC',str(client_cpp),'-pthread','-ldl','-o',str(foreign)])
+            obs_args=common+['-shared','-fPIC','-ftls-model=initial-exec',str(observer_cpp)]
+            if qemu:obs_args += [str(ROOT/'import/native_mutex_entry.S'),str(ROOT/'import/import_forwarding.cpp')]
+            compile_one('observer',obs_args+['-pthread','-ldl','-o',str(observer)])
+            compile_one('api',common+['-shared','-fPIC',str(api_cpp),'-o',str(api)])
+            exe=common+['-rdynamic','-Wl,-z,lazy','-DCLIENT_FILE='+json.dumps(str(client)),
+                        '-DFOREIGN_FILE='+json.dumps(str(foreign)),str(main_cpp),'-L',str(folder),
+                        '-Wl,-rpath,'+str(folder),'-Wl,--no-as-needed','-lobserver','-lapi','-pthread','-ldl']
+            compile_one('main',exe+['-o',str(main)])
+            compile_one('early',exe+['-DDEEP_EARLY','-o',str(early)])
+            def command_for(program,env_values,extra=()):
+                if qemu:
+                    command=[str(qemu),'-L',str(prefix)]
+                    env_values={**env_values,'LD_LIBRARY_PATH':str(prefix/'lib')+':'+str(folder)+':/usr/aarch64-linux-gnu/lib'}
+                    for key,value in env_values.items():command+=['-E',key+'='+value]
+                    return command+[str(program),*extra],clean
+                return [str(program),*extra],{**clean,**env_values}
+            command,environment=command_for(main,{'LD_LIBRARY_PATH':str(folder)},['provider'])
+            observed=helper.recorded_run(command,folder,logs,'actual_provider',15,environment)
+            if observed.returncode:raise SystemExit(observed.stderr)
+            libc_name=observed.stdout.strip();libc=Path(libc_name).resolve(strict=True)
+            def geometry(path):
+                ranges=[]
+                for line in subprocess.check_output(['readelf','-lW',str(path)],text=True).splitlines():
+                    columns=line.split()
+                    if columns and columns[0]=='LOAD' and 'E' in columns[6:-1]:ranges.append((int(columns[2],16),int(columns[2],16)+int(columns[4],16)))
+                if len(ranges)!=1:raise SystemExit('Expected one executable file-backed segment')
+                return ranges[0]
+            def symbol(path,wanted):
+                args=['nm','-a','--defined-only',str(path)] if path!=libc else ['nm','-D','--defined-only',str(path)]
+                for line in subprocess.check_output(args,text=True).splitlines():
+                    columns=line.split()
+                    if len(columns)>=3 and columns[-1].split('@')[0]==wanted:return int(columns[0],16)
+                raise SystemExit('Missing fixture symbol '+wanted)
+            rx={key:geometry(path) for key,path in [('main',main),('api',api),('observer',observer),('client',client),('libc',libc)]}
+            bridge=symbol(observer,'fixture_deep_bridge');init=symbol(api,'VR_InitInternal2');shutdown=symbol(api,'VR_ShutdownInternal')
+            mutex_init=symbol(libc,'pthread_mutex_init');mutex_destroy=symbol(libc,'pthread_mutex_destroy')
+            config=folder/'configuration.cpp'
+            def configured(label,rva_delta=0,partial=False,wrong_target='init'):
+                def spec(name,extent):return '{'+json.dumps(name)+','+str(extent[0])+','+str(extent[1])+'}'
+                config.write_text('#include "import/import_startup_audit.h"\nnamespace frame_import_startup_audit {const Preparation* preparation() noexcept {static const Preparation p={'+
+                    spec('',rx['main'])+','+spec(str(api),rx['api'])+','+spec(str(observer),rx['observer'])+','+
+                    f'{bridge},{init},{shutdown},true,'+spec(str(client),rx['client'])+','+spec(libc_name,rx['libc'])+','+
+                    f'{mutex_init+(rva_delta if wrong_target=="init" else 0)},{0 if partial else mutex_destroy+(rva_delta if wrong_target=="destroy" else 0)}'+'};return &p;}}\n')
+                audit=folder/(label+'.so')
+                audit_args=common+['-shared','-fPIC','-nostdlib','-fvisibility=hidden','-fno-exceptions','-fno-rtti','-fno-builtin']
+                if qemu:audit_args+=['-mno-outline-atomics']
+                compile_one(label,audit_args+[str(CORE),str(config),'-o',str(audit)])
+                if subprocess.check_output(['nm','-u',str(audit)],text=True).strip():raise SystemExit('Audit imports foreign namespace providers')
+                return audit
+            relocations=subprocess.check_output(['readelf','-rW',str(client)],text=True)
+            order=[]
+            for line in relocations.splitlines():
+                if 'JUMP_SLOT' not in line:continue
+                for kind in ('init','destroy'):
+                    if 'pthread_mutex_'+kind+'@' in line:order.append(kind)
+            if len(order)!=2:raise SystemExit('Unknown owned eager relocation order')
+            data['actual_client_mutex_relocation_order']=order
+            audit=configured('audit');bad=configured('bad',1,wrong_target=order[1]);partial=configured('partial',partial=True)
+            selected=args.case or DEEP_CASES
+            for label in selected:
+                if label not in DEEP_CASES:raise SystemExit('Not a focused deepbind case: '+label)
+                env_values={'LD_PRELOAD':str(observer),'LD_LIBRARY_PATH':str(folder)}
+                mode='redirect' if label in ('deepbind_redirect','deepbind_dlsym') else 'partial_'+order[0] if label=='deepbind_wrong_native_rva' else 'native'
+                if label!='deepbind_preload_only':env_values['LD_AUDIT']=str(bad if label=='deepbind_wrong_native_rva' else partial if label=='deepbind_partial_optin' else audit)
+                if label=='deepbind_wrong_client':env_values['FIXTURE_FOREIGN_CLIENT']='1'
+                if label=='deepbind_bad_owned_entry':env_values['FIXTURE_BAD_MUTEX_ENTRY']='1'
+                program=early if label=='deepbind_early_client' else main
+                command,environment=command_for(program,env_values,[mode])
+                value=helper.recorded_run(command,folder,logs,label,15,environment)
+                if value.returncode:raise SystemExit(label+': '+value.stdout+value.stderr)
+                if 'RESULT=' not in value.stdout:raise SystemExit('Fixture did not complete semantics')
+                cases[label]=json.loads(value.stdout.split('RESULT=')[1])
+            data['libc_name_actual_public_dladdr']=libc_name
+            data['libc_identity']=sha(libc)
+            data['entry_abi']='actual shared native_mutex_entry.S + versioned real libc forwarding' if qemu else 'host intrinsic caller PC + versioned real libc forwarding (not native ARM stack proof)'
+            data['actual_native_flags']='RTLD_NOW|RTLD_DEEPBIND (10), not altered'
+            data['audit_provider_imports']=[]
+            data['fixture_only']=True
+            data['production_ready_proven']=False
+    report['status']='passed'
+    print(json.dumps({'status':'passed','focused_deepbind_cases':{a:len(d['cases']) for a,d in report['architectures'].items()},'native_openvr_init_executed':False}))
+
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -250,11 +586,14 @@ def main():
     parser.add_argument('--qemu',type=Path)
     parser.add_argument('--providers',type=Path)
     parser.add_argument('--record',type=Path)
+    parser.add_argument('--native-only',action='store_true',help='Use only the explicit AArch64/provider pair; reuse already passing host evidence')
+    parser.add_argument('--deepbind',action='store_true',help='Run only the new actual NOW|DEEPBIND client/libc binding controls')
     parser.add_argument('--case',action='append',choices=('normal','wrong_process','missing_api','eager_now',
-        'environment_now','constructor_binding','bad_owned_entry','bad_native_rva','inactive_default','weak_default_inactive'),
+        'environment_now','constructor_binding','bad_owned_entry','bad_native_rva','inactive_default','weak_default_inactive',*DEEP_CASES),
         help='focused case selection; the receipt records its limited scope')
     args=parser.parse_args()
     if bool(args.qemu)!=bool(args.providers): parser.error('explicit QEMU and providers must be supplied together')
+    if args.native_only and not args.qemu:parser.error('--native-only requires the explicit QEMU/provider pair')
     helper_path=ROOT/'tools/run_import_native_forwarding.py'
     spec=importlib.util.spec_from_file_location('owned_runner',helper_path)
     helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
@@ -263,7 +602,10 @@ def main():
     clean=os.environ.copy()
     for name in ('LD_PRELOAD','LD_AUDIT','LD_LIBRARY_PATH','QEMU_LD_PREFIX'): clean.pop(name,None)
     try:
-        architectures=[('host','g++',None)]
+        if args.deepbind:
+            run_deepbind(args,helper,report,clean)
+            return
+        architectures=[] if args.native_only else [('host','g++',None)]
         if args.qemu:
             prefix=args.providers.resolve(strict=True)
             for name,pin in helper.PINNED.items():

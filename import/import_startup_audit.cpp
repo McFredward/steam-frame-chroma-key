@@ -91,7 +91,22 @@ std::uintptr_t bridge_address(const Preparation& p, const ModuleView& observer) 
     return add(observer.bias, p.bridge_rva, address) && address >= observer.rx_begin &&
            address < observer.rx_end ? address : 0;
 }
-void loss() noexcept { lost.store(true); ready.store(false); }
+void loss() noexcept {
+    const bool first=!lost.exchange(true,std::memory_order_acq_rel);
+    ready.store(false,std::memory_order_release);
+    if (!first || !preinit_seen.load() || !bridge_admitted.load()) return;
+    const auto* p=prepared();
+    BridgeRequest request{};request.stage=Stage::Loss;
+    request.missed_before_preinit=missed.load();
+    // Earlier eager relocations may already point to owned veneers. They must
+    // keep forwarding native behavior, but MAIN retires their evidence now.
+    // Do not call views(): the newly sticky loss deliberately rejects it.
+    if (!p || !view(2,request.provider.observer)) return;
+    (void)view(0,request.provider.receiver);(void)view(1,request.provider.api);
+    (void)view(3,request.provider.client);(void)view(4,request.provider.libc);
+    const auto address=bridge_address(*p,request.provider.observer);
+    if (address) (void)reinterpret_cast<Bridge>(address)(request);
+}
 } // namespace
 
 #define AUDIT_EXPORT extern "C" __attribute__((visibility("default")))
