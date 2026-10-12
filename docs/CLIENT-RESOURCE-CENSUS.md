@@ -88,9 +88,19 @@ prepared stack. Neither result is a working passthrough test.
 `tools/inspect_client_connection.py` extends the existing read-only kernel helper
 to find the peer FD in one specified process instead of guessing it. Supply
 the live left PID/FD/process-start ticks and right PID/process-start ticks.
-It examines at most 256 FD entries, uses four exact kernel queries within two
-seconds, repeats their actual cookies, and rechecks PID/start, UID, namespace,
-FD and reciprocal peer inodes. Aliases or changes reject the snapshot.
+The discovery CLI now accepts `--max-peer-fds` in `1..4096`, defaulting to 4096;
+the Python API preserves its compatible default of 256 unless explicitly set.
+It scans the entire specified process's FD directory within that bound, uses
+four exact kernel queries within two seconds, repeats their actual cookies,
+and rechecks PID/start, UID, namespace, FD and reciprocal peer inodes. Finding
+the peer early does not skip the remaining alias checks. Success and refusal
+report the configured scan limit and number of entries inspected.
+
+The first hardware lookup refused the old 256-entry cap. The bounded repair
+passed nine focused controls, including a real separate peer with over 300 open
+FDs and a duplicate alias beyond 256. Twenty unaffected baseline controls retain
+their previous passing evidence. The corrected helper has not been rerun on
+the Frame; it supplies no peer-pair proof for the completed hardware capture.
 
 This is contemporaneous kernel metadata only. It does not authenticate the
 historical FD from a previous capture, continuous descriptor ownership, a

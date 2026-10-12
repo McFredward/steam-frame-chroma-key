@@ -52,9 +52,12 @@ pair**, historical captured-FD ownership, continuous socket lifetime or native
 resource namespace.
 
 The failure concerns an internal bounded FD scan, not a native connection
-failure. The reviewed limit must be corrected and tested locally while
-retaining the four-query/two-second budget, exact process checks and alias
-rejection. Do not reuse the completed run's descriptor number as a future lease.
+failure. The corrected helper now offers an explicit bounded limit up to 4096
+and passed nine focused controls, including a real separate peer with over 300
+FDs and late alias rejection. It retains the four-query/two-second budget and
+exact process checks. This is a local repair, not a retrospective hardware
+pairing result. Do not reuse the completed run's descriptor number as a future
+lease.
 
 ## Validation and complete recovery
 
