@@ -25,6 +25,7 @@ class SessionTests(unittest.TestCase):
         self.home, self.runtime = self.root / "home", self.root / "runtime"
         self.home.mkdir(mode=0o700); self.runtime.mkdir(mode=0o700)
         self.calls, self.fail_restart, self.interrupt_restart = [], False, False
+        self.manager_after_restart = []
         self.original = {"Environment": "NATIVE_SETTING=unchanged", "EnvironmentFiles": "", "DropInPaths": ""}
         self.manager = "NATIVE_ENV=yes\n"
         self.session = M.Session(self.home, self.runtime, self.command, environment={})
@@ -99,6 +100,7 @@ class SessionTests(unittest.TestCase):
         elif "restart" in args:
             if self.interrupt_restart: raise KeyboardInterrupt()
             if self.fail_restart: raise subprocess.TimeoutExpired(args, 45)
+            if self.manager_after_restart: self.manager = self.manager_after_restart.pop(0)
         return subprocess.CompletedProcess(args, 0, text, "")
     def stage(self, **kwargs):
         opts = {"runtime_scope": True, "reviewed_helpers": self.helpers}; opts.update(kwargs)
@@ -269,6 +271,77 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(json.loads(self.session.layer.read_bytes())["layer"]["library_path"], self.session.activation_values()["LD_PRELOAD"])
         self.assertTrue(all(call[0:2] == ("systemctl", "--user") for call in self.calls))
         self.assertTrue(all("steam.service" not in call for call in self.calls))
+    def graphical_manager(self, number, *, session_paths=False):
+        values = {"NATIVE_ENV": "yes", "XDG_SESSION_ID": str(number),
+            "XDG_SESSION_PATH": "/org/freedesktop/DisplayManager/Session" + str(number)}
+        if session_paths:
+            values.update(GAMESCOPE_LIMITER_FILE=str(self.runtime / ("gamescope-limiter-" + str(number))),
+                MANGOHUD_CONFIGFILE=str(self.runtime / ("gamescope-mangoapp-" + str(number))))
+        return values
+    @staticmethod
+    def manager_text(values):
+        return "\n".join(key + "=" + shlex.quote(value) for key, value in values.items()) + "\n"
+    def test_coordinated_restart_accepts_exact_graphical_metadata_and_session_paths(self):
+        self.manager = self.manager_text(self.graphical_manager(1, session_paths=True))
+        self.stage()
+        current = self.manager_text(self.graphical_manager(2, session_paths=True))
+        restored = self.manager_text(self.graphical_manager(3, session_paths=True))
+        self.manager_after_restart = [current, restored]
+        self.activate(); self.assertEqual(self.manager, current)
+        self.assertTrue(self.session.readcheck()["active"])
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.manager, restored)
+        result = json.loads((self.session.folder / "rollback-complete.json").read_bytes())
+        self.assertFalse(result["exact_manager"])
+        self.assertFalse(result["manager_matches_except_session_paths"])
+        self.assertTrue(result["manager_matches_except_session_metadata"])
+        self.assertEqual(result["permitted_metadata_changes"], ["XDG_SESSION_ID", "XDG_SESSION_PATH"])
+        self.assertEqual(result["permitted_path_changes"], ["GAMESCOPE_LIMITER_FILE", "MANGOHUD_CONFIGFILE"])
+        self.assertFalse(self.session.readcheck()["active"])
+        self.assertTrue(all("set-environment" not in call and "import-environment" not in call for call in self.calls))
+    def test_graphical_metadata_before_activation_remains_exact(self):
+        self.manager = self.manager_text(self.graphical_manager(1)); self.stage()
+        self.manager = self.manager_text(self.graphical_manager(2))
+        with self.assertRaisesRegex(RuntimeError, "changed after staging"): self.activate()
+        self.assertEqual(self.restart_count(), 0)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+    def test_merely_staged_readcheck_does_not_allow_graphical_metadata_changes(self):
+        self.manager = self.manager_text(self.graphical_manager(1)); self.stage()
+        self.manager = self.manager_text(self.graphical_manager(2))
+        with self.assertRaises(RuntimeError): self.session.readcheck()
+        self.assertEqual(self.restart_count(), 0)
+    def test_invalid_restoration_receipt_cannot_enable_post_restart_comparison(self):
+        self.manager = self.manager_text(self.graphical_manager(1)); self.stage()
+        self.manager = self.manager_text(self.graphical_manager(2))
+        M.exclusive(self.session.folder / "rollback-complete.json", M.json_bytes({"restored": True}))
+        with self.assertRaisesRegex(RuntimeError, "Invalid restoration record"): self.session.readcheck()
+        self.assertEqual(self.restart_count(), 0)
+    def test_malformed_or_unrelated_post_restart_manager_changes_fail_closed(self):
+        initial = self.graphical_manager(1)
+        self.manager = self.manager_text(initial); self.stage(); self.activate()
+        variants = [("XDG_SESSION_ID", "c2"), ("XDG_SESSION_ID", "02"), ("XDG_SESSION_ID", "1" * 17),
+            ("XDG_SESSION_ID", "２"), ("XDG_SESSION_PATH", "/tmp/Session2"),
+            ("XDG_SESSION_PATH", "/org/freedesktop/DisplayManager/Session02"),
+            ("XDG_SESSION_PATH", "/org/freedesktop/DisplayManager/Session2\nforeign"),
+            ("XDG_SESSION_COOKIE", "new"), ("NATIVE_ENV", "changed"),
+            ("LD_AUDIT", "foreign"), ("VK_INSTANCE_LAYERS", "foreign")]
+        for key, value in variants:
+            current = dict(initial); current[key] = value; self.manager = self.manager_text(current)
+            with self.subTest(key=key, value=value), self.assertRaises(RuntimeError): self.session.readcheck()
+        self.manager = self.manager_text(initial); self.session.rollback(restart_ready=True)
+    def test_new_graphical_metadata_after_restart_is_not_a_permitted_addition(self):
+        self.stage(); self.activate()
+        self.manager = self.manager_text(self.graphical_manager(2))
+        with self.assertRaises(RuntimeError): self.session.readcheck()
+        with self.assertRaises(RuntimeError): self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+    def test_bad_original_graphical_metadata_cannot_become_an_allowed_changed_value(self):
+        original = self.graphical_manager(1); original["XDG_SESSION_ID"] = "c1"
+        self.manager = self.manager_text(original); self.stage(); self.activate()
+        self.manager = self.manager_text(self.graphical_manager(2))
+        with self.assertRaises(RuntimeError): self.session.readcheck()
+        with self.assertRaises(RuntimeError): self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
     def test_changed_native_or_staged_helper_prevents_activation(self):
         self.stage(); self.native["libc"].write_bytes(self.elf(99))
         with self.assertRaises(RuntimeError): self.activate()

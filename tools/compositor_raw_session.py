@@ -409,7 +409,8 @@ class Session(base.Session):
         if snapshots != m["original_environment_files"]: raise RuntimeError("Native environment files changed")
         manager = self.env_values(self.command("show-environment"))
         if any(blocked(k, v) for k, v in manager.items()) or not base.compare_manager(
-                m["original_manager_environment"], manager, self.runtime)["manager_matches_except_session_paths"]:
+                m["original_manager_environment"], manager, self.runtime,
+                allow_graphical_session_metadata=True)["manager_matches_except_session_metadata"]:
             raise RuntimeError("Manager environment changed during activation")
         self.revalidate_native_layers(m, allow_own=True, state=current, manager=manager, environment_files=snapshots)
         return current
@@ -457,7 +458,7 @@ class Session(base.Session):
                 for name, item in m["activation"].items():
                     if read_regular(Path(name), private=True) != bytes.fromhex(item["bytes_hex"]): raise RuntimeError("Owned activation changed")
                 self.active_environment(m)
-            else: self.restoration_state(m)
+            else: self.restoration_state(m, post_restart=self.completed_restoration())
             return {"owned_files_verified": True, "native_files_verified": True, "service_environment_verified": True,
                     "active": active, "capture_verified": False, "native_mapping_unload_verified": False}
 
@@ -474,27 +475,41 @@ class Session(base.Session):
                     raise RuntimeError("Invalid restoration record")
                 for path in (self.dropin, self.layer, self.dropin.with_suffix(".pending"), self.layer.with_suffix(".pending")):
                     if path.exists() or path.is_symlink(): raise RuntimeError("Activation appeared after restoration")
-                self.restoration_state(m); return
+                self.restoration_state(m, post_restart=True); return
             self.remove_activation(m)
             self.revalidate_native_layers(m)
             if not (self.folder / "archive").exists(): self.recovery_event("activation_removed", restart_readiness=restart_ready)
             if restart_ready is not True:
                 self.recovery_event("restart_pending", loaded_processes_may_remain=True); return
             self.command("daemon-reload"); self.command("restart", UNIT); self.command("is-active", UNIT)
-            comparison = self.restoration_state(m); archive = self.archive()
+            comparison = self.restoration_state(m, post_restart=True); archive = self.archive()
             exclusive(complete, json_bytes({"restored": True, "runtime_activation_absent": True, "original_service_matches": True,
                 "native_environment_files_match": True, "native_mapping_unload_verified": False, "time": time.time(), "archive": archive, **comparison}))
             directory_sync(self.folder)
             self.recovery_event("rollback_complete", native_mapping_unload_verified=False)
 
-    def restoration_state(self, m):
+    def completed_restoration(self):
+        path = self.folder / "rollback-complete.json"
+        if not path.exists() and not path.is_symlink(): return False
+        recorded = json.loads(read_regular(path, private=True))
+        if not isinstance(recorded, dict) or any(recorded.get(key) is not True for key in
+               ("restored", "runtime_activation_absent", "original_service_matches", "native_environment_files_match")):
+            raise RuntimeError("Invalid restoration record")
+        return True
+
+    def restoration_state(self, m, *, post_restart=False):
+        if type(post_restart) is not bool: raise RuntimeError("Explicit post-restart comparison phase required")
         restored = self.state();self._owned_caller = self.activation_values()
         try: manager = self.reject_environment(restored)
         finally: self._owned_caller = None
         snapshots = self.native_environment_files(restored, {n: v["sha256"] for n, v in m["original_environment_files"].items()})
-        comparison = base.compare_manager(m["original_manager_environment"], manager, self.runtime)
+        # SteamVR can recreate the graphical session during the coordinated
+        # restart. Accept only the separately bounded metadata grammar here;
+        # never write the old manager values back or relax pre-restart checks.
+        comparison = base.compare_manager(m["original_manager_environment"], manager, self.runtime,
+                                          allow_graphical_session_metadata=post_restart)
         if (restored != m["original_service"] or snapshots != m["original_environment_files"] or
-            not comparison["manager_matches_except_session_paths"]):
+            not comparison["manager_matches_except_session_metadata"]):
             raise RuntimeError("Original service/manager/native-file snapshot not restored")
         self.revalidate_native_layers(m, state=restored, manager=manager, environment_files=snapshots)
         return comparison
@@ -504,8 +519,8 @@ class Session(base.Session):
         # read. Configuration restoration alone never claims library unload.
         with self.lock():
             m = self.manifest()
-            if not (self.folder / "rollback-complete.json").exists(): raise RuntimeError("Manual restoration required before unload verification")
-            self.restoration_state(m)
+            if not self.completed_restoration(): raise RuntimeError("Manual restoration required before unload verification")
+            self.restoration_state(m, post_restart=True)
             entries = list(self.proc.iterdir())
             if len(entries) > 8192: raise RuntimeError("Process directory bound exceeded")
             owned, managed = 0, 0
