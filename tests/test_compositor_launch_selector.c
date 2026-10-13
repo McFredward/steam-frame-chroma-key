@@ -55,6 +55,10 @@ int main(void) {
         CHECK(!frame_launch_config_valid(&invalid));
         CHECK(frame_launch_build_environment(&invalid, dirty, 0, &b) == FRAME_LAUNCH_INVALID_CONFIG);
         CHECK(b.forward == dirty);
+        invalid.payload = "/owned/../payload.so"; CHECK(!frame_launch_config_valid(&invalid));
+        invalid.payload = "/owned//payload.so"; CHECK(!frame_launch_config_valid(&invalid));
+        invalid.payload = "/owned/./payload.so"; CHECK(!frame_launch_config_valid(&invalid));
+        invalid.payload = "/owned/payload.so/"; CHECK(!frame_launch_config_valid(&invalid));
     }
     {
         char **many = calloc(FRAME_LAUNCH_MAX_ENTRIES + 3u, sizeof(char *));

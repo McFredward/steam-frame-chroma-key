@@ -1,8 +1,9 @@
-/* A small launch selector, not a generic subprocess sandbox. Public exec/spawn
- * APIs below are covered. libc-internal exec (including system/popen), execl*,
- * fexecve/execveat and direct syscalls are not intercepted. Startup health must
- * verify actual non-target helper env/mappings; do not infer isolation merely
- * from compositor liveness. No cleanup API is called implicitly. */
+/* Public launch shims inject diagnostics into the exact reviewed target only.
+ * The explicit cold handshake then cleans real environ so libc-internal launch
+ * paths inherit no full diagnostics. This is not a subprocess sandbox: callers
+ * supplying their own saved dirty envp to unwrapped raw syscalls are outside its
+ * contract. Startup health must verify actual helper environment and mappings.
+ * No freeze/cleanup API is called implicitly. */
 #define _GNU_SOURCE 1
 #include "compositor_launch_selector.h"
 #include <errno.h>
@@ -10,7 +11,10 @@
 #include <string.h>
 #ifndef FRAME_COMPOSITOR_LAUNCH_CORE_ONLY
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <stdatomic.h>
 #include <spawn.h>
+#include <sys/auxv.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -29,10 +33,16 @@ static size_t bounded_length(const char *s, size_t limit) {
     return n;
 }
 static int safe_path(const char *p) {
-    size_t i, n = bounded_length(p, FRAME_LAUNCH_MAX_PATH);
+    size_t i, segment = 1u, n = bounded_length(p, FRAME_LAUNCH_MAX_PATH);
     if (!n || n == FRAME_LAUNCH_MAX_PATH || p[0] != '/') return 0;
     for (i = 0; i < n; ++i)
         if ((unsigned char)p[i] < 33 || (unsigned char)p[i] > 126 || p[i] == ':' || p[i] == '=') return 0;
+    for (i = 1u; i <= n; ++i) if (p[i] == '/' || !p[i]) {
+        size_t count = i - segment;
+        if (!count || (count == 1u && p[segment] == '.') ||
+            (count == 2u && p[segment] == '.' && p[segment + 1u] == '.')) return 0;
+        segment = i + 1u;
+    }
     return 1;
 }
 HIDDEN int frame_launch_config_valid(const struct frame_launch_config *c) {
@@ -207,32 +217,100 @@ __attribute__((weak, visibility("hidden"))) const struct frame_launch_config *fr
 typedef int (*execve_fn)(const char *, char *const[], char *const[]);
 typedef int (*spawn_fn)(pid_t *, const char *, const posix_spawn_file_actions_t *,
     const posix_spawnattr_t *, char *const[], char *const[]);
+typedef char *(*getenv_fn)(const char *);
 static execve_fn native_execve, native_execvpe;
 static spawn_fn native_spawn, native_spawnp;
+static getenv_fn native_getenv, native_secure_getenv;
 static struct frame_launch_environment clean_baseline;
-static int cleaned;
+static _Atomic unsigned freeze_attempted;
+static _Atomic pid_t frozen_pid;
+static char frozen_values[3u][FRAME_LAUNCH_MAX_PATH];
+static const char *const frozen_names[5u] = {
+    "GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE", "GHVR_FRAME_COMPOSITOR_RAW_OUTPUT",
+    "FRAME_MASK_TRACE_OUTPUT", "FRAME_MASK_TRACE", "FRAME_MASK_TRACE_BINDINGS"
+};
 #if defined(__aarch64__)
 #define EXECVE_VERSION "GLIBC_2.17"
 #define EXECVPE_VERSION "GLIBC_2.17"
 #define SPAWN_VERSION "GLIBC_2.17"
+#define GETENV_VERSION "GLIBC_2.17"
 #elif defined(__x86_64__)
 #define EXECVE_VERSION "GLIBC_2.2.5"
 #define EXECVPE_VERSION "GLIBC_2.11"
 #define SPAWN_VERSION "GLIBC_2.15"
+#define GETENV_VERSION "GLIBC_2.2.5"
 #else
 #error "Launch selector provider versions must be reviewed for this architecture"
 #endif
 __attribute__((constructor)) static void resolve_providers(void) {
     int saved = errno;
+    /* An earlier payload constructor may already have completed the cold
+     * handshake. Do not rewrite provider pointers after it starts its writer. */
+    if (native_execve && native_execvpe && native_spawn && native_spawnp && native_getenv && native_secure_getenv) return;
     void *p = dlvsym(RTLD_NEXT, "execve", EXECVE_VERSION); memcpy(&native_execve, &p, sizeof p);
     p = dlvsym(RTLD_NEXT, "execvpe", EXECVPE_VERSION); memcpy(&native_execvpe, &p, sizeof p);
     p = dlvsym(RTLD_NEXT, "posix_spawn", SPAWN_VERSION); memcpy(&native_spawn, &p, sizeof p);
     p = dlvsym(RTLD_NEXT, "posix_spawnp", SPAWN_VERSION); memcpy(&native_spawnp, &p, sizeof p);
+    p = dlvsym(RTLD_NEXT, "getenv", GETENV_VERSION); memcpy(&native_getenv, &p, sizeof p);
+    p = dlvsym(RTLD_NEXT, "secure_getenv", "GLIBC_2.17"); memcpy(&native_secure_getenv, &p, sizeof p);
     errno = saved;
 }
 PUBLIC unsigned frame_compositor_launch_provider_mask(void) {
     return (native_execve ? 1u : 0u) | (native_execvpe ? 2u : 0u) |
-        (native_spawn ? 4u : 0u) | (native_spawnp ? 8u : 0u);
+        (native_spawn ? 4u : 0u) | (native_spawnp ? 8u : 0u) | (native_getenv ? 16u : 0u) |
+        (native_secure_getenv ? 32u : 0u);
+}
+/* ELF constructors may call getenv before this preload's own constructor.
+ * This bootstrap path performs libc's ordinary exact-key scan without changing
+ * environ or admitting virtual diagnostics. Genuine forwarding is established
+ * in the constructor/cold handshake; no dlsym or I/O occurs in this wrapper. */
+static char *bootstrap_getenv(const char *name) {
+    size_t n;
+    char **entry;
+    if (!name || !*name) return NULL;
+    n = strlen(name);
+    for (entry = environ; entry && *entry; ++entry)
+        if (!strncmp(*entry, name, n) && (*entry)[n] == '=') return *entry + n + 1u;
+    return NULL;
+}
+static char *frozen_value(const char *name) {
+    size_t i;
+    if (!name) return NULL;
+    for (i = 0; i < 5u; ++i) if (!strcmp(name, frozen_names[i]))
+        return i < 3u ? frozen_values[i] : (char *)"1";
+    return NULL;
+}
+PUBLIC char *getenv(const char *name) {
+    int saved = errno;
+    char *result = NULL;
+    pid_t owner = atomic_load_explicit(&frozen_pid, memory_order_acquire);
+    if (owner && owner == (pid_t)syscall(SYS_getpid) && (result = frozen_value(name))) {
+        errno = saved; return result;
+    }
+    result = native_getenv ? native_getenv(name) : bootstrap_getenv(name);
+    errno = saved; return result;
+}
+static int nonsecure_aux(void) {
+    unsigned long secure;
+    errno = 0; secure = getauxval(AT_SECURE);
+    return !errno && !secure;
+}
+static int nonsecure_process(void) {
+    return nonsecure_aux() && syscall(SYS_getuid) == syscall(SYS_geteuid) &&
+        syscall(SYS_getgid) == syscall(SYS_getegid);
+}
+PUBLIC char *secure_getenv(const char *name) {
+    int saved = errno;
+    char *result = NULL;
+    pid_t owner = atomic_load_explicit(&frozen_pid, memory_order_acquire);
+    /* Freeze already proved nonsecure admission; check live credentials too.
+     * Later credential changes must never resurrect a virtual secure key. */
+    if (owner && owner == (pid_t)syscall(SYS_getpid) && nonsecure_process() && (result = frozen_value(name))) {
+        errno = saved; return result;
+    }
+    if (native_secure_getenv) result = native_secure_getenv(name);
+    else result = nonsecure_aux() ? bootstrap_getenv(name) : NULL;
+    errno = saved; return result;
 }
 static int target_path(const struct frame_launch_config *c, const char *path, int search, int actions) {
     char cwd[FRAME_LAUNCH_MAX_PATH];
@@ -283,13 +361,127 @@ PUBLIC int posix_spawnp(pid_t *pid, const char *path, const posix_spawn_file_act
     const posix_spawnattr_t *attr, char *const argv[], char *const envp[]) {
     return forward_spawn(native_spawnp, pid, path, actions, attr, argv, envp, 1);
 }
-PUBLIC int frame_compositor_launch_clean_environment(void) {
+struct task_entry { uint64_t ino; int64_t offset; unsigned short size; unsigned char type; char name[]; };
+static int cold_single_thread(void) {
+    union { uint64_t alignment; char bytes[4096]; } storage;
+    char *bytes = storage.bytes;
+    long fd = syscall(SYS_openat, AT_FDCWD, "/proc/self/task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    long got, second;
+    size_t offset = 0, count = 0;
+    int valid = 1;
+    if (fd < 0) return 0;
+    got = syscall(SYS_getdents64, fd, bytes, sizeof storage.bytes);
+    if (got <= 0) valid = 0;
+    while (valid && offset < (size_t)got) {
+        struct task_entry *entry = (struct task_entry *)(void *)(bytes + offset);
+        size_t available = (size_t)got - offset, n, i;
+        if (available < offsetof(struct task_entry, name) + 1u || entry->size > available ||
+            entry->size < offsetof(struct task_entry, name) + 1u) { valid = 0; break; }
+        n = bounded_length(entry->name, entry->size - offsetof(struct task_entry, name));
+        if (n == entry->size - offsetof(struct task_entry, name)) { valid = 0; break; }
+        if (strcmp(entry->name, ".") && strcmp(entry->name, "..")) {
+            for (i = 0; i < n; ++i) if (entry->name[i] < '0' || entry->name[i] > '9') valid = 0;
+            if (!n || ++count != 1u) valid = 0;
+        }
+        offset += entry->size;
+    }
+    second = syscall(SYS_getdents64, fd, bytes, sizeof storage.bytes);
+    syscall(SYS_close, fd);
+    return valid && count == 1u && !second;
+}
+static int known_environment(const struct frame_launch_config *c) {
+    const char *expected[5u] = {c->envelope, c->output, c->journal, "1", "1"};
+    unsigned seen = 0;
+    size_t entry, i;
+    int preload = 0, audit = 0;
+    for (entry = 0; environ && environ[entry] && entry < FRAME_LAUNCH_MAX_ENTRIES; ++entry) {
+        const char *p = environ[entry];
+        if (diagnostic_key(p)) {
+            for (i = 0; i < 5u; ++i) {
+                size_t n = strlen(frozen_names[i]);
+                if (!strncmp(p, frozen_names[i], n) && p[n] == '=') {
+                    if ((seen & (1u << i)) || strcmp(p + n + 1u, expected[i])) return 0;
+                    seen |= 1u << i; break;
+                }
+            }
+            if (i == 5u) return 0;
+        }
+        if (starts(p, "LD_PRELOAD=")) {
+            size_t j = 11u;
+            while (p[j]) {
+                size_t begin;
+                if (separator(p[j])) { ++j; continue; }
+                begin = j; while (p[j] && !separator(p[j])) ++j;
+                if (token_equals(p + begin, j - begin, c->payload)) preload = 1;
+            }
+        }
+        if (starts(p, "LD_AUDIT=")) {
+            size_t j = 9u;
+            while (p[j]) {
+                size_t begin;
+                if (separator(p[j])) { ++j; continue; }
+                begin = j; while (p[j] && !separator(p[j])) ++j;
+                if (token_equals(p + begin, j - begin, c->audit)) audit = 1;
+            }
+        }
+    }
+    return (!environ || !environ[entry]) && seen == 31u && preload && audit;
+}
+PUBLIC int frame_compositor_launch_freeze_environment_v1(unsigned abi) {
+    int saved = errno, result = FRAME_LAUNCH_FREEZE_NOT_COLD;
+    const struct frame_launch_config *c = frame_compositor_launch_config_v1();
+    unsigned expected = 0;
+    uint64_t signals = UINT64_MAX, old_signals;
+    char executable[FRAME_LAUNCH_MAX_PATH];
+    long n;
+    enum frame_launch_result rewrite;
+    size_t i;
+    if (abi != FRAME_LAUNCH_FREEZE_ABI) { result = FRAME_LAUNCH_FREEZE_INVALID_ABI; goto done; }
+    if (!frame_launch_config_valid(c)) { result = FRAME_LAUNCH_FREEZE_INVALID_CONFIG; goto done; }
+    n = syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", executable, sizeof executable);
+    if (n <= 0 || n >= (long)sizeof executable) { result = FRAME_LAUNCH_FREEZE_WRONG_PROCESS; goto done; }
+    executable[n] = 0;
+    if (strcmp(executable, c->target)) { result = FRAME_LAUNCH_FREEZE_WRONG_PROCESS; goto done; }
+    if (syscall(SYS_gettid) != syscall(SYS_getpid)) goto done;
+    if (!atomic_compare_exchange_strong_explicit(&freeze_attempted, &expected, 1u,
+            memory_order_acq_rel, memory_order_acquire)) { result = FRAME_LAUNCH_FREEZE_ALREADY_ATTEMPTED; goto done; }
+    /* Linux uses one 64-bit kernel sigset on both reviewed architectures. No
+     * handler may race environment publication after the one-task proof. */
+    if (syscall(SYS_rt_sigprocmask, 0 /* SIG_BLOCK */, &signals, &old_signals, sizeof signals)) goto done;
+    if (!cold_single_thread()) goto restore_signals;
+    rewrite = frame_launch_build_environment(c, environ, 0, &clean_baseline);
+    if (rewrite != FRAME_LAUNCH_REWRITTEN) { result = FRAME_LAUNCH_FREEZE_ENVIRONMENT; goto restore_signals; }
+    /* Resolve before publication, including reversed preload constructor order.
+     * No allocation or loader resolution is ever performed by getters. */
+    resolve_providers();
+    if (!cold_single_thread()) goto restore_signals;
+    if (!nonsecure_process() || frame_compositor_launch_provider_mask() != 63u)
+        result = FRAME_LAUNCH_FREEZE_PROVIDER;
+    else if (!known_environment(c)) result = FRAME_LAUNCH_FREEZE_ENVIRONMENT;
+    else {
+        for (i = 0; i < 3u; ++i) {
+            const char *value = i == 0u ? c->envelope : i == 1u ? c->output : c->journal;
+            memcpy(frozen_values[i], value, strlen(value) + 1u);
+        }
+        result = FRAME_LAUNCH_FROZEN;
+    }
+    /* Denied admitted attempts are scrubbed too; only success publishes the
+     * virtual view. No thread existed and all handlers remain blocked here. */
+    environ = clean_baseline.forward;
+    if (result == FRAME_LAUNCH_FROZEN)
+        atomic_store_explicit(&frozen_pid, (pid_t)syscall(SYS_getpid), memory_order_release);
+restore_signals:
+    if (syscall(SYS_rt_sigprocmask, 2 /* SIG_SETMASK */, &old_signals, NULL, sizeof signals)) {
+        atomic_store_explicit(&frozen_pid, 0, memory_order_release);
+        result = FRAME_LAUNCH_FREEZE_NOT_COLD;
+    }
+done:
+    errno = saved; return result;
+}
+PUBLIC unsigned frame_compositor_launch_frozen_status_v1(void) {
     int saved = errno;
-    enum frame_launch_result r;
-    if (cleaned) { errno = saved; return 0; }
-    r = frame_launch_build_environment(frame_compositor_launch_config_v1(), environ, 0, &clean_baseline);
-    if (r == FRAME_LAUNCH_DIRTY_OVERFLOW) { errno = saved; return E2BIG; }
-    if (r != FRAME_LAUNCH_REWRITTEN) { errno = saved; return EINVAL; }
-    environ = clean_baseline.forward; cleaned = 1; errno = saved; return 0;
+    pid_t owner = atomic_load_explicit(&frozen_pid, memory_order_acquire);
+    unsigned admitted = owner && owner == (pid_t)syscall(SYS_getpid);
+    errno = saved; return admitted;
 }
 #endif

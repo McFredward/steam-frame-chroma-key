@@ -44,7 +44,7 @@ class PreloadIsolation(unittest.TestCase):
                 raise RuntimeError(out + err)
         cls.compile_file = staticmethod(compile_file)
         cls.launcher = cls.directory / "launcher"
-        compile_file(cls.launcher, [ROOT / "tests/test_compositor_launch_child.c"], ["-ldl"])
+        compile_file(cls.launcher, [ROOT / "tests/test_compositor_launch_child.c"], ["-ldl", "-pthread"])
         cls.target, cls.peer = cls.directory / "vrcompositor", cls.directory / "vrwebhelper"
         # Distinct, exact path identities; never symlinks posing as source proof.
         cls.target.write_bytes(cls.launcher.read_bytes()); cls.target.chmod(0o700)
@@ -52,8 +52,37 @@ class PreloadIsolation(unittest.TestCase):
         cls.payload, cls.audit, cls.selector = (cls.directory / name for name in (
             "fixture_payload.so", "fixture_audit.so", "selector.so"))
         payload_source = cls.directory / "payload.c"
-        payload_source.write_text('__thread unsigned char large_tls[512] __attribute__((tls_model("initial-exec")));\n'
-                                  'int frame_fixture_tls_value(void) { large_tls[511] = 37; return large_tls[511]; }\n')
+        payload_source.write_text('''#define _GNU_SOURCE 1
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+extern int frame_compositor_launch_freeze_environment_v1(unsigned) __attribute__((weak));
+extern char **environ;
+__thread unsigned char large_tls[512] __attribute__((tls_model("initial-exec")));
+static const char *early_foreign, *early_secure;
+static int ctor_result = -1, early_errno, early_edges;
+__attribute__((constructor)) static void payload_start(void) {
+    const char *freeze;
+    char **original = environ;
+    char *edges[] = {"DUP=first", "DUP=second", "A=B=value-with-equals", "=hidden", NULL};
+    errno = 77;
+    environ = edges;
+    early_edges = !strcmp(getenv("DUP"), "first") && !strcmp(secure_getenv("DUP"), "first") &&
+        !getenv("") && !getenv("MISSING") && !strcmp(getenv("A=B"), "value-with-equals");
+    environ = original;
+    early_foreign = getenv("FOREIGN_UNRELATED"); early_secure = secure_getenv("FOREIGN_UNRELATED");
+    early_errno = errno;
+    freeze = getenv("FIXTURE_FREEZE_IN_CTOR");
+    if (freeze && !strcmp(freeze, "1") && frame_compositor_launch_freeze_environment_v1)
+        ctor_result = frame_compositor_launch_freeze_environment_v1(1);
+}
+int frame_fixture_tls_value(void) { large_tls[511] = 37; return large_tls[511]; }
+const char *frame_fixture_early_foreign(void) { return early_foreign; }
+const char *frame_fixture_early_secure(void) { return early_secure; }
+int frame_fixture_ctor_result(void) { return ctor_result; }
+int frame_fixture_early_errno(void) { return early_errno; }
+int frame_fixture_early_edges(void) { return early_edges; }
+''')
         compile_file(cls.payload, [payload_source], ["-fPIC", "-shared"])
         cls.large_tls = cls.directory / "fixture_large_tls.so"
         large_tls_source = cls.directory / "large_tls.c"
@@ -76,7 +105,7 @@ class PreloadIsolation(unittest.TestCase):
                                  'const struct frame_launch_config *frame_compositor_launch_config_v1(void) { return &c; }\n')
         cls.mapflag = "-Wl,--version-script=" + str(ROOT / "receiver/compositor_launch_selector.map")
         compile_file(cls.selector, [ROOT / "receiver/compositor_launch_selector.c", config_source],
-                     ["-fPIC", "-shared", "-fvisibility=hidden", cls.mapflag, "-ldl"])
+                     ["-fPIC", "-shared", "-fvisibility=hidden", "-Wl,-z,now", cls.mapflag, "-ldl"])
         cls.inert = cls.directory / "inert.so"
         compile_file(cls.inert, [ROOT / "receiver/compositor_launch_selector.c"],
                      ["-fPIC", "-shared", "-fvisibility=hidden", cls.mapflag, "-ldl"])
@@ -108,7 +137,7 @@ class PreloadIsolation(unittest.TestCase):
 
     def assert_clean(self, row):
         self.assertEqual(row["payload_mapped"], 0)
-        self.assertEqual(row["provider_mask"], 15)
+        self.assertEqual(row["provider_mask"], 63)
         for key in ("audit", "trace", "bindings", "envelope", "output", "journal"):
             self.assertEqual(row[key], "", (key, row))
         self.assertEqual(row["preload"], str(self.selector))
@@ -117,7 +146,7 @@ class PreloadIsolation(unittest.TestCase):
     def assert_target(self, row):
         self.assertEqual(row["payload_mapped"], 1)
         self.assertEqual(row["tls_value"], 37)  # Really accesses a 512-byte initial-exec TLS payload.
-        self.assertEqual(row["provider_mask"], 15)
+        self.assertEqual(row["provider_mask"], 63)
         self.assertEqual(row["preload"], str(self.selector) + ":" + str(self.payload))
         self.assertEqual(row["audit"], str(self.audit))
         self.assertEqual(row["trace"], "1"); self.assertEqual(row["bindings"], "1")
@@ -129,7 +158,8 @@ class PreloadIsolation(unittest.TestCase):
         self.assertEqual(code, 0, err)
         exports = {line.split()[-1] for line in elf.splitlines() if "GLOBAL" in line and "DEFAULT" in line and "UND" not in line}
         self.assertEqual(exports, {"execve", "execv", "execvp", "execvpe", "posix_spawn", "posix_spawnp",
-                                   "frame_compositor_launch_clean_environment", "frame_compositor_launch_provider_mask"})
+                                   "getenv", "secure_getenv", "frame_compositor_launch_freeze_environment_v1",
+                                   "frame_compositor_launch_frozen_status_v1", "frame_compositor_launch_provider_mask"})
         for forbidden in ("__tls_get_addr", "malloc", "calloc", "realloc", "_Z", "pthread"):
             self.assertNotIn(forbidden, elf)
         code, sections, _ = bounded_run(["readelf", "-W", "--sections", str(self.selector)])
@@ -208,7 +238,7 @@ class PreloadIsolation(unittest.TestCase):
     def test_09_inert_unconfigured_selector_forwards_without_changes(self):
         env = dict(self.base_env, LD_PRELOAD=str(self.inert))
         rows, _ = self.run_fixture(["--relay", "execve", self.peer, "--report", "inert"], env=env)
-        self.assertEqual(rows[1]["preload"], str(self.inert)); self.assertEqual(rows[1]["provider_mask"], 15)
+        self.assertEqual(rows[1]["preload"], str(self.inert)); self.assertEqual(rows[1]["provider_mask"], 63)
         self.assertEqual(rows[1]["payload_mapped"], 0)
 
     def test_09b_argv_bytes_preserved(self):
@@ -221,6 +251,145 @@ class PreloadIsolation(unittest.TestCase):
         script.write_text('exec "' + str(self.peer) + '" --report fallback\n'); script.chmod(0o700)
         rows, _ = self.run_fixture(["--relay", "execvpe", script, "unused-argument"])
         self.assert_clean(rows[1]); self.assertEqual(rows[1]["tag"], "fallback")
+
+    def assert_frozen(self, row):
+        self.assertEqual(row["freeze_result"], 0, row)
+        self.assertEqual(row["errno"], 77)
+        self.assertEqual(row["frozen_status"], 1)
+        self.assertEqual(row["signal_mask_unchanged"], 1)
+        self.assertEqual(row["actual_preload"], str(self.selector))
+        for key in ("actual_audit", "actual_trace", "actual_envelope"):
+            self.assertEqual(row[key], "", row)
+        self.assertEqual(row["secure_trace"], "1")
+
+    def test_11_cold_freeze_preserves_lazy_view_and_native_internal_launches(self):
+        for route in ("system", "popen", "execve", "execv", "execvpe", "execvp", "spawn", "spawnp"):
+            with self.subTest(route=route):
+                rows, err = self.run_fixture(["--relay", "execve", self.target, "--frozen", route, self.peer])
+                self.assert_clean(rows[0]); self.assert_target(rows[1]); self.assert_frozen(rows[2])
+                self.assertEqual(rows[3]["payload_mapped"], 1)
+                self.assertEqual(rows[3]["trace"], "1")
+                self.assertEqual(rows[3]["preload"], str(self.selector))
+                self.assertEqual(rows[3]["audit"], "")
+                self.assert_clean(rows[4])
+                self.assertEqual(err.count("AUDIT_FIXTURE_LOADED"), 1)
+
+    def test_12_fork_does_not_inherit_virtual_view(self):
+        rows, _ = self.run_fixture(["--relay", "execve", self.target, "--frozen", "fork", self.peer])
+        self.assert_frozen(rows[2])
+        self.assertEqual(rows[4], {"fork_frozen_status": 0, "trace": "", "secure_trace": "", "actual_trace": ""})
+
+    def test_13_wrong_process_phase_abi_and_unknown_config_are_denied(self):
+        rows, _ = self.run_fixture(["--freeze-denied", "normal"])
+        self.assertEqual(rows[0]["freeze_result"], 3)
+        self.assertEqual(rows[0]["frozen_status"], 0)
+        rows, _ = self.run_fixture(["--relay", "execve", self.target, "--freeze-denied", "threads"])
+        self.assertEqual(rows[1]["freeze_result"], 4)
+        self.assertEqual(rows[1]["frozen_status"], 0)
+        self.assertEqual(rows[2]["freeze_result"], 7)
+        self.assertEqual(rows[2]["frozen_status"], 0)
+        rows, _ = self.run_fixture(["--relay", "execve", self.target, "--freeze-denied", "abi"])
+        self.assertEqual(rows[1]["freeze_result"], 1)
+        rows, _ = self.run_fixture(["--freeze-denied", "normal"], env=dict(self.base_env, LD_PRELOAD=str(self.inert)))
+        self.assertEqual(rows[0]["freeze_result"], 2)
+
+    def test_14_freeze_is_sticky_and_repeat_does_not_change_success(self):
+        rows, _ = self.run_fixture(["--relay", "execve", self.target, "--frozen", "repeat", self.peer])
+        self.assert_frozen(rows[2])
+        self.assertEqual(rows[4]["freeze_result"], 7)
+        self.assertEqual(rows[4]["frozen_status"], 1)
+        self.assertEqual(rows[5]["trace"], "1")
+
+    def test_15_constructor_order_and_gnu_getters_preserve_native_values(self):
+        rows, _ = self.run_fixture(["--relay", "execve", self.target, "--descend", "spawn", self.peer],
+                                   env=dict(self.base_env, FIXTURE_FREEZE_IN_CTOR="1"))
+        row = rows[1]
+        self.assertEqual(row["ctor_result"], 0, row)
+        self.assertEqual(row["provider_mask"], 63)
+        self.assertEqual(row["early_errno"], 77)
+        self.assertEqual(row["early_edges"], 1)
+        self.assertEqual(row["early_foreign"], self.base_env["FOREIGN_UNRELATED"])
+        self.assertEqual(row["early_secure_foreign"], self.base_env["FOREIGN_UNRELATED"])
+        self.assertEqual(row["trace"], "1")
+        self.assertEqual(row["preload"], str(self.selector))
+        self.assert_clean(rows[2])
+
+    def test_16_denied_cold_values_are_scrubbed_without_virtual_keys(self):
+        for failure in ("value", "unknown", "missing", "duplicate"):
+            with self.subTest(failure=failure):
+                rows, _ = self.run_fixture(["--relay", "execve", self.target, "--freeze-denied", failure])
+                row = rows[1]
+                self.assertEqual(row["freeze_result"], 5, row)
+                self.assertEqual(row["frozen_status"], 0)
+                self.assertEqual(row["secure_trace"], "")
+                self.assertEqual(row["actual_preload"], str(self.selector))
+                self.assertEqual(row["actual_audit"], "")
+                self.assertEqual(row["actual_trace"], "")
+
+    def test_17_late_real_vulkan_loader_and_implicit_layer_after_freeze(self):
+        # Exercise the actual host loader's secure_getenv enable gate and the
+        # real passive layer's later std::getenv reads, then Mesa GPU lifecycle.
+        # This supplies no native Frame import/pixel or Ready evidence.
+        icd = next((Path("/usr/share/vulkan/icd.d") / name for name in
+                    ("lvp_icd.json", "lvp_icd.x86_64.json")
+                    if (Path("/usr/share/vulkan/icd.d") / name).is_file()), None)
+        self.assertIsNotNone(icd, "Real Mesa software Vulkan ICD is required")
+        probe_source = self.directory / "late_vulkan.cpp"
+        fixture = (ROOT / "tests/test_compositor_preload_vulkan.cpp").read_text()
+        fixture = fixture.replace("int main(int argc,char** argv)",
+                                  'extern "C" int frame_fixture_vulkan_run(int argc,char** argv)')
+        end = fixture.rfind("}")
+        probe_source.write_text(fixture[:end] + "return 0;\n" + fixture[end:])
+        probe = self.directory / "late_vulkan.so"
+        layer = self.directory / "late_passive_layer.so"
+        for command in (
+            ["c++", "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+             "-Wno-missing-field-initializers", "-fPIC", "-shared", str(probe_source),
+             "-lvulkan", "-ldl", "-o", str(probe)],
+            ["c++", "-std=c++17", "-O2", "-fPIC", "-shared", "-pthread",
+             "-DFRAME_MASK_PRIVATE_VULKAN_EXPORTS=1", "-fvisibility=hidden", "-Wl,-Bsymbolic-functions",
+             "-Wl,--version-script=" + str(ROOT / "layer/compositor_raw_exports.map"),
+             str(ROOT / "layer/passive_pipeline_trace.cpp"), "-o", str(layer)],
+        ):
+            code, out, err = bounded_run(command, timeout=60)
+            self.assertEqual(code, 0, (out, err))
+        home = self.directory / "late-vulkan-home"
+        manifest_path = home / "vulkan/implicit_layer.d/frame.json"
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text(json.dumps({"file_format_version": "1.2.0", "layer": {
+            "name": "VK_LAYER_FRAME_MASK_trace", "type": "GLOBAL", "library_path": str(layer),
+            "api_version": "1.3.0", "implementation_version": "1", "description": "Host launch isolation fixture",
+            "functions": {key: "frame_compositor_raw_" + key for key in (
+                "vkGetInstanceProcAddr", "vkGetDeviceProcAddr", "vkNegotiateLoaderLayerInterfaceVersion")},
+            "enable_environment": {"FRAME_MASK_TRACE": "1"},
+            "disable_environment": {"FRAME_MASK_TRACE_DISABLE": "1"}}}))
+        env = dict(self.base_env, XDG_DATA_HOME=str(home), VK_ICD_FILENAMES=str(icd), VK_LOADER_DEBUG="error")
+        for key in ("VK_LAYER_PATH", "VK_INSTANCE_LAYERS", "VK_ADD_LAYER_PATH", "VK_ADD_IMPLICIT_LAYER_PATH",
+                    "VK_LOADER_LAYERS_ENABLE", "VK_LOADER_LAYERS_DISABLE"):
+            env.pop(key, None)
+        journal = Path(self.config["journal"])
+        self.assertFalse(journal.exists())
+        code, out, err = bounded_run([str(self.launcher), "--relay", "execve", str(self.target),
+                                     "--frozen", "vulkan", str(probe)], env=env, timeout=30)
+        self.assertEqual(code, 0, (out, err))
+        rows = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+        self.assert_frozen(rows[2])
+        result = json.loads(next(line[7:] for line in out.splitlines() if line.startswith("RESULT=")))
+        self.assertTrue(result["query_pool"] and result["image_bind_view"] and result["teardown"])
+        self.assertFalse(result["native_frame"])
+        self.assertTrue(journal.exists(), (out, err))
+        records = [json.loads(line) for line in journal.read_text().splitlines()]
+        self.assertEqual(records[0]["event"], "header")
+        footer = records[-1]
+        self.assertEqual(footer["event"], "footer")
+        self.assertTrue(footer["io_ok"])
+        self.assertFalse(footer["lost_state"] or footer["lost_binding_state"])
+        self.assertGreaterEqual(footer["binding_journal"]["published"], 8)
+        self.assertEqual(footer["binding_journal"]["published"], footer["binding_journal"]["replayed"])
+        self.receipts.append({"test": self.id().split(".")[-1], "real_vulkan_loader": True,
+                              "real_mesa": True, "after_actual_environ_scrub": True, "native_frame": False,
+                              "result": result, "journal_bytes": journal.stat().st_size,
+                              "journal_footer": footer, "stderr": err[:2048]})
 
 
 if __name__ == "__main__":

@@ -47,14 +47,34 @@ int frame_launch_config_valid(const struct frame_launch_config *);
  * owned diagnostics removed. argv and native provider path stay untouched. */
 int frame_launch_is_target(const struct frame_launch_config *, const char *file,
     const char *cwd, const char *search_path, int path_search, int has_actions);
-/* OPTIONAL, NOT CALLED by this prototype. Lazy Vulkan/capture env reads and
- * an existing observer writer thread currently prohibit production use.
- * Call ONCE, during single-threaded startup, AFTER the observer has copied every
- * startup value it needs. Never call before the observer freezes its config.
- * This changes only the current environ pointer, not caller-owned env strings.
- * 0: clean baseline published; E2BIG/EINVAL: no mutation. */
-int frame_compositor_launch_clean_environment(void);
-/* Genuine GLIBC-versioned execve/execvpe/spawn/spawnp providers: all bits = 15. */
+#define FRAME_LAUNCH_FREEZE_ABI 1u
+enum frame_launch_freeze_result {
+    FRAME_LAUNCH_FROZEN = 0,
+    FRAME_LAUNCH_FREEZE_INVALID_ABI = 1,
+    FRAME_LAUNCH_FREEZE_INVALID_CONFIG = 2,
+    FRAME_LAUNCH_FREEZE_WRONG_PROCESS = 3,
+    FRAME_LAUNCH_FREEZE_NOT_COLD = 4,
+    FRAME_LAUNCH_FREEZE_ENVIRONMENT = 5,
+    FRAME_LAUNCH_FREEZE_PROVIDER = 6,
+    FRAME_LAUNCH_FREEZE_ALREADY_ATTEMPTED = 7
+};
+/* Explicit cold-start handshake, never called automatically by this DSO.
+ * The observer must call it before its first thread is started. Exact public
+ * /proc/self/exe and bounded /proc/self/task metadata prove target identity and
+ * a single-threaded phase while signals are blocked. Once exact target admission
+ * begins, an attempt is sticky and cannot be retried. Success publishes a clean actual environ:
+ * native internal exec, system and popen inherit only the tiny selector.
+ * Five exact diagnostic getenv keys remain frozen for this PID only, allowing
+ * lazy capture/layer reads. Fork children never receive those virtual values.
+ * Unknown diagnostic keys, duplicated keys and non-exact values are refused.
+ * After single-thread admission, a denied handshake also removes owned launch
+ * settings without exposing frozen keys. If cold admission itself fails, no
+ * environ mutation is safe: start no diagnostic threads and reject readiness.
+ * errno is preserved on every result. New threads may start only after success. */
+int frame_compositor_launch_freeze_environment_v1(unsigned abi);
+/* Read-only PID-local admission; inherited fork state is never admitted. */
+unsigned frame_compositor_launch_frozen_status_v1(void);
+/* Genuine execve/execvpe/spawn/spawnp/getenv/secure_getenv: all bits = 63. */
 unsigned frame_compositor_launch_provider_mask(void);
 #ifdef __cplusplus
 }

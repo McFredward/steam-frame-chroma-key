@@ -6,7 +6,10 @@
     execvpe;
     posix_spawn;
     posix_spawnp;
-    frame_compositor_launch_clean_environment;
+    getenv;
+    secure_getenv;
+    frame_compositor_launch_freeze_environment_v1;
+    frame_compositor_launch_frozen_status_v1;
     frame_compositor_launch_provider_mask;
   local: *;
 };
