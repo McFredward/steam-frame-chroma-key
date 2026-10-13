@@ -9,6 +9,8 @@ option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
 option(FRAME_MASK_BUILD_IMPORT_ENTRY
     "Build uninstalled AArch64 import entry forwarding (no observer activation)" OFF)
+option(FRAME_MASK_LAYER_PRIVATE_EXPORTS
+    "Use private layer interface exports (also usable by host preload ABI fixtures)" OFF)
 option(FRAME_MASK_COMPOSITOR_RAW
     "Build a combined, inactive-by-default bounded compositor import diagnostic" OFF)
 if(FRAME_MASK_COMPOSITOR_RAW AND NOT FRAME_MASK_BUILD_IMPORT_ENTRY)
@@ -160,6 +162,13 @@ if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE OR FRAME_MASK_BUILD_IMPORT_
         target_compile_definitions(VkLayer_frame_mask_trace PRIVATE FRAME_MASK_IMPORT_ENTRY=1)
         target_link_options(VkLayer_frame_mask_trace PRIVATE -Wl,--no-undefined)
     endif()
+    if(FRAME_MASK_COMPOSITOR_RAW OR FRAME_MASK_LAYER_PRIVATE_EXPORTS)
+        target_compile_definitions(VkLayer_frame_mask_trace PRIVATE FRAME_MASK_PRIVATE_VULKAN_EXPORTS=1)
+        target_link_options(VkLayer_frame_mask_trace PRIVATE
+            "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/layer/compositor_raw_exports.map")
+        set_property(TARGET VkLayer_frame_mask_trace APPEND PROPERTY LINK_DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/layer/compositor_raw_exports.map)
+    endif()
     if(FRAME_MASK_COMPOSITOR_RAW)
         target_sources(VkLayer_frame_mask_trace PRIVATE
             receiver/compositor_raw_observer.cpp receiver/compositor_raw_runtime.cpp
@@ -172,13 +181,13 @@ if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE OR FRAME_MASK_BUILD_IMPORT_
         target_compile_definitions(VkLayer_frame_mask_trace PRIVATE FRAME_MASK_COMPOSITOR_RAW=1)
         target_compile_options(VkLayer_frame_mask_trace PRIVATE -ftls-model=initial-exec -fexceptions -fno-rtti)
         target_link_options(VkLayer_frame_mask_trace PRIVATE -Wl,-z,separate-code)
-        target_link_options(VkLayer_frame_mask_trace PRIVATE
-            "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/layer/compositor_raw_exports.map")
-        set_property(TARGET VkLayer_frame_mask_trace APPEND PROPERTY LINK_DEPENDS
-            ${CMAKE_CURRENT_SOURCE_DIR}/layer/compositor_raw_exports.map)
         target_link_libraries(VkLayer_frame_mask_trace PRIVATE ${CMAKE_DL_LIBS})
     endif()
     set(FRAME_MASK_TRACE_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}VkLayer_frame_mask_trace${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    set(FRAME_MASK_TRACE_FUNCTIONS "")
+    if(FRAME_MASK_COMPOSITOR_RAW OR FRAME_MASK_LAYER_PRIVATE_EXPORTS)
+        set(FRAME_MASK_TRACE_FUNCTIONS "\n    \"functions\": {\n      \"vkGetInstanceProcAddr\": \"frame_compositor_raw_vkGetInstanceProcAddr\",\n      \"vkGetDeviceProcAddr\": \"frame_compositor_raw_vkGetDeviceProcAddr\",\n      \"vkNegotiateLoaderLayerInterfaceVersion\": \"frame_compositor_raw_vkNegotiateLoaderLayerInterfaceVersion\"\n    },")
+    endif()
     configure_file(layer/VkLayer_frame_mask_trace.json.in
         ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_mask_trace.json @ONLY)
 elseif(FRAME_MASK_BUILD_TRACE)
@@ -589,6 +598,32 @@ if(BUILD_TESTING)
         add_test(NAME mask_gpu COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_mask_gpu.py $<TARGET_FILE:test_mask_gpu>
             $<TARGET_FILE:test_mask_module_guard>)
+        if(UNIX AND NOT CMAKE_CROSSCOMPILING)
+            # A layer-only ABI fixture uses the real loader/Mesa while remaining
+            # unable to seal native compositor preparation or import entry scope.
+            add_library(VkLayer_frame_compositor_private_fixture SHARED layer/passive_pipeline_trace.cpp)
+            target_include_directories(VkLayer_frame_compositor_private_fixture PRIVATE ${Vulkan_INCLUDE_DIRS})
+            target_compile_definitions(VkLayer_frame_compositor_private_fixture PRIVATE FRAME_MASK_PRIVATE_VULKAN_EXPORTS=1)
+            target_compile_options(VkLayer_frame_compositor_private_fixture PRIVATE -Wall -Wextra -Wpedantic -fvisibility=hidden)
+            target_link_options(VkLayer_frame_compositor_private_fixture PRIVATE -Wl,-Bsymbolic-functions
+                "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/layer/compositor_raw_exports.map")
+            set_property(TARGET VkLayer_frame_compositor_private_fixture APPEND PROPERTY LINK_DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/layer/compositor_raw_exports.map)
+            target_link_libraries(VkLayer_frame_compositor_private_fixture PRIVATE Threads::Threads)
+            add_executable(test_compositor_preload_vulkan tests/test_compositor_preload_vulkan.cpp)
+            target_link_libraries(test_compositor_preload_vulkan PRIVATE Vulkan::Vulkan ${CMAKE_DL_LIBS})
+            target_compile_options(test_compositor_preload_vulkan PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+            set(FRAME_MASK_TRACE_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}VkLayer_frame_compositor_private_fixture${CMAKE_SHARED_LIBRARY_SUFFIX}")
+            set(FRAME_MASK_TRACE_FUNCTIONS "\n    \"functions\": {\n      \"vkGetInstanceProcAddr\": \"frame_compositor_raw_vkGetInstanceProcAddr\",\n      \"vkGetDeviceProcAddr\": \"frame_compositor_raw_vkGetDeviceProcAddr\",\n      \"vkNegotiateLoaderLayerInterfaceVersion\": \"frame_compositor_raw_vkNegotiateLoaderLayerInterfaceVersion\"\n    },")
+            configure_file(layer/VkLayer_frame_mask_trace.json.in
+                ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_compositor_private_fixture.json @ONLY)
+            add_test(NAME compositor_preload_implicit_vulkan COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compositor_preload_vulkan.py
+                $<TARGET_FILE:test_compositor_preload_vulkan>
+                $<TARGET_FILE:VkLayer_frame_compositor_private_fixture>
+                ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_compositor_private_fixture.json)
+            set_tests_properties(compositor_preload_implicit_vulkan PROPERTIES TIMEOUT 120)
+        endif()
         if(TARGET VkLayer_frame_mask_trace)
             add_test(NAME passive_pipeline_trace_gpu COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_passive_pipeline_trace.py

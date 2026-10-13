@@ -29,6 +29,19 @@
 
 #define TRACE_EXPORT extern "C" __attribute__((visibility("default")))
 
+// A combined preload/layer must not interpose the application's Vulkan loader
+// entry points. Interface v2 discovers these private exports through the layer
+// manifest's negotiation mapping and receives their pointers directly. The
+// standard Vulkan query strings and per-device next-provider chain stay intact.
+#if defined(FRAME_MASK_COMPOSITOR_RAW) && !defined(FRAME_MASK_PRIVATE_VULKAN_EXPORTS)
+#error "Raw compositor preload requires private Vulkan layer interface exports"
+#endif
+#ifdef FRAME_MASK_PRIVATE_VULKAN_EXPORTS
+#define vkGetInstanceProcAddr frame_compositor_raw_vkGetInstanceProcAddr
+#define vkGetDeviceProcAddr frame_compositor_raw_vkGetDeviceProcAddr
+#define vkNegotiateLoaderLayerInterfaceVersion frame_compositor_raw_vkNegotiateLoaderLayerInterfaceVersion
+#endif
+
 namespace {
 using namespace frame_trace;
 constexpr std::size_t OutputLimit = 1024 * 1024;

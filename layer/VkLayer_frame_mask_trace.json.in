@@ -5,7 +5,7 @@
     "type": "GLOBAL",
     "library_path": "@FRAME_MASK_TRACE_LIBRARY@",
     "api_version": "1.3.0",
-    "implementation_version": "1",
+    "implementation_version": "1",@FRAME_MASK_TRACE_FUNCTIONS@
     "description": "Opt-in bounded passive compositor pipeline metadata",
     "enable_environment": { "FRAME_MASK_TRACE": "1" },
     "disable_environment": { "FRAME_MASK_TRACE_DISABLE": "1" }
