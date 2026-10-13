@@ -72,6 +72,10 @@ one complete matching request/reply and following receiver reference, using
 393 additional private metadata bytes. The temporary diagnostic was fully
 removed. Compositor resource, source video/eye/UV and GPU association remain
 unproven; streamed genuine-mask passthrough is not enabled.
+The next [raw compositor components](docs/COMPOSITOR-RESOURCE-RAW-PREPARATION.md)
+now reuse the native decoder and public Vulkan result types with bounded
+copy admission. Their software checks pass; production bootstrap, the owning
+resource-journal bridge and actual compositor capture are still pending.
 
 The original upstream chroma-key implementation and instructions below remain
 available as a separate path. They do not enable the new explicit-mask path.

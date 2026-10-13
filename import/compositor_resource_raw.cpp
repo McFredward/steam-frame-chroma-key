@@ -266,6 +266,8 @@ Outcome Observer::observe(const Event& e, Scope& s) const noexcept {
             r.bind_succeeded = true; s.state_ = Scope::State::ViewBefore;
         } else {
             r.view = e.view;
+            // Equal image/view format is the pinned native import path's
+            // source contract, not a rule for arbitrary Vulkan image views.
             if (e.view.result != e.native_result || e.view.device != r.image.device ||
                 e.view.native_device != e.entry.x[0] || e.view.native_device != r.image.native_device ||
                 e.view.image != r.image.image || !e.view.view || e.view.format != r.image.format) return refuse(PublicMetadata, s);

@@ -205,6 +205,22 @@ if(BUILD_TESTING)
         target_include_directories(test_compositor_resource_sparse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_options(test_compositor_resource_sparse PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME compositor_resource_sparse_copy COMMAND test_compositor_resource_sparse)
+        add_executable(test_compositor_resource_raw tests/test_compositor_resource_raw.cpp
+            import/compositor_resource_raw.cpp import/compositor_resource_sparse.cpp
+            import/native_import_route.cpp)
+        target_include_directories(test_compositor_resource_raw PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(test_compositor_resource_raw PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME compositor_resource_raw_metadata COMMAND test_compositor_resource_raw)
+        add_executable(test_compositor_resource_thread tests/test_compositor_resource_thread.cpp
+            import/compositor_resource_thread.cpp import/import_startup_gate.cpp
+            import/native_client_birth.cpp import/import_pipe_epoch.cpp)
+        target_include_directories(test_compositor_resource_thread PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_compositor_resource_thread PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(test_compositor_resource_thread PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+        add_test(NAME compositor_resource_thread_preparation COMMAND test_compositor_resource_thread)
+        set_tests_properties(compositor_resource_thread_preparation PROPERTIES
+            ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0:detect_leaks=1")
         add_executable(test_import_pipe_epoch tests/test_import_pipe_epoch.cpp
             import/import_pipe_epoch.cpp)
         target_include_directories(test_import_pipe_epoch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
