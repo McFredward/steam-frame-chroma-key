@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -43,6 +44,38 @@ def sample(now=2.0):
             line("Done initializing CGraphicsDevice resources"), line("Compositor render thread started")]),
             "vrserver": "\n".join([line("New Connect message from " + M.WEBHELPER + " (VRApplication_WebHelper) (Args: -lang=en_us) 102 "),
                 line("SetApplicationPid appkey=system.systemui pid=103, external transition")])}}
+
+
+def descriptor():
+    result = {"schema": M.ISOLATION_SCHEMA, "target_exe": M.COMPOSITOR,
+        "selector_path": "/reviewed/selector.so", "payload_path": "/reviewed/observer.so", "audit_path": "/reviewed/audit.so"}
+    result["target_exec_environment"] = {"LD_PRELOAD": result["selector_path"] + " " + result["payload_path"],
+        "LD_AUDIT": result["audit_path"], "GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE": "/reviewed/envelope.bin",
+        "GHVR_FRAME_COMPOSITOR_RAW_OUTPUT": "/reviewed/raw.jsonl", "FRAME_MASK_TRACE": "1",
+        "FRAME_MASK_TRACE_BINDINGS": "1", "FRAME_MASK_TRACE_OUTPUT": "/reviewed/trace.jsonl"}
+    return result
+
+
+def isolated_report():
+    config = descriptor()
+    rows = []
+    for p in sample()["processes"]:
+        target = p["exe"] == M.COMPOSITOR
+        rows.append({key: p[key] for key in ("pid", "start_ticks", "state", "exe")})
+        rows[-1].update(ppid=100, selector_mapped=True, payload_mapped=target, audit_mapped=target,
+            owned_mapping_deleted=False, loader_payload=target, loader_audit=target,
+            diagnostic_keys=sorted(set(config["target_exec_environment"]) - {"LD_PRELOAD", "LD_AUDIT"}) if target else [],
+            target_initial_environment_matches=True if target else None)
+    return {"schema": M.ISOLATION_SCHEMA, "descriptor": config, "invocation": unit()["InvocationID"],
+        "control_group": unit()["ControlGroup"], "status": "isolated", "reason": None, "processes": rows,
+        "errors": [], "inventory_stable": True, "unit_stable": True, "target_env_view": "initial-exec-only",
+        "runtime_environ_verified": False, "metadata_usage": {"samples": 1, "processes": 4, "metadata_bytes": 4000}}
+
+
+def rejudge(report):
+    report["status"], report["reason"] = M.isolation_verdict(report["processes"], report["errors"],
+        inventory_stable=report["inventory_stable"], unit_stable=report["unit_stable"])
+    return report
 
 
 class Source:
@@ -379,5 +412,307 @@ class NativeSourceTests(unittest.TestCase):
         self.source.baseline(); checkpoint = self.source.checkpoint()
         checkpoint["log_offsets"]["vrserver"]["offset"] = -1
         with self.assertRaises(RuntimeError): self.source.resume(checkpoint)
+
+class IsolationGateTests(unittest.TestCase):
+    def setUp(self):
+        self.b = baseline(); self.b["isolation_descriptor"] = descriptor()
+        self.s = sample(); self.s["isolation"] = isolated_report()
+
+    def test_reviewed_isolation_is_required_in_addition_to_actual_ui_health(self):
+        self.assertFalse(M.StartupGate(self.b).consume(sample(), stable_seconds=0)["ready"])
+        result = M.StartupGate(self.b).consume(self.s, stable_seconds=0)
+        self.assertTrue(result["ready"]); self.assertTrue(result["isolation_verified"])
+        self.assertFalse(result["screen_pixels_verified"])
+        self.assertEqual(result["isolation"]["target_env_view"], "initial-exec-only")
+        self.assertFalse(result["isolation"]["runtime_environ_verified"])
+        self.s["processes"].pop(1)
+        self.assertFalse(M.StartupGate(self.b).consume(self.s, stable_seconds=0)["ready"])
+
+    def test_each_non_target_mapping_or_initial_flag_contaminates_and_fault_is_sticky(self):
+        for key in ("payload_mapped", "audit_mapped", "loader_payload", "loader_audit", "diagnostic_keys"):
+            s = copy.deepcopy(self.s)
+            s["isolation"]["processes"][1][key] = ["FRAME_MASK_TRACE"] if key == "diagnostic_keys" else True
+            rejudge(s["isolation"])
+            gate = M.StartupGate(self.b)
+            with self.subTest(key=key):
+                result = gate.consume(s, stable_seconds=0)
+                self.assertEqual(result["status"], "fault"); self.assertFalse(result["isolation_verified"])
+                self.assertEqual(gate.consume(self.s)["status"], "fault")
+
+    def test_unknown_unreadable_changing_and_possible_fork_inventory_never_proves_isolation(self):
+        for variant in ("unreadable", "inventory", "unit", "duplicate_target", "target_mapping", "target_state"):
+            s = copy.deepcopy(self.s); report = s["isolation"]
+            if variant == "unreadable": report["errors"] = [{"pid": 200, "reason": "PermissionError"}]
+            if variant == "inventory": report["inventory_stable"] = False
+            if variant == "unit": report["unit_stable"] = False
+            if variant == "duplicate_target":
+                child = copy.deepcopy(report["processes"][0]); child.update(pid=200, start_ticks=20000, ppid=101)
+                report["processes"].append(child); report["metadata_usage"]["processes"] += 1
+            if variant == "target_mapping": report["processes"][0]["audit_mapped"] = False
+            if variant == "target_state": report["processes"][0]["state"] = "Z"
+            rejudge(report)
+            with self.subTest(variant=variant):
+                result = M.StartupGate(self.b).consume(s, stable_seconds=0)
+                self.assertFalse(result["ready"]); self.assertEqual(result["status"], "not-ready")
+
+    def test_target_initial_input_mismatch_and_deleted_mapping_refuse(self):
+        for key in ("target_initial_environment_matches", "owned_mapping_deleted"):
+            s = copy.deepcopy(self.s)
+            s["isolation"]["processes"][0][key] = key == "owned_mapping_deleted"
+            rejudge(s["isolation"])
+            with self.subTest(key=key): self.assertEqual(M.StartupGate(self.b).consume(s)["status"], "fault")
+
+    def test_ready_monitor_cannot_reuse_missing_isolation_or_reset_budget(self):
+        for variant in ("missing", "unreadable", "budget", "cgroup"):
+            gate = M.StartupGate(self.b); self.assertTrue(gate.consume(self.s, stable_seconds=0)["ready"])
+            s = copy.deepcopy(self.s); s["monotonic"] = 4
+            if variant == "missing": s.pop("isolation")
+            if variant == "unreadable":
+                s["isolation"]["errors"] = [{"pid": 200, "reason": "PermissionError"}]; rejudge(s["isolation"])
+            if variant == "budget": s["isolation"]["metadata_usage"]["metadata_bytes"] -= 1
+            if variant == "cgroup":
+                s["unit"]["ControlGroup"] = "/changed/steamvr.service"
+                s["isolation"]["control_group"] = s["unit"]["ControlGroup"]
+            with self.subTest(variant=variant):
+                result = gate.consume(s)
+                self.assertEqual(result["status"], "fault"); self.assertFalse(result["isolation_verified"])
+
+    def test_exact_isolated_target_must_be_the_actual_ui_compositor(self):
+        report = self.s["isolation"]
+        report["processes"][0]["pid"] += 10
+        self.assertEqual(M.StartupGate(self.b).consume(self.s)["status"], "fault")
+
+    def test_reports_do_not_self_attest_isolation_or_runtime_environment(self):
+        for variant in ("verdict", "descriptor", "runtime", "invocation", "unknown", "duplicate", "zero_budget"):
+            s = copy.deepcopy(self.s); report = s["isolation"]
+            if variant == "verdict": report["processes"][1]["payload_mapped"] = True
+            if variant == "descriptor": report["descriptor"]["payload_path"] = "/unreviewed/observer.so"
+            if variant == "runtime": report["runtime_environ_verified"] = True
+            if variant == "invocation": report["invocation"] = "c" * 32
+            if variant == "unknown": report["extra"] = True
+            if variant == "duplicate": report["processes"].append(copy.deepcopy(report["processes"][0]))
+            if variant == "zero_budget": report["metadata_usage"]["samples"] = 0
+            with self.subTest(variant=variant): self.assertEqual(M.StartupGate(self.b).consume(s)["status"], "fault")
+
+    def test_checkpoint_retains_required_isolation_and_rejects_invented_proof(self):
+        gate = M.StartupGate(self.b); gate.consume(self.s, stable_seconds=0)
+        saved = json.loads(json.dumps(gate.checkpoint()))
+        self.assertTrue(M.StartupGate.resume(saved).consume(self.s, stable_seconds=0)["ready"])
+        for variant in ("missing", "false", "unscoped", "bad_budget", "target_identity"):
+            broken = copy.deepcopy(saved)
+            if variant == "missing": broken["isolation"] = None
+            if variant == "false": broken["isolation"]["processes"][1]["payload_mapped"] = True
+            if variant == "unscoped": broken["baseline"].pop("isolation_descriptor")
+            if variant == "bad_budget": broken["isolation"]["metadata_usage"]["samples"] = M.ISOLATION_SAMPLE_LIMIT + 1
+            if variant == "target_identity": broken["isolation"]["processes"][0]["start_ticks"] += 1
+            with self.subTest(variant=variant), self.assertRaises(RuntimeError): M.StartupGate.resume(broken)
+
+
+class IsolationSourceTests(unittest.TestCase):
+    command = NativeSourceTests.command
+    procfile = NativeSourceTests.procfile
+    def setUp(self):
+        NativeSourceTests.setUp(self)
+        self.config = descriptor()
+        self.cgroot = self.root / "cgroups"; self.cgroot.mkdir()
+        self.group = self.cgroot / unit()["ControlGroup"].lstrip("/")
+        self.group.mkdir(parents=True); (self.group / "cgroup.procs").write_text("100\n101\n102\n")
+        self.source.isolation_descriptor = M.require_isolation_descriptor(self.config)
+        self.source.cgroup_root = self.cgroot
+        self.managed(100, exe="/usr/bin/launcher")
+        self.managed(101, exe=M.COMPOSITOR, env=self.config["target_exec_environment"], full=True)
+        self.managed(102, exe="/usr/bin/unrecognized-service-helper")
+    def tearDown(self): NativeSourceTests.tearDown(self)
+    def managed(self, pid, *, exe, env=None, full=False, group=None):
+        p = self.procfile(pid, "compositor" if exe == M.COMPOSITOR else "browser", group=group)
+        (p / "exe").unlink(); (p / "exe").symlink_to(exe)
+        cols = ["S", "100" if pid != 100 else "1"] + ["0"] * 17 + [str(pid * 100)]
+        (p / "stat").write_text(str(pid) + " (helper) " + " ".join(cols))
+        env = env if env is not None else {"LD_PRELOAD": self.config["selector_path"], "PRIVATE_USER_VALUE": "never-log-this"}
+        (p / "environ").write_bytes(b"".join(key.encode() + b"=" + value.encode() + b"\0" for key, value in env.items()))
+        paths = [self.config["selector_path"]]
+        if full: paths += [self.config["payload_path"], self.config["audit_path"]]
+        (p / "maps").write_text("\n".join("1000-2000 r-xp 00000000 00:00 0 " + path for path in paths) + "\n")
+        return p
+    def report(self): return self.source.isolation(unit())
+
+    def test_every_managed_executable_is_checked_with_only_sanitized_evidence(self):
+        report = self.report(); M.require_isolation_report(report, self.config, unit())
+        self.assertEqual(report["status"], "isolated")
+        self.assertEqual({row["pid"] for row in report["processes"]}, {100, 101, 102})
+        self.assertNotIn("never-log-this", json.dumps(report))
+        self.assertFalse(report["runtime_environ_verified"])
+        self.assertEqual(report["target_env_view"], "initial-exec-only")
+        self.assertGreater(report["metadata_usage"]["metadata_bytes"], 0)
+
+    def test_unknown_helper_environment_and_mappings_cannot_be_skipped_by_name(self):
+        p = self.proc / "102"
+        for case in ("preload", "audit", "flag", "payload_map", "audit_map", "deleted_map", "prefix"):
+            original_env, original_maps = (p / "environ").read_bytes(), (p / "maps").read_bytes()
+            if case == "preload": (p / "environ").write_bytes(b"LD_PRELOAD=/foreign.so:" + self.config["payload_path"].encode() + b"\0")
+            if case == "audit": (p / "environ").write_bytes(b"LD_AUDIT=" + self.config["audit_path"].encode() + b"\0")
+            if case == "flag": (p / "environ").write_bytes(b"FRAME_MASK_TRACE=0\0")
+            if case == "prefix": (p / "environ").write_bytes(b"GHVR_FRAME_COMPOSITOR_RAW_UNREVIEWED=secret\0")
+            if case.endswith("map"):
+                key = "audit_path" if case == "audit_map" else "payload_path"
+                (p / "maps").write_text("1000-2000 r-xp 00000000 00:00 0 " + self.config[key] + (" (deleted)" if case == "deleted_map" else "") + "\n")
+            with self.subTest(case=case): self.assertEqual(self.report()["status"], "contaminated")
+            (p / "environ").write_bytes(original_env); (p / "maps").write_bytes(original_maps)
+
+    def test_descriptor_matches_exact_paths_and_target_initial_seven_values(self):
+        target = self.proc / "101"
+        original = (target / "environ").read_bytes()
+        (target / "environ").write_bytes(original + b"FRAME_MASK_TRACE_DISABLE=1\0")
+        self.assertEqual(self.report()["status"], "contaminated")
+        (target / "environ").write_bytes(original.replace(b"FRAME_MASK_TRACE=1", b"FRAME_MASK_TRACE=0"))
+        self.assertEqual(self.report()["status"], "contaminated")
+        (target / "environ").write_bytes(original)
+        p = self.proc / "102"
+        (p / "environ").write_bytes(b"LD_PRELOAD=/unrelated/observer.so /unrelated/audit.so\0")
+        (p / "maps").write_text("1000-2000 r-xp 00000000 00:00 0 /unrelated/observer.so\n")
+        self.assertEqual(self.report()["status"], "isolated")
+
+    def test_managed_descendants_are_included_and_unrelated_pid_metadata_is_not_read(self):
+        child = self.group / "nested"; child.mkdir(); (child / "cgroup.procs").write_text("200\n")
+        self.managed(200, exe="/usr/bin/nested-helper", group=unit()["ControlGroup"] + "/nested")
+        unrelated = self.managed(201, exe="/unrelated/helper", group="/other.service")
+        (unrelated / "environ").unlink()
+        result = self.report()
+        self.assertEqual(result["status"], "isolated")
+        self.assertEqual({row["pid"] for row in result["processes"]}, {100, 101, 102, 200})
+
+    def test_unknown_unreadable_managed_members_are_non_proof_never_skipped(self):
+        for file in ("environ", "maps", "exe", "cgroup", "stat"):
+            path = self.proc / "102" / file; rename = path.with_name(file + ".held")
+            path.rename(rename)
+            result = self.report()
+            with self.subTest(file=file):
+                self.assertEqual(result["status"], "not-isolated")
+                self.assertTrue(any(error["pid"] == 102 for error in result["errors"]))
+            rename.rename(path)
+        (self.group / "cgroup.procs").write_text("100\n101\n102\n200\n")
+        self.assertEqual(self.report()["status"], "not-isolated")
+
+    def test_permission_denial_of_any_managed_helper_is_explicit_non_proof(self):
+        original = self.source.isolation_read
+        def deny(path, limit):
+            if path == self.proc / "102" / "maps": raise PermissionError("managed mapping denied")
+            return original(path, limit)
+        with mock.patch.object(self.source, "isolation_read", side_effect=deny): result = self.report()
+        self.assertEqual(result["status"], "not-isolated")
+        self.assertIn({"pid": 102, "reason": "PermissionError"}, result["errors"])
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux proc initial environment contract")
+    def test_real_proc_environment_is_initial_exec_input_not_late_runtime_getenv(self):
+        # The actual kernel interface retains the initial range after unsetenv.
+        # Reading it cannot certify that a compositor's late getenv is frozen.
+        code = ("import os\nfrom pathlib import Path\nimport sys\n"
+                "os.environ.pop('FRAME_MASK_TRACE')\nos.environ.pop('GHVR_FRAME_COMPOSITOR_RAW_OUTPUT')\n"
+                "assert os.getenv('FRAME_MASK_TRACE') is None\n"
+                "sys.stdout.buffer.write(Path('/proc/self/environ').read_bytes())\n")
+        result = subprocess.run([sys.executable, "-c", code], env={"FRAME_MASK_TRACE": "1",
+            "GHVR_FRAME_COMPOSITOR_RAW_OUTPUT": "/reviewed/raw.jsonl"}, check=True, capture_output=True, timeout=5)
+        evidence = self.source.isolation_environment(result.stdout, target=False)
+        self.assertEqual(set(evidence["diagnostic_keys"]), {"FRAME_MASK_TRACE", "GHVR_FRAME_COMPOSITOR_RAW_OUTPUT"})
+        self.assertIsNone(evidence["target_initial_environment_matches"])
+
+    def test_uid_pid_start_exe_cgroup_and_inventory_are_bracketed(self):
+        for variant in ("uid", "start", "exe", "group", "inventory", "unit"):
+            with self.subTest(variant=variant):
+                original = self.source.isolation_read
+                changed = False
+                def mutate(path, limit):
+                    nonlocal changed
+                    data = original(path, limit)
+                    if path == self.proc / "102" / "maps" and not changed:
+                        changed = True
+                        if variant == "start":
+                            p = self.proc / "102" / "stat"; p.write_text(p.read_text().replace("10200", "10201"))
+                        if variant == "exe":
+                            p = self.proc / "102" / "exe"; p.unlink(); p.symlink_to("/changed/helper")
+                        if variant == "group": (self.proc / "102" / "cgroup").write_text("0::/other.service\n")
+                        if variant == "inventory": (self.group / "cgroup.procs").write_text("100\n101\n")
+                    return data
+                if variant == "uid":
+                    self.source.uid = os.getuid() + 1
+                    result = self.report(); self.source.uid = os.getuid()
+                elif variant == "unit":
+                    with mock.patch.object(self.source, "unit", return_value=unit("c" * 32)): result = self.report()
+                else:
+                    with mock.patch.object(self.source, "isolation_read", side_effect=mutate): result = self.report()
+                self.assertEqual(result["status"], "not-isolated")
+                if variant in ("start", "exe", "group"):
+                    for p in (self.proc / "102",):
+                        for child in p.iterdir(): child.unlink()
+                        p.rmdir()
+                    self.managed(102, exe="/usr/bin/unrecognized-service-helper")
+                (self.group / "cgroup.procs").write_text("100\n101\n102\n")
+
+    def test_non_exec_fork_copies_are_ambiguous_and_not_called_unloaded(self):
+        self.managed(200, exe=M.COMPOSITOR, env=self.config["target_exec_environment"], full=True)
+        (self.group / "cgroup.procs").write_text("100\n101\n102\n200\n")
+        result = self.report()
+        self.assertEqual(result["status"], "not-isolated"); self.assertIn("fork", result["reason"])
+        (self.proc / "200" / "exe").unlink(); (self.proc / "200" / "exe").symlink_to("/usr/bin/forked-shell")
+        self.assertEqual(self.report()["status"], "contaminated")
+
+    def test_source_checkpoint_preserves_budget_descriptor_and_never_resets_on_resume(self):
+        self.source.baseline(); self.report()
+        saved = json.loads(json.dumps(self.source.checkpoint()))
+        resumed = M.NativeEvidenceSource(self.home, proc_root=self.proc, run=self.command, isolation=self.config, cgroup_root=self.cgroot)
+        resumed.resume(saved)
+        self.assertEqual(resumed.isolation_usage, saved["isolation_usage"])
+        resumed.isolation(unit())
+        self.assertGreater(resumed.isolation_usage["samples"], saved["isolation_usage"]["samples"])
+        self.assertGreater(resumed.isolation_usage["metadata_bytes"], saved["isolation_usage"]["metadata_bytes"])
+        for key, value in (("samples", M.ISOLATION_SAMPLE_LIMIT + 1), ("processes", True), ("metadata_bytes", -1)):
+            bad = copy.deepcopy(saved); bad["isolation_usage"][key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError): resumed.resume(bad)
+        bad = copy.deepcopy(saved); bad["isolation_descriptor"]["audit_path"] = "/unreviewed/audit.so"
+        with self.assertRaises(RuntimeError): resumed.resume(bad)
+
+    def test_cumulative_limits_and_per_process_extents_fail_without_metadata_leak(self):
+        self.source.isolation_usage["samples"] = M.ISOLATION_SAMPLE_LIMIT
+        with self.assertRaises(RuntimeError): self.report()
+        self.source.isolation_usage["samples"] = 0
+        self.source.isolation_usage["processes"] = M.ISOLATION_PROCESS_LIMIT
+        self.assertEqual(self.report()["status"], "not-isolated")
+        self.source.isolation_usage = {"samples": 0, "processes": 0, "metadata_bytes": M.ISOLATION_BYTE_LIMIT - 1}
+        self.assertEqual(self.report()["status"], "not-isolated")
+        self.assertEqual(self.source.isolation_usage["metadata_bytes"], M.ISOLATION_BYTE_LIMIT)
+        self.source.isolation_usage = {"samples": 0, "processes": 0, "metadata_bytes": 0}
+        (self.proc / "102" / "environ").write_bytes(b"PRIVATE=secret" + b"x" * M.ISOLATION_ENV_LIMIT + b"\0")
+        report = self.report(); self.assertEqual(report["status"], "not-isolated")
+        self.assertNotIn("secret", json.dumps(report))
+        (self.proc / "102" / "environ").write_bytes(b"LD_PRELOAD=" + self.config["selector_path"].encode() + b"\0")
+        (self.proc / "102" / "maps").write_bytes(b"x" * (M.ISOLATION_MAP_LIMIT + 1))
+        self.assertEqual(self.report()["status"], "not-isolated")
+
+    def test_cgroup_inventory_bounds_prevent_unbounded_process_or_directory_scan(self):
+        (self.group / "cgroup.procs").write_text("\n".join(str(pid) for pid in range(1, M.MAX_PROCESSES + 2)) + "\n")
+        result = self.report(); self.assertEqual(result["status"], "not-isolated")
+        self.assertFalse(result["processes"])
+        (self.group / "cgroup.procs").write_text("100\n101\n102\n")
+        for index in range(M.ISOLATION_GROUP_LIMIT):
+            child = self.group / str(index); child.mkdir(); (child / "cgroup.procs").write_text("")
+        result = self.report(); self.assertEqual(result["status"], "not-isolated")
+        self.assertFalse(result["processes"])
+
+    def test_unsafe_descriptors_and_scope_paths_are_refused_without_guessing(self):
+        for variant in ("path", "relative", "aliases", "keys", "loader", "flag", "foreign"):
+            config = descriptor()
+            if variant == "path": config["selector_path"] = "/reviewed/../selector.so"
+            if variant == "relative": config["target_exe"] = "vrcompositor"
+            if variant == "aliases": config["audit_path"] = config["payload_path"]
+            if variant == "keys": config["target_exec_environment"].pop("LD_AUDIT")
+            if variant == "loader": config["target_exec_environment"]["LD_AUDIT"] = "/unrelated/audit.so"
+            if variant == "flag": config["target_exec_environment"]["FRAME_MASK_TRACE"] = "0"
+            if variant == "foreign": config["extra"] = "unreviewed"
+            with self.subTest(variant=variant), self.assertRaises(RuntimeError): M.require_isolation_descriptor(config)
+        u = unit(); u["ControlGroup"] = "/user.slice/../steamvr.service"
+        self.assertEqual(self.source.isolation(u)["status"], "not-isolated")
+        original = self.group / "cgroup.procs"; original.unlink(); original.symlink_to(self.proc / "102" / "environ")
+        self.assertEqual(self.report()["status"], "not-isolated")
+
 
 if __name__ == "__main__": unittest.main()

@@ -3,6 +3,9 @@
 
 Run outside rendering threads. A live compositor/service is insufficient: the
 current UI browser, system UI and a libcef-backed renderer must also be alive.
+An optional reviewed descriptor checks every managed executable for diagnostic
+inheritance. Linux proc environ is initial-exec evidence, never a claim that late
+getenv is clean; the observer's separately bound freeze receipt is still needed.
 No recovery/restart command is issued by this module.
 """
 from __future__ import annotations
@@ -20,6 +23,16 @@ UNIT = "steamvr.service"
 SCHEMA = "frame-compositor-startup-health-v1"
 LIMIT = 512 * 1024
 MAX_PROCESSES = 512
+ISOLATION_SCHEMA = "frame-compositor-startup-isolation-v1"
+ISOLATION_BYTE_LIMIT = 64 * 1024 * 1024
+ISOLATION_SAMPLE_LIMIT = 64
+ISOLATION_PROCESS_LIMIT = 4096
+ISOLATION_GROUP_LIMIT = 128
+ISOLATION_ENV_LIMIT = 64 * 1024
+ISOLATION_MAP_LIMIT = 1024 * 1024
+ISOLATION_ENV_KEYS = frozenset(("LD_PRELOAD", "LD_AUDIT", "GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE",
+    "GHVR_FRAME_COMPOSITOR_RAW_OUTPUT", "FRAME_MASK_TRACE", "FRAME_MASK_TRACE_BINDINGS", "FRAME_MASK_TRACE_OUTPUT"))
+DIAGNOSTIC_PREFIXES = (b"GHVR_FRAME_COMPOSITOR_RAW_", b"FRAME_MASK_TRACE")
 INELIGIBLE_STATES = frozenset("TtXxZ")
 PROPERTIES = ("InvocationID", "ActiveState", "SubState", "MainPID", "ControlGroup", "NRestarts", "ExecMainStartTimestampMonotonic")
 COMPOSITOR = "/opt/steamvr/bin/linuxarm64/vrcompositor"
@@ -31,6 +44,113 @@ FATAL = re.compile(r"cannot allocate memory in static TLS block|error while load
     r"(?:renderer|GPU process).*?(?:crashed|crash loop|failed to start)|"
     r"(?:segmentation fault|segfault|core dumped)", re.I)
 DATE = re.compile(r"^\w{3} (\w{3} +\d{1,2} \d{4} \d{2}:\d{2}:\d{2}\.\d{6}) ")
+
+
+def reviewed_absolute_path(value):
+    return (isinstance(value, str) and 1 < len(value) <= 1024 and value.startswith("/") and
+            value == os.path.normpath(value) and "//" not in value and
+            all(33 <= ord(char) <= 126 and char not in ":=" for char in value))
+
+
+def require_isolation_descriptor(descriptor):
+    """Paths and target inputs are supplied by the reviewed artifact, not guessed."""
+    if descriptor is None: return None
+    keys = {"schema", "target_exe", "selector_path", "payload_path", "audit_path", "target_exec_environment"}
+    if (not isinstance(descriptor, dict) or set(descriptor) != keys or descriptor["schema"] != ISOLATION_SCHEMA or
+            any(not reviewed_absolute_path(descriptor[key]) for key in keys - {"schema", "target_exec_environment"}) or
+            len({descriptor[key] for key in ("target_exe", "selector_path", "payload_path", "audit_path")}) != 4):
+        raise RuntimeError("Invalid reviewed startup isolation descriptor")
+    env = descriptor["target_exec_environment"]
+    if (not isinstance(env, dict) or set(env) != ISOLATION_ENV_KEYS or
+            any(not isinstance(value, str) or not value or len(value) > 4096 or
+                any(not 32 <= ord(char) <= 126 for char in value) for value in env.values()) or
+            env["FRAME_MASK_TRACE"] != "1" or env["FRAME_MASK_TRACE_BINDINGS"] != "1" or
+            any(not reviewed_absolute_path(env[key]) for key in
+                ("GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE", "GHVR_FRAME_COMPOSITOR_RAW_OUTPUT", "FRAME_MASK_TRACE_OUTPUT"))):
+        raise RuntimeError("Invalid reviewed target initial environment")
+    preload = re.split(r"[ :]+", env["LD_PRELOAD"])
+    audit = re.split(r"[ :]+", env["LD_AUDIT"])
+    if (preload.count(descriptor["payload_path"]) != 1 or preload.count(descriptor["selector_path"]) != 1 or
+            descriptor["audit_path"] in preload or audit.count(descriptor["audit_path"]) != 1 or
+            descriptor["payload_path"] in audit or descriptor["selector_path"] in audit):
+        raise RuntimeError("Reviewed target loader input does not select the exact artifact")
+    return {**descriptor, "target_exec_environment": dict(env)}
+
+
+def require_isolation_usage(usage):
+    if (not isinstance(usage, dict) or set(usage) != {"samples", "processes", "metadata_bytes"} or
+            any(type(usage[key]) is not int or not 0 <= usage[key] <= limit for key, limit in
+                (("samples", ISOLATION_SAMPLE_LIMIT), ("processes", ISOLATION_PROCESS_LIMIT),
+                 ("metadata_bytes", ISOLATION_BYTE_LIMIT)))):
+        raise RuntimeError("Invalid cumulative startup isolation budget")
+
+
+def isolation_verdict(rows, errors, *, inventory_stable, unit_stable):
+    """A fork without exec may retain mappings; never call it clean or unloadable."""
+    for row in rows:
+        if row["owned_mapping_deleted"]:
+            return "contaminated", "Owned diagnostic mapping has been deleted or replaced"
+        if row["target_initial_environment_matches"] is None:
+            if (row["payload_mapped"] or row["audit_mapped"] or row["loader_payload"] or
+                    row["loader_audit"] or row["diagnostic_keys"]):
+                return "contaminated", "Non-target process inherited full diagnostic state"
+        elif not row["target_initial_environment_matches"]:
+            return "contaminated", "Target initial-exec environment differs from reviewed inputs"
+    if errors or not inventory_stable or not unit_stable:
+        return "not-isolated", "Managed process inventory or metadata is unreadable/changing"
+    targets = [row for row in rows if row["target_initial_environment_matches"] is not None]
+    if len(targets) != 1:
+        return "not-isolated", "Exact target identity is missing or ambiguous, including possible fork descendants"
+    target = targets[0]
+    if target["state"] in INELIGIBLE_STATES or not all(target[key] for key in ("selector_mapped", "payload_mapped", "audit_mapped")):
+        return "not-isolated", "Exact target diagnostic executable mappings are not ready"
+    return "isolated", None
+
+
+def require_isolation_report(report, descriptor, unit):
+    expected = {"schema", "descriptor", "invocation", "control_group", "status", "reason", "processes", "errors",
+        "inventory_stable", "unit_stable", "target_env_view", "runtime_environ_verified", "metadata_usage"}
+    if (not isinstance(report, dict) or set(report) != expected or report["schema"] != ISOLATION_SCHEMA or
+            report["descriptor"] != descriptor or report["invocation"] != unit["InvocationID"] or
+            report["control_group"] != unit["ControlGroup"] or report["target_env_view"] != "initial-exec-only" or
+            report["runtime_environ_verified"] is not False or
+            type(report["inventory_stable"]) is not bool or type(report["unit_stable"]) is not bool):
+        raise RuntimeError("Invalid current startup isolation report")
+    require_isolation_usage(report["metadata_usage"])
+    if not report["metadata_usage"]["samples"]:
+        raise RuntimeError("Startup isolation report contains no current sample budget")
+    if (not isinstance(report["errors"], list) or len(report["errors"]) > 16 or
+            any(not isinstance(error, dict) or set(error) != {"pid", "reason"} or
+                type(error["pid"]) is not int or not 0 <= error["pid"] < 2**64 or
+                not isinstance(error["reason"], str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", error["reason"])
+                for error in report["errors"])):
+        raise RuntimeError("Invalid startup isolation unreadable-process report")
+    rows = report["processes"]
+    row_keys = {"pid", "start_ticks", "state", "ppid", "exe", "selector_mapped", "payload_mapped", "audit_mapped",
+        "owned_mapping_deleted", "loader_payload", "loader_audit", "diagnostic_keys", "target_initial_environment_matches"}
+    if not isinstance(rows, list) or len(rows) > MAX_PROCESSES:
+        raise RuntimeError("Invalid startup isolation process count")
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) != row_keys or
+                any(type(row[key]) is not int or not 0 < row[key] < 2**64 for key in ("pid", "start_ticks")) or
+                type(row["ppid"]) is not int or not 0 <= row["ppid"] < 2**64 or
+                row["state"] not in tuple("RSDTtXxZIKPW") or not isinstance(row["exe"], str) or
+                not row["exe"].startswith("/") or len(row["exe"]) > 4096 or
+                any(type(row[key]) is not bool for key in
+                    ("selector_mapped", "payload_mapped", "audit_mapped", "owned_mapping_deleted", "loader_payload", "loader_audit")) or
+                not isinstance(row["diagnostic_keys"], list) or len(row["diagnostic_keys"]) > 16 or
+                any(not isinstance(key, str) or len(key) > 128 or not key.encode("ascii").startswith(DIAGNOSTIC_PREFIXES)
+                    for key in row["diagnostic_keys"]) or
+                row["target_initial_environment_matches"] is not None and type(row["target_initial_environment_matches"]) is not bool or
+                (row["exe"] == descriptor["target_exe"]) != (row["target_initial_environment_matches"] is not None)):
+            raise RuntimeError("Invalid startup isolation process metadata")
+    if len({row["pid"] for row in rows}) != len(rows):
+        raise RuntimeError("Duplicate startup isolation process identity")
+    if report["metadata_usage"]["processes"] < len(rows) or rows and not report["metadata_usage"]["metadata_bytes"]:
+        raise RuntimeError("Startup isolation report metadata budget disagrees with process evidence")
+    verdict = isolation_verdict(rows, report["errors"], inventory_stable=report["inventory_stable"], unit_stable=report["unit_stable"])
+    if (report["status"], report["reason"]) != verdict:
+        raise RuntimeError("Startup isolation verdict/evidence disagreement")
 
 
 def identity(process):
@@ -76,11 +196,15 @@ def require_unit(unit, *, allow_inactive=False):
 class NativeEvidenceSource:
     """Kernel process metadata, bounded fresh native log ranges and journal only."""
     def __init__(self, home, *, proc_root=Path("/proc"), run=subprocess.run,
-                 clock=time.monotonic, wall_clock=time.time, uid=None):
+                 clock=time.monotonic, wall_clock=time.time, uid=None, isolation=None,
+                 cgroup_root=Path("/sys/fs/cgroup")):
         self.home, self.proc, self.run = Path(home), Path(proc_root), run
         self.clock, self.wall_clock = clock, wall_clock
         self.sleep = time.sleep
         self.uid = os.getuid() if uid is None else uid
+        self.isolation_descriptor = require_isolation_descriptor(isolation)
+        self.cgroup_root = Path(cgroup_root)
+        self.isolation_usage = {"samples": 0, "processes": 0, "metadata_bytes": 0}
         self.native_paths = {name: os.path.realpath(name) for name in (COMPOSITOR, WEBHELPER, LIBCEF)}
         self.logs = {name: self.home / ".local/share/Steam/logs" / (name + ".txt")
                      for name in ("vrcompositor", "vrserver")}
@@ -194,6 +318,190 @@ class NativeEvidenceSource:
                 errors.append({"pid": int(path.name), "reason": type(error).__name__})
         return result, errors
 
+    def isolation_read(self, path, limit):
+        # This cumulative accounting includes metadata reads which later fail
+        # identity checks. A retry/resume never restores the spent budget.
+        remaining = ISOLATION_BYTE_LIMIT - self.isolation_usage["metadata_bytes"]
+        if remaining <= 0: raise RuntimeError("Startup isolation byte budget exhausted")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            data = stream.read(min(limit + 1, remaining))
+        self.isolation_usage["metadata_bytes"] += len(data)
+        if len(data) > limit: raise RuntimeError("Startup isolated metadata extent exceeded")
+        if remaining <= limit and len(data) == remaining:
+            raise RuntimeError("Startup isolation byte budget exhausted")
+        return data
+
+    def managed_inventory(self, unit):
+        """Authoritative service cgroup tree, including otherwise unknown children."""
+        group = unit["ControlGroup"]
+        if not group or any(part in (".", "..") for part in group.split("/")):
+            raise RuntimeError("Current managed control group unavailable")
+        root = self.cgroup_root / group.lstrip("/")
+        for path in (root, *root.parents):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode): raise RuntimeError("Symlink control-group path refused")
+        pending, groups, pids = [root], {}, set()
+        while pending:
+            path = pending.pop()
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode): raise RuntimeError("Invalid control-group directory")
+            groups[str(path)] = (info.st_dev, info.st_ino)
+            if len(groups) > ISOLATION_GROUP_LIMIT: raise RuntimeError("Startup control-group directory bound exceeded")
+            raw = self.isolation_read(path / "cgroup.procs", 8192)
+            for row in raw.splitlines():
+                if not re.fullmatch(rb"[1-9][0-9]{0,9}", row) or int(row) >= 2**31:
+                    raise RuntimeError("Unsupported control-group PID inventory")
+                pids.add(int(row))
+                if len(pids) > MAX_PROCESSES: raise RuntimeError("Startup managed process bound exceeded")
+            with os.scandir(path) as entries:
+                count = 0
+                for entry in entries:
+                    count += 1
+                    if count > 512: raise RuntimeError("Startup control-group entry bound exceeded")
+                    if entry.is_symlink(): raise RuntimeError("Symlink control-group entry refused")
+                    if entry.is_dir(follow_symlinks=False): pending.append(Path(entry.path))
+            if len(pending) + len(groups) > ISOLATION_GROUP_LIMIT:
+                raise RuntimeError("Startup control-group directory bound exceeded")
+        return groups, pids
+
+    def isolation_identity(self, path):
+        raw = self.isolation_read(path / "stat", 8192)
+        end = raw.rfind(b")"); columns = raw[end + 2:].split()
+        if (end < 0 or raw.split(b" ", 1)[0] != path.name.encode("ascii") or len(columns) < 20 or
+                columns[0] not in tuple(state.encode("ascii") for state in "RSDTtXxZIKPW")):
+            raise RuntimeError("Unsupported isolated process identity")
+        start, ppid = int(columns[19]), int(columns[1])
+        if not 0 < start < 2**64 or not 0 <= ppid < 2**64:
+            raise RuntimeError("Invalid isolated process start/parent identity")
+        return start, columns[0].decode("ascii"), ppid
+
+    def isolation_link(self, path):
+        value = os.readlink(path)
+        size = len(value.encode("utf-8"))
+        if size > 4096: raise RuntimeError("Startup executable link extent exceeded")
+        if self.isolation_usage["metadata_bytes"] + size > ISOLATION_BYTE_LIMIT:
+            self.isolation_usage["metadata_bytes"] = ISOLATION_BYTE_LIMIT
+            raise RuntimeError("Startup isolation byte budget exhausted")
+        self.isolation_usage["metadata_bytes"] += size
+        return value
+
+    def isolation_scope(self, path, unit):
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != self.uid:
+            raise RuntimeError("Managed process UID/type differs from service user")
+        groups = self.isolation_read(path / "cgroup", 8192).decode("ascii").splitlines()
+        group = unit["ControlGroup"]
+        if not any(len(row.split(":", 2)) == 3 and
+                (row.split(":", 2)[2] == group or row.split(":", 2)[2].startswith(group + "/")) for row in groups):
+            raise RuntimeError("Managed inventory/process control group disagrees")
+        return info.st_dev, info.st_ino, info.st_uid
+
+    def isolation_environment(self, raw, *, target):
+        descriptor = self.isolation_descriptor
+        payload, audit = (descriptor[key].encode("ascii") for key in ("payload_path", "audit_path"))
+        expected = descriptor["target_exec_environment"]
+        seen, diagnostic, loader_payload, loader_audit = {}, [], False, False
+        entries = raw.split(b"\0")
+        if len(entries) > 4096 or raw and not raw.endswith(b"\0"):
+            raise RuntimeError("Unsupported initial process environment extent")
+        for entry in entries:
+            # Cold cleanup may leave zeroed holes in the original exec range.
+            if not entry: continue
+            key, separator, value = entry.partition(b"=")
+            if not separator or not key or len(key) > 256:
+                raise RuntimeError("Unsupported initial process environment entry")
+            if key.startswith(DIAGNOSTIC_PREFIXES):
+                name = key.decode("ascii")
+                if len(name) > 128 or len(diagnostic) >= 16:
+                    raise RuntimeError("Startup diagnostic key bound exceeded")
+                diagnostic.append(name)
+            if key in (b"LD_PRELOAD", b"LD_AUDIT"):
+                tokens = re.split(rb"[:\s]+", value)
+                loader_payload |= payload in tokens
+                loader_audit |= audit in tokens
+            if key in {name.encode("ascii") for name in expected}:
+                seen.setdefault(key.decode("ascii"), []).append(value)
+        matches = None
+        if target:
+            matches = (set(seen) == set(expected) and
+                all(seen[key] == [value.encode("ascii")] for key, value in expected.items()) and
+                set(diagnostic) == set(expected) - {"LD_PRELOAD", "LD_AUDIT"} and
+                len(diagnostic) == len(set(diagnostic)))
+        return {"diagnostic_keys": diagnostic, "loader_payload": loader_payload,
+                "loader_audit": loader_audit, "target_initial_environment_matches": matches}
+
+    def isolation_mappings(self, raw):
+        descriptor = self.isolation_descriptor
+        result = {"selector_mapped": False, "payload_mapped": False, "audit_mapped": False,
+                  "owned_mapping_deleted": False}
+        rows = raw.decode("utf-8").splitlines()
+        if len(rows) > 8192: raise RuntimeError("Startup isolated map row bound exceeded")
+        for row in rows:
+            fields = row.split(None, 5)
+            if (len(fields) < 5 or not re.fullmatch(r"[0-9a-f]+-[0-9a-f]+", fields[0]) or
+                    not re.fullmatch(r"[r-][w-][x-][ps]", fields[1])):
+                raise RuntimeError("Unsupported managed executable mapping record")
+            if len(fields) != 6 or fields[1][2] != "x": continue
+            mapped = fields[5]
+            for path_key, result_key in (("selector_path", "selector_mapped"),
+                    ("payload_path", "payload_mapped"), ("audit_path", "audit_mapped")):
+                if mapped == descriptor[path_key]: result[result_key] = True
+                if mapped == descriptor[path_key] + " (deleted)":
+                    result[result_key] = True; result["owned_mapping_deleted"] = True
+        return result
+
+    def isolated_process(self, pid, unit):
+        path = self.proc / str(pid)
+        scope = self.isolation_scope(path, unit)
+        start, state, ppid = self.isolation_identity(path)
+        exe = self.isolation_link(path / "exe")
+        if not exe.startswith("/") or len(exe) > 4096 or exe.endswith(" (deleted)"):
+            raise RuntimeError("Unknown managed executable identity")
+        target = exe == self.isolation_descriptor["target_exe"]
+        env = self.isolation_environment(self.isolation_read(path / "environ", ISOLATION_ENV_LIMIT), target=target)
+        maps = self.isolation_mappings(self.isolation_read(path / "maps", ISOLATION_MAP_LIMIT))
+        after = self.isolation_identity(path)
+        if (after[0] != start or after[2] != ppid or self.isolation_link(path / "exe") != exe or
+                self.isolation_scope(path, unit) != scope):
+            raise RuntimeError("Managed process changed identity/scope during isolation sampling")
+        return {"pid": pid, "start_ticks": start, "state": after[1], "ppid": ppid, "exe": exe, **env, **maps}
+
+    def isolation(self, unit):
+        if self.isolation_descriptor is None: return None
+        self.isolation_usage["samples"] += 1
+        if self.isolation_usage["samples"] > ISOLATION_SAMPLE_LIMIT:
+            self.isolation_usage["samples"] = ISOLATION_SAMPLE_LIMIT
+            raise RuntimeError("Startup isolation sample budget exhausted")
+        rows, errors, inventory_stable, unit_stable = [], [], False, False
+        def error(pid, failure):
+            if len(errors) >= 16: raise RuntimeError("Startup isolation unreadable-process bound exceeded")
+            errors.append({"pid": pid, "reason": type(failure).__name__})
+        try:
+            before = self.managed_inventory(unit)
+            if int(unit["MainPID"]) <= 0 or int(unit["MainPID"]) not in before[1]:
+                raise RuntimeError("Service main is absent from managed process inventory")
+            for pid in sorted(before[1]):
+                self.isolation_usage["processes"] += 1
+                if self.isolation_usage["processes"] > ISOLATION_PROCESS_LIMIT:
+                    self.isolation_usage["processes"] = ISOLATION_PROCESS_LIMIT
+                    raise RuntimeError("Startup isolation process budget exhausted")
+                try: rows.append(self.isolated_process(pid, unit))
+                except (OSError, RuntimeError, UnicodeError, ValueError) as failure: error(pid, failure)
+            inventory_stable = self.managed_inventory(unit) == before
+            unit_stable = self.unit() == unit
+        except (OSError, RuntimeError, UnicodeError, ValueError, subprocess.SubprocessError) as failure:
+            # PID zero denotes a service/cgroup-level evidence gap, not an
+            # invented process identity.
+            error(int(unit["MainPID"]), failure)
+        verdict = isolation_verdict(rows, errors, inventory_stable=inventory_stable, unit_stable=unit_stable)
+        return {"schema": ISOLATION_SCHEMA, "descriptor": self.isolation_descriptor,
+            "invocation": unit["InvocationID"], "control_group": unit["ControlGroup"],
+            "status": verdict[0], "reason": verdict[1], "processes": rows, "errors": errors,
+            "inventory_stable": inventory_stable, "unit_stable": unit_stable,
+            "target_env_view": "initial-exec-only", "runtime_environ_verified": False,
+            "metadata_usage": dict(self.isolation_usage)}
+
     def log_read(self, name, *, initial=False):
         path = self.logs[name]
         try:
@@ -243,6 +551,7 @@ class NativeEvidenceSource:
 
     def baseline(self):
         self.total = 0
+        self.isolation_usage = {"samples": 0, "processes": 0, "metadata_bytes": 0}
         self.pending_lines = {name: "" for name in self.logs}
         unit = self.unit(); self.journal(initial=True)
         for name in self.logs: self.log_read(name, initial=True)
@@ -255,25 +564,33 @@ class NativeEvidenceSource:
                 if len(errors) >= 16: raise RuntimeError("Startup unreadable process bound exceeded")
                 errors.append({"pid": pid, "reason": type(error).__name__})
         return {"schema": SCHEMA, "unit": unit, "cursor": self.cursor, "log_offsets": dict(self.offsets),
-                "processes": processes, "main_process": main, "errors": errors, "monotonic": self.clock(), "wall_time": self.wall_clock()}
+                "processes": processes, "main_process": main, "errors": errors, "monotonic": self.clock(), "wall_time": self.wall_clock(),
+                "isolation_descriptor": self.isolation_descriptor}
 
     def sample(self):
         unit = self.unit(); processes, errors = self.processes(unit)
         try: main = self.main_process(unit)
         except (OSError, RuntimeError) as error:
             main = None; errors.append({"pid": int(unit["MainPID"]), "reason": type(error).__name__})
+        isolation = self.isolation(unit)
         journal = self.journal()
         return {"unit": unit, "processes": processes, "main_process": main, "errors": errors, "journal": journal,
-                "logs": {name: self.log_read(name) for name in self.logs}, "monotonic": self.clock()}
+                "logs": {name: self.log_read(name) for name in self.logs}, "monotonic": self.clock(), "isolation": isolation}
 
     def checkpoint(self):
-        return {"cursor": self.cursor, "log_offsets": self.offsets, "pending_lines": self.pending_lines, "total": self.total}
+        return {"cursor": self.cursor, "log_offsets": self.offsets, "pending_lines": self.pending_lines, "total": self.total,
+                "isolation_descriptor": self.isolation_descriptor, "isolation_usage": self.isolation_usage}
 
     def resume(self, checkpoint):
-        if not isinstance(checkpoint, dict) or set(checkpoint) != {"cursor", "log_offsets", "pending_lines", "total"}:
+        if not isinstance(checkpoint, dict) or set(checkpoint) != {"cursor", "log_offsets", "pending_lines", "total", "isolation_descriptor", "isolation_usage"}:
             raise RuntimeError("Invalid startup source checkpoint shape")
         if type(checkpoint["total"]) is not int or not 0 <= checkpoint["total"] <= LIMIT:
             raise RuntimeError("Invalid cumulative startup evidence budget")
+        require_isolation_usage(checkpoint["isolation_usage"])
+        descriptor = require_isolation_descriptor(checkpoint["isolation_descriptor"])
+        if descriptor != self.isolation_descriptor:
+            raise RuntimeError("Startup isolation descriptor changed across resume")
+        self.isolation_usage = dict(checkpoint["isolation_usage"])
         self.total = checkpoint["total"]
         self.cursor = checkpoint["cursor"]
         self.offsets, self.pending_lines = checkpoint["log_offsets"], checkpoint["pending_lines"]
@@ -299,6 +616,8 @@ class StartupGate:
         require_errors(baseline.get("errors", []))
         if baseline.get("main_process") is not None: require_process(baseline["main_process"], main=True)
         self.baseline = baseline
+        self.isolation_descriptor = require_isolation_descriptor(baseline.get("isolation_descriptor"))
+        self.isolation_result = None
         self.invocation, self.unit_identity = None, None
         self.markers, self.pinned = {}, {}
         self.ready_since, self.ready = None, False
@@ -309,6 +628,9 @@ class StartupGate:
         return {"schema": SCHEMA, "status": status, "ready": status == "ready", "reason": reason,
                 "invocation": self.invocation, "process_identities": self.pinned,
                 "evidence": sorted(self.markers), "screen_pixels_verified": False,
+                "diagnostic_isolation_required": self.isolation_descriptor is not None,
+                "isolation_verified": status == "ready" and self.isolation_result is not None and self.isolation_result["status"] == "isolated",
+                "isolation": self.isolation_result,
                 "automatic_restart": False}
 
     def consume(self, sample, *, stable_seconds=1.0):
@@ -343,6 +665,22 @@ class StartupGate:
         self.invocation, self.unit_identity = unit["InvocationID"], current_unit
         if unit["ActiveState"] in ("failed", "inactive") or unit["SubState"] in ("failed", "dead"):
             raise RuntimeError("SteamVR service exited or failed during startup")
+        if self.isolation_descriptor is not None:
+            report = sample.get("isolation")
+            if report is not None:
+                require_isolation_report(report, self.isolation_descriptor, unit)
+                if self.isolation_result is not None:
+                    if self.isolation_result["control_group"] != report["control_group"]:
+                        raise RuntimeError("Startup isolation control-group identity changed")
+                    if any(report["metadata_usage"][key] < self.isolation_result["metadata_usage"][key]
+                            for key in self.isolation_result["metadata_usage"]):
+                        raise RuntimeError("Startup isolation cumulative evidence budget regressed")
+                if report["status"] == "contaminated":
+                    self.isolation_result = report
+                    raise RuntimeError("Startup diagnostic isolation failure: " + report["reason"])
+            self.isolation_result = report
+        elif sample.get("isolation") is not None:
+            raise RuntimeError("Startup isolation evidence has no reviewed descriptor")
         old_ids = {identity(p) for p in self.baseline["processes"]}
         old_pids = {p["pid"] for p in self.baseline["processes"]}
         if self.baseline.get("main_process"): old_pids.add(self.baseline["main_process"]["pid"])
@@ -423,6 +761,13 @@ class StartupGate:
             complete = complete and current[self.pinned["ui_renderer"]["pid"]]["kind"] == "renderer"
         if unit["ActiveState"] != "active" or unit["SubState"] != "running" or int(unit["MainPID"]) <= 0 or sample["errors"]:
             complete = False
+        if self.isolation_descriptor is not None and (self.isolation_result is None or self.isolation_result["status"] != "isolated"):
+            complete = False
+        elif self.isolation_descriptor is not None and complete:
+            target = next(row for row in self.isolation_result["processes"] if row["target_initial_environment_matches"] is not None)
+            pin = self.pinned["compositor"]
+            if identity(target) != (pin["pid"], pin["start_ticks"]):
+                raise RuntimeError("Startup UI compositor and isolated target identity disagree")
         if not complete:
             if self.ready: raise RuntimeError("Previously ready compositor/UI evidence was lost")
             self.ready_since = None
@@ -435,11 +780,11 @@ class StartupGate:
         return {"baseline": self.baseline, "invocation": self.invocation, "unit_identity": self.unit_identity,
                 "markers": self.markers, "pinned": self.pinned, "ready_since": self.ready_since,
                 "ready": self.ready, "last_progress": self.last_progress, "progress": self.progress,
-                "failed": self.failed}
+                "failed": self.failed, "isolation": self.isolation_result}
 
     @classmethod
     def resume(cls, checkpoint):
-        expected = {"baseline", "invocation", "unit_identity", "markers", "pinned", "ready_since", "ready", "last_progress", "progress", "failed"}
+        expected = {"baseline", "invocation", "unit_identity", "markers", "pinned", "ready_since", "ready", "last_progress", "progress", "failed", "isolation"}
         if not isinstance(checkpoint, dict) or set(checkpoint) != expected:
             raise RuntimeError("Invalid startup gate checkpoint shape")
         gate = cls(checkpoint["baseline"])
@@ -467,6 +812,23 @@ class StartupGate:
                 raise RuntimeError("Startup checkpoint marker/process disagreement")
         if checkpoint["unit_identity"] is not None and (not isinstance(checkpoint["unit_identity"], (list, tuple)) or len(checkpoint["unit_identity"]) != 4 or checkpoint["unit_identity"][0] != checkpoint["invocation"] or not re.fullmatch(r"[0-9a-f]{32}", checkpoint["invocation"] or "")):
             raise RuntimeError("Invalid startup checkpoint unit identity")
+        if checkpoint["isolation"] is not None:
+            if gate.isolation_descriptor is None or checkpoint["unit_identity"] is None:
+                raise RuntimeError("Unscoped startup isolation checkpoint")
+            report_unit = {**gate.baseline["unit"], "InvocationID": checkpoint["invocation"],
+                           "ControlGroup": checkpoint["isolation"]["control_group"]}
+            require_isolation_report(checkpoint["isolation"], gate.isolation_descriptor, report_unit)
+            if gate.baseline["unit"]["ControlGroup"] and checkpoint["isolation"]["control_group"] != gate.baseline["unit"]["ControlGroup"]:
+                raise RuntimeError("Startup isolation checkpoint control group changed")
+        if checkpoint["ready"] and gate.isolation_descriptor is not None and (
+                checkpoint["isolation"] is None or checkpoint["isolation"]["status"] != "isolated"):
+            raise RuntimeError("Ready startup checkpoint lacks diagnostic isolation proof")
+        if checkpoint["ready"] and gate.isolation_descriptor is not None:
+            target = next(row for row in checkpoint["isolation"]["processes"] if row["target_initial_environment_matches"] is not None)
+            pin = checkpoint["pinned"]["compositor"]
+            if identity(target) != (pin["pid"], pin["start_ticks"]):
+                raise RuntimeError("Ready checkpoint compositor/isolation identity disagreement")
+        gate.isolation_result = checkpoint["isolation"]
         for key in ("invocation", "unit_identity", "markers", "pinned", "ready_since", "ready", "last_progress", "progress", "failed"):
             setattr(gate, key, checkpoint[key])
         if gate.unit_identity is not None: gate.unit_identity = tuple(gate.unit_identity)
