@@ -12,6 +12,12 @@
 #include <unistd.h>
 
 extern "C" {
+// The generated selector is a separately reviewed launch artifact. Weak imports
+// keep an ordinary/unsupported loader configuration inert; there is no fallback
+// to broad service-preload observation or late environment mutation.
+__attribute__((weak)) int frame_compositor_launch_freeze_environment_v1(unsigned);
+__attribute__((weak)) unsigned frame_compositor_launch_provider_mask(void);
+__attribute__((weak)) unsigned frame_compositor_launch_frozen_status_v1(void);
 __attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_raw_scope[16]={
     'F','C','M','R','A','W','0','1',1,0,0,0,0x50,0x20,0,0};
 __attribute__((visibility("hidden"))) std::atomic<unsigned> frame_compositor_raw_ready{0};
@@ -23,6 +29,7 @@ int __register_atfork(void(*)(void),void(*)(void),void(*)(void),void*) noexcept;
 
 namespace {
 namespace runtime=frame_compositor_runtime;
+constexpr unsigned LaunchFreezeAbi=1,LaunchProviderMask=63;
 constexpr std::size_t EnvelopeBytes=8272,OutputBytes=65536;
 constexpr std::uint64_t DurationNs=120ULL*1000000000;
 std::atomic<bool> stopping{false};
@@ -32,6 +39,20 @@ pid_t owner_pid=0;
 int output_fd=-1;
 char output_path[1024]{};
 frame_compositor_main::Digest observer_identity{};
+
+using LaunchFreeze=int(*)(unsigned);
+using LaunchProviders=unsigned(*)(void);
+using LaunchFrozen=unsigned(*)(void);
+bool freeze_before_observation(LaunchFreeze freeze,LaunchProviders providers,LaunchFrozen frozen) noexcept {
+    const int saved=errno;
+    // Do not assume constructor order between the two preload objects. The
+    // selector owns provider initialization and proves single-threaded target
+    // admission inside this explicit cold handshake. No getenv/Journal/thread
+    // work in this observer may precede successful, owner-PID-local freezing.
+    const bool accepted=freeze && providers && frozen && freeze(LaunchFreezeAbi)==0 &&
+        providers()==LaunchProviderMask && frozen()==1;
+    errno=saved;return accepted;
+}
 
 bool owned() noexcept {return owner_pid>0 && getpid()==owner_pid;}
 void child_retire() noexcept {
@@ -249,6 +270,8 @@ void finish_owned() noexcept {
 }
 __attribute__((constructor)) void start() noexcept {
     const int saved=errno;char input[1024]{};
+    if(!freeze_before_observation(frame_compositor_launch_freeze_environment_v1,
+        frame_compositor_launch_provider_mask,frame_compositor_launch_frozen_status_v1)){errno=saved;return;}
     if(!path(std::getenv("GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE"),input,sizeof(input)) ||
        !path(std::getenv("GHVR_FRAME_COMPOSITOR_RAW_OUTPUT"),output_path,sizeof(output_path))){errno=saved;return;}
     frame_compositor_main::Profiles profiles{};
@@ -262,7 +285,8 @@ __attribute__((constructor)) void start() noexcept {
     }
     Line header;header.add("{\"schema\":1,\"capture\":\"compositor_raw_import\",\"pid\":%ld,\"observer_profile\":\"",long(owner_pid));
     header.hex(observer_identity);
-    header.add("\",\"modules\":[");unsigned module=0;
+    header.add("\",\"launch_environment_frozen\":true,\"launch_freeze_abi\":%u,\"launch_provider_mask\":%u,\"launch_frozen_owner_pid\":%ld",LaunchFreezeAbi,LaunchProviderMask,long(owner_pid));
+    header.add(",\"modules\":[");unsigned module=0;
     for(const auto& image:prepared.images()) {
         header.add("%s{\"role\":%u,\"file_sha256\":\"",module++?",":"",unsigned(image.role));header.hex(image.expected_file_identity);
         header.add("\",\"profile_sha256\":\"");header.hex(image.profile_identity);header.add("\"}");

@@ -48,6 +48,54 @@ namespace {
 unsigned checks=0;
 void check_at(bool v,unsigned line){++checks;if(!v){std::fprintf(stderr,"observer check %u failed at line %u\n",checks,line);std::abort();}}
 #define check(v) check_at((v),__LINE__)
+namespace launch_stubs {
+unsigned calls=0,mask=LaunchProviderMask,frozen=1,abi=0;
+int result=0;
+int freeze(unsigned value) {abi=value;calls=calls*10+1;errno=EPERM;return result;}
+unsigned providers() {calls=calls*10+2;errno=ENOENT;return mask;}
+unsigned status() {calls=calls*10+3;errno=ESRCH;return frozen;}
+void reset() {calls=abi=0;mask=LaunchProviderMask;frozen=1;result=0;}
+}
+void launch_controls() {
+    // These pointer-only controls cannot manufacture a production launch or a
+    // sealed native preparation. The actual linked weak imports stay absent.
+    using namespace launch_stubs;
+    reset();errno=E2BIG;
+    check(freeze_before_observation(freeze,providers,status));
+    check(calls==123 && abi==1 && errno==E2BIG);
+    for(const int denied:{1,2,3,4,5,6,7,-1}) {
+        reset();result=denied;errno=E2BIG;
+        check(!freeze_before_observation(freeze,providers,status));
+        check(calls==1 && abi==LaunchFreezeAbi && errno==E2BIG);
+    }
+    for(const unsigned incomplete:{0u,15u,31u,62u,127u}) {
+        reset();mask=incomplete;errno=E2BIG;
+        check(!freeze_before_observation(freeze,providers,status));
+        check(calls==12 && errno==E2BIG);
+    }
+    for(const unsigned denied:{0u,2u,7u}) {
+        reset();frozen=denied;errno=E2BIG;
+        check(!freeze_before_observation(freeze,providers,status));
+        check(calls==123 && errno==E2BIG);
+    }
+    for(unsigned missing=0;missing!=3;++missing) {
+        reset();errno=E2BIG;
+        check(!freeze_before_observation(missing==0?nullptr:freeze,
+            missing==1?nullptr:providers,missing==2?nullptr:status));
+        check(calls==0 && errno==E2BIG);
+    }
+    check(!frame_compositor_launch_freeze_environment_v1 &&
+        !frame_compositor_launch_provider_mask && !frame_compositor_launch_frozen_status_v1);
+    // Diagnostic-bearing environment alone cannot enter the cold constructor:
+    // without the reviewed selector it creates neither output nor writers.
+    check(!setenv("GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE","/invalid/raw-envelope",1));
+    check(!setenv("GHVR_FRAME_COMPOSITOR_RAW_OUTPUT","/invalid/raw-output",1));
+    const bool prior_finalized=writer_stubs::finalized;errno=E2BIG;start();
+    check(errno==E2BIG && !writer_started && output_fd==-1 && owner_pid==0 &&
+        frame_compositor_raw_ready.load()==0 && writer_stubs::finalized==prior_finalized);
+    check(!std::strcmp(std::getenv("GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE"),"/invalid/raw-envelope"));
+    check(!unsetenv("GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE") && !unsetenv("GHVR_FRAME_COMPOSITOR_RAW_OUTPUT"));
+}
 frame_compositor_raw::RawRecord raw_fixture() {
     frame_compositor_raw::RawRecord r{};r.raw_only=r.matched=r.terminal=r.native_send_success=true;
     r.reply_token=0x8877665544332211ULL;r.reply_bytes=21;r.scalar_bytes_copied=364;r.wire_bytes_copied=21;
@@ -148,6 +196,6 @@ void fork_controls() {
 }
 int main() {
     check(!writer_started && output_fd==-1); // Actual production constructor inert on host.
-    join_controls();formatter_controls();output_controls();fork_controls();
+    launch_controls();join_controls();formatter_controls();output_controls();fork_controls();
     std::printf("compositor observer: %u pure/writer controls passed; transport stubs are not owning-resource or hardware proof\n",checks);
 }
