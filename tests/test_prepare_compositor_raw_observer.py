@@ -24,7 +24,8 @@ REMOTE = '/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw/' + tool.
 def fixture(*, missing_entry=None, missing_import=None, extra_export=None, extra_entry=None,
             marker=tool.MARKER, marker_flags=4, marker_visibility=2, ready_rva=0x7400,
             ready_flags=6, ready_size=4, ready_value=0, entry_size=156, entry_visibility=2,
-            dynamic_tls=False, tls_bytes=0, extra_scope=None, dependency='libc.so.6'):
+            dynamic_tls=False, tls_bytes=0, extra_scope=None, dependency='libc.so.6', standard_exports=False,
+            missing_export=None):
     """Only ELF metadata and zero-filled own synthetic instruction slots."""
     raw = bytearray(0x8000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
@@ -41,7 +42,8 @@ def fixture(*, missing_entry=None, missing_import=None, extra_export=None, extra
     raw[0x6000:0x6010] = marker
     if 0x7000 <= ready_rva < 0x7300:
         struct.pack_into('<I', raw, ready_rva, ready_value)
-    dynamic = [(name, 0x2200 + 16 * i) for i, name in enumerate(sorted(tool.PUBLIC))]
+    public = {tool.BRIDGE, *tool.VULKAN_FUNCTIONS} if standard_exports else tool.PUBLIC
+    dynamic = [(name, 0x2200 + 16 * i) for i, name in enumerate(sorted(public)) if name != missing_export]
     if extra_export:
         dynamic.append((extra_export, 0x2250))
     imports = list(tool.ALIAS_IMPORTS) + list(tool.BOOTSTRAP_IMPORTS)
@@ -112,6 +114,8 @@ class PackageControls(unittest.TestCase):
         elf, report = self.validate(fixture())
         self.assertEqual(set(report['hidden_entries']), set(tool.ENTRIES))
         self.assertEqual(report['public_exports'], sorted(tool.PUBLIC))
+        self.assertEqual(report['vulkan_functions'], tool.VULKAN_FUNCTIONS)
+        self.assertEqual(report['standard_vulkan_exports'], [])
         self.assertEqual(report['scope_marker']['bytes'], 16)
         self.assertEqual(report['ready_object']['bytes'], 4)
         self.assertEqual(report['ready_object']['initial_value'], 0)
@@ -119,6 +123,20 @@ class PackageControls(unittest.TestCase):
         self.assertEqual((report['data_rva_begin'], report['data_rva_end']), (0x7000, 0x8000))
         self.assertFalse(report['native_namespace_associated']); self.assertFalse(report['source_frame_associated'])
         self.assertEqual(set(elf.imports()), set(tool.ALIAS_IMPORTS) | set(tool.BOOTSTRAP_IMPORTS))
+
+    def test_standard_vulkan_exports_are_unsafe_even_with_exact_raw_scope(self):
+        # The old combined export surface had the valid raw marker/envelope and
+        # all eleven veneers, but preloading its ordinary GPA names could steal
+        # application/loader lookups. Independently reviewing its SHA is not a
+        # reason to admit that export ABI.
+        with self.assertRaisesRegex(ValueError, 'standard Vulkan API'):
+            self.validate(fixture(standard_exports=True))
+        for name in (*tool.VULKAN_FUNCTIONS, 'vkCreateQueryPool', 'vkCreateDevice', 'vkDestroyInstance'):
+            with self.subTest(standard=name), self.assertRaisesRegex(ValueError, 'standard Vulkan API'):
+                self.validate(fixture(extra_export=name))
+        for name in tool.VULKAN_EXPORTS:
+            with self.subTest(private=name), self.assertRaises(ValueError):
+                self.validate(fixture(missing_export=name))
 
     def test_missing_entry_provider_export_scope_never_relabels(self):
         for name in tool.ENTRIES:
@@ -180,6 +198,7 @@ class PackageControls(unittest.TestCase):
         self.assertEqual(manifest['layer']['library_path'], REMOTE)
         self.assertEqual(manifest['layer']['name'], tool.LAYER)
         self.assertEqual(manifest['layer']['enable_environment'], {'FRAME_MASK_TRACE': '1'})
+        self.assertEqual(manifest['layer']['functions'], tool.VULKAN_FUNCTIONS)
 
     def test_fixed_envelope_framing_and_each_limit(self):
         blobs = synthetic_profiles(); reviewed = blobs[3][-32:]
@@ -221,6 +240,7 @@ class PackageControls(unittest.TestCase):
                           'native_binary_or_script_changes', 'shader_or_mask_activation', 'source_frame_associated', 'gpu_coherent'):
                 self.assertIs(plan[field], False)
             self.assertEqual(plan['manifest']['library_path'], plan['environment']['LD_PRELOAD'])
+            self.assertEqual(plan['manifest']['functions'], tool.VULKAN_FUNCTIONS)
             self.assertEqual(plan['manifest']['frame_path'], '/home/steamos/.local/share/vulkan/implicit_layer.d/frame_compositor_raw.json')
             self.assertEqual([p['role'] for p in plan['native_profiles']], [7, 3, 4])
             parsed = tool.decode_envelope((output / tool.ENVELOPE).read_bytes(), bytes.fromhex(plan['envelope']['reviewed_observer_profile_identity']))

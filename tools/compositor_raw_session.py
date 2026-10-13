@@ -31,6 +31,11 @@ SCHEMA = "frame-compositor-raw-offline-bundle-v1"
 SESSION_SCHEMA = "frame-compositor-raw-owned-session-v1"
 MAIN, AUDIT, ENVELOPE = "libVkLayer_frame_mask_trace.so", "libframe_compositor_raw_audit.so", "compositor-raw-envelope.bin"
 LAYER = "VkLayer_FRAME_compositor_raw.json"
+VULKAN_FUNCTIONS = {
+    "vkGetInstanceProcAddr": "frame_compositor_raw_vkGetInstanceProcAddr",
+    "vkGetDeviceProcAddr": "frame_compositor_raw_vkGetDeviceProcAddr",
+    "vkNegotiateLoaderLayerInterfaceVersion": "frame_compositor_raw_vkNegotiateLoaderLayerInterfaceVersion"}
+PUBLIC_EXPORTS = {"frame_compositor_raw_bridge", *VULKAN_FUNCTIONS.values()}
 HELPERS = ("compositor_raw_session.py", "receiver_observer_session.py")
 NATIVE = {
     "compositor": ("vrcompositor", "0bb148eda6b5e54e2fbed09d475a43671f5ff6fcb6c2b4f48345b1a9fe8d6f96"),
@@ -257,6 +262,10 @@ class Session(base.Session):
                 raise RuntimeError("Artifact report changed")
         if plan["audit"].get("native_rvas") != NATIVE_RVAS or plan["audit"].get("early_forward_only") is not True:
             raise RuntimeError("Canonical audited providers required")
+        if (plan["observer"].get("public_exports") != sorted(PUBLIC_EXPORTS) or
+            plan["observer"].get("vulkan_functions") != VULKAN_FUNCTIONS or
+            plan["observer"].get("standard_vulkan_exports") != []):
+            raise RuntimeError("Reviewed combined DSO must expose only the private layer entries and bridge")
         if (plan["envelope"].get("schema") != 1 or plan["envelope"].get("module_count") != 4 or
             plan["envelope"].get("module_roles") != [7, 3, 4, 5]):
             raise RuntimeError("Exact envelope module report required")
@@ -264,7 +273,8 @@ class Session(base.Session):
         self.validate_layer(payloads[LAYER])
         if (plan["manifest"].get("frame_path") != str(self.layer) or
             plan["manifest"].get("staged_path") != str(self.folder / LAYER) or
-            plan["manifest"].get("library_path") != str(self.library)):
+            plan["manifest"].get("library_path") != str(self.library) or
+            plan["manifest"].get("functions") != VULKAN_FUNCTIONS):
             raise RuntimeError("Same owned combined DSO and exact layer paths required")
         for name, source in ((HELPERS[0], Path(__file__)), (HELPERS[1], Path(base.__file__))):
             data = read_regular(source)
@@ -280,6 +290,7 @@ class Session(base.Session):
             "name": "VK_LAYER_FRAME_MASK_trace", "type": "GLOBAL", "library_path": str(self.library),
             "api_version": "1.3.0", "implementation_version": "1",
             "description": "Opt-in bounded passive compositor raw import metadata",
+            "functions": dict(VULKAN_FUNCTIONS),
             "enable_environment": {"FRAME_MASK_TRACE": "1"}, "disable_environment": {"FRAME_MASK_TRACE_DISABLE": "1"}}}
         if actual != expected: raise RuntimeError("Passive implicit layer shape or same-DSO identity changed")
 

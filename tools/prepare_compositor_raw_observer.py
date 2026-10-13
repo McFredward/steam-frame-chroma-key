@@ -47,7 +47,11 @@ NATIVE_PROFILES = tuple(bytes.fromhex(value) for value in (
 LIBC_NAME = '/usr/lib/libc.so.6'
 ENTRIES = tuple('frame_import_' + name + '_entry' for name in
                 ('init', 'destroy', 'lock', 'unlock', 'write', 'close', 'read', 'connect', 'image', 'bind', 'view'))
-VULKAN_EXPORTS = ('vkGetInstanceProcAddr', 'vkGetDeviceProcAddr', 'vkNegotiateLoaderLayerInterfaceVersion')
+VULKAN_FUNCTIONS = {
+    'vkGetInstanceProcAddr': 'frame_compositor_raw_vkGetInstanceProcAddr',
+    'vkGetDeviceProcAddr': 'frame_compositor_raw_vkGetDeviceProcAddr',
+    'vkNegotiateLoaderLayerInterfaceVersion': 'frame_compositor_raw_vkNegotiateLoaderLayerInterfaceVersion'}
+VULKAN_EXPORTS = tuple(VULKAN_FUNCTIONS.values())
 PUBLIC = {BRIDGE, *VULKAN_EXPORTS}
 ALIAS_IMPORTS = common.ALIASES
 BOOTSTRAP_IMPORTS = ('dl_iterate_phdr@GLIBC_2.17', 'dladdr@GLIBC_2.34', 'dlvsym@GLIBC_2.34')
@@ -111,6 +115,8 @@ def validate_observer(data, reviewed_sha, provider_exports):
         raise ValueError('Combined DSO differs from its independently reviewed SHA-256')
     elf = Elf(data)
     exports = {s['name'] for s in elf.exported()}
+    if any(name.startswith('vk') for name in exports):
+        raise ValueError('A preloaded raw observer must not export a standard Vulkan API')
     if exports != PUBLIC:
         raise ValueError('Combined observer/layer exports an unexpected public API: ' + ','.join(sorted(exports ^ PUBLIC)))
     for name in PUBLIC:
@@ -155,7 +161,8 @@ def validate_observer(data, reviewed_sha, provider_exports):
                  'ready_rva': ready['rva'], 'rx_rva_begin': rx[0], 'rx_rva_end': rx[1],
                  'data_rva_begin': ready['data_rva_begin'], 'data_rva_end': ready['data_rva_end'],
                  'hidden_entries': entries, 'scope_marker': marker, 'ready_object': ready,
-                 'public_exports': sorted(exports), 'required_aliases': list(ALIAS_IMPORTS),
+                 'public_exports': sorted(exports), 'vulkan_functions': dict(VULKAN_FUNCTIONS),
+                 'standard_vulkan_exports': [], 'required_aliases': list(ALIAS_IMPORTS),
                  'bootstrap_imports': list(BOOTSTRAP_IMPORTS), 'versioned_glibc_imports': sorted(versioned),
                  'static_tls_bytes': sum(tls), 'raw_only': True, 'native_namespace_associated': False,
                  'source_frame_associated': False, 'gpu_consumed': False}
@@ -241,6 +248,10 @@ def manifest_for(observer_path, home='/home/steamos'):
     return {'file_format_version': '1.2.0', 'layer': {
         'name': LAYER, 'type': 'GLOBAL', 'library_path': observer_path, 'api_version': '1.3.0',
         'implementation_version': '1', 'description': 'Opt-in bounded passive compositor raw import metadata',
+        # Loader-interface v2 obtains GPA pointers from the uniquely named
+        # negotiation entry. Alternate GPA names are retained as exact metadata
+        # for older loaders; modern loaders may ignore those two mapping keys.
+        'functions': dict(VULKAN_FUNCTIONS),
         'enable_environment': {'FRAME_MASK_TRACE': '1'}, 'disable_environment': {'FRAME_MASK_TRACE_DISABLE': '1'}}}
 
 
@@ -315,6 +326,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
             'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 1,
                          'reviewed_observer_profile_identity': reviewed.hex(), 'module_count': 4, 'module_roles': list(ROLES)},
             'manifest': {'name': MANIFEST, 'bytes': len(manifest), 'sha256': digest(manifest).hex(), 'layer_name': LAYER,
+                         'functions': dict(VULKAN_FUNCTIONS),
                          'library_path': str(frame_observer), 'staged_path': str(frame / MANIFEST),
                          'frame_path': str(PurePosixPath(home) / '.local/share/vulkan/implicit_layer.d/frame_compositor_raw.json')},
             'native_profiles': reports[:3], 'observer_profile': reports[3],

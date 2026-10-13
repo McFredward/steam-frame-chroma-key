@@ -50,11 +50,13 @@ class SessionTests(unittest.TestCase):
         self.plan = {"schema": M.SCHEMA, "prepared": True, "frame_directory": str(self.session.folder),
             "frame_user_home": str(self.home), "directory_mode": "0700", "environment": self.session.activation_values(), "native_profiles": reports,
             "observer_profile": {"role": 5, "file_sha256": M.digest(main), "profile_sha256": profiles[-1][-32:].hex()},
-            "observer": {"sha256": M.digest(main), "bytes": len(main)},
+            "observer": {"sha256": M.digest(main), "bytes": len(main), "public_exports": sorted(M.PUBLIC_EXPORTS),
+                "vulkan_functions": dict(M.VULKAN_FUNCTIONS), "standard_vulkan_exports": []},
             "audit": {"sha256": M.digest(audit), "bytes": len(audit), "native_rvas": dict(M.NATIVE_RVAS), "early_forward_only": True},
             "envelope": {"sha256": M.digest(envelope), "bytes": len(envelope), "schema": 1, "module_count": 4,
                 "module_roles": [7, 3, 4, 5], "reviewed_observer_profile_identity": profiles[-1][-32:].hex()},
             "manifest": {"sha256": M.digest(layer), "bytes": len(layer), "library_path": str(self.session.library),
+                "functions": dict(M.VULKAN_FUNCTIONS),
                 "staged_path": str(self.session.folder / M.LAYER), "frame_path": str(self.session.layer)},
             "capture_limits": dict(M.CAPTURE_LIMITS), "raw_limits": dict(M.RAW_LIMITS), "journal_limits": dict(M.JOURNAL_LIMITS), "inventory": []}
         for flag in ("installed", "activated", "runtime_authorized", "frame_access", "network_access",
@@ -77,6 +79,7 @@ class SessionTests(unittest.TestCase):
         return M.json_bytes({"file_format_version": "1.2.0", "layer": {"name": "VK_LAYER_FRAME_MASK_trace", "type": "GLOBAL",
             "library_path": str(self.session.library), "api_version": "1.3.0", "implementation_version": "1",
             "description": "Opt-in bounded passive compositor raw import metadata", "enable_environment": {"FRAME_MASK_TRACE": "1"},
+            "functions": dict(M.VULKAN_FUNCTIONS),
             "disable_environment": {"FRAME_MASK_TRACE_DISABLE": "1"}}})
     def tearDown(self):
         for patch in reversed(self.patches): patch.stop()
@@ -227,6 +230,32 @@ class SessionTests(unittest.TestCase):
         for key, value in (("library_path", "/foreign.so"), ("name", "REPLACEMENT_SHADER"), ("disable_environment", {})):
             data = copy.deepcopy(original); data["layer"][key] = value; self.alter_artifact(M.LAYER, M.json_bytes(data))
             with self.subTest(key=key), self.assertRaises(RuntimeError): self.stage()
+    def test_private_layer_function_mapping_is_required_and_exact(self):
+        original = json.loads(self.artifacts[M.LAYER].read_bytes())
+        maps = [None, {}, [], {key: key for key in M.VULKAN_FUNCTIONS},
+            {**M.VULKAN_FUNCTIONS, "vkGetInstanceProcAddr": M.VULKAN_FUNCTIONS["vkGetDeviceProcAddr"]},
+            {**M.VULKAN_FUNCTIONS, "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"},
+            {**M.VULKAN_FUNCTIONS, "vkCreateInstance": "frame_compositor_raw_vkCreateInstance"}]
+        maps += [{key: value for key, value in M.VULKAN_FUNCTIONS.items() if key != missing} for missing in M.VULKAN_FUNCTIONS]
+        for mapping in maps:
+            data = copy.deepcopy(original)
+            if mapping is None: data["layer"].pop("functions")
+            else: data["layer"]["functions"] = mapping
+            self.alter_artifact(M.LAYER, M.json_bytes(data))
+            with self.subTest(mapping=mapping), self.assertRaises(RuntimeError): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+    def test_old_or_inconsistent_public_export_and_mapping_reports_cannot_stage(self):
+        original = copy.deepcopy(self.plan)
+        for section, field, value in (("observer", "public_exports", None),
+            ("observer", "public_exports", ["frame_compositor_raw_bridge", *M.VULKAN_FUNCTIONS]),
+            ("observer", "vulkan_functions", {}), ("observer", "standard_vulkan_exports", ["vkGetDeviceProcAddr"]),
+            ("manifest", "functions", {})):
+            self.plan = copy.deepcopy(original)
+            if value is None: self.plan[section].pop(field)
+            else: self.plan[section][field] = value
+            self.save_plan()
+            with self.subTest(section=section, field=field), self.assertRaises(RuntimeError): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
     def test_activate_requires_both_actual_acknowledgments(self):
         self.stage()
         for args in ({"runtime_scope": False}, {"restart_ready": False}, {"runtime_scope": 1}, {"restart_ready": 1}):
