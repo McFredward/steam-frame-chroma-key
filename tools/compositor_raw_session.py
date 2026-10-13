@@ -112,20 +112,79 @@ class Session(base.Session):
             raise RuntimeError("Foreign audit/tracing in native EnvironmentFile")
         return snapshots
 
-    def reject_old_activation(self, allow_own=False):
+    @staticmethod
+    def layer_stat(info):
+        return {key: getattr(info, "st_" + key) for key in
+                ("dev", "ino", "mode", "uid", "gid", "nlink", "size", "mtime_ns", "ctime_ns")}
+
+    def native_layer_snapshots(self, reviewed, allow_own=False):
+        # Each exact file has its own independently reviewed digest. Filenames
+        # or vendor names alone never admit an implicit layer. The current
+        # native Steam manifests are regular files; symlinks are not followed.
+        if not isinstance(reviewed, dict) or len(reviewed) > 64:
+            raise RuntimeError("Explicit bounded native layer reviews required")
+        safe_path(self.layer.parent)
+        expected = {}
+        for name, sha in reviewed.items():
+            node = Path(name)
+            if (not isinstance(name, str) or str(node) != name or node.parent != self.layer.parent or
+                node == self.layer or node.suffix != ".json" or not re.fullmatch(r"[0-9a-f]{64}", sha or "")):
+                raise RuntimeError("Exact native layer node/digest required")
+            expected[name] = sha
+        entries = list(self.layer.parent.iterdir()) if self.layer.parent.exists() else []
+        if len(entries) > 65: raise RuntimeError("User layer directory bound exceeded")
+        actual = {str(path) for path in entries if not (allow_own and path == self.layer)}
+        if actual != set(expected): raise RuntimeError("New, missing or unreviewed user implicit layer")
+        result, total = {}, 0
+        for name, sha in sorted(expected.items()):
+            path = safe_path(name); before = path.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_mode & 0o022:
+                raise RuntimeError("Unsafe native layer ownership/type/mode")
+            raw = read_regular(path, 16384); after = path.lstat(); total += len(raw)
+            if self.layer_stat(before) != self.layer_stat(after) or total > 65536 or digest(raw) != sha:
+                raise RuntimeError("Reviewed native layer changed or exceeded bound")
+            document = json.loads(raw)
+            layer = document.get("layer") if isinstance(document, dict) else None
+            if (not isinstance(layer, dict) or not isinstance(layer.get("name"), str) or
+                layer["name"] == "VK_LAYER_FRAME_MASK_trace" or not isinstance(layer.get("library_path"), str) or
+                layer["library_path"].startswith(str(self.folder))):
+                raise RuntimeError("Native layer cannot be a diagnostic or malformed manifest")
+            enables = layer.get("enable_environment")
+            if (not isinstance(enables, dict) or not 1 <= len(enables) <= 8 or
+                any(not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or
+                    not isinstance(value, str) or blocked(key, value) for key, value in enables.items())):
+                raise RuntimeError("Native layers require explicit inactive enable gates")
+            result[name] = {"sha256": sha, "bytes_hex": raw.hex(), "node": self.layer_stat(after),
+                            "enable_environment": enables, "library_path": layer["library_path"], "layer_name": layer["name"]}
+        return result
+
+    def native_layers_inactive(self, snapshots, state, manager, environment_files):
+        values = [self.environment, manager, self.env_values(state["Environment"])]
+        values.extend(item["values"] for item in environment_files.values())
+        keys = {key for item in snapshots.values() for key in item["enable_environment"]}
+        if any(key in scope for scope in values for key in keys):
+            raise RuntimeError("Reviewed native implicit layer enable variable is present")
+
+    def revalidate_native_layers(self, m, *, allow_own=False, state=None, manager=None, environment_files=None):
+        baseline = m.get("original_native_layers")
+        if not isinstance(baseline, dict): raise RuntimeError("Owned native layer baseline missing")
+        current = self.native_layer_snapshots({name: item["sha256"] for name, item in baseline.items()}, allow_own)
+        if current != baseline: raise RuntimeError("Native layer node/content baseline changed")
+        if state is None: state = self.state()
+        if manager is None: manager = self.env_values(self.command("show-environment"))
+        if environment_files is None:
+            environment_files = self.native_environment_files(state, {name: item["sha256"] for name, item in m["original_environment_files"].items()})
+        self.native_layers_inactive(current, state, manager, environment_files)
+        return current
+
+    def reject_old_activation(self, reviewed_native_layers=None, allow_own=False):
         for path in (self.runtime / "systemd/user/steam.service.d/94-frame-client-startup.conf",
             self.runtime / "systemd/user/steam.service.d/91-frame-receiver-observer.conf",
             self.runtime / "systemd/user/steamvr.service.d/91-frame-receiver-observer.conf",
             self.runtime / "systemd/user/steamvr.service.d/90-frame-mask-trace.conf"):
             safe_path(path)
             if path.exists() or path.is_symlink(): raise RuntimeError("Prior diagnostic activation remains")
-        safe_path(self.layer.parent)
-        if self.layer.parent.exists():
-            entries = list(self.layer.parent.iterdir())
-            if len(entries) > 64: raise RuntimeError("User layer directory bound exceeded")
-            for path in entries:
-                if not allow_own or path != self.layer:
-                    raise RuntimeError("Foreign user implicit layer must be reviewed first")
+        return self.native_layer_snapshots(reviewed_native_layers or {}, allow_own)
 
     @staticmethod
     def elf(data):
@@ -227,9 +286,9 @@ class Session(base.Session):
     def activation_files(self, layer_data):
         return {self.dropin: self.activation(), self.layer: layer_data}
 
-    def stage(self, path, expected, native, artifacts, *, runtime_scope=False, reviewed_helpers=None, reviewed_environment_files=None):
+    def stage(self, path, expected, native, artifacts, *, runtime_scope=False, reviewed_helpers=None, reviewed_environment_files=None, reviewed_native_layers=None):
         if runtime_scope is not True: raise RuntimeError("Separate compositor-private-scope acknowledgment required")
-        self.reject_old_activation()
+        native_layers = self.reject_old_activation(reviewed_native_layers)
         for target in (self.folder, self.dropin, self.layer, self.dropin.with_suffix(".pending"), self.layer.with_suffix(".pending")):
             safe_path(target)
             if target.exists() or target.is_symlink(): raise RuntimeError("Existing session/activation refused")
@@ -237,13 +296,14 @@ class Session(base.Session):
         self.command("is-active", UNIT); original = self.state()
         manager = self.reject_environment(original)
         snapshots = self.native_environment_files(original, reviewed_environment_files or {})
+        self.native_layers_inactive(native_layers, original, manager, snapshots)
         private_parents(self.folder.parent); self.folder.mkdir(mode=0o700); self.folder.chmod(0o700)
         exclusive(self.folder / "operation.lock", b""); exclusive(self.folder / "session.jsonl", b"")
         with self.lock():
             activation = self.activation_files(payloads[LAYER])
             manifest = {"schema": SESSION_SCHEMA, "unit": UNIT, "scope_acknowledged": True,
                 "plan_sha256": expected, "original_service": original, "original_manager_environment": manager,
-                "original_environment_files": snapshots, "native_files": files,
+                "original_environment_files": snapshots, "original_native_layers": native_layers, "native_files": files,
                 "activation": {str(p): {"sha256": digest(raw), "bytes_hex": raw.hex()} for p, raw in activation.items()},
                 "owned_files": {name: digest(data) for name, data in payloads.items()}, "automatic_restart": False}
             exclusive(self.folder / "owned.json", json_bytes(manifest))
@@ -260,6 +320,8 @@ class Session(base.Session):
             set(m.get("native_files", {})) != set(NATIVE) or
             m["owned_files"].get("deployment-plan.json") != m.get("plan_sha256")):
             raise RuntimeError("Invalid owned compositor session manifest")
+        if not isinstance(m.get("original_native_layers"), dict) or len(m["original_native_layers"]) > 64:
+            raise RuntimeError("Invalid owned native layer baseline")
         for name, sha in m["owned_files"].items():
             if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha): raise RuntimeError("Invalid owned fingerprint")
         for path, item in m["activation"].items():
@@ -291,7 +353,9 @@ class Session(base.Session):
     def activate(self, *, runtime_scope=False, restart_ready=False):
         if runtime_scope is not True or restart_ready is not True: raise RuntimeError("Actual scope and coordinated SteamVR restart required")
         with self.lock():
-            m = self.manifest(); self.verify_owned(m); self.reject_old_activation()
+            m = self.manifest(); self.verify_owned(m)
+            self.reject_old_activation({name: item["sha256"] for name, item in m["original_native_layers"].items()})
+            self.revalidate_native_layers(m)
             if (self.folder / "rollback-complete.json").exists(): raise RuntimeError("Restored session cannot reactivate")
             for name in m["activation"]:
                 path = safe_path(name)
@@ -332,6 +396,7 @@ class Session(base.Session):
         if any(blocked(k, v) for k, v in manager.items()) or not base.compare_manager(
                 m["original_manager_environment"], manager, self.runtime)["manager_matches_except_session_paths"]:
             raise RuntimeError("Manager environment changed during activation")
+        self.revalidate_native_layers(m, allow_own=True, state=current, manager=manager, environment_files=snapshots)
         return current
 
     def start(self, *args, runtime_scope=False, restart_ready=False, **kwargs):
@@ -396,6 +461,7 @@ class Session(base.Session):
                     if path.exists() or path.is_symlink(): raise RuntimeError("Activation appeared after restoration")
                 self.restoration_state(m); return
             self.remove_activation(m)
+            self.revalidate_native_layers(m)
             if not (self.folder / "archive").exists(): self.recovery_event("activation_removed", restart_readiness=restart_ready)
             if restart_ready is not True:
                 self.recovery_event("restart_pending", loaded_processes_may_remain=True); return
@@ -415,6 +481,7 @@ class Session(base.Session):
         if (restored != m["original_service"] or snapshots != m["original_environment_files"] or
             not comparison["manager_matches_except_session_paths"]):
             raise RuntimeError("Original service/manager/native-file snapshot not restored")
+        self.revalidate_native_layers(m, state=restored, manager=manager, environment_files=snapshots)
         return comparison
 
     def verify_unloaded(self):
@@ -495,6 +562,7 @@ def main(argv=None):
     for artifact in ("observer", "audit", "envelope", "layer"): p.add_argument("--" + artifact, type=Path)
     p.add_argument("--reviewed-session-helper-sha256"); p.add_argument("--reviewed-receiver-helper-sha256")
     p.add_argument("--reviewed-environment-file", action="append", default=[], metavar="PATH=SHA256")
+    p.add_argument("--reviewed-native-layer", action="append", default=[], metavar="PATH=SHA256")
     p.add_argument("--ack-compositor-raw-diagnostic-scope", action="store_true")
     p.add_argument("--ack-steamvr-restart-readiness", action="store_true")
     a = p.parse_args(argv)
@@ -510,9 +578,11 @@ def main(argv=None):
                 raise RuntimeError("Reviewed plan and every fresh native/own artifact path required")
             reviewed = dict(entry.rsplit("=", 1) for entry in a.reviewed_environment_file)
             if len(reviewed) != len(a.reviewed_environment_file): raise RuntimeError("Duplicate reviewed environment file")
+            layers = dict(entry.rsplit("=", 1) for entry in a.reviewed_native_layer)
+            if len(layers) != len(a.reviewed_native_layer): raise RuntimeError("Duplicate reviewed native layer")
             kwargs = {"runtime_scope": a.ack_compositor_raw_diagnostic_scope,
                 "reviewed_helpers": {HELPERS[0]: a.reviewed_session_helper_sha256, HELPERS[1]: a.reviewed_receiver_helper_sha256},
-                "reviewed_environment_files": reviewed}
+                "reviewed_environment_files": reviewed, "reviewed_native_layers": layers}
             if a.mode == "start": kwargs["restart_ready"] = a.ack_steamvr_restart_readiness
             getattr(session, a.mode)(a.reviewed_plan, a.reviewed_plan_sha256, native,
                 {MAIN: a.observer, AUDIT: a.audit, ENVELOPE: a.envelope, LAYER: a.layer}, **kwargs)

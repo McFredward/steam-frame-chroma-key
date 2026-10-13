@@ -298,4 +298,133 @@ class SessionTests(unittest.TestCase):
         self.assertNotIn('"watchdog"', source); self.assertNotIn('"sudo"', source); self.assertNotIn('"timer"', source)
         with mock.patch.object(M.platform, "machine", return_value="x86_64"), self.assertRaises(SystemExit): M.main(["stage"])
 
+class NativeLayerTests(unittest.TestCase):
+    setUp, tearDown = SessionTests.setUp, SessionTests.tearDown
+    elf, profile = staticmethod(SessionTests.elf), staticmethod(SessionTests.profile)
+    layer_bytes, save_plan, command = SessionTests.layer_bytes, SessionTests.save_plan, SessionTests.command
+    stage, activate, restart_count = SessionTests.stage, SessionTests.activate, SessionTests.restart_count
+
+    def native_layer(self, name="native.json", document=None):
+        M.private_parents(self.session.layer.parent)
+        path = self.session.layer.parent / name
+        raw = M.json_bytes(document or {"file_format_version": "1.0.0", "layer": {
+            "name": "VK_LAYER_VENDOR_native", "type": "GLOBAL", "library_path": "/usr/lib/libNativeLayer.so",
+            "enable_environment": {"ENABLE_NATIVE_LAYER": "1"}}})
+        M.exclusive(path, raw); path.chmod(0o644)
+        return path, {str(path): M.digest(raw)}
+
+    def test_native_layer_exact_reviewed_baseline_preserved(self):
+        path, reviewed = self.native_layer(); original = path.read_bytes(); before = path.stat()
+        self.stage(reviewed_native_layers=reviewed)
+        baseline = self.session.manifest()["original_native_layers"][str(path)]
+        self.assertEqual(baseline["sha256"], reviewed[str(path)])
+        self.assertEqual(baseline["node"]["ino"], before.st_ino)
+        self.assertEqual(bytes.fromhex(baseline["bytes_hex"]), original)
+        self.activate(); self.assertTrue(self.session.readcheck()["active"])
+        self.session.rollback(restart_ready=True); self.assertFalse(self.session.readcheck()["active"])
+        self.assertEqual(path.read_bytes(), original); self.assertEqual(path.stat().st_ino, before.st_ino)
+        self.assertEqual(path.stat().st_mode, before.st_mode)
+
+    def test_native_layer_review_required_no_filename_whitelist(self):
+        path, _ = self.native_layer("steamfossilize_arm64.json")
+        with self.assertRaises(RuntimeError): self.stage()
+        self.assertTrue(path.exists()); self.assertFalse(self.session.folder.exists())
+
+    def test_native_layer_wrong_or_extra_digest_refused(self):
+        path, reviewed = self.native_layer()
+        for value in ("0" * 64, "not-a-sha", "", None):
+            with self.subTest(value=value), self.assertRaises(RuntimeError): self.stage(reviewed_native_layers={str(path): value})
+        reviewed[str(self.session.layer.parent / "missing.json")] = "0" * 64
+        with self.assertRaises(RuntimeError): self.stage(reviewed_native_layers=reviewed)
+
+    def test_native_layer_symlink_targets_are_never_followed(self):
+        path, reviewed = self.native_layer(); original = path.read_bytes(); path.unlink()
+        target = self.root / "native-target.json"; M.exclusive(target, original)
+        for selected in (target, self.root / "missing-target", self.artifacts[M.MAIN]):
+            path.symlink_to(selected)
+            with self.subTest(target=selected), self.assertRaises(RuntimeError): self.stage(reviewed_native_layers=reviewed)
+            path.unlink()
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_native_layer_nonregular_or_shared_nodes_refused(self):
+        path, reviewed = self.native_layer(); original = path.read_bytes(); path.unlink(); path.mkdir()
+        with self.assertRaises(RuntimeError): self.stage(reviewed_native_layers=reviewed)
+        path.rmdir(); os.mkfifo(path)
+        with self.assertRaises(RuntimeError): self.stage(reviewed_native_layers=reviewed)
+        path.unlink(); M.exclusive(path, original); os.link(path, self.root / "shared-layer")
+        with self.assertRaises(RuntimeError): self.stage(reviewed_native_layers=reviewed)
+
+    def test_native_layer_world_writable_refused(self):
+        path, reviewed = self.native_layer(); path.chmod(0o666)
+        with self.assertRaises(RuntimeError): self.stage(reviewed_native_layers=reviewed)
+
+    def test_native_layer_enable_gate_must_be_absent_in_all_scopes(self):
+        path, reviewed = self.native_layer()
+        for where in ("caller", "manager", "service", "file"):
+            self.session.environment = {}; self.manager = "NATIVE_ENV=yes\n"
+            self.original["Environment"] = "NATIVE_SETTING=unchanged"; self.original["EnvironmentFiles"] = ""
+            opts = {"reviewed_native_layers": reviewed}
+            if where == "caller": self.session.environment = {"ENABLE_NATIVE_LAYER": ""}
+            if where == "manager": self.manager += "ENABLE_NATIVE_LAYER=1\n"
+            if where == "service": self.original["Environment"] += " ENABLE_NATIVE_LAYER=1"
+            if where == "file":
+                source = self.root / "native-enable-env"; M.exclusive(source, b"ENABLE_NATIVE_LAYER=1\n")
+                self.original["EnvironmentFiles"] = str(source) + " (ignore_errors=no)"
+                opts["reviewed_environment_files"] = {str(source): M.digest(source.read_bytes())}
+            with self.subTest(where=where), self.assertRaises(RuntimeError): self.stage(**opts)
+        self.assertTrue(path.exists())
+
+    def test_native_layer_gate_or_diagnostic_injection_refused(self):
+        path, _ = self.native_layer(); path.unlink()
+        for changed in ("missing_gate", "diagnostic_name", "diagnostic_library", "diagnostic_gate", "malformed"):
+            document = {"file_format_version": "1.0.0", "layer": {"name": "VK_LAYER_VENDOR_native",
+                "library_path": "/usr/lib/libNativeLayer.so", "enable_environment": {"ENABLE_NATIVE_LAYER": "1"}}}
+            if changed == "missing_gate": document["layer"].pop("enable_environment")
+            if changed == "diagnostic_name": document["layer"]["name"] = "VK_LAYER_FRAME_MASK_trace"
+            if changed == "diagnostic_library": document["layer"]["library_path"] = str(self.session.library)
+            if changed == "diagnostic_gate": document["layer"]["enable_environment"] = {"FRAME_MASK_TRACE": "1"}
+            if changed == "malformed": document["layer"] = []
+            _, reviewed = self.native_layer(document=document)
+            with self.subTest(changed=changed), self.assertRaises(RuntimeError): self.stage(reviewed_native_layers=reviewed)
+            path.unlink()
+
+    def test_native_layer_changes_prevent_activation(self):
+        path, reviewed = self.native_layer(); self.stage(reviewed_native_layers=reviewed)
+        before = path.read_bytes(); path.write_bytes(before + b" ")
+        with self.assertRaises(RuntimeError): self.activate()
+        self.assertEqual(self.restart_count(), 0); self.assertFalse(self.session.dropin.exists())
+
+    def test_native_layer_removed_or_new_entry_prevents_activation(self):
+        path, reviewed = self.native_layer(); self.stage(reviewed_native_layers=reviewed)
+        original = path.read_bytes(); path.unlink()
+        with self.assertRaises(RuntimeError): self.activate()
+        M.exclusive(path, original); extra = self.session.layer.parent / "extra.json"; M.exclusive(extra, original)
+        with self.assertRaises(RuntimeError): self.activate()
+        self.assertTrue(extra.exists())
+
+    def test_native_layer_equal_content_replacement_is_not_same_node(self):
+        path, reviewed = self.native_layer(); self.stage(reviewed_native_layers=reviewed)
+        original = path.read_bytes(); path.rename(self.root / "old-layer")
+        M.exclusive(path, original); path.chmod(0o644)
+        with self.assertRaises(RuntimeError): self.activate()
+
+    def test_native_layer_change_active_readcheck_refused(self):
+        path, reviewed = self.native_layer(); self.stage(reviewed_native_layers=reviewed); self.activate()
+        path.write_bytes(path.read_bytes() + b" ")
+        with self.assertRaises(RuntimeError): self.session.readcheck()
+        with self.assertRaises(RuntimeError): self.session.rollback()
+        self.assertFalse(self.session.dropin.exists()); self.assertFalse(self.session.layer.exists()); self.assertTrue(path.exists())
+
+    def test_native_layer_enable_variable_after_activation_refused(self):
+        _, reviewed = self.native_layer(); self.stage(reviewed_native_layers=reviewed); self.activate()
+        self.manager += "ENABLE_NATIVE_LAYER=1\n"
+        with self.assertRaises(RuntimeError): self.session.readcheck()
+        with self.assertRaises(RuntimeError): self.session.rollback()
+        self.assertFalse(self.session.dropin.exists()); self.assertFalse(self.session.layer.exists())
+
+    def test_native_layer_live_diagnostic_is_not_native_baseline(self):
+        path, reviewed = self.native_layer(); reviewed[str(self.session.layer)] = "0" * 64
+        with self.assertRaises(RuntimeError): self.stage(reviewed_native_layers=reviewed)
+        self.assertTrue(path.exists())
+
 if __name__ == "__main__": unittest.main()
