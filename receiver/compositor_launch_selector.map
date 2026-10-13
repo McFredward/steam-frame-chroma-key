@@ -1,0 +1,12 @@
+{
+  global:
+    execve;
+    execv;
+    execvp;
+    execvpe;
+    posix_spawn;
+    posix_spawnp;
+    frame_compositor_launch_clean_environment;
+    frame_compositor_launch_provider_mask;
+  local: *;
+};
