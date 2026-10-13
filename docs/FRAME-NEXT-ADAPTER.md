@@ -1,5 +1,11 @@
 # Next native association adapter
 
+Build note, 2026-10-13: the native addresses in this 2026-10-11 report describe
+its historical binary, not the updated SteamOS 0.4.5 compositor. Use the pinned
+[current carrier audit](FRAME-RESOURCE-CARRIER-20261012.md) and
+[next compositor scope](COMPOSITOR-RAW-NEXT-SCOPE-20261013.md) for current
+instrumentation. Never transplant an older helper address into a new build.
+
 ## Decision
 
 The next useful experiment is a **selected-record/resource scalar observer**, not

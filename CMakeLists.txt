@@ -200,6 +200,11 @@ if(BUILD_TESTING)
         target_include_directories(test_native_import_route PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_options(test_native_import_route PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME compositor_import_native_route COMMAND test_native_import_route)
+        add_executable(test_compositor_resource_sparse tests/test_compositor_resource_sparse.cpp
+            import/compositor_resource_sparse.cpp import/native_import_route.cpp)
+        target_include_directories(test_compositor_resource_sparse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(test_compositor_resource_sparse PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME compositor_resource_sparse_copy COMMAND test_compositor_resource_sparse)
         add_executable(test_import_pipe_epoch tests/test_import_pipe_epoch.cpp
             import/import_pipe_epoch.cpp)
         target_include_directories(test_import_pipe_epoch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
