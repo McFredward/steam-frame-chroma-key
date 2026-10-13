@@ -287,7 +287,11 @@ struct Capture {
         // When timed recovery is enabled, leave time for its independently
         // armed 180-second watchdog to restore SteamVR after capture closure.
         // Manual recovery uses these same recording bounds without a watchdog.
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        const unsigned deadlineSeconds = 120;
+#else
         const unsigned deadlineSeconds = fragmentFilter ? 120 : 30;
+#endif
         char header[1024];
         const auto headerLength = std::snprintf(header, sizeof(header),
             "{\"event\":\"header\",\"version\":1,\"layer\":\"VK_LAYER_FRAME_MASK_trace\","

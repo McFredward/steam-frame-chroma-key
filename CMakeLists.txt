@@ -9,6 +9,11 @@ option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
 option(FRAME_MASK_BUILD_IMPORT_ENTRY
     "Build uninstalled AArch64 import entry forwarding (no observer activation)" OFF)
+option(FRAME_MASK_COMPOSITOR_RAW
+    "Build a combined, inactive-by-default bounded compositor import diagnostic" OFF)
+if(FRAME_MASK_COMPOSITOR_RAW AND NOT FRAME_MASK_BUILD_IMPORT_ENTRY)
+    message(FATAL_ERROR "Compositor raw diagnosis requires the actual AArch64 entry veneers")
+endif()
 option(FRAME_MASK_BUILD_STARTUP_AUDIT
     "Build an uninstalled startup audit bridge with inactive default preparation" OFF)
 option(FRAME_MASK_BUILD_CLIENT_STARTUP
@@ -155,6 +160,20 @@ if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE OR FRAME_MASK_BUILD_IMPORT_
         target_compile_definitions(VkLayer_frame_mask_trace PRIVATE FRAME_MASK_IMPORT_ENTRY=1)
         target_link_options(VkLayer_frame_mask_trace PRIVATE -Wl,--no-undefined)
     endif()
+    if(FRAME_MASK_COMPOSITOR_RAW)
+        target_sources(VkLayer_frame_mask_trace PRIVATE
+            receiver/compositor_raw_observer.cpp receiver/compositor_raw_runtime.cpp
+            import/compositor_main_preparation.cpp import/import_main_preparation.cpp
+            import/import_loader_reader.cpp import/import_module_identity.cpp
+            import/compositor_import_thread.cpp import/import_startup_gate.cpp
+            import/native_client_birth.cpp import/import_pipe_epoch.cpp import/compositor_resource_raw.cpp
+            import/compositor_resource_sparse.cpp import/native_import_route.cpp
+            import/compositor_journal_bridge.cpp)
+        target_compile_definitions(VkLayer_frame_mask_trace PRIVATE FRAME_MASK_COMPOSITOR_RAW=1)
+        target_compile_options(VkLayer_frame_mask_trace PRIVATE -ftls-model=initial-exec -fexceptions -fno-rtti)
+        target_link_options(VkLayer_frame_mask_trace PRIVATE -Wl,-z,separate-code)
+        target_link_libraries(VkLayer_frame_mask_trace PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     set(FRAME_MASK_TRACE_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}VkLayer_frame_mask_trace${CMAKE_SHARED_LIBRARY_SUFFIX}")
     configure_file(layer/VkLayer_frame_mask_trace.json.in
         ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_mask_trace.json @ONLY)
@@ -188,6 +207,23 @@ if(BUILD_TESTING)
     add_test(NAME mask_module_guard COMMAND test_mask_module_guard)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(UNIX)
+        add_executable(test_compositor_bootstrap tests/test_compositor_bootstrap.cpp
+            import/compositor_main_preparation.cpp import/import_main_preparation.cpp
+            import/import_loader_reader.cpp import/import_module_identity.cpp)
+        target_include_directories(test_compositor_bootstrap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(test_compositor_bootstrap PRIVATE ${CMAKE_DL_LIBS})
+        add_test(NAME compositor_cold_bootstrap COMMAND test_compositor_bootstrap)
+        add_executable(test_compositor_import_thread tests/test_compositor_import_thread.cpp
+            import/compositor_import_thread.cpp import/import_startup_gate.cpp import/native_client_birth.cpp import/import_pipe_epoch.cpp)
+        target_include_directories(test_compositor_import_thread PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME compositor_first_import_thread COMMAND test_compositor_import_thread)
+        add_executable(test_compositor_raw_receipt tests/test_compositor_raw_receipt.cpp
+            import/compositor_journal_bridge.cpp)
+        target_include_directories(test_compositor_raw_receipt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+        target_link_libraries(test_compositor_raw_receipt PRIVATE Threads::Threads)
+        add_test(NAME compositor_owning_journal_receipt COMMAND test_compositor_raw_receipt)
+        add_test(NAME compositor_selective_startup_audit COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compositor_startup_audit.py)
         add_executable(test_import_observer tests/test_import_observer.cpp
             import/import_observer_core.cpp)
         target_include_directories(test_import_observer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
