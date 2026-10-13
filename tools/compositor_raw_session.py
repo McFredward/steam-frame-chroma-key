@@ -345,7 +345,11 @@ class Session(base.Session):
 
     def verify_owned(self, m):
         for name, sha in m["owned_files"].items():
-            if digest(read_regular(self.folder / name, private=True)) != sha: raise RuntimeError("Owned staged artifact/helper/plan changed")
+            # The final combined DSO is larger than the metadata/helper cap.
+            # Its independent reviewed hash still applies; no other input gets
+            # a wider allowance merely because it is in the owned folder.
+            limit = MAX_INPUT if name == MAIN else 262144 if name == AUDIT else base.LIMIT
+            if digest(read_regular(self.folder / name, limit, private=True)) != sha: raise RuntimeError("Owned staged artifact/helper/plan changed")
         for role, item in m["native_files"].items():
             data = read_regular(Path(item["path"]), MAX_INPUT)
             if digest(data) != item["sha256"] or len(data) != item["bytes"]: raise RuntimeError("Native identity changed since staging")

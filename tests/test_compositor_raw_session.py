@@ -114,6 +114,34 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.restart_count(), 0); self.assertEqual(self.session.folder.stat().st_mode & 0o777, 0o700)
         self.assertFalse(self.session.readcheck()["active"])
         self.assertTrue(self.session.manifest()["scope_acknowledged"])
+    def large_main(self, size):
+        # The real final ARM artifact is 3,606,520 bytes. Preserve all modeled
+        # reviewed profile/envelope relationships instead of widening a toy
+        # file after staging. This tests lifecycle limits, not native ELF Ready.
+        raw = self.elf(7) + bytes(size - 64)
+        profile = self.profile(5, raw)
+        envelope = bytearray(self.artifacts[M.ENVELOPE].read_bytes())
+        envelope[16:48] = profile[-32:]
+        envelope[112 + 3 * 2032:-32] = profile
+        envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
+        self.alter_artifact(M.MAIN, raw)
+        self.plan["observer_profile"] = {"role": 5, "file_sha256": M.digest(raw), "profile_sha256": profile[-32:].hex()}
+        self.plan["envelope"]["reviewed_observer_profile_identity"] = profile[-32:].hex()
+        self.alter_artifact(M.ENVELOPE, bytes(envelope))
+    def test_actual_sized_main_survives_stage_activate_readcheck_rollback(self):
+        self.large_main(3606520); self.stage(); self.activate()
+        self.assertTrue(self.session.readcheck()["active"])
+        self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.readcheck()["active"])
+    def test_large_main_limit_does_not_extend_audit_or_metadata(self):
+        self.stage(); m = self.session.manifest()
+        for name in (M.AUDIT, M.HELPERS[0]):
+            path = self.session.folder / name; original = path.read_bytes()
+            limit = 262144 if name == M.AUDIT else M.base.LIMIT
+            large = original + bytes(limit + 1 - len(original))
+            path.write_bytes(large); m["owned_files"][name] = M.digest(large)
+            with self.subTest(name=name), self.assertRaises(RuntimeError): self.session.verify_owned(m)
+            path.write_bytes(original); m["owned_files"][name] = M.digest(original)
     def test_scope_is_actual_boolean_not_plan_permission(self):
         for bad in (False, 1, "yes", None):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError): self.stage(runtime_scope=bad)
