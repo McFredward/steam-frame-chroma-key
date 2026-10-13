@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vulkan/vk_layer.h>
 
 namespace {
 unsigned checks=0;
@@ -26,6 +27,21 @@ int main(int argc,char** argv) {
     auto bridge=reinterpret_cast<frame_compositor_audit::Bridge>(dlsym(dso,"frame_compositor_raw_bridge"));expect(bridge);
     Dl_info info{};expect(dladdr(reinterpret_cast<void*>(bridge),&info));
     const auto base=reinterpret_cast<uintptr_t>(info.dli_fbase);
+    // The same final DSO is also an implicit layer. Its negotiated entry names
+    // must never interpose the application's ordinary Vulkan-loader API.
+    for (const char* name : {"vkGetInstanceProcAddr", "vkGetDeviceProcAddr", "vkNegotiateLoaderLayerInterfaceVersion"}) {
+        expect(!dlsym(dso, name));
+    }
+    auto gipa=reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(dso,"frame_compositor_raw_vkGetInstanceProcAddr"));
+    auto gdpa=reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(dso,"frame_compositor_raw_vkGetDeviceProcAddr"));
+    auto negotiate=reinterpret_cast<PFN_vkNegotiateLoaderLayerInterfaceVersion>(
+        dlsym(dso,"frame_compositor_raw_vkNegotiateLoaderLayerInterfaceVersion"));
+    expect(gipa && gdpa && negotiate);
+    VkNegotiateLayerInterface interface{};
+    interface.sType=LAYER_NEGOTIATE_INTERFACE_STRUCT;
+    interface.loaderLayerInterfaceVersion=2;
+    expect(negotiate(&interface)==VK_SUCCESS && interface.loaderLayerInterfaceVersion==2);
+    expect(interface.pfnGetInstanceProcAddr==gipa && interface.pfnGetDeviceProcAddr==gdpa);
     uintptr_t entries[8]{};for(unsigned i=0;i<8;++i){entries[i]=base+strtoull(argv[i+2],nullptr,16);expect(entries[i]>base);}
     expect(!dlsym(dso,"frame_compositor_raw_ready") && !dlsym(dso,"frame_import_lock_entry"));
     for(auto stage:{frame_compositor_audit::Stage::Prepare,frame_compositor_audit::Stage::Bind,frame_compositor_audit::Stage::ForwardOnly}) {
