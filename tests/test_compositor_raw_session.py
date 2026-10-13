@@ -28,9 +28,13 @@ class SessionTests(unittest.TestCase):
         self.manager_after_restart = []
         self.original = {"Environment": "NATIVE_SETTING=unchanged", "EnvironmentFiles": "", "DropInPaths": ""}
         self.manager = "NATIVE_ENV=yes\n"
-        self.session = M.Session(self.home, self.runtime, self.command, environment={})
+        self.health_source = mock.Mock()
+        self.health_source.baseline.return_value = {"fixture_baseline": True}
+        self.health_source.clock = lambda: 1.0
+        self.health_source.sleep = lambda seconds: None
+        self.session = M.Session(self.home, self.runtime, self.command, environment={}, health_source=self.health_source)
         self.native, self.artifacts, self.patches = {}, {}, []
-        for module, name in ((M, M.HELPERS[0]), (M.base, M.HELPERS[1])):
+        for module, name in ((M, M.HELPERS[0]), (M.base, M.HELPERS[1]), (M.health, M.HELPERS[2])):
             target = self.root / name; M.exclusive(target, Path(module.__file__).read_bytes())
             patch = mock.patch.object(module, "__file__", str(target)); patch.start(); self.patches.append(patch)
         pins, profiles, reports = {}, [], []
@@ -68,7 +72,12 @@ class SessionTests(unittest.TestCase):
             self.plan["inventory"].append({"name": name, "bytes": len(data), "sha256": M.digest(data), "frame_path":
                 str(self.session.folder / name) if name in self.artifacts else None, "owned_source": True, "native_bytes": False, "mode": "0600"})
         self.plan_path = self.root / "deployment-plan.json"; self.save_plan()
-        self.helpers = {M.HELPERS[0]: M.digest(Path(M.__file__).read_bytes()), M.HELPERS[1]: M.digest(Path(M.base.__file__).read_bytes())}
+        self.helpers = {name: M.digest(Path(module.__file__).read_bytes()) for module, name in
+                        ((M, M.HELPERS[0]), (M.base, M.HELPERS[1]), (M.health, M.HELPERS[2]))}
+        self.ready_result = {"schema": M.health.SCHEMA, "status": "ready", "ready": True,
+            "screen_pixels_verified": False, "automatic_restart": False, "fixture_health": True}
+        patch = mock.patch.object(M.health, "wait_ready", return_value=self.ready_result)
+        self.wait_ready = patch.start(); self.patches.append(patch)
 
     @staticmethod
     def elf(value): return b"\x7fELF\x02\x01\x01" + b"\0" * 9 + b"\x03\0\xb7\0" + bytes([value]) * 44
@@ -113,6 +122,58 @@ class SessionTests(unittest.TestCase):
         report = {M.MAIN: "observer", M.AUDIT: "audit", M.ENVELOPE: "envelope", M.LAYER: "manifest"}[name]
         self.plan[report].update(sha256=M.digest(raw), bytes=len(raw))
         next(i for i in self.plan["inventory"] if i["name"] == name).update(sha256=M.digest(raw), bytes=len(raw)); self.save_plan()
+
+    def test_activation_requires_current_ui_health_and_fault_removes_only_own_activation(self):
+        self.stage()
+        self.wait_ready.return_value = {"status": "fault", "ready": False,
+            "reason": "vrwebhelper cannot allocate memory in static TLS block", "automatic_restart": False}
+        with self.assertRaisesRegex(RuntimeError, "compositor/UI startup not ready"): self.activate()
+        self.assertEqual(self.restart_count(), 1)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        result = json.loads((self.session.folder / "activation-startup-health.json").read_bytes())
+        self.assertFalse(result["ready"]); self.assertIn("static TLS", result["reason"])
+        self.assertFalse((self.session.folder / "rollback-complete.json").exists())
+
+    def test_missing_recovery_baseline_does_not_prevent_original_restart(self):
+        self.stage(); self.activate()
+        self.health_source.baseline.side_effect = PermissionError("startup journal denied")
+        with self.assertRaisesRegex(RuntimeError, "Original service restarted"):
+            self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertFalse((self.session.folder / "rollback-complete.json").exists())
+        result = json.loads((self.session.folder / "restoration-startup-health.json").read_bytes())
+        self.assertFalse(result["ready"]); self.assertIn("baseline unavailable", result["reason"])
+
+    def test_activation_baseline_is_captured_immediately_before_restart(self):
+        self.stage()
+        self.health_source.baseline.side_effect = lambda: {"restart_count_when_captured": self.restart_count()}
+        self.activate()
+        self.assertEqual(json.loads((self.session.folder / "activation-startup-baseline.json").read_bytes()),
+                         {"restart_count_when_captured": 0})
+        self.wait_ready.assert_called_once()
+        self.assertFalse(self.session.readcheck()["startup_health_current_verified"])
+
+    def test_restoration_health_failure_is_not_reported_as_completed(self):
+        self.stage(); self.activate()
+        self.wait_ready.return_value = {"status": "not-ready", "ready": False, "reason": "UI evidence unreadable"}
+        with self.assertRaisesRegex(RuntimeError, "compositor/UI startup not ready"):
+            self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertFalse((self.session.folder / "rollback-complete.json").exists())
+
+    def test_monitor_api_retains_failure_receipt_without_an_automatic_restart(self):
+        self.stage(); self.activate()
+        self.ready_result.update(gate_checkpoint={"fixture": True}, source_checkpoint={"fixture": True})
+        self.session.health_receipt("activation-startup-health.json", self.ready_result)
+        with mock.patch.object(M.health.StartupGate, "resume", return_value=mock.Mock()), \
+             mock.patch.object(M.health, "monitor", return_value={"status": "fault", "ready": False,
+                 "reason": "Required UI process exited", "automatic_restart": False}):
+            with self.assertRaisesRegex(RuntimeError, "health lost"): self.session.monitor_startup(seconds=1)
+        self.assertEqual(self.restart_count(), 1)
+        result = json.loads((self.session.folder / "startup-monitor.json").read_bytes())
+        self.assertFalse(result["automatic_restart"]); self.assertEqual(result["status"], "fault")
 
     def test_stage_does_not_enable_or_restart(self):
         self.stage(); self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
@@ -442,6 +503,41 @@ class NativeLayerTests(unittest.TestCase):
             "enable_environment": {"ENABLE_NATIVE_LAYER": "1"}}})
         M.exclusive(path, raw); path.chmod(0o644)
         return path, {str(path): M.digest(raw)}
+
+    def test_native_layer_node_only_rewrite_allows_original_restart_and_is_recorded(self):
+        path, reviewed = self.native_layer(); self.stage(reviewed_native_layers=reviewed); self.activate()
+        original = path.read_bytes(); original_inode = path.stat().st_ino
+        path.rename(self.root / "retired-native-layer")
+        M.exclusive(path, original); path.chmod(0o644)
+        rewritten_inode = path.stat().st_ino
+        self.assertNotEqual(original_inode, rewritten_inode)
+        self.assertTrue(self.session.readcheck()["active"])
+        self.session.rollback(restart_ready=True)
+        result = json.loads((self.session.folder / "rollback-complete.json").read_bytes())
+        self.assertFalse(result["native_layer_nodes_exact"])
+        self.assertIn("ino", result["native_layer_node_drift"][str(path)]["changed_node_fields"])
+        self.assertTrue(result["startup_health_ready"])
+        self.assertEqual(path.read_bytes(), original); self.assertEqual(path.stat().st_ino, rewritten_inode)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertFalse(self.session.readcheck()["active"])
+
+    def test_recovery_rejects_changed_layer_content_mode_owner_links_or_gate(self):
+        path, reviewed = self.native_layer(); self.stage(reviewed_native_layers=reviewed); self.activate()
+        raw = path.read_bytes(); info = path.stat()
+        for variant in ("content", "mode", "links", "gate"):
+            if variant == "content": path.write_bytes(raw + b" ")
+            if variant == "mode": path.chmod(0o600)
+            if variant == "links": os.link(path, self.root / "extra-layer-link")
+            if variant == "gate": self.manager += "ENABLE_NATIVE_LAYER=1\n"
+            with self.subTest(variant=variant), self.assertRaises(RuntimeError): self.session.rollback(restart_ready=True)
+            self.assertEqual(self.restart_count(), 1)
+            self.assertTrue(path.exists()); self.assertFalse((self.session.folder / "rollback-complete.json").exists())
+            if variant == "content": path.write_bytes(raw)
+            if variant == "mode": path.chmod(info.st_mode & 0o777)
+            if variant == "links": (self.root / "extra-layer-link").unlink()
+            if variant == "gate": self.manager = "NATIVE_ENV=yes\n"
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(path.read_bytes(), raw)
 
     def test_native_layer_exact_reviewed_baseline_preserved(self):
         path, reviewed = self.native_layer(); original = path.read_bytes(); before = path.stat()

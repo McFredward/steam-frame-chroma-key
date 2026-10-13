@@ -24,6 +24,10 @@ _base_spec = importlib.util.spec_from_file_location("client_session_safe_primiti
     Path(__file__).with_name("receiver_observer_session.py"))
 base = importlib.util.module_from_spec(_base_spec)
 _base_spec.loader.exec_module(base)
+_health_spec = importlib.util.spec_from_file_location("compositor_startup_health",
+    Path(__file__).with_name("compositor_startup_health.py"))
+health = importlib.util.module_from_spec(_health_spec)
+_health_spec.loader.exec_module(health)
 safe_path, read_regular, exclusive = base.safe_path, base.read_regular, base.exclusive
 digest, json_bytes, private_parents = base.digest, base.json_bytes, base.private_parents
 UNIT = "steamvr.service"
@@ -36,7 +40,7 @@ VULKAN_FUNCTIONS = {
     "vkGetDeviceProcAddr": "frame_compositor_raw_vkGetDeviceProcAddr",
     "vkNegotiateLoaderLayerInterfaceVersion": "frame_compositor_raw_vkNegotiateLoaderLayerInterfaceVersion"}
 PUBLIC_EXPORTS = {"frame_compositor_raw_bridge", *VULKAN_FUNCTIONS.values()}
-HELPERS = ("compositor_raw_session.py", "receiver_observer_session.py")
+HELPERS = ("compositor_raw_session.py", "receiver_observer_session.py", "compositor_startup_health.py")
 NATIVE = {
     "compositor": ("vrcompositor", "0bb148eda6b5e54e2fbed09d475a43671f5ff6fcb6c2b4f48345b1a9fe8d6f96"),
     "libc": ("libc.so.6", "be7ee393429d493c4d3b996ed25cbb02fabb2896a77efe6d57e5993ead5bbb3b"),
@@ -67,7 +71,7 @@ def directory_sync(path):
     finally: os.close(fd)
 
 class Session(base.Session):
-    def __init__(self, home, runtime, run=subprocess.run, environment=None, proc_root=Path("/proc")):
+    def __init__(self, home, runtime, run=subprocess.run, environment=None, proc_root=Path("/proc"), *, health_source=None):
         super().__init__(home, runtime, run, environment, proc_root)
         self.folder = self.home / ".local/share/GloomhavenVR/frame-compositor-raw"
         self.dropin = self.runtime / "systemd/user/steamvr.service.d/96-frame-compositor-raw.conf"
@@ -76,6 +80,8 @@ class Session(base.Session):
         self.capture = self.folder / "compositor-raw.jsonl"
         self.journal = self.folder / "compositor-journal.jsonl"
         self._owned_caller = None
+        self.health_source = health_source or health.NativeEvidenceSource(self.home, proc_root=self.proc, run=self.run)
+        self.native_layer_node_drift = {}
 
     def state(self):
         data = self.command("show", UNIT, "--property=Environment,EnvironmentFiles,DropInPaths")
@@ -170,11 +176,21 @@ class Session(base.Session):
         if any(key in scope for scope in values for key in keys):
             raise RuntimeError("Reviewed native implicit layer enable variable is present")
 
-    def revalidate_native_layers(self, m, *, allow_own=False, state=None, manager=None, environment_files=None):
+    def revalidate_native_layers(self, m, *, allow_own=False, state=None, manager=None, environment_files=None, allow_node_rewrite=False):
         baseline = m.get("original_native_layers")
         if not isinstance(baseline, dict): raise RuntimeError("Owned native layer baseline missing")
         current = self.native_layer_snapshots({name: item["sha256"] for name, item in baseline.items()}, allow_own)
-        if current != baseline: raise RuntimeError("Native layer node/content baseline changed")
+        if type(allow_node_rewrite) is not bool: raise RuntimeError("Explicit native-layer comparison phase required")
+        drift = {}
+        for name, original in baseline.items():
+            item = current[name]
+            if item == original: continue
+            changed = {key for key in item["node"] if item["node"][key] != original["node"].get(key)}
+            same_manifest = {k: v for k, v in item.items() if k != "node"} == {k: v for k, v in original.items() if k != "node"}
+            if not allow_node_rewrite or not same_manifest or not changed <= {"dev", "ino", "mtime_ns", "ctime_ns"}:
+                raise RuntimeError("Native layer node/content baseline changed")
+            drift[name] = {"changed_node_fields": sorted(changed), "original": original["node"], "current": item["node"]}
+        self.native_layer_node_drift = drift
         if state is None: state = self.state()
         if manager is None: manager = self.env_values(self.command("show-environment"))
         if environment_files is None:
@@ -276,7 +292,7 @@ class Session(base.Session):
             plan["manifest"].get("library_path") != str(self.library) or
             plan["manifest"].get("functions") != VULKAN_FUNCTIONS):
             raise RuntimeError("Same owned combined DSO and exact layer paths required")
-        for name, source in ((HELPERS[0], Path(__file__)), (HELPERS[1], Path(base.__file__))):
+        for name, source in ((HELPERS[0], Path(__file__)), (HELPERS[1], Path(base.__file__)), (HELPERS[2], Path(health.__file__))):
             data = read_regular(source)
             if not re.fullmatch(r"[0-9a-f]{64}", reviewed_helpers[name] or "") or digest(data) != reviewed_helpers[name]:
                 raise RuntimeError("Separately reviewed helper SHA required")
@@ -391,14 +407,19 @@ class Session(base.Session):
                     exclusive(pending, bytes.fromhex(m["activation"][name]["bytes_hex"]))
                     os.link(pending, path, follow_symlinks=False); pending.unlink(); directory_sync(path.parent)
                 self.event("activation_created", restart_readiness=True)
-                self.command("daemon-reload"); self.command("restart", UNIT); self.command("is-active", UNIT)
-                self.active_environment(m)
-                self.event("activated", runtime_loaded_verified=False, capture_verified=False)
+                self.command("daemon-reload")
+                baseline = self.health_source.baseline()
+                self.health_receipt("activation-startup-baseline.json", baseline)
+                self.command("restart", UNIT); self.command("is-active", UNIT)
+                self.active_environment(m, post_restart=True)
+                self.check_startup(baseline, "activation-startup-health.json")
+                self.event("activated", startup_health_ready=True, startup_screen_pixels_verified=False,
+                           runtime_loaded_verified=False, capture_verified=False)
             except BaseException:
                 self.remove_activation(m); self.recovery_event("activation_interrupted", native_restart_still_required=True)
                 raise
 
-    def active_environment(self, m):
+    def active_environment(self, m, *, post_restart=False):
         current = self.state();actual = self.env_values(current["Environment"])
         expected = self.env_values(m["original_service"]["Environment"]);expected.update(self.activation_values())
         paths = shlex.split(current["DropInPaths"])
@@ -412,8 +433,52 @@ class Session(base.Session):
                 m["original_manager_environment"], manager, self.runtime,
                 allow_graphical_session_metadata=True)["manager_matches_except_session_metadata"]:
             raise RuntimeError("Manager environment changed during activation")
-        self.revalidate_native_layers(m, allow_own=True, state=current, manager=manager, environment_files=snapshots)
+        self.revalidate_native_layers(m, allow_own=True, state=current, manager=manager, environment_files=snapshots, allow_node_rewrite=post_restart)
         return current
+
+    def health_receipt(self, name, value):
+        if name not in {"activation-startup-baseline.json", "activation-startup-health.json", "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"}:
+            raise RuntimeError("Unsupported startup receipt")
+        raw = json_bytes(value)
+        if len(raw) > 262144: raise RuntimeError("Startup receipt bound exceeded")
+        path = self.folder / name
+        pending = path.with_suffix(".pending")
+        if path.exists(): read_regular(path, 262144, private=True)
+        exclusive(pending, raw)
+        os.replace(pending, path); directory_sync(self.folder)
+
+    def check_startup(self, baseline, receipt):
+        result = health.wait_ready(self.health_source, baseline, clock=self.health_source.clock, sleep=self.health_source.sleep)
+        self.health_receipt(receipt, result)
+        if result.get("ready") is not True or result.get("status") != "ready":
+            self.recovery_event("startup_not_ready", startup_result=result.get("status"), reason=result.get("reason"),
+                                native_restart_still_required=receipt.startswith("activation"))
+            raise RuntimeError("SteamVR compositor/UI startup not ready: " + str(result.get("reason")))
+        return result
+
+    def monitor_startup(self, *, seconds=10.0):
+        with self.lock():
+            m = self.manifest(); self.verify_owned(m)
+            active = self.dropin.exists() or self.layer.exists()
+            if active: self.active_environment(m, post_restart=True)
+            else:
+                if not self.completed_restoration(): raise RuntimeError("Completed startup/restoration required before monitoring")
+                self.restoration_state(m, post_restart=True)
+            name = "activation-startup-health.json" if active else "restoration-startup-health.json"
+            saved = json.loads(read_regular(self.folder / name, 262144, private=True))
+            previous = self.folder / "startup-monitor.json"
+            if previous.exists():
+                observed = json.loads(read_regular(previous, 262144, private=True))
+                if observed.get("startup_receipt") == name: saved = observed
+            gate = health.StartupGate.resume(saved["gate_checkpoint"])
+            self.health_source.resume(saved["source_checkpoint"])
+            result = health.monitor(self.health_source, gate, seconds=seconds, clock=self.health_source.clock, sleep=self.health_source.sleep)
+            result["startup_receipt"] = name
+            self.health_receipt("startup-monitor.json", result)
+            if result.get("ready") is not True:
+                self.recovery_event("startup_monitor_not_ready", reason=result.get("reason"), automatic_restart=False)
+                raise RuntimeError("SteamVR compositor/UI health lost: " + str(result.get("reason")))
+            return result
 
     def start(self, *args, runtime_scope=False, restart_ready=False, **kwargs):
         if runtime_scope is not True or restart_ready is not True: raise RuntimeError("Scope and coordinated restart required")
@@ -457,10 +522,11 @@ class Session(base.Session):
             if active:
                 for name, item in m["activation"].items():
                     if read_regular(Path(name), private=True) != bytes.fromhex(item["bytes_hex"]): raise RuntimeError("Owned activation changed")
-                self.active_environment(m)
+                self.active_environment(m, post_restart=(self.folder / "activation-startup-baseline.json").exists())
             else: self.restoration_state(m, post_restart=self.completed_restoration())
             return {"owned_files_verified": True, "native_files_verified": True, "service_environment_verified": True,
-                    "active": active, "capture_verified": False, "native_mapping_unload_verified": False}
+                    "active": active, "startup_health_current_verified": False, "capture_verified": False, "native_mapping_unload_verified": False,
+                    "native_layer_node_drift": self.native_layer_node_drift}
 
     def rollback(self, *, restart_ready=False):
         if not self.folder.exists():
@@ -471,20 +537,38 @@ class Session(base.Session):
             m = self.manifest(); complete = self.folder / "rollback-complete.json"
             if complete.exists():
                 recorded = json.loads(read_regular(complete, private=True))
-                if any(recorded.get(k) is not True for k in ("restored", "runtime_activation_absent", "original_service_matches", "native_environment_files_match")):
+                if any(recorded.get(k) is not True for k in ("restored", "runtime_activation_absent", "original_service_matches", "native_environment_files_match", "startup_health_ready")):
                     raise RuntimeError("Invalid restoration record")
                 for path in (self.dropin, self.layer, self.dropin.with_suffix(".pending"), self.layer.with_suffix(".pending")):
                     if path.exists() or path.is_symlink(): raise RuntimeError("Activation appeared after restoration")
                 self.restoration_state(m, post_restart=True); return
             self.remove_activation(m)
-            self.revalidate_native_layers(m)
+            # Steam atomically rewrites its native inactive manifests when the
+            # graphical session changes. Node-only drift cannot strand the
+            # diagnostic in the old service. Bytes/type/owner/mode/gates remain
+            # independently exact; native manifests are never written here.
+            self.revalidate_native_layers(m, allow_node_rewrite=True)
             if not (self.folder / "archive").exists(): self.recovery_event("activation_removed", restart_readiness=restart_ready)
             if restart_ready is not True:
                 self.recovery_event("restart_pending", loaded_processes_may_remain=True); return
-            self.command("daemon-reload"); self.command("restart", UNIT); self.command("is-active", UNIT)
-            comparison = self.restoration_state(m, post_restart=True); archive = self.archive()
+            self.command("daemon-reload")
+            try:
+                baseline = self.health_source.baseline()
+                self.health_receipt("restoration-startup-baseline.json", baseline)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                # Missing evidence must never prevent the already-authorized
+                # original-service restart after own activation is removed.
+                # It does prevent declaring the recovered UI healthy.
+                baseline = None
+                self.health_receipt("restoration-startup-health.json", {"status": "not-ready", "ready": False,
+                    "reason": "Restoration baseline unavailable: " + str(error)[:384], "automatic_restart": False})
+            self.command("restart", UNIT); self.command("is-active", UNIT)
+            comparison = self.restoration_state(m, post_restart=True)
+            if baseline is None: raise RuntimeError("Original service restarted; fresh UI startup evidence unavailable")
+            self.check_startup(baseline, "restoration-startup-health.json")
+            archive = self.archive()
             exclusive(complete, json_bytes({"restored": True, "runtime_activation_absent": True, "original_service_matches": True,
-                "native_environment_files_match": True, "native_mapping_unload_verified": False, "time": time.time(), "archive": archive, **comparison}))
+                "native_environment_files_match": True, "startup_health_ready": True, "startup_screen_pixels_verified": False, "native_mapping_unload_verified": False, "time": time.time(), "archive": archive, **comparison}))
             directory_sync(self.folder)
             self.recovery_event("rollback_complete", native_mapping_unload_verified=False)
 
@@ -493,7 +577,7 @@ class Session(base.Session):
         if not path.exists() and not path.is_symlink(): return False
         recorded = json.loads(read_regular(path, private=True))
         if not isinstance(recorded, dict) or any(recorded.get(key) is not True for key in
-               ("restored", "runtime_activation_absent", "original_service_matches", "native_environment_files_match")):
+               ("restored", "runtime_activation_absent", "original_service_matches", "native_environment_files_match", "startup_health_ready")):
             raise RuntimeError("Invalid restoration record")
         return True
 
@@ -511,8 +595,8 @@ class Session(base.Session):
         if (restored != m["original_service"] or snapshots != m["original_environment_files"] or
             not comparison["manager_matches_except_session_metadata"]):
             raise RuntimeError("Original service/manager/native-file snapshot not restored")
-        self.revalidate_native_layers(m, state=restored, manager=manager, environment_files=snapshots)
-        return comparison
+        self.revalidate_native_layers(m, state=restored, manager=manager, environment_files=snapshots, allow_node_rewrite=post_restart)
+        return {**comparison, "native_layer_nodes_exact": not self.native_layer_node_drift, "native_layer_node_drift": self.native_layer_node_drift}
 
     def verify_unloaded(self):
         # Explicit /proc metadata only. Neither mapped memory nor map_files is
@@ -586,11 +670,12 @@ class Session(base.Session):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=("stage", "readcheck", "activate", "start", "rollback", "verify-unloaded"))
+    p.add_argument("mode", choices=("stage", "readcheck", "activate", "start", "rollback", "verify-unloaded", "monitor-startup"))
     p.add_argument("--reviewed-plan", type=Path); p.add_argument("--reviewed-plan-sha256")
     for role in NATIVE: p.add_argument("--native-" + role, type=Path)
     for artifact in ("observer", "audit", "envelope", "layer"): p.add_argument("--" + artifact, type=Path)
     p.add_argument("--reviewed-session-helper-sha256"); p.add_argument("--reviewed-receiver-helper-sha256")
+    p.add_argument("--reviewed-startup-health-helper-sha256"); p.add_argument("--monitor-seconds", type=float, default=10.0)
     p.add_argument("--reviewed-environment-file", action="append", default=[], metavar="PATH=SHA256")
     p.add_argument("--reviewed-native-layer", action="append", default=[], metavar="PATH=SHA256")
     p.add_argument("--ack-compositor-raw-diagnostic-scope", action="store_true")
@@ -611,7 +696,7 @@ def main(argv=None):
             layers = dict(entry.rsplit("=", 1) for entry in a.reviewed_native_layer)
             if len(layers) != len(a.reviewed_native_layer): raise RuntimeError("Duplicate reviewed native layer")
             kwargs = {"runtime_scope": a.ack_compositor_raw_diagnostic_scope,
-                "reviewed_helpers": {HELPERS[0]: a.reviewed_session_helper_sha256, HELPERS[1]: a.reviewed_receiver_helper_sha256},
+                "reviewed_helpers": {HELPERS[0]: a.reviewed_session_helper_sha256, HELPERS[1]: a.reviewed_receiver_helper_sha256, HELPERS[2]: a.reviewed_startup_health_helper_sha256},
                 "reviewed_environment_files": reviewed, "reviewed_native_layers": layers}
             if a.mode == "start": kwargs["restart_ready"] = a.ack_steamvr_restart_readiness
             getattr(session, a.mode)(a.reviewed_plan, a.reviewed_plan_sha256, native,
@@ -619,6 +704,7 @@ def main(argv=None):
         elif a.mode == "activate": session.activate(runtime_scope=a.ack_compositor_raw_diagnostic_scope,
             restart_ready=a.ack_steamvr_restart_readiness)
         elif a.mode == "rollback": session.rollback(restart_ready=a.ack_steamvr_restart_readiness)
+        elif a.mode == "monitor-startup": print(json.dumps(session.monitor_startup(seconds=a.monitor_seconds), sort_keys=True))
         elif a.mode == "verify-unloaded": print(json.dumps(session.verify_unloaded(), sort_keys=True))
         else: print(json.dumps(session.readcheck(), sort_keys=True))
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, struct.error, subprocess.SubprocessError) as error:
