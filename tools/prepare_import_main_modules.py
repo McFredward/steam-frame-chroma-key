@@ -25,6 +25,9 @@ NATIVE = {
     3: ("libc.so.6", "be7ee393429d493c4d3b996ed25cbb02fabb2896a77efe6d57e5993ead5bbb3b"),
     4: ("ld-linux-aarch64.so.1", "2ddc56a02f476765a21e31d69144e68bee933950fe613747d54b87a2369a037e"),
 }
+# Keep NATIVE's receiver set unchanged: receiver preparation iterates it and
+# must never start requiring the unrelated compositor file/API namespace.
+COMPOSITOR = ("vrcompositor", "0bb148eda6b5e54e2fbed09d475a43671f5ff6fcb6c2b4f48345b1a9fe8d6f96")
 
 
 def digest(data):
@@ -32,10 +35,11 @@ def digest(data):
 
 
 def profile_from_bytes(data, role, reviewed_sha=None):
-    if not 64 <= len(data) <= MAX_FILE or role not in range(1, 7):
+    if not 64 <= len(data) <= MAX_FILE or role not in range(1, 8):
         raise ValueError("Unsupported bounded descriptor input")
     sha = hashlib.sha256(data).hexdigest()
-    if role in NATIVE and sha != NATIVE[role][1]:
+    native = COMPOSITOR if role == 7 else NATIVE.get(role)
+    if native and sha != native[1]:
         raise ValueError("Unsupported native identity")
     if role == 5 and (not reviewed_sha or sha != reviewed_sha):
         raise ValueError("Observer requires the independently reviewed artifact SHA")
@@ -124,6 +128,7 @@ def main():
     p.add_argument("--observer", type=Path)
     p.add_argument("--observer-sha")
     p.add_argument("--fixture", type=Path)
+    p.add_argument("--compositor", action="store_true", help="Prepare the exact compositor/libc/loader set without a receiver or OpenVR API")
     p.add_argument("--output", required=True, type=Path)
     args = p.parse_args()
     try:
@@ -131,9 +136,11 @@ def main():
             raise ValueError("Choose either a native set or one explicit host fixture")
         if args.api and not args.native_dir:
             raise ValueError("An explicit API override requires the native set")
+        if args.compositor and (not args.native_dir or args.api):
+            raise ValueError("Compositor preparation requires the native set and no API override")
         inputs = [(6, args.fixture, None)] if args.fixture else [
-            (role, args.api if role == 2 and args.api else args.native_dir / name, None)
-            for role, (name, _) in NATIVE.items()]
+            (role, args.api if role == 2 and args.api else args.native_dir / (COMPOSITOR if role == 7 else NATIVE[role])[0], None)
+            for role in ((7, 3, 4) if args.compositor else (1, 2, 3, 4))]
         if args.observer:
             inputs.append((5, args.observer, args.observer_sha))
         args.output.mkdir(mode=0o700, parents=True, exist_ok=True)

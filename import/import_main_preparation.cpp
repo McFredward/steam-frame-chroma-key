@@ -48,7 +48,7 @@ bool authenticated(const Profile& p,const Digest& reviewed) noexcept {
     const auto native=pinned_identity(static_cast<Role>(p.role));
     const auto expected=native==Digest{} ? reviewed : native;
     if(expected==Digest{} || p.fingerprint!=expected || fingerprint(p)!=expected)return false;
-    if(p.schema!=1 || p.role<1 || p.role>6 || (p.machine!=62 && p.machine!=183) ||
+    if(p.schema!=1 || p.role<1 || p.role>7 || (p.machine!=62 && p.machine!=183) ||
        (p.role!=6 && p.machine!=183) || p.elf_type!=3 || p.file_size<64 || p.file_size>8*1024*1024 ||
        !p.phnum || p.phnum>kHeaders || p.phoff>p.file_size || p.phnum*56>p.file_size-p.phoff ||
        !p.note_count || p.note_count>kNotes || !p.build_id_size || p.build_id_size>64 || p.mapped_span>16*1024*1024)return false;
@@ -145,6 +145,7 @@ struct Discovery {
 };
 } // namespace
 Digest pinned_identity(Role role) noexcept {
+    if(role==Role::Compositor)return from_hex("a6c63d91e7da71328088cf912241b737e7529a2adf383d5227bb43f5bf0a8c6e");
     const auto value=static_cast<std::uint64_t>(role);
     return value>=1&&value<=4 ? kNative[value-1] : Digest{};
 }

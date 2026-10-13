@@ -5,7 +5,7 @@ namespace frame_import_main {
 constexpr std::size_t kProfileBytes=2032,kModules=5,kHeaders=16,kNotes=4;
 using Digest=frame_import_module::Digest;
 using ProfileBlob=std::array<std::uint8_t,kProfileBytes>;
-enum class Role : std::uint64_t { Receiver=1, Api=2, Libc=3, Loader=4, Observer=5, Fixture=6 };
+enum class Role : std::uint64_t { Receiver=1, Api=2, Libc=3, Loader=4, Observer=5, Fixture=6, Compositor=7 };
 struct Note { std::uint64_t rva=0,size=0; Digest digest{}; };
 struct Profile {
     std::uint64_t schema=0,role=0,machine=0,elf_type=0,file_size=0,phoff=0,phnum=0,note_count=0,build_id_size=0,mapped_span=0;
