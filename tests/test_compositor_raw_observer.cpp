@@ -54,7 +54,9 @@ frame_compositor_raw::RawRecord raw_fixture() {
     r.image.device=71;r.image.native_device=0xabc0;r.image.image=10;r.image.format=37;r.image.width=1152;r.image.height=4608;r.image.depth=1;r.image.layers=1;
     r.bind.memory=20;r.bind.offset=16;r.view.view=30;r.view.format=37;
     r.begin_lock_succeeded=r.early_unlock_succeeded=r.native_payload_read=r.image_succeeded=r.bind_succeeded=r.view_succeeded=true;
-    r.send_lock_succeeded=r.reply_complete=r.finish_unlock_succeeded=true;return r;
+    r.send_lock_succeeded=r.reply_complete=r.finish_unlock_succeeded=true;
+    r.last_boundary=frame_compositor_raw::Boundary::Finish;r.last_phase=frame_compositor_raw::Phase::After;
+    r.last_native_result=0;r.last_native_result_available=true;return r;
 }
 frame_compositor_journal::Receipt receipt_fixture() {
     frame_compositor_journal::Receipt value{};auto& r=value.resource;
@@ -92,10 +94,23 @@ void join_controls() {
 }
 void formatter_controls() {
     runtime::Record r{};r.kind=runtime::Kind::RawMatched;r.raw=raw_fixture();r.ordinal=2;
+    r.entry.sp=0xabcdef00;r.entry.x[29]=0xabcdef20;r.entry.x[30]=0x98765400;
     Line l;record(l,r);check(l.valid && l.used<l.bytes.size() && l.bytes[l.used-1]=='\n');
     const std::string text(l.bytes.data(),l.used);
     for(const auto* name:{"\"mask_enabled\":false","\"source_frame_associated\":false","\"accepted_submit\":false","\"gpu_consumed\":false"})check(text.find(name)!=std::string::npos);
     check(text.find("\"reply_token\":\"8877665544332211\"")!=std::string::npos);
+    for(const auto* field:{"\"entry_sp\":\"abcdef00\"", "\"entry_fp\":\"abcdef20\"", "\"entry_lr\":\"98765400\"",
+        "\"last_boundary\":7", "\"last_phase\":1", "\"last_native_result\":0", "\"last_native_result_available\":true"})
+        check(text.find(field)!=std::string::npos);
+    auto refused=r;refused.kind=runtime::Kind::RawRefused;refused.raw.matched=false;
+    refused.raw.reason=frame_compositor_raw::InvalidEntry;refused.raw.last_boundary=frame_compositor_raw::Boundary::Image;
+    refused.raw.last_phase=frame_compositor_raw::Phase::Before;refused.raw.last_native_result=-1;
+    refused.raw.last_native_result_available=false;Line refusal;record(refusal,refused);
+    check(refusal.valid && refusal.used<refusal.bytes.size());
+    const std::string denial(refusal.bytes.data(),refusal.used);
+    for(const auto* field:{"\"reason\":128", "\"last_boundary\":2", "\"last_phase\":0",
+        "\"last_native_result\":-1", "\"last_native_result_available\":false", "\"entry_lr\":\"98765400\""})
+        check(denial.find(field)!=std::string::npos);
     r.kind=runtime::Kind::Receipt;r.receipt=receipt_fixture();Line second;record(second,r);check(second.valid && second.used<second.bytes.size());
     check(std::string(second.bytes.data(),second.used).find("\"image_generation\":1")!=std::string::npos);
     Line overflow;const std::string huge(overflow.bytes.size(),'x');overflow.add("%s",huge.c_str());check(!overflow.valid);

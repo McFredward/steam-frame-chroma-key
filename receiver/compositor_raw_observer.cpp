@@ -155,8 +155,8 @@ void proofs(Line& l) noexcept {
 }
 void record(Line& l,const runtime::Record& r) noexcept {
     l.add("{\"schema\":1,\"ordinal\":%llu,\"kind\":%u,\"refusal\":%u,\"thread_reason\":%u,\"forward_only\":%s,"
-        "\"entry_lr\":\"%llx\",\"entry_sp\":\"%llx\",\"audit_function\":%u,\"audit_original\":\"%llx\"",
-        u(r.ordinal),unsigned(r.kind),unsigned(r.refusal),r.thread_reason,r.forward_only?"true":"false",u(r.entry.x[30]),u(r.entry.sp),unsigned(r.bindings.function),u(r.bindings.original));
+        "\"entry_lr\":\"%llx\",\"entry_sp\":\"%llx\",\"entry_fp\":\"%llx\",\"audit_function\":%u,\"audit_original\":\"%llx\"",
+        u(r.ordinal),unsigned(r.kind),unsigned(r.refusal),r.thread_reason,r.forward_only?"true":"false",u(r.entry.x[30]),u(r.entry.sp),u(r.entry.x[29]),unsigned(r.bindings.function),u(r.bindings.original));
     if(r.kind==runtime::Kind::Attached || r.kind==runtime::Kind::Bound) {
         l.add(",\"audit_views\":[");unsigned count=0;
         for(const auto& v:{r.bindings.compositor,r.bindings.observer,r.bindings.libc}) {
@@ -167,9 +167,11 @@ void record(Line& l,const runtime::Record& r) noexcept {
     }
     if(r.kind==runtime::Kind::RawMatched || r.kind==runtime::Kind::RawRefused) {
         const auto& c=r.raw;
-        l.add(",\"raw\":{\"matched\":%s,\"reason\":%llu,\"decoder_refusal\":%u,\"client\":%u,\"fd\":%d,\"writes\":%u,"
+        l.add(",\"raw\":{\"matched\":%s,\"reason\":%llu,\"decoder_refusal\":%u,"
+            "\"last_boundary\":%u,\"last_phase\":%u,\"last_native_result\":%lld,\"last_native_result_available\":%s,\"client\":%u,\"fd\":%d,\"writes\":%u,"
             "\"reply_token\":\"%llx\",\"reply_bytes\":%u,\"scalar_copies\":%zu,\"wire_copies\":%zu,\"reply\":\"",
-            c.matched?"true":"false",u(c.reason),unsigned(c.decoder_refusal),c.client,c.fd,c.writes,u(c.reply_token),c.reply_bytes,c.scalar_bytes_copied,c.wire_bytes_copied);
+            c.matched?"true":"false",u(c.reason),unsigned(c.decoder_refusal),unsigned(c.last_boundary),unsigned(c.last_phase),
+            static_cast<long long>(c.last_native_result),c.last_native_result_available?"true":"false",c.client,c.fd,c.writes,u(c.reply_token),c.reply_bytes,c.scalar_bytes_copied,c.wire_bytes_copied);
         l.hex(c.reply);
         l.add("\",\"sequence\":%u,\"pipe\":\"%llx\",\"dispatch_frame\":\"%llx\",\"device\":%llu,\"native_device\":\"%llx\",\"image\":\"%llx\",\"memory\":\"%llx\",\"memory_offset\":%llu,"
             "\"view\":\"%llx\",\"format\":%u,\"extent\":[%u,%u,%u],\"layers\":%u,\"native_payload_read\":%s,"

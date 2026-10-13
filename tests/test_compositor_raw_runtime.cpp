@@ -208,6 +208,10 @@ void success(unsigned chunk) {
     check(fixture_stubs::journal_requests==1 && fixture_stubs::requested_tag==rt::kTag && fixture_stubs::requested_cookie==rt::kCookie);
     check(fixture_stubs::requested_device==device && fixture_stubs::requested_image==(VkImage)(std::uintptr_t)10 && fixture_stubs::requested_view==(VkImageView)(std::uintptr_t)30);
     rt::Record r;check(drain(rt::Kind::RawMatched,&r)==1);no_proof(r.raw);
+    const auto finish=f.entry(Boundary::Finish);
+    check(r.entry.sp==finish.sp && r.entry.x==finish.x);
+    check(r.raw.last_boundary==Boundary::Finish && r.raw.last_phase==raw::Phase::After &&
+        r.raw.last_native_result_available && r.raw.last_native_result==0);
     check(r.raw.reply_token==token && r.raw.reply==f.packet && r.raw.writes==writes && r.raw.image.device==device && r.raw.image.native_device==native_device);
     const auto before=rt::status();f.libc_pair(Boundary::Begin);check(rt::status().queued==before.queued);
     rt::finalize();check(rt::status().retired && rt::quiescent() && !frame_compositor_raw_ready.load());
@@ -295,6 +299,29 @@ void invalid_vulkan(unsigned which) {
     check(rt::vulkan_notification(n,&rt::runtime)==0 && rt::status().retired);
     check(rt::status().scalar_bytes==initial+(which==2?80:0) && !fixture_stubs::journal_requests);
 }
+void refusal_entry_evidence(bool vulkan) {
+    attach();Fixture f;f.through(Boundary::EarlyUnlock);
+    raw::Entry rejected{};
+    const auto before=rt::status();
+    if(vulkan) {
+        auto n=f.vnote(Boundary::Image,frame_import_vulkan::Phase::Before);
+        n.entry.x[30]+=4;rejected=n.entry;
+        check(rt::vulkan_notification(n,&rt::runtime)==0);
+    } else {
+        auto n=f.note(Boundary::SendLock,raw::Phase::Before);
+        n.entry.x[20]=0;rejected=n.entry;
+        rt::libc_notification(n,&rt::runtime);
+    }
+    check(rt::status().retired && rt::status().terminal && rt::status().refusal==rt::Refusal::Raw);
+    check(rt::status().parent_bytes==before.parent_bytes && rt::status().scalar_bytes==before.scalar_bytes &&
+        rt::status().wire_bytes==before.wire_bytes && before.parent_bytes==16 && before.scalar_bytes==24 && before.wire_bytes==0);
+    rt::Record r;check(drain(rt::Kind::RawRefused,&r)==1);
+    check(r.entry.sp==rejected.sp && r.entry.x==rejected.x);
+    check(r.raw.reason==raw::InvalidEntry && r.raw.decoder_refusal==frame_import_native::Refusal::None &&
+        r.raw.last_boundary==(vulkan?Boundary::Image:Boundary::SendLock) && r.raw.last_phase==raw::Phase::Before &&
+        !r.raw.last_native_result_available && r.raw.last_native_result==0);
+    no_proof(r.raw);
+}
 void attaching_not_published() {
     model_cold_adapter_only();rt::runtime.state.store(5);
     check(!rt::bridge({audit::Stage::Bind,provider(audit::Function::MutexLock),false,{}}).ready);
@@ -337,14 +364,15 @@ int main(int argc,char** argv) {
     check(reinterpret_cast<std::uintptr_t>(&::pthread_attr_destroy)==mapped_libc+0x81420);
     std::printf("Actual retained ARM libc pthread helpers: %s\n",provider.dli_fname);
 #endif
-    constexpr std::array<void(*)(),25> cases{
+    constexpr std::array<void(*)(),27> cases{
         inert_production,forwarding_only,+[]{success(21);},+[]{success(3);},
         native_failure,incomplete_finalization,parent_mismatch,+[]{ownership_postcheck(0);},
         +[]{ownership_postcheck(1);},queue_budget,foreign_begin,
         +[]{callback_losses(0);},+[]{callback_losses(1);},+[]{callback_losses(2);},
         +[]{mutated_binding(0);},+[]{mutated_binding(1);},+[]{mutated_binding(2);},
         missing_binding,request_failure,+[]{invalid_vulkan(0);},+[]{invalid_vulkan(1);},
-        +[]{invalid_vulkan(2);},attaching_not_published,foreign_after_during_parent_copy,main_thread_rejected};
+        +[]{invalid_vulkan(2);},attaching_not_published,foreign_after_during_parent_copy,main_thread_rejected,
+        +[]{refusal_entry_evidence(false);},+[]{refusal_entry_evidence(true);}};
     unsigned passed=0;
     if(argc==2) {char* end=nullptr;const auto n=std::strtoul(argv[1],&end,10);check(end && !*end && n<cases.size());run(cases[n],passed);}
     else {check(argc==1);for(unsigned n=0;n<cases.size();++n){std::printf("runtime case %u\n",n);std::fflush(stdout);run(cases[n],passed);}}

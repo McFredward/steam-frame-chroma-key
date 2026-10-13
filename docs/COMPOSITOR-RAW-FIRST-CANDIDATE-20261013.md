@@ -8,10 +8,11 @@ exited, nor that the raw refusal caused the blue Frame interface. The separate
 Those two failures require separate repairs.
 
 This review uses the retained `compositor-raw.jsonl`, `compositor-journal.jsonl`
-and native service logs from the failed-start run, plus current source at
-`2700aa6`. It performs no Frame access, runtime/source change, added native
-copy, shader activation or sender modification. Full native records and
-instruction listings remain in ignored private evidence.
+and native service logs from the failed-start run, plus source at `2700aa6`.
+A subsequent bounded evidence-format repair is described below. Neither the
+review nor that repair performs Frame access, additional native acquisition,
+shader activation or sender modification. Full native records and instruction
+listings remain in ignored private evidence.
 
 ## What the raw result establishes
 
@@ -92,13 +93,15 @@ reset its counters, or substitute a new journal to make an old receipt current.
 
 ## Bounded next steps
 
-1. **Expose the existing refusal facts.** Serialize the already retained last
-   boundary/phase/native result, and value-copy the refusing event's already
-   captured public entry registers into its diagnostic record. This requires no
-   additional native memory acquisition or new transaction. Review actual
-   artifact/record sizes and forwarding behavior before deployment. It lets the
-   next refusal distinguish a response-branch mismatch from a Vulkan entry ABI
-   or layer-order mismatch instead of guessing.
+1. **Expose the existing refusal facts.** The bounded source repair now
+   serializes the already retained last boundary/phase/native result and its
+   availability flag. It value-copies the refusing or matched event's already
+   supplied public entry into the existing queued record and emits LR/SP/FP.
+   This requires no additional native acquisition or new transaction. The exact
+   next rejected boundary and entry shape will be available for diagnosis;
+   unchanged older captures do not retroactively acquire those fields. Actual
+   artifact/forwarding review and a new capture remain required before any
+   hardware conclusion.
 2. **Explicitly arm candidate selection after healthy startup.** Keep providers,
    callbacks, ownership mechanisms and the journal prepared before native MAIN.
    While unarmed, skip candidate claim, thread-stack preparation and every
@@ -122,7 +125,8 @@ reset its counters, or substitute a new journal to make an old receipt current.
    The current Begin entry does not establish an authenticated receiver endpoint
    or PC session. Do not introduce a guessed peer/PID/resource pointer predicate.
 
-Steps 1–3 remain proposals, not implemented or hardware-validated behavior.
+Step 1 is implemented and software-tested only. Steps 2–4 remain proposals,
+not implemented or hardware-validated behavior.
 Even an operator-armed capture can select an unrelated post-arm import or a
 native failure. There must be no automatic second attempt after private bytes
 have been acquired. A terminal scope, budget, TLS claim or journal cannot be
@@ -141,3 +145,27 @@ only a local token-to-public-resource association. Continuous native registry
 lifetime, contemporaneous endpoint/namespace association, selected PC source
 session/frame/eye, exact reprojection/foveation UV mapping, and GPU lifetime
 remain separate obligations before enabling explicit-mask passthrough.
+
+## Bounded formatter repair validation
+
+The evidence-format repair changes only raw outcome record publication and
+background serialization. Candidate selection, callbacks, gate predicates,
+scalar/wire reads, native forwarding and all limits remain unchanged.
+
+The focused host checks passed both affected CTest targets: **27 callback
+integration subprocess cases** and **84 writer/formatter controls**. Two new
+cases independently produce the same 40-byte cutoff for a wrong Image return
+PC and a wrong send payload shape, then verify that each distinct refusing
+entry and boundary remains in the immutable queued record. Successful outcomes
+likewise preserve their actual final entry and available original native result.
+Formatter controls cover signed values, unavailable results, LR/SP/FP and
+unchanged false proof flags within the existing output bounds.
+
+ASan/UBSan writer checks passed. The runtime fixture's first sanitizer attempt
+refused its synthetic native-frame array because ASan's fake-stack feature
+moves it outside the real pthread stack interval. Only that affected target was
+rerun with `detect_stack_use_after_return=0`, retaining ASan/UBSan and leak
+checking while keeping its simulated native frame on the actual thread stack.
+All 27 cases then passed. No production ownership check was weakened. These
+internal adapter/transport fixtures establish neither native cold admission nor
+a real headset result. No complete gate was repeated for this bounded change.

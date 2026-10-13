@@ -104,10 +104,12 @@ bool read_stack(std::uintptr_t at,void* output,std::size_t count,void* owner) no
     (runtime.parent_read?runtime.parent_bytes:runtime.scalar_bytes).fetch_add(count,std::memory_order_relaxed);
     return alive() && (runtime.parent_read?runtime.candidate_stack.current():runtime.gate->window_current(marker,at,count));
 }
-void outcome(const raw::Outcome& out) noexcept {
+void outcome(const raw::Outcome& out,const raw::Entry& entry) noexcept {
     if(out.kind==raw::Kind::None)return;
     auto r=message(out.kind==raw::Kind::Matched?Kind::RawMatched:Kind::RawRefused);
-    r.raw=out.record;runtime.terminal.store(true,std::memory_order_release);enqueue(r);
+    // Preserve only the already supplied public-entry snapshot. This adds no
+    // native read or candidate and never changes admission/refusal behavior.
+    r.raw=out.record;r.entry=entry;runtime.terminal.store(true,std::memory_order_release);enqueue(r);
     if(out.kind==raw::Kind::Refused)retire(Refusal::Raw);
 }
 raw::Event event(Boundary b,Phase phase,const raw::Entry& entry,std::int64_t result,int error) noexcept {
@@ -175,7 +177,7 @@ void libc_notification(frame_import_forwarding::Notification note,void* owner) n
         e.scalars=runtime.saved;e.decoded_available=true;
     } else acquire(e);
     if((b==Boundary::EarlyUnlock || b==Boundary::Finish) && note.phase==Phase::Before && e.decoded_available)runtime.saved=e.scalars;
-    outcome(runtime.observer.observe(e,runtime.scope));
+    outcome(runtime.observer.observe(e,runtime.scope),e.entry);
 }
 std::uint64_t vulkan_notification(frame_import_vulkan::Notification note,void* owner) noexcept {
     const Activity activity;
@@ -197,7 +199,7 @@ std::uint64_t vulkan_notification(frame_import_vulkan::Notification note,void* o
         e.bind={note.device,note.image,note.memory,note.memory_offset,static_cast<int>(note.result),note.entry.x[0]};
         e.view={note.device,note.image,note.view,static_cast<std::uint32_t>(note.format),static_cast<int>(note.result),note.entry.x[0]};
     }
-    outcome(runtime.observer.observe(e,runtime.scope));
+    outcome(runtime.observer.observe(e,runtime.scope),e.entry);
     if(!alive())return 0;
     if(phase==Phase::After && b==Boundary::View &&
        !frame_compositor_journal::request(note.device,(VkImage)(std::uintptr_t)note.image,(VkImageView)(std::uintptr_t)note.view,kTag,kCookie))retire(Refusal::Journal);
