@@ -354,8 +354,12 @@ class StartupGate:
             if (not isinstance(message, str) or len(message) > 32768 or not isinstance(pid, str) or not re.fullmatch(r"[0-9]{1,20}", pid) or not isinstance(stamp, str) or not re.fullmatch(r"[0-9]{1,20}", stamp)):
                 raise RuntimeError("Unsupported current journal evidence")
             if invocation and invocation != self.invocation: continue
-            if int(pid) in old_pids or int(stamp) / 1000000 < self.baseline["monotonic"]: continue
-            if old_pids and re.search(r"(?:Process |pid=)(?:" + "|".join(str(p) for p in old_pids) + r")(?:\D|$)", message): continue
+            if int(stamp) / 1000000 < self.baseline["monotonic"]: continue
+            # A PID number may be reused after restart. An explicit current
+            # invocation overrides the old-number filter, never its converse.
+            if invocation != self.invocation:
+                if int(pid) in old_pids: continue
+                if old_pids and re.search(r"(?:Process |pid=)(?:" + "|".join(str(p) for p in old_pids) + r")(?:\D|$)", message): continue
             if FATAL.search(message): raise RuntimeError("Fresh startup failure: " + message[:384])
         current = {p["pid"]: p for p in sample["processes"] if identity(p) not in old_ids and p["state"] not in INELIGIBLE_STATES}
         if len(current) > MAX_PROCESSES: raise RuntimeError("Startup process evidence bound exceeded")

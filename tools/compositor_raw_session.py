@@ -60,6 +60,17 @@ RAW_LIMITS = {"transactions": 1, "writes": 8, "scalar_bytes": 672, "wire_bytes":
     "parent_bytes": 16, "private_bytes": 709, "bootstrap_poll_bytes": 0}
 NATIVE_RVAS = {"lock": "0x87370", "unlock": "0x88f74", "write": "0xdfee0"}
 ENVELOPE_LIMITS = (672, 21, 16, 8, 32, 65536, 120, 4)
+STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-startup-health.json",
+    "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"})
+
+
+def require_reviewed_launch_isolation():
+    # The last Frame start loaded the service-wide audit/preload into libcef's
+    # frontend and failed with static TLS exhaustion. The public-exec selector
+    # is an offline prototype: native system/popen routes still bypass it.
+    # No flag or environment variable may admit this known-unsafe deployment.
+    raise RuntimeError("Compositor activation blocked: service-wide preload/audit can break the SteamVR UI; "
+                       "complete, reviewed compositor-only launch isolation is required")
 
 
 def blocked(key, value):
@@ -383,6 +394,7 @@ class Session(base.Session):
 
     def activate(self, *, runtime_scope=False, restart_ready=False):
         if runtime_scope is not True or restart_ready is not True: raise RuntimeError("Actual scope and coordinated SteamVR restart required")
+        require_reviewed_launch_isolation()
         with self.lock():
             m = self.manifest(); self.verify_owned(m)
             self.reject_old_activation({name: item["sha256"] for name, item in m["original_native_layers"].items()})
@@ -437,7 +449,7 @@ class Session(base.Session):
         return current
 
     def health_receipt(self, name, value):
-        if name not in {"activation-startup-baseline.json", "activation-startup-health.json", "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"}:
+        if name not in STARTUP_RECEIPTS:
             raise RuntimeError("Unsupported startup receipt")
         raw = json_bytes(value)
         if len(raw) > 262144: raise RuntimeError("Startup receipt bound exceeded")
@@ -482,6 +494,7 @@ class Session(base.Session):
 
     def start(self, *args, runtime_scope=False, restart_ready=False, **kwargs):
         if runtime_scope is not True or restart_ready is not True: raise RuntimeError("Scope and coordinated restart required")
+        require_reviewed_launch_isolation()
         self.stage(*args, runtime_scope=True, **kwargs)
         self.activate(runtime_scope=True, restart_ready=True)
 
@@ -543,14 +556,15 @@ class Session(base.Session):
                     if path.exists() or path.is_symlink(): raise RuntimeError("Activation appeared after restoration")
                 self.restoration_state(m, post_restart=True); return
             self.remove_activation(m)
-            # Steam atomically rewrites its native inactive manifests when the
-            # graphical session changes. Node-only drift cannot strand the
-            # diagnostic in the old service. Bytes/type/owner/mode/gates remain
-            # independently exact; native manifests are never written here.
-            self.revalidate_native_layers(m, allow_node_rewrite=True)
             if not (self.folder / "archive").exists(): self.recovery_event("activation_removed", restart_readiness=restart_ready)
             if restart_ready is not True:
-                self.recovery_event("restart_pending", loaded_processes_may_remain=True); return
+                self.recovery_event("restart_pending", loaded_processes_may_remain=True)
+                self.revalidate_native_layers(m, allow_node_rewrite=True)
+                return
+            # Once exact own activation bytes are removed, an authorized
+            # original-service restart takes priority over baseline reports.
+            # Changed native manifests are preserved, never repaired here.
+            # They still prevent a successful restoration claim below.
             self.command("daemon-reload")
             try:
                 baseline = self.health_source.baseline()
@@ -560,8 +574,14 @@ class Session(base.Session):
                 # original-service restart after own activation is removed.
                 # It does prevent declaring the recovered UI healthy.
                 baseline = None
-                self.health_receipt("restoration-startup-health.json", {"status": "not-ready", "ready": False,
-                    "reason": "Restoration baseline unavailable: " + str(error)[:384], "automatic_restart": False})
+                try:
+                    self.health_receipt("restoration-startup-health.json", {"status": "not-ready", "ready": False,
+                        "reason": "Restoration baseline unavailable: " + str(error)[:384], "automatic_restart": False})
+                except (OSError, RuntimeError, ValueError):
+                    # ENOSPC/read-only or an existing foreign pending receipt
+                    # can defeat both writes. Preserve it, still restart the
+                    # original service, and report unavailable proof below.
+                    pass
             self.command("restart", UNIT); self.command("is-active", UNIT)
             comparison = self.restoration_state(m, post_restart=True)
             if baseline is None: raise RuntimeError("Original service restarted; fresh UI startup evidence unavailable")
@@ -647,13 +667,14 @@ class Session(base.Session):
         info = destination.lstat()
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700 or not stat.S_ISDIR(info.st_mode):
             raise RuntimeError("Archive directory ownership changed")
-        names = {"owned.json", "deployment-plan.json", "session.jsonl", "compositor-raw.jsonl", "compositor-journal.jsonl"}
+        names = {"owned.json", "deployment-plan.json", "session.jsonl", "compositor-raw.jsonl", "compositor-journal.jsonl"} | STARTUP_RECEIPTS
         if any(p.name not in names | {"expected.json"} for p in destination.iterdir()): raise RuntimeError("Foreign archive preserved")
         payloads, items = {}, {}
         for name in sorted(names):
             source = self.folder / name
             if not source.exists(): continue
-            raw = read_regular(source, 65536 if name == "compositor-raw.jsonl" else base.LIMIT, private=True)
+            limit = 65536 if name == "compositor-raw.jsonl" else 262144 if name in STARTUP_RECEIPTS else base.LIMIT
+            raw = read_regular(source, limit, private=True)
             payloads[name] = raw; items[name] = {"bytes": len(raw), "sha256": digest(raw)}
         expected = destination / "expected.json"
         if expected.exists():

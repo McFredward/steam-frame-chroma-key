@@ -239,6 +239,26 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compositor_startup_audit.py)
         add_test(NAME compositor_raw_session_recovery COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_compositor_raw_session.py)
+        add_test(NAME compositor_ui_startup_health COMMAND ${Python3_EXECUTABLE}
+            -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_compositor_startup_health.py)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+            # Uninstalled prototype only. Public exec/spawn coverage does not
+            # admit deployment; native system/popen launches remain unsupported.
+            enable_language(C)
+            add_executable(test_compositor_launch_selector tests/test_compositor_launch_selector.c
+                receiver/compositor_launch_selector.c)
+            target_include_directories(test_compositor_launch_selector PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_compile_options(test_compositor_launch_selector PRIVATE -std=c11 -Wall -Wextra -Wpedantic)
+            target_link_libraries(test_compositor_launch_selector PRIVATE ${CMAKE_DL_LIBS})
+            add_test(NAME compositor_launch_selector_core COMMAND test_compositor_launch_selector)
+            add_test(NAME compositor_launch_loader_fixture COMMAND ${Python3_EXECUTABLE}
+                -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_compositor_launch_preload.py)
+            set_tests_properties(compositor_launch_loader_fixture PROPERTIES
+                ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1;FRAME_LAUNCH_TEST_RECEIPT=${CMAKE_CURRENT_BINARY_DIR}/launch-selector-host.json"
+                TIMEOUT 120)
+        endif()
+        set_tests_properties(compositor_raw_session_recovery compositor_ui_startup_health PROPERTIES
+            ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1" TIMEOUT 120)
         add_test(NAME compositor_raw_offline_artifacts COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_prepare_compositor_raw_observer.py)
         # These fixtures include the production implementation directly, with

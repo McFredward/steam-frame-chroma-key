@@ -119,6 +119,14 @@ class GateTests(unittest.TestCase):
         s = sample(); s["journal"] = [{"MESSAGE": "Process 10 (vrcompositor) core dumped", "_PID": "1592", "__MONOTONIC_TIMESTAMP": "2000000"}]
         self.assertTrue(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
 
+    def test_current_invocation_fault_is_not_hidden_by_reused_old_pid(self):
+        s = sample(); s["journal"] = [{"MESSAGE": "cannot allocate memory in static TLS block",
+            "_PID": "10", "_SYSTEMD_USER_INVOCATION_ID": "b" * 32,
+            "__MONOTONIC_TIMESTAMP": "2000000"}]
+        result = M.StartupGate(baseline()).consume(s, stable_seconds=0)
+        self.assertEqual(result["status"], "fault")
+        self.assertIn("static TLS", result["reason"])
+
     def test_stale_rotated_native_readiness_and_error_lines_are_not_admitted(self):
         s = sample()
         s["logs"] = {key: "\n".join(line(row.split("[Info] - ", 1)[1], wall=99) for row in value.splitlines()) for key, value in s["logs"].items()}

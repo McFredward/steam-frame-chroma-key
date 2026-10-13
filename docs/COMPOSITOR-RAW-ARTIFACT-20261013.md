@@ -146,6 +146,67 @@ remain exact. Unrelated environment changes and native service/file changes
 still fail closed; no stale session value is written back. Receiver-session
 comparisons retain their earlier path-only policy.
 
+## Second startup: missing user interface
+
+The private-entry-point replacement (`eeba4ede…`) started the compositor on
+2026-10-13 at 21:58:45 CEST. The maintainer saw a blue background with no usable
+Frame interface. The same invocation's journal identifies a separate frontend
+failure: `vrwebhelper` could not load its `libcef.so` because the dynamic loader
+reported `cannot allocate memory in static TLS block`. The compositor remained
+alive until the requested manual recovery at 22:00:53; this was not another
+`vkCreateQueryPool` crash.
+
+The service drop-in applied `LD_PRELOAD`, `LD_AUDIT` and the layer's activation
+environment to **every descendant of `steamvr.service`**. Constructor checks
+inside the observer restrict capture admission, but cannot undo the loader's
+dependency and TLS effects in an unrelated process. This deployment boundary
+is too broad. The next artifact must keep the combined observer/audit/layer
+activation out of the CEF frontend and other non-compositor children. Raising
+global TLS reserves is not the selected repair. Static TLS is allocated at
+startup and cannot subsequently be enlarged; see the
+[glibc dynamic-linking documentation](https://sourceware.org/glibc/manual/latest/html_node/Dynamic-Linking-Tunables.html).
+
+The old startup check accepted service activity, a live compositor, mapped
+diagnostic libraries and audit/preparation records. These observations establish
+neither frontend readiness nor visible output. The replacement check now brackets
+the actual restart, identifies fresh compositor and UI processes, verifies their
+real initialization/CEF/renderer evidence, and rejects new loader failures before
+requesting a PC-VR stream. Existing Gamescope warnings occur in the restored
+healthy session too; they cannot be used alone as a fatal signature. A metadata
+check still must not claim pixel inspection or a successful headset image.
+
+Activation and the combined stage/start command are now blocked in production
+before any restart or activation publication. Inert offline preparation/staging,
+inspection and authorized rollback remain available. The new public-exec
+selector is an **uninstalled prototype**, not a reviewed replacement deployment:
+the current compositor also imports `system` and `popen`, whose internal libc
+launches can bypass those public hooks and propagate the same unsafe environment.
+There is no runtime flag to bypass the block. See
+[the startup-safety review](COMPOSITOR-STARTUP-SAFETY-20261013.md) for the tested
+scope and remaining launch requirements.
+
+This run also ended raw admission on `InvalidEntry` after only 16 parent bytes
+and 24 scalar bytes. It supplied no image result, reply token or resource join.
+The raw recorder's `retired` footer is its own fail-closed terminal state, not
+proof that the native compositor exited. This run's formatter omitted the stored
+boundary/phase/result and rejected entry context, so the exact failing route is
+not yet established. The formatter now preserves that already-collected evidence
+without additional native reads. The first candidate occurred during Frame startup, before
+a confirmed PC-VR stream; it does not identify a PC video frame.
+
+Recovery removed both owned activation files, then the helper stopped because
+Steam had regenerated its five native layer JSON nodes. Their contents were
+unchanged. The original service was restarted directly after confirming that
+activation was absent. Original service/environment/native file hashes, all 15
+readable managed-process mappings and normal user-visible startup were verified.
+Both exact owned input/session folders were archived and removed. Recovery must
+record content-identical native node churn without allowing it to prevent the
+original-service restart; admission still requires the reviewed baseline.
+The helper now prioritizes an explicitly authorized original-service restart
+once exact owned activation is removed. Native baseline mismatches still prevent
+a successful restoration claim and never authorize rewriting native files.
+Baseline, readiness and monitor receipts are retained in the capture archive.
+
 ## Evidence and remaining goal
 
 Local checks cover bootstrap/audit forwarding, source-specific worker admission,
