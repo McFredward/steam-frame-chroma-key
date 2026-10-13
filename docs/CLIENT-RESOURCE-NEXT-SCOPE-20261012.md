@@ -1,5 +1,11 @@
 # Next bounded resource transaction diagnostic
 
+Status, 2026-10-13: the separately approved
+[actual raw capture](CLIENT-RESOURCE-RAW-CAPTURE-20261013.md) completed and was
+fully rolled back. It confirms one matching local request/reply/publication
+timeline. The proposal below records the reviewed scope and proof limits;
+it is not a pending hardware request or permission for a later run.
+
 ## Decision after the cold-thread hardware run
 
 The next useful step is **one raw client import transaction on the already

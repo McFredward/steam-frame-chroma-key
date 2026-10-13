@@ -4,7 +4,7 @@
 
 The [actual cold-thread capture](CLIENT-RESOURCE-THREAD-CAPTURE-20261012.md)
 established current-thread ownership at the six first-trace resource boundaries.
-The next diagnostic is implemented at `0f53189` using that finite prepared
+The diagnostic is implemented at `0f53189` using that finite prepared
 phase. It captures **one raw import transaction**, without relaxing subsequent
 ownership refusal or entering the strict resource carrier.
 
@@ -39,7 +39,7 @@ and whether a started transaction was abandoned. An interpreter must require
 the actual matched terminal record, no loss and a quiescent complete footer;
 `resource_raw_completed` alone supplies no proof.
 
-## Exact uninstalled candidate
+## Exact reviewed candidate
 
 The sole scope marker is hidden, read-only, non-executable **`FCRAW001`**, schema
 **5**, envelope **11,800 bytes**. Main retains one own public bridge, ten private
@@ -57,7 +57,7 @@ fixups and appended read/write RVAs at offsets 200/208.
 
 The plan hash is
 `7456b0f349c38c58d1c6af78c17201eecfa661bcd37ef8d30a44df9a288c97e7`.
-The proposed **six own inputs total 557,815 bytes**, including the plan and
+The **six own inputs total 557,815 bytes**, including the plan and
 both exact session helpers. Kernel inspector helpers are unnecessary in this
 scope. The final expected libc loader name is the historically observed
 `/usr/lib/libc.so.6`; it is not inferred from canonicalized file paths.
@@ -105,9 +105,12 @@ deliverables, source/manifest and hardware evidence are retained.
 
 ## Separate authorization and recovery
 
-This candidate is **uninstalled and not hardware-authorized**. The preceding
-register-only/cold-thread approvals allowed zero extra resource private bytes;
-they do not cover this new 2,101-byte maximum. Stage/start/activate require
+The [separately authorized hardware run](CLIENT-RESOURCE-RAW-CAPTURE-20261013.md)
+completed and was fully rolled back. It captured one matching transaction
+using 393 additional private bytes; no diagnostic remains installed. The
+preceding register-only/cold-thread approvals allowed zero extra resource
+private bytes and did not authorize this scope. Any future run still needs
+its own agreed scope and restart readiness. Stage/start/activate require
 `--ack-resource-raw-transaction-scope` alongside the four preceding scope
 acknowledgements, exact reviewed inputs and coordinated Steam-restart readiness.
 

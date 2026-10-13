@@ -64,10 +64,14 @@ finite observation nor the later peer snapshot establishes continuous lifetime,
 resource/video or GPU association. The temporary diagnostic was fully removed.
 These diagnostics change no rendered pixels and do not enable genuine-mask
 passthrough.
-The next [bounded raw import adapter](docs/CLIENT-RESOURCE-RAW-PREPARATION.md)
+The [bounded raw import adapter](docs/CLIENT-RESOURCE-RAW-PREPARATION.md)
 is built and reviewed offline, with actual final ARM read/write/cancellation
-checks and the complete 56-check local host gate. Its separately authorized
-hardware capture remains pending; resource/video/GPU association is not accepted.
+checks and the complete 56-check local host gate. Its
+[actual Frame capture](docs/CLIENT-RESOURCE-RAW-CAPTURE-20261013.md) now records
+one complete matching request/reply and following receiver reference, using
+393 additional private metadata bytes. The temporary diagnostic was fully
+removed. Compositor resource, source video/eye/UV and GPU association remain
+unproven; streamed genuine-mask passthrough is not enabled.
 
 The original upstream chroma-key implementation and instructions below remain
 available as a separate path. They do not enable the new explicit-mask path.
