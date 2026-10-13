@@ -1,4 +1,5 @@
 #include "import/compositor_journal_bridge.h"
+#include "layer/passive_pipeline_trace.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -6,6 +7,9 @@
 #include <memory>
 #include <new>
 #include <thread>
+#include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 thread_local bool inHook = false;
@@ -75,7 +79,7 @@ struct Fixture {
     VkMemoryDedicatedAllocateInfo dedicated = info<VkMemoryDedicatedAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
     VkMemoryAllocateInfo memoryInfo = info<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
     VkImageViewCreateInfo viewInfo = info<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
-    Fixture() {
+    explicit Fixture(Callbacks callback = {}) {
         imageInfo.imageType = VK_IMAGE_TYPE_2D; imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
         imageInfo.extent = {1152, 4608, 1}; imageInfo.mipLevels = 1; imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT; imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
@@ -88,7 +92,8 @@ struct Fixture {
         viewInfo.image = image; viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D; viewInfo.format = imageInfo.format;
         viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         require(bridge.initialize_before_threads(true), "owning bridge initialization failed");
-        require(bridge.register_receipts_before_threads({Results::receive, &results}), "owning callback registration failed");
+        if (!callback.notify) callback = {Results::receive, &results};
+        require(bridge.register_receipts_before_threads(callback), "owning callback registration failed");
     }
     void create(bool tagged = true) {
         if (tagged) require(journal->createImageTagged(device, image, imageInfo, tag), "tagged image failed");
@@ -185,6 +190,60 @@ void concurrentUnpublishedPredecessor() {
     require(f.results.count == 1 && f.results.snapshots == 1 && f.results.receipts[0].current_after_drain &&
             f.bridge.validate(f.results.receipts[0]), "owned receipt failed after real producer quiescence");
 }
+Owner* childOwner = nullptr;
+frame_trace::EventRing* childEvents = nullptr;
+void retireForkedChild() noexcept {
+    if (childOwner) childOwner->retire_child_atomically();
+    if (childEvents) childEvents->retire_child_admission();
+}
+void forkWhileBackgroundOwnerIsLocked() {
+    struct Blocked {
+        std::atomic<bool> entered{false}, release{false};
+        Receipt received{};
+        static void receive(const Receipt& receipt, void* context) noexcept {
+            auto& self = *static_cast<Blocked*>(context);
+            self.received = receipt;
+            self.entered.store(true, std::memory_order_release);
+            while (!self.release.load(std::memory_order_acquire)) std::this_thread::yield();
+        }
+    } blocked;
+    Fixture f({Blocked::receive, &blocked}); f.create(); f.request();
+    std::thread owner([&] { f.bridge.drain(nullptr, nullptr); });
+    while (!blocked.entered.load(std::memory_order_acquire)) std::this_thread::yield();
+    frame_trace::EventRing events;
+    std::atomic<bool> producerEntered{false}, producerRelease{false};
+    std::thread producer([&] {
+        const auto admitted = events.admit();
+        if (!admitted) std::abort();
+        producerEntered.store(true, std::memory_order_release);
+        while (!producerRelease.load(std::memory_order_acquire)) std::this_thread::yield();
+    });
+    while (!producerEntered.load(std::memory_order_acquire)) std::this_thread::yield();
+    childOwner = &f.bridge; childEvents = &events;
+    require(!pthread_atfork(nullptr, nullptr, retireForkedChild), "could not register real child retirement");
+    const auto pid = fork();
+    require(pid >= 0, "real fork failed");
+    if (!pid) {
+        // The parent's background callback holds owner_mutex_ across fork.
+        // Every child entry below must bypass that inherited mutex entirely.
+        alarm(3);
+        const bool retired = events.closed() && !events.admit() && !events.push(frame_trace::Event{}) &&
+            !f.bridge.validate(blocked.received) && !f.bridge.drain(nullptr, nullptr) &&
+            !f.bridge.request(f.device, f.image, f.view, f.tag, f.cookie);
+        f.bridge.stop();
+        _exit(retired ? 0 : 1);
+    }
+    int status = 0;
+    require(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && !WEXITSTATUS(status),
+            "child retirement entered an inherited owner mutex or admitted new work");
+    childOwner = nullptr; childEvents = nullptr;
+    require(!events.closed() && bool(events.admit()), "child event retirement modified parent admission");
+    producerRelease.store(true, std::memory_order_release); producer.join();
+    blocked.release.store(true, std::memory_order_release); owner.join();
+    require(f.bridge.validate(blocked.received) && !f.bridge.notification_loss() &&
+            f.bridge.counters().requested == 1 && f.bridge.counters().delivered == 1,
+            "child retirement modified the parent's capture/admission");
+}
 void registrationAndBoundedRequests() {
     auto journal = std::make_unique<Journal>(); Owner inactive{*journal}; Results results;
     require(!inactive.initialize_before_threads(false), "disabled bridge initialized");
@@ -210,5 +269,6 @@ void registrationAndBoundedRequests() {
 int main() {
     realJournalSuccess(); deferredReplayAndRetirement(); missingTagsAndClosure();
     concurrentUnpublishedPredecessor(); registrationAndBoundedRequests();
+    forkWhileBackgroundOwnerIsLocked();
     std::cout << "compositor raw owning-journal bridge: " << checks << " checks passed\n";
 }

@@ -45,6 +45,7 @@ struct Capture {
     frame_compositor_journal::Owner importReceipts{bindings};
     // Set only by the file-owning background writer after its protected header.
     std::atomic<unsigned> importWriterReady{0};
+    std::atomic<bool> importProcessAdmitted{false}, importChildRetired{false};
 #endif
     std::atomic<bool> stop{false};
     std::thread writer;
@@ -139,12 +140,24 @@ struct Capture {
                 return;
             }
 #endif
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+            importProcessAdmitted.store(true, std::memory_order_release);
+#endif
             core.enable(true);
             try { writer = std::thread([this, path, armPath] { write(path, armPath); }); }
             catch (...) { core.enable(false); processAllowed = false; }
         });
     }
     ~Capture() {
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        if (importChildRetired.load(std::memory_order_acquire)) {
+            // Teardown outside the atfork callback: the copied writer no
+            // longer exists in this child. Replace only its inert C++ handle,
+            // without pthread join/detach or an inherited owner lock.
+            new (&writer) std::thread();
+            return;
+        }
+#endif
         core.enable(false);
         stop.store(true);
         if (writer.joinable()) writer.join(); // Process/layer teardown only.
@@ -480,12 +493,19 @@ struct Capture {
 #include "passive_binding_serialize.inc"
 
 Capture& capture() { static Capture instance; return instance; }
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+std::atomic<Capture*> preparedImportCapture{nullptr};
+static_assert(std::atomic<Capture*>::is_always_lock_free);
+#endif
 template <typename T> std::uint64_t number(T handle) { return (std::uint64_t)(std::uintptr_t)handle; }
 template <typename T> void* dispatchKey(T handle) { return *reinterpret_cast<void**>(handle); }
 
 template <typename Observer> void observeBindings(Observer observer) {
     auto& c = capture();
     if (!c.bindingsEnabled || !c.core.enabled()) return;
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+    if (!c.importProcessAdmitted.load(std::memory_order_acquire)) return;
+#endif
     // Admission includes owned scalar journal publications in the stable footer.
     // Object-table lookup/mutation is exclusively replayed by the writer. This
     // scope never spans a driver call or waits for the writer.
@@ -589,7 +609,11 @@ bool initialize_before_main() noexcept {
     // may wait for protected output readiness; no graphics callback does so.
     for (unsigned attempt = 0; attempt < 2000; ++attempt) {
         const auto ready = c.importWriterReady.load(std::memory_order_acquire);
-        if (ready) return ready == 1 && c.core.enabled();
+        if (ready) {
+            const bool enabled = ready == 1 && c.core.enabled();
+            if (enabled) preparedImportCapture.store(&c, std::memory_order_release);
+            return enabled;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     c.core.enable(false); c.stop.store(true);
@@ -611,6 +635,21 @@ bool request(std::uint64_t device, VkImage image, VkImageView view,
 }
 bool validate(const Receipt& receipt) noexcept { return capture().importReceipts.validate(receipt); }
 void stop() noexcept { capture().importReceipts.stop(); }
+void retire_child_atomically() noexcept {
+    // Only a successfully prepared constructor publishes this pointer; do not
+    // enter the function-static Capture guard or create a thread in a child.
+    auto* c = preparedImportCapture.load(std::memory_order_acquire);
+    if (!c) return;
+    c->importChildRetired.store(true, std::memory_order_release);
+    c->importProcessAdmitted.store(false, std::memory_order_release);
+    c->core.enable(false);
+    c->stop.store(true, std::memory_order_release);
+    c->importReceipts.retire_child_atomically();
+    // Journal::close is atomic-only. Ordinary EventRing::close waits for
+    // producers that may no longer exist; its child-only closure never waits.
+    c->events.retire_child_admission();
+    c->bindings.close();
+}
 bool notification_loss() noexcept { return capture().importReceipts.notification_loss(); }
 Counters counters() noexcept { return capture().importReceipts.counters(); }
 } // namespace frame_compositor_journal

@@ -38,6 +38,7 @@ bool Owner::request(std::uint64_t device, VkImage image, VkImageView view,
     return true;
 }
 std::size_t Owner::drain(SnapshotNotify snapshot, void* context, std::size_t max_records) noexcept {
+    if (child_retired_.load(std::memory_order_acquire)) return 0;
     std::lock_guard<std::mutex> owner(owner_mutex_);
     struct Collector {
         Owner& bridge; SnapshotNotify snapshot; void* context;
@@ -70,16 +71,23 @@ std::size_t Owner::drain(SnapshotNotify snapshot, void* context, std::size_t max
     return drained;
 }
 bool Owner::validate(const Receipt& receipt) noexcept {
+    if (child_retired_.load(std::memory_order_acquire)) return false;
     std::lock_guard<std::mutex> owner(owner_mutex_);
     return initialization_.load(std::memory_order_acquire) == 2 &&
         !stopped_.load(std::memory_order_acquire) && !lost_.load(std::memory_order_acquire) &&
         receipt.current_after_drain && journal_.validateImportResourceReceipt(receipt.resource);
 }
 void Owner::stop() noexcept {
+    if (child_retired_.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> owner(owner_mutex_);
     stopped_.store(true, std::memory_order_release);
     registration_.store(0, std::memory_order_release);
     callbacks_ = {};
+}
+void Owner::retire_child_atomically() noexcept {
+    child_retired_.store(true, std::memory_order_release);
+    stopped_.store(true, std::memory_order_release);
+    registration_.store(0, std::memory_order_release);
 }
 Counters Owner::counters() const noexcept {
     return {requested_.load(std::memory_order_relaxed), delivered_.load(std::memory_order_relaxed),

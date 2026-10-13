@@ -136,6 +136,12 @@ public:
         producers_.fetch_or(Closed, std::memory_order_acq_rel);
         while (producers_.load(std::memory_order_acquire) != Closed) std::this_thread::yield();
     }
+    // Atfork child only. The copied producer count may include vanished
+    // threads, so close admission without waiting for their destructors.
+    // Do not use this instead of close() for a parent capture footer.
+    void retire_child_admission() noexcept {
+        producers_.fetch_or(Closed, std::memory_order_acq_rel);
+    }
     bool closed() const noexcept { return (producers_.load(std::memory_order_acquire) & Closed) != 0; }
     bool push(Event event) noexcept {
         // The lifetime cap intentionally closes the observation window. A core
