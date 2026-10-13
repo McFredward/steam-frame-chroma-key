@@ -3,8 +3,10 @@
 #include <cstdint>
 
 // A separate, inactive-by-default selective audit for the compositor. It
-// forwards copied public loader facts to the prepared MAIN observer only after
-// actual la_preinit. Names/ordinals do not authenticate mapped native bytes.
+// forwards copied public loader facts to the prepared MAIN observer. A proved
+// own cold-ready marker permits forwarding-only constructor bindings; capture
+// remains unarmed until actual la_preinit. Names/ordinals never authenticate
+// mapped native bytes or establish a private-read capability.
 namespace frame_compositor_audit {
 enum class Function : std::uint8_t { None, MutexLock, MutexUnlock, Write };
 enum class Stage : std::uint8_t { Prepare, Bind, Retire, Loss, ForwardOnly };
