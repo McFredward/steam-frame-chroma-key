@@ -15,11 +15,13 @@ const Preparation* preparation() noexcept { return nullptr; }
 }
 namespace {
 using namespace frame_compositor_audit;
-static_assert(std::atomic<std::uintptr_t>::is_always_lock_free && std::atomic<std::uint64_t>::is_always_lock_free);
+static_assert(std::atomic<std::uintptr_t>::is_always_lock_free && std::atomic<std::uint64_t>::is_always_lock_free &&
+              std::atomic<unsigned>::is_always_lock_free && sizeof(std::atomic<unsigned>) == 4);
 enum : unsigned { Empty, Filling, Alive, Retired };
 struct Slot {
     std::atomic<unsigned> state{Empty};
     std::atomic<std::uintptr_t> bias{0}, begin{0}, end{0};
+    std::atomic<std::uintptr_t> data_begin{0}, data_end{0};
     std::atomic<std::uint64_t> generation{0};
 };
 Slot slots[3];
@@ -51,12 +53,18 @@ const Preparation* prepared() noexcept {
        p->native_mutex_lock_rva == p->native_mutex_unlock_rva || p->native_mutex_lock_rva == p->native_write_rva ||
        p->native_mutex_unlock_rva == p->native_write_rva || same_name(p->compositor.loader_name,p->observer.loader_name) ||
        same_name(p->compositor.loader_name,p->libc.loader_name) || same_name(p->observer.loader_name,p->libc.loader_name))return nullptr;
+    const auto& own = p->observer;
+    if(!own.data_rva_begin || own.data_rva_begin >= own.data_rva_end ||
+       (own.data_rva_begin < own.rx_rva_end && own.rx_rva_begin < own.data_rva_end) ||
+       p->owned_ready_rva % alignof(std::atomic<unsigned>) || p->owned_ready_rva < own.data_rva_begin ||
+       p->owned_ready_rva > own.data_rva_end || sizeof(std::atomic<unsigned>) > own.data_rva_end - p->owned_ready_rva)
+        return nullptr;
     return p;
 }
 bool view(unsigned i, ModuleView& out) noexcept {
     auto& s = slots[i];
     if(s.state.load(std::memory_order_acquire) != Alive)return false;
-    out = {s.bias.load(),s.begin.load(),s.end.load(),s.generation.load()};
+    out = {s.bias.load(),s.begin.load(),s.end.load(),s.generation.load(),s.data_begin.load(),s.data_end.load()};
     return s.state.load(std::memory_order_acquire) == Alive && out.observed_open_generation;
 }
 bool views(BoundProvider& p) noexcept {
@@ -66,10 +74,21 @@ std::uintptr_t bridge_address(const Preparation& p, const ModuleView& observer) 
     std::uintptr_t at = 0;
     return add(observer.bias,p.bridge_rva,at) && at >= observer.rx_begin && at < observer.rx_end ? at : 0;
 }
+bool own_ready(const Preparation& p, const ModuleView& observer) noexcept {
+    std::uintptr_t at = 0;
+    if(!observer.observed_open_generation || !add(observer.bias,p.owned_ready_rva,at) ||
+       at < observer.data_begin || at > observer.data_end ||
+       sizeof(std::atomic<unsigned>) > observer.data_end - at || at % alignof(std::atomic<unsigned>))return false;
+    // Own artifact only: independently pinned preparation and actual objopen
+    // lifetime/range precede this acquire. MAIN authenticates all native files
+    // before publishing one. No native scalar or socket is touched here.
+    const auto* marker = reinterpret_cast<const std::atomic<unsigned>*>(at);
+    return marker->load(std::memory_order_acquire) == 1 && slots[1].state.load(std::memory_order_acquire) == Alive;
+}
 void loss() noexcept {
     const bool first = !lost.exchange(true,std::memory_order_acq_rel);
     ready.store(false,std::memory_order_release);
-    if(!first || !preinit_seen.load() || !bridge_admitted.load())return;
+    if(!first || !bridge_admitted.load())return;
     const auto* p = prepared(); BridgeRequest r{}; r.stage = Stage::Loss; r.missed_before_preinit = missed.load();
     if(!p || !view(1,r.provider.observer))return;
     (void)view(0,r.provider.compositor); (void)view(2,r.provider.libc);
@@ -98,11 +117,15 @@ AUDIT_EXPORT unsigned int la_objopen(link_map* map, Lmid_t lmid, std::uintptr_t*
         unsigned empty = Empty;
         auto& s = slots[i];
         if(!s.state.compare_exchange_strong(empty,Filling)) { loss(); return 0; }
-        std::uintptr_t begin = 0, end = 0;
+        std::uintptr_t begin = 0, end = 0, data_begin = 0, data_end = 0;
         const auto generation = next_generation.fetch_add(1);
         if(!generation || generation == std::numeric_limits<std::uint64_t>::max() || !add(map->l_addr,module.rx_rva_begin,begin) ||
-           !add(map->l_addr,module.rx_rva_end,end)) { s.state.store(Retired); loss(); return 0; }
+           !add(map->l_addr,module.rx_rva_end,end) ||
+           (i == 1 && (!add(map->l_addr,module.data_rva_begin,data_begin) || !add(map->l_addr,module.data_rva_end,data_end)))) {
+            s.state.store(Retired); loss(); return 0;
+        }
         s.bias.store(map->l_addr); s.begin.store(begin); s.end.store(end); s.generation.store(generation);
+        s.data_begin.store(data_begin); s.data_end.store(data_end);
         s.state.store(Alive,std::memory_order_release); *cookie = i + 1;
         return i == 0 ? LA_FLG_BINDFROM : i == 2 ? LA_FLG_BINDTO : 0;
     }
@@ -112,6 +135,7 @@ AUDIT_EXPORT void la_preinit(std::uintptr_t*) {
     if(preinit_seen.exchange(true)) { loss(); return; }
     const auto* p = prepared(); BridgeRequest r{};
     if(!p || !views(r.provider))return;
+    if(!own_ready(*p,r.provider.observer)) { loss(); return; }
     r.missed_before_preinit = missed.load();
     const auto at = bridge_address(*p,r.provider.observer);
     if(!at) { loss(); return; }
@@ -128,14 +152,20 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
     if(!p || !reference || !definition || !flags || *reference != 1 || *definition != 3 || !target(name,index,function))return original;
     if(*flags & (LA_SYMB_DLSYM | LA_SYMB_ALTVALUE)) { loss(); return original; }
     BoundProvider provider{};
-    if(!views(provider))return original;
+    if(!views(provider)) {
+        if(!preinit_seen.load())missed.store(true);
+        loss(); return original;
+    }
     const std::uintptr_t rvas[]{p->native_mutex_lock_rva,p->native_mutex_unlock_rva,p->native_write_rva};
     std::uintptr_t expected = 0;
     if(!add(provider.libc.bias,rvas[index],expected) || original != expected || original < provider.libc.rx_begin || original >= provider.libc.rx_end) {
         loss(); return original;
     }
-    if(!preinit_seen.load()) { missed.store(true); return original; }
-    if(!ready.load())return original;
+    const bool before_preinit = !preinit_seen.load();
+    if(before_preinit && !own_ready(*p,provider.observer)) {
+        missed.store(true); loss(); return original;
+    }
+    if(!before_preinit && !ready.load())return original;
     const auto state = binding_state[index].load(std::memory_order_acquire);
     if(state == Alive) {
         if(original_cache[index].load() != original) { loss(); return original; }
@@ -146,19 +176,20 @@ AUDIT_EXPORT std::uintptr_t la_symbind64(Elf64_Sym* symbol, unsigned int,
     provider.function = function; provider.original = original;
     const auto at = bridge_address(*p,provider.observer);
     if(!at) { loss(); return original; }
-    const auto response = reinterpret_cast<Bridge>(at)(BridgeRequest{Stage::Bind,provider,false,{}});
+    const auto response = reinterpret_cast<Bridge>(at)(BridgeRequest{before_preinit ? Stage::ForwardOnly : Stage::Bind,provider,false,{}});
     if(!response.ready || !response.hidden_entry || response.hidden_entry < provider.observer.rx_begin ||
        response.hidden_entry >= provider.observer.rx_end || lost.load()) {
         binding_state[index].store(Retired); loss(); return original;
     }
     original_cache[index].store(original); entry_cache[index].store(response.hidden_entry);
+    if(before_preinit)bridge_admitted.store(true,std::memory_order_release);
     binding_state[index].store(Alive,std::memory_order_release);
     *flags |= LA_SYMB_NOPLTENTER | LA_SYMB_NOPLTEXIT; return response.hidden_entry;
 }
 AUDIT_EXPORT unsigned int la_objclose(std::uintptr_t* cookie) {
     if(cookie && *cookie >= 1 && *cookie <= 3) {
         const auto* p = prepared(); BridgeRequest r{}; r.stage = Stage::Retire; r.missed_before_preinit = missed.load();
-        if(p && preinit_seen.load() && bridge_admitted.load() && view(*cookie - 1,r.retired_module) && view(1,r.provider.observer)) {
+        if(p && bridge_admitted.load() && view(*cookie - 1,r.retired_module) && view(1,r.provider.observer)) {
             (void)view(0,r.provider.compositor); (void)view(2,r.provider.libc);
             const auto at = bridge_address(*p,r.provider.observer);
             if(at)(void)reinterpret_cast<Bridge>(at)(r);
