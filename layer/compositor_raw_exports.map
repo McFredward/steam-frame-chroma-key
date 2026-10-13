@@ -1,0 +1,8 @@
+{
+    global:
+        vkGetInstanceProcAddr;
+        vkGetDeviceProcAddr;
+        vkNegotiateLoaderLayerInterfaceVersion;
+        frame_compositor_raw_bridge;
+    local: *;
+};

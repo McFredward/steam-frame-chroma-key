@@ -172,6 +172,10 @@ if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE OR FRAME_MASK_BUILD_IMPORT_
         target_compile_definitions(VkLayer_frame_mask_trace PRIVATE FRAME_MASK_COMPOSITOR_RAW=1)
         target_compile_options(VkLayer_frame_mask_trace PRIVATE -ftls-model=initial-exec -fexceptions -fno-rtti)
         target_link_options(VkLayer_frame_mask_trace PRIVATE -Wl,-z,separate-code)
+        target_link_options(VkLayer_frame_mask_trace PRIVATE
+            "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/layer/compositor_raw_exports.map")
+        set_property(TARGET VkLayer_frame_mask_trace APPEND PROPERTY LINK_DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/layer/compositor_raw_exports.map)
         target_link_libraries(VkLayer_frame_mask_trace PRIVATE ${CMAKE_DL_LIBS})
     endif()
     set(FRAME_MASK_TRACE_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}VkLayer_frame_mask_trace${CMAKE_SHARED_LIBRARY_SUFFIX}")
@@ -224,6 +228,29 @@ if(BUILD_TESTING)
         add_test(NAME compositor_owning_journal_receipt COMMAND test_compositor_raw_receipt)
         add_test(NAME compositor_selective_startup_audit COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compositor_startup_audit.py)
+        add_test(NAME compositor_raw_session_recovery COMMAND ${Python3_EXECUTABLE}
+            -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_compositor_raw_session.py)
+        add_test(NAME compositor_raw_offline_artifacts COMMAND ${Python3_EXECUTABLE}
+            -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_prepare_compositor_raw_observer.py)
+        # These fixtures include the production implementation directly, with
+        # explicit test transports. They cannot create sealed native Ready.
+        add_executable(test_compositor_raw_runtime tests/test_compositor_raw_runtime.cpp
+            import/compositor_import_thread.cpp import/compositor_resource_sparse.cpp
+            import/compositor_resource_raw.cpp import/native_import_route.cpp
+            import/import_startup_gate.cpp import/import_pipe_epoch.cpp import/native_client_birth.cpp
+            import/compositor_main_preparation.cpp import/import_main_preparation.cpp
+            import/import_loader_reader.cpp import/import_module_identity.cpp)
+        target_include_directories(test_compositor_raw_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+        target_link_libraries(test_compositor_raw_runtime PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+        target_compile_options(test_compositor_raw_runtime PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME compositor_raw_callback_integration COMMAND test_compositor_raw_runtime)
+        add_executable(test_compositor_raw_writer tests/test_compositor_raw_observer.cpp
+            import/compositor_main_preparation.cpp import/import_main_preparation.cpp
+            import/import_loader_reader.cpp import/import_module_identity.cpp)
+        target_include_directories(test_compositor_raw_writer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+        target_link_libraries(test_compositor_raw_writer PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+        target_compile_options(test_compositor_raw_writer PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME compositor_raw_bounded_writer COMMAND test_compositor_raw_writer)
         add_executable(test_import_observer tests/test_import_observer.cpp
             import/import_observer_core.cpp)
         target_include_directories(test_import_observer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

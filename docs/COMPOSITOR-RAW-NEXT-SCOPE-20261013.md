@@ -13,6 +13,12 @@ installation, kernel query, native executable change or rendering change was
 performed for it. The source decoder and copy helper are foundations; they are
 not a deployable observer or hardware authorization.
 
+The later [combined diagnostic artifact](COMPOSITOR-RAW-ARTIFACT-20261013.md)
+implements this local-resource step. Its deterministic first-import gate
+supersedes the generic poll candidate below: the current private-byte ceiling
+is **709**, not the historical experimental 741. Neither artifact preparation
+nor software validation authorizes deployment or establishes working passthrough.
+
 ## Useful result to acquire next
 
 Record one exact compositor import invocation, its synchronous public Vulkan
