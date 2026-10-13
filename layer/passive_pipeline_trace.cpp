@@ -2,6 +2,9 @@
 // mutation, image/memory readback, GPU work, or render-thread log I/O.
 #include "passive_pipeline_trace.h"
 #include "passive_binding_journal.h"
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+#include "../import/compositor_journal_bridge.h"
+#endif
 #ifdef FRAME_MASK_IMPORT_ENTRY
 #include "../import/import_vulkan_forwarding.h"
 #endif
@@ -38,6 +41,11 @@ struct Capture {
     EventRing events;
     Core core{events};
     frame_bindings::Journal bindings;
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+    frame_compositor_journal::Owner importReceipts{bindings};
+    // Set only by the file-owning background writer after its protected header.
+    std::atomic<unsigned> importWriterReady{0};
+#endif
     std::atomic<bool> stop{false};
     std::thread writer;
     std::once_flag once;
@@ -53,12 +61,25 @@ struct Capture {
     std::array<bool, BindingSnapshotLimit> bindingReady{};
     std::size_t drainBindings() {
         if (!bindingsEnabled) return 0;
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        // The same owner serializes typed import receipts and draw snapshots.
+        // API hooks never enter this background-only mutex or the replay Core.
+        return importReceipts.drain([](std::uint32_t cookie, const frame_bindings::Snapshot& result,
+                                      void* context) noexcept {
+            auto& capture = *static_cast<Capture*>(context);
+            if (cookie < BindingSnapshotLimit) {
+                capture.bindingResults[cookie] = result;
+                capture.bindingReady[cookie] = true;
+            }
+        }, this);
+#else
         return bindings.drain([this](std::uint32_t cookie, const frame_bindings::Snapshot& result) {
             if (cookie < BindingSnapshotLimit) {
                 bindingResults[cookie] = result;
                 bindingReady[cookie] = true;
             }
         });
+#endif
     }
 
     bool drawsReady() const noexcept {
@@ -112,6 +133,12 @@ struct Capture {
             if (configured && configured[0] == '/' && strnlen(configured, 4096) < 4096)
                 path = configured;
             else path = "/tmp/frame-mask-trace-" + std::to_string(getpid()) + ".jsonl";
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+            if (!importReceipts.initialize_before_threads(bindingsEnabled)) {
+                processAllowed = false;
+                return;
+            }
+#endif
             core.enable(true);
             try { writer = std::thread([this, path, armPath] { write(path, armPath); }); }
             catch (...) { core.enable(false); processAllowed = false; }
@@ -121,6 +148,9 @@ struct Capture {
         core.enable(false);
         stop.store(true);
         if (writer.joinable()) writer.join(); // Process/layer teardown only.
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        importReceipts.stop();
+#endif
     }
 
     static bool append(char* out, std::size_t capacity, std::size_t& used,
@@ -224,10 +254,22 @@ struct Capture {
         // O_EXCL/O_NOFOLLOW prevents replacing an existing file or following a
         // symlink. The trace contains no binary shader payload or private image.
         const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-        if (fd < 0) { core.enable(false); return; }
+        if (fd < 0) {
+            core.enable(false);
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+            importWriterReady.store(2, std::memory_order_release);
+#endif
+            return;
+        }
         // Control helper can reject closed/crashed captures before creating an
         // arm marker. This lock belongs only to the background writer.
-        if (flock(fd, LOCK_EX | LOCK_NB)) { core.enable(false); close(fd); return; }
+        if (flock(fd, LOCK_EX | LOCK_NB)) {
+            core.enable(false);
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+            importWriterReady.store(2, std::memory_order_release);
+#endif
+            close(fd); return;
+        }
         if (!armPath.empty() && armRequested(armPath)) bindingsArmed.store(true, std::memory_order_release);
         // When timed recovery is enabled, leave time for its independently
         // armed 180-second watchdog to restore SteamVR after capture closure.
@@ -252,6 +294,10 @@ struct Capture {
             armPath.empty() ? "false" : "true", bindingsArmed.load() ? "true" : "false", deadlineSeconds);
         std::size_t total = static_cast<std::size_t>(headerLength);
         bool ioGood = writeAll(fd, header, total), capped = false;
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        importWriterReady.store(ioGood ? 1 : 2, std::memory_order_release);
+        if (!ioGood) { core.enable(false); close(fd); return; }
+#endif
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(deadlineSeconds);
         auto armCheck = std::chrono::steady_clock::now();
         const auto writerStart = armCheck;
@@ -532,6 +578,44 @@ bool ordinaryPipeline(const VkGraphicsPipelineCreateInfo& info) {
 }
 } // namespace
 
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+namespace frame_compositor_journal {
+bool initialize_before_main() noexcept {
+    try { capture().start(); }
+    catch (...) { return false; }
+    auto& c = capture();
+    if (!c.processAllowed || !c.bindingsEnabled || !c.core.enabled()) return false;
+    // Native MAIN has not started. Only this explicit constructor-side path
+    // may wait for protected output readiness; no graphics callback does so.
+    for (unsigned attempt = 0; attempt < 2000; ++attempt) {
+        const auto ready = c.importWriterReady.load(std::memory_order_acquire);
+        if (ready) return ready == 1 && c.core.enabled();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    c.core.enable(false); c.stop.store(true);
+    return false;
+}
+bool register_receipts_before_threads(Callbacks callbacks) noexcept {
+    auto& c = capture();
+    return c.processAllowed && c.bindingsEnabled && c.core.enabled() &&
+        c.importReceipts.register_receipts_before_threads(callbacks);
+}
+bool request(std::uint64_t device, VkImage image, VkImageView view,
+             std::uint64_t tag, std::uint64_t cookie) noexcept {
+    auto& c = capture();
+    // Retain the existing event admission so closure accounts for an in-flight
+    // request. This does not span a native provider or wait for replay.
+    const auto admission = c.events.admit();
+    if (!admission || !c.core.enabled() || !c.bindingsEnabled) return false;
+    return c.importReceipts.request(device, image, view, tag, cookie);
+}
+bool validate(const Receipt& receipt) noexcept { return capture().importReceipts.validate(receipt); }
+void stop() noexcept { capture().importReceipts.stop(); }
+bool notification_loss() noexcept { return capture().importReceipts.notification_loss(); }
+Counters counters() noexcept { return capture().importReceipts.counters(); }
+} // namespace frame_compositor_journal
+#endif
+
 TRACE_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance, const char*);
 TRACE_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice, const char*);
 
@@ -579,7 +663,9 @@ extern "C" std::uint64_t frame_import_view_dispatch(const frame_import_native::E
 
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateInstance(const VkInstanceCreateInfo* info,
     const VkAllocationCallbacks* allocator, VkInstance* output) {
+#ifndef FRAME_MASK_COMPOSITOR_RAW
     capture().start();
+#endif
     auto* chain = static_cast<VkLayerInstanceCreateInfo*>(const_cast<void*>(info->pNext));
     while (chain && (chain->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO || chain->function != VK_LAYER_LINK_INFO))
         chain = static_cast<VkLayerInstanceCreateInfo*>(const_cast<void*>(chain->pNext));
