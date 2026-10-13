@@ -175,13 +175,14 @@ requesting a PC-VR stream. Existing Gamescope warnings occur in the restored
 healthy session too; they cannot be used alone as a fatal signature. A metadata
 check still must not claim pixel inspection or a successful headset image.
 
-Activation and the combined stage/start command are now blocked in production
-before any restart or activation publication. Inert offline preparation/staging,
-inspection and authorized rollback remain available. The new public-exec
-selector is an **uninstalled prototype**, not a reviewed replacement deployment:
-the current compositor also imports `system` and `popen`, whose internal libc
-launches can bypass those public hooks and propagate the same unsafe environment.
-There is no runtime flag to bypass the block. See
+The safety checkpoint blocked activation before any restart or publication.
+The version-1 service-wide deployment remains rejected. Version-2 preparation
+and sessions now require a cold-freeze selector that cleans the actual target
+environment before threads, retains PID-local delayed getter values and covers
+native internal `system`/`popen` inheritance. Startup also requires actual
+managed-process isolation, fresh UI readiness and the current frozen header.
+The new package has been tested locally but is not yet deployed on the Frame.
+There is no runtime flag admitting the unsafe legacy package. See
 [the startup-safety review](COMPOSITOR-STARTUP-SAFETY-20261013.md) for the tested
 scope and remaining launch requirements.
 

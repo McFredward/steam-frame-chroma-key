@@ -46,7 +46,7 @@ def fixture(*, missing_entry=None, missing_import=None, extra_export=None, extra
     dynamic = [(name, 0x2200 + 16 * i) for i, name in enumerate(sorted(public)) if name != missing_export]
     if extra_export:
         dynamic.append((extra_export, 0x2250))
-    imports = list(tool.ALIAS_IMPORTS) + list(tool.BOOTSTRAP_IMPORTS)
+    imports = list(tool.ALIAS_IMPORTS) + list(tool.BOOTSTRAP_IMPORTS) + list(tool.FREEZE_IMPORTS)
     if dynamic_tls:
         imports.append('__tls_get_addr@GLIBC_2.17')
     if missing_import:
@@ -66,8 +66,13 @@ def fixture(*, missing_entry=None, missing_import=None, extra_export=None, extra
     for name, rva in dynamic:
         dynsym.extend(struct.pack('<IBBHQQ', offsets[name], 0x12, 0, 1, rva, 4)); versions.append(1)
     for item in imports:
-        name, version = item.split('@')
-        dynsym.extend(struct.pack('<IBBHQQ', offsets[name], 0x12, 0, 0, 0, 0)); versions.append(2 if version == 'GLIBC_2.17' else 3)
+        if '@' in item:
+            name, version = item.split('@')
+            dynsym.extend(struct.pack('<IBBHQQ', offsets[name], 0x12, 0, 0, 0, 0)); versions.append(2 if version == 'GLIBC_2.17' else 3)
+        else:
+            # AArch64 GCC's address-tested unresolved weak C functions are
+            # STT_NOTYPE; the defined selector providers are STT_FUNC.
+            dynsym.extend(struct.pack('<IBBHQQ', offsets[item], 0x20, 0, 0, 0, 0)); versions.append(1)
     statstr = bytearray(b'\0'); symtab = bytearray(24)
     def hidden(name, rva, size, kind=2, visibility=2):
         at = len(statstr); statstr.extend(name.encode() + b'\0')
@@ -122,7 +127,27 @@ class PackageControls(unittest.TestCase):
         self.assertEqual(report['ready_rva'], 0x7400)
         self.assertEqual((report['data_rva_begin'], report['data_rva_end']), (0x7000, 0x8000))
         self.assertFalse(report['native_namespace_associated']); self.assertFalse(report['source_frame_associated'])
-        self.assertEqual(set(elf.imports()), set(tool.ALIAS_IMPORTS) | set(tool.BOOTSTRAP_IMPORTS))
+        self.assertEqual(set(elf.imports()), set(tool.ALIAS_IMPORTS) | set(tool.BOOTSTRAP_IMPORTS) | set(tool.FREEZE_IMPORTS))
+        self.assertEqual(report['cold_environment_freeze_abi'], 1)
+        self.assertEqual(report['launch_provider_mask'], 63)
+
+    def test_old_observer_without_cold_freeze_cannot_be_packaged(self):
+        for name in tool.FREEZE_IMPORTS:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'cold-freeze'):
+                self.validate(fixture(missing_import=name))
+
+    def test_launch_configuration_is_exact_and_child_service_only_preloads_selector(self):
+        config = tool.launch_config(Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw'))
+        env = tool.launch_environment(config)
+        self.assertEqual(env['LD_PRELOAD'], config['selector'] + ':' + config['payload'])
+        self.assertEqual(env['LD_AUDIT'], config['audit'])
+        self.assertEqual(len(env), 7)
+        marker = tool.launch_marker(config)
+        self.assertEqual(len(marker), 48)
+        changed = dict(config, target='/opt/other/vrcompositor')
+        self.assertNotEqual(marker, tool.launch_marker(changed))
+        for target in ('vrcompositor', '/opt/../vrcompositor', '/opt/a:bad/vrcompositor'):
+            with self.subTest(target=target), self.assertRaises(ValueError): tool.launch_config(Path('/own'), target)
 
     def test_standard_vulkan_exports_are_unsafe_even_with_exact_raw_scope(self):
         # The old combined export surface had the valid raw marker/envelope and
@@ -233,13 +258,15 @@ class PackageControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='frame-compositor-preparer-controls-') as temporary:
             output = Path(temporary) / 'bundle'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, REMOTE)
-            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v1')
+            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v2')
             self.assertEqual(plan['raw_limits'], tool.RAW_LIMITS)
             self.assertEqual(plan['capture_limits'], tool.CAPTURE_LIMITS)
             for field in ('installed', 'activated', 'runtime_authorized', 'frame_access', 'network_access', 'automatic_restart',
                           'native_binary_or_script_changes', 'shader_or_mask_activation', 'source_frame_associated', 'gpu_coherent'):
                 self.assertIs(plan[field], False)
-            self.assertEqual(plan['manifest']['library_path'], plan['environment']['LD_PRELOAD'])
+            self.assertEqual(plan['environment'], {'LD_PRELOAD': plan['selector']['configuration']['selector']})
+            self.assertEqual(plan['manifest']['library_path'], plan['selector']['configuration']['payload'])
+            self.assertEqual(plan['launch_isolation']['target_exec_environment'], tool.launch_environment(plan['selector']['configuration']))
             self.assertEqual(plan['manifest']['functions'], tool.VULKAN_FUNCTIONS)
             self.assertEqual(plan['manifest']['frame_path'], '/home/steamos/.local/share/vulkan/implicit_layer.d/frame_compositor_raw.json')
             self.assertEqual([p['role'] for p in plan['native_profiles']], [7, 3, 4])
@@ -253,7 +280,8 @@ class PackageControls(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), entry['sha256'])
                 self.assertFalse(entry['native_bytes'])
             with self.assertRaises(ValueError): tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, REMOTE)
-            self.assertEqual({p.name for p in output.iterdir()}, {tool.MAIN, tool.AUDIT, tool.ENVELOPE, tool.MANIFEST, tool.PLAN, 'audit-preparation.cpp'})
+            self.assertEqual({p.name for p in output.iterdir()}, {tool.MAIN, tool.AUDIT, tool.SELECTOR, tool.SELECTOR_SOURCE,
+                tool.ENVELOPE, tool.MANIFEST, tool.PLAN, 'audit-preparation.cpp'})
 
 
 def main():

@@ -31,9 +31,12 @@ _health_spec.loader.exec_module(health)
 safe_path, read_regular, exclusive = base.safe_path, base.read_regular, base.exclusive
 digest, json_bytes, private_parents = base.digest, base.json_bytes, base.private_parents
 UNIT = "steamvr.service"
-SCHEMA = "frame-compositor-raw-offline-bundle-v1"
-SESSION_SCHEMA = "frame-compositor-raw-owned-session-v1"
+SCHEMA = "frame-compositor-raw-offline-bundle-v2"
+SESSION_SCHEMA = "frame-compositor-raw-owned-session-v2"
 MAIN, AUDIT, ENVELOPE = "libVkLayer_frame_mask_trace.so", "libframe_compositor_raw_audit.so", "compositor-raw-envelope.bin"
+SELECTOR = "libframe_compositor_launch_selector.so"
+SELECTOR_EXPORTS = {"execve", "execv", "execvp", "execvpe", "posix_spawn", "posix_spawnp", "getenv", "secure_getenv",
+    "frame_compositor_launch_freeze_environment_v1", "frame_compositor_launch_frozen_status_v1", "frame_compositor_launch_provider_mask"}
 LAYER = "VkLayer_FRAME_compositor_raw.json"
 VULKAN_FUNCTIONS = {
     "vkGetInstanceProcAddr": "frame_compositor_raw_vkGetInstanceProcAddr",
@@ -64,13 +67,14 @@ STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-st
     "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"})
 
 
-def require_reviewed_launch_isolation():
-    # The last Frame start loaded the service-wide audit/preload into libcef's
-    # frontend and failed with static TLS exhaustion. The public-exec selector
-    # is an offline prototype: native system/popen routes still bypass it.
-    # No flag or environment variable may admit this known-unsafe deployment.
-    raise RuntimeError("Compositor activation blocked: service-wide preload/audit can break the SteamVR UI; "
-                       "complete, reviewed compositor-only launch isolation is required")
+def require_reviewed_launch_isolation(manifest=None):
+    # No flag admits the old service-wide audit/preload. The versioned package
+    # must have a reviewed cold-freeze selector and a runtime isolation probe.
+    if (not isinstance(manifest, dict) or manifest.get("schema") != SESSION_SCHEMA or
+            SELECTOR not in manifest.get("owned_files", {}) or manifest.get("launch_freeze_abi") != 1 or
+            manifest.get("launch_provider_mask") != 63 or not manifest.get("launch_isolation")):
+        raise RuntimeError("Compositor activation blocked: reviewed cold-freeze launch isolation is required")
+    health.require_isolation_descriptor(manifest["launch_isolation"])
 
 
 def blocked(key, value):
@@ -88,6 +92,7 @@ class Session(base.Session):
         self.dropin = self.runtime / "systemd/user/steamvr.service.d/96-frame-compositor-raw.conf"
         self.layer = self.home / ".local/share/vulkan/implicit_layer.d/frame_compositor_raw.json"
         self.library, self.audit, self.envelope = (self.folder / name for name in (MAIN, AUDIT, ENVELOPE))
+        self.selector = self.folder / SELECTOR
         self.capture = self.folder / "compositor-raw.jsonl"
         self.journal = self.folder / "compositor-journal.jsonl"
         self._owned_caller = None
@@ -102,7 +107,10 @@ class Session(base.Session):
         return result
 
     def activation_values(self):
-        return {"LD_PRELOAD": str(self.library), "LD_AUDIT": str(self.audit),
+        return {"LD_PRELOAD": str(self.selector)}
+
+    def target_environment(self):
+        return {"LD_PRELOAD": str(self.selector) + ":" + str(self.library), "LD_AUDIT": str(self.audit),
             "GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE": str(self.envelope),
             "GHVR_FRAME_COMPOSITOR_RAW_OUTPUT": str(self.capture), "FRAME_MASK_TRACE": "1",
             "FRAME_MASK_TRACE_BINDINGS": "1", "FRAME_MASK_TRACE_OUTPUT": str(self.journal)}
@@ -255,21 +263,22 @@ class Session(base.Session):
         for key in ("installed", "activated", "runtime_authorized", "frame_access", "network_access",
             "native_binary_or_script_changes", "shader_or_mask_activation", "source_frame_associated", "gpu_coherent", "automatic_restart", "continuous_connection_owned", "native_namespace_associated"):
             if plan.get(key) is not False: raise RuntimeError("Passive offline plan exceeds approved scope")
-        if set(native) != set(NATIVE) or set(artifacts) != {MAIN, AUDIT, ENVELOPE, LAYER} or set(reviewed_helpers) != set(HELPERS):
-            raise RuntimeError("Exact fresh natives, four own artifacts and reviewed helpers required")
+        if set(native) != set(NATIVE) or set(artifacts) != {MAIN, AUDIT, SELECTOR, ENVELOPE, LAYER} or set(reviewed_helpers) != set(HELPERS):
+            raise RuntimeError("Exact fresh natives, five own artifacts and reviewed helpers required")
         if (plan.get("capture_limits") != CAPTURE_LIMITS or plan.get("raw_limits") != RAW_LIMITS or plan.get("journal_limits") != JOURNAL_LIMITS or
             any(type(v) is not int for v in plan.get("capture_limits", {}).values()) or
             any(type(v) is not int for v in plan.get("raw_limits", {}).values()) or
             any(type(v) is not int for v in plan.get("journal_limits", {}).values())):
             raise RuntimeError("Exact bounded raw diagnostic limits required")
         inventory = plan.get("inventory")
-        names = {MAIN, AUDIT, ENVELOPE, LAYER, "audit-preparation.cpp"}
+        sources = {"audit-preparation.cpp", "launch-configuration.c"}
+        names = {MAIN, AUDIT, SELECTOR, ENVELOPE, LAYER} | sources
         if not isinstance(inventory, list) or len(inventory) != len(names): raise RuntimeError("Exact bundle inventory required")
         entries = {item.get("name"): item for item in inventory if isinstance(item, dict)}
         if set(entries) != names: raise RuntimeError("Unexpected or duplicate inventory entry")
         for name, item in entries.items():
             if (item.get("owned_source") is not True or item.get("native_bytes") is not False or item.get("mode") != "0600" or
-                item.get("frame_path") != (None if name == "audit-preparation.cpp" else str(self.folder / name))):
+                item.get("frame_path") != (None if name in sources else str(self.folder / name))):
                 raise RuntimeError("Source/native or foreign artifact may not be deployed")
         files, payloads = {}, {}
         for role, source in native.items():
@@ -278,12 +287,12 @@ class Session(base.Session):
                 raise RuntimeError("Fresh canonical native hash/ABI mismatch")
             files[role] = {"path": str(safe_path(source)), "sha256": digest(data), "bytes": len(data)}
         for name, source in artifacts.items():
-            data = read_regular(source, 256 * 1024 if name == AUDIT else MAX_INPUT, private=True)
+            data = read_regular(source, 256 * 1024 if name in (AUDIT, SELECTOR) else MAX_INPUT, private=True)
             if entries[name].get("sha256") != digest(data) or entries[name].get("bytes") != len(data):
                 raise RuntimeError("Reviewed own artifact changed")
-            if name in (MAIN, AUDIT) and not self.elf(data): raise RuntimeError("Own artifact ABI changed")
+            if name in (MAIN, AUDIT, SELECTOR) and not self.elf(data): raise RuntimeError("Own artifact ABI changed")
             payloads[name] = data
-        for report_name, name in (("observer", MAIN), ("audit", AUDIT), ("envelope", ENVELOPE), ("manifest", LAYER)):
+        for report_name, name in (("observer", MAIN), ("audit", AUDIT), ("selector", SELECTOR), ("envelope", ENVELOPE), ("manifest", LAYER)):
             report = plan.get(report_name, {})
             if report.get("sha256") != digest(payloads[name]) or report.get("bytes") != len(payloads[name]):
                 raise RuntimeError("Artifact report changed")
@@ -293,6 +302,19 @@ class Session(base.Session):
             plan["observer"].get("vulkan_functions") != VULKAN_FUNCTIONS or
             plan["observer"].get("standard_vulkan_exports") != []):
             raise RuntimeError("Reviewed combined DSO must expose only the private layer entries and bridge")
+        if (plan["observer"].get("cold_environment_freeze_abi") != 1 or plan["observer"].get("launch_provider_mask") != 63 or
+                plan["selector"].get("public_exports") != sorted(SELECTOR_EXPORTS) or
+                plan["selector"].get("cold_environment_freeze_abi") != 1 or plan["selector"].get("launch_provider_mask") != 63 or
+                plan["selector"].get("module_tls_bytes") != 0 or plan["selector"].get("standard_vulkan_exports") != []):
+            raise RuntimeError("Exact cold-freeze observer/selector ABI required")
+        isolation = health.require_isolation_descriptor(plan.get("launch_isolation"))
+        expected_isolation = {"schema": health.ISOLATION_SCHEMA, "target_exe": files["compositor"]["path"],
+            "selector_path": str(self.selector), "payload_path": str(self.library), "audit_path": str(self.audit),
+            "target_exec_environment": self.target_environment()}
+        expected_config = {"target": files["compositor"]["path"], "selector": str(self.selector), "payload": str(self.library),
+            "audit": str(self.audit), "envelope": str(self.envelope), "output": str(self.capture), "journal": str(self.journal)}
+        if isolation != expected_isolation or plan["selector"].get("configuration") != expected_config:
+            raise RuntimeError("Reviewed exact launch/isolation paths differ from staged natives/artifacts")
         if (plan["envelope"].get("schema") != 1 or plan["envelope"].get("module_count") != 4 or
             plan["envelope"].get("module_roles") != [7, 3, 4, 5]):
             raise RuntimeError("Exact envelope module report required")
@@ -344,6 +366,8 @@ class Session(base.Session):
                 "original_environment_files": snapshots, "original_native_layers": native_layers, "native_files": files,
                 "activation": {str(p): {"sha256": digest(raw), "bytes_hex": raw.hex()} for p, raw in activation.items()},
                 "owned_files": {name: digest(data) for name, data in payloads.items()}, "automatic_restart": False}
+            plan = json.loads(payloads["deployment-plan.json"])
+            manifest.update(launch_isolation=plan["launch_isolation"], launch_freeze_abi=1, launch_provider_mask=63)
             exclusive(self.folder / "owned.json", json_bytes(manifest))
             for name, data in payloads.items(): exclusive(self.folder / name, data)
             exclusive(self.folder / "staged.json", json_bytes({"staged": True, "activated": False}))
@@ -354,10 +378,14 @@ class Session(base.Session):
         self.private_folder(); m = json.loads(read_regular(self.folder / "owned.json", private=True))
         if (m.get("schema") != SESSION_SCHEMA or m.get("unit") != UNIT or m.get("scope_acknowledged") is not True or
             m.get("automatic_restart") is not False or set(m.get("activation", {})) != {str(self.dropin), str(self.layer)} or
-            set(m.get("owned_files", {})) != {MAIN, AUDIT, ENVELOPE, LAYER, "deployment-plan.json", *HELPERS} or
+            set(m.get("owned_files", {})) != {MAIN, AUDIT, SELECTOR, ENVELOPE, LAYER, "deployment-plan.json", *HELPERS} or
             set(m.get("native_files", {})) != set(NATIVE) or
             m["owned_files"].get("deployment-plan.json") != m.get("plan_sha256")):
             raise RuntimeError("Invalid owned compositor session manifest")
+        require_reviewed_launch_isolation(m)
+        plan_raw = read_regular(self.folder / "deployment-plan.json", private=True)
+        if digest(plan_raw) != m["plan_sha256"] or json.loads(plan_raw).get("launch_isolation") != m["launch_isolation"]:
+            raise RuntimeError("Owned launch isolation differs from the separately reviewed plan")
         if not isinstance(m.get("original_native_layers"), dict) or len(m["original_native_layers"]) > 64:
             raise RuntimeError("Invalid owned native layer baseline")
         for name, sha in m["owned_files"].items():
@@ -386,7 +414,7 @@ class Session(base.Session):
             # The final combined DSO is larger than the metadata/helper cap.
             # Its independent reviewed hash still applies; no other input gets
             # a wider allowance merely because it is in the owned folder.
-            limit = MAX_INPUT if name == MAIN else 262144 if name == AUDIT else base.LIMIT
+            limit = MAX_INPUT if name == MAIN else 262144 if name in (AUDIT, SELECTOR) else base.LIMIT
             if digest(read_regular(self.folder / name, limit, private=True)) != sha: raise RuntimeError("Owned staged artifact/helper/plan changed")
         for role, item in m["native_files"].items():
             data = read_regular(Path(item["path"]), MAX_INPUT)
@@ -394,9 +422,10 @@ class Session(base.Session):
 
     def activate(self, *, runtime_scope=False, restart_ready=False):
         if runtime_scope is not True or restart_ready is not True: raise RuntimeError("Actual scope and coordinated SteamVR restart required")
-        require_reviewed_launch_isolation()
+        if not self.folder.exists(): require_reviewed_launch_isolation()
         with self.lock():
             m = self.manifest(); self.verify_owned(m)
+            require_reviewed_launch_isolation(m)
             self.reject_old_activation({name: item["sha256"] for name, item in m["original_native_layers"].items()})
             self.revalidate_native_layers(m)
             if (self.folder / "rollback-complete.json").exists(): raise RuntimeError("Restored session cannot reactivate")
@@ -420,6 +449,7 @@ class Session(base.Session):
                     os.link(pending, path, follow_symlinks=False); pending.unlink(); directory_sync(path.parent)
                 self.event("activation_created", restart_readiness=True)
                 self.command("daemon-reload")
+                self.configure_startup_isolation(m, active=True)
                 baseline = self.health_source.baseline()
                 self.health_receipt("activation-startup-baseline.json", baseline)
                 self.command("restart", UNIT); self.command("is-active", UNIT)
@@ -461,6 +491,13 @@ class Session(base.Session):
 
     def check_startup(self, baseline, receipt):
         result = health.wait_ready(self.health_source, baseline, clock=self.health_source.clock, sleep=self.health_source.sleep)
+        if receipt.startswith("activation") and result.get("ready") is True:
+            try:
+                if result.get("isolation_verified") is not True: raise RuntimeError("Managed process isolation was not established")
+                self.verify_freeze_receipt(baseline, result)
+                result["launch_freeze_receipt_verified"] = True
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+                self.deny_startup_result(result, "Cold-freeze startup evidence refused: " + str(error)[:384])
         self.health_receipt(receipt, result)
         if result.get("ready") is not True or result.get("status") != "ready":
             self.recovery_event("startup_not_ready", startup_result=result.get("status"), reason=result.get("reason"),
@@ -468,10 +505,53 @@ class Session(base.Session):
             raise RuntimeError("SteamVR compositor/UI startup not ready: " + str(result.get("reason")))
         return result
 
+    @staticmethod
+    def deny_startup_result(result, reason):
+        result.update(status="fault", ready=False, reason=reason, launch_freeze_receipt_verified=False)
+        checkpoint = result.get("gate_checkpoint")
+        if isinstance(checkpoint, dict):
+            checkpoint.update(ready=False, ready_since=None, failed=reason)
+
+    def configure_startup_isolation(self, manifest, *, active):
+        if isinstance(self.health_source, health.NativeEvidenceSource):
+            self.health_source.isolation_descriptor = health.require_isolation_descriptor(manifest["launch_isolation"] if active else None)
+
+    def verify_freeze_receipt(self, baseline, result):
+        # The header is immutable; its writer may still append later records.
+        # Require a stable owned node and bounded file, not a frozen mtime.
+        path = safe_path(self.capture)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            node = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_nlink)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or
+                    stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1 or not 0 < before.st_size <= 65536):
+                raise RuntimeError("Private bounded raw startup file required")
+            raw = stream.read(8193)
+            after, current = os.fstat(stream.fileno()), path.lstat()
+            if (node(before) != node(after) or node(before) != node(current) or
+                    after.st_size < len(raw) or after.st_size < before.st_size or after.st_size > 65536 or current.st_size > 65536):
+                raise RuntimeError("Raw startup node changed or truncated")
+        first = raw.split(b"\n", 1)[0]
+        if len(first) > 8192 or b"\n" not in raw: raise RuntimeError("Bounded complete raw startup header required")
+        header = json.loads(first)
+        if not isinstance(header, dict): raise RuntimeError("Raw startup header must be an object")
+        pid = result["process_identities"]["compositor"]["pid"]
+        if (header.get("schema") != 1 or header.get("capture") != "compositor_raw_import" or
+                type(header.get("pid")) is not int or header["pid"] != pid or
+                header.get("launch_environment_frozen") is not True or
+                any(type(header.get(key)) is not int for key in ("launch_freeze_abi", "launch_provider_mask", "launch_frozen_owner_pid")) or
+                header.get("launch_freeze_abi") != 1 or header.get("launch_provider_mask") != 63 or header.get("launch_frozen_owner_pid") != pid or
+                type(header.get("launch_frozen_observed_ns")) is not int or
+                not 0 < header["launch_frozen_observed_ns"] < 2**64 or
+                not baseline["monotonic"] * 1000000000 < header["launch_frozen_observed_ns"] <= self.health_source.clock() * 1000000000):
+            raise RuntimeError("Fresh current-compositor cold-freeze receipt required")
+
     def monitor_startup(self, *, seconds=10.0):
         with self.lock():
             m = self.manifest(); self.verify_owned(m)
             active = self.dropin.exists() or self.layer.exists()
+            self.configure_startup_isolation(m, active=active)
             if active: self.active_environment(m, post_restart=True)
             else:
                 if not self.completed_restoration(): raise RuntimeError("Completed startup/restoration required before monitoring")
@@ -482,10 +562,16 @@ class Session(base.Session):
             if previous.exists():
                 observed = json.loads(read_regular(previous, 262144, private=True))
                 if observed.get("startup_receipt") == name: saved = observed
+            if saved.get("status") != "ready" or saved.get("ready") is not True:
+                raise RuntimeError("A failed startup receipt cannot authorize monitoring")
+            if active and (saved.get("isolation_verified") is not True or saved.get("launch_freeze_receipt_verified") is not True):
+                raise RuntimeError("Verified cold-freeze isolation required before monitoring")
             gate = health.StartupGate.resume(saved["gate_checkpoint"])
             self.health_source.resume(saved["source_checkpoint"])
+            if active: self.verify_freeze_receipt(gate.baseline, saved)
             result = health.monitor(self.health_source, gate, seconds=seconds, clock=self.health_source.clock, sleep=self.health_source.sleep)
             result["startup_receipt"] = name
+            result["launch_freeze_receipt_verified"] = active
             self.health_receipt("startup-monitor.json", result)
             if result.get("ready") is not True:
                 self.recovery_event("startup_monitor_not_ready", reason=result.get("reason"), automatic_restart=False)
@@ -494,7 +580,6 @@ class Session(base.Session):
 
     def start(self, *args, runtime_scope=False, restart_ready=False, **kwargs):
         if runtime_scope is not True or restart_ready is not True: raise RuntimeError("Scope and coordinated restart required")
-        require_reviewed_launch_isolation()
         self.stage(*args, runtime_scope=True, **kwargs)
         self.activate(runtime_scope=True, restart_ready=True)
 
@@ -566,6 +651,7 @@ class Session(base.Session):
             # Changed native manifests are preserved, never repaired here.
             # They still prevent a successful restoration claim below.
             self.command("daemon-reload")
+            self.configure_startup_isolation(m, active=False)
             try:
                 baseline = self.health_source.baseline()
                 self.health_receipt("restoration-startup-baseline.json", baseline)
@@ -649,7 +735,7 @@ class Session(base.Session):
                     if len(maps) > 8192: raise RuntimeError("Process mapping bound exceeded")
                     for row in maps:
                         columns = row.split(None, 5)
-                        if len(columns) == 6 and (columns[5].removesuffix(" (deleted)") in (str(self.library), str(self.audit)) or
+                        if len(columns) == 6 and (columns[5].removesuffix(" (deleted)") in (str(self.library), str(self.audit), str(self.selector)) or
                             columns[5].startswith(str(self.folder) + "/")):
                             raise RuntimeError("Diagnostic mapping remains in an owned process")
                     if identity() != original:
@@ -694,7 +780,7 @@ def main(argv=None):
     p.add_argument("mode", choices=("stage", "readcheck", "activate", "start", "rollback", "verify-unloaded", "monitor-startup"))
     p.add_argument("--reviewed-plan", type=Path); p.add_argument("--reviewed-plan-sha256")
     for role in NATIVE: p.add_argument("--native-" + role, type=Path)
-    for artifact in ("observer", "audit", "envelope", "layer"): p.add_argument("--" + artifact, type=Path)
+    for artifact in ("observer", "audit", "selector", "envelope", "layer"): p.add_argument("--" + artifact, type=Path)
     p.add_argument("--reviewed-session-helper-sha256"); p.add_argument("--reviewed-receiver-helper-sha256")
     p.add_argument("--reviewed-startup-health-helper-sha256"); p.add_argument("--monitor-seconds", type=float, default=10.0)
     p.add_argument("--reviewed-environment-file", action="append", default=[], metavar="PATH=SHA256")
@@ -710,7 +796,7 @@ def main(argv=None):
         session = Session(Path.home(), runtime)
         if a.mode in ("stage", "start"):
             native = {role: getattr(a, "native_" + role) for role in NATIVE}
-            if any(v is None for v in (*native.values(), a.reviewed_plan, a.reviewed_plan_sha256, a.observer, a.audit, a.envelope, a.layer)):
+            if any(v is None for v in (*native.values(), a.reviewed_plan, a.reviewed_plan_sha256, a.observer, a.audit, a.selector, a.envelope, a.layer)):
                 raise RuntimeError("Reviewed plan and every fresh native/own artifact path required")
             reviewed = dict(entry.rsplit("=", 1) for entry in a.reviewed_environment_file)
             if len(reviewed) != len(a.reviewed_environment_file): raise RuntimeError("Duplicate reviewed environment file")
@@ -721,7 +807,7 @@ def main(argv=None):
                 "reviewed_environment_files": reviewed, "reviewed_native_layers": layers}
             if a.mode == "start": kwargs["restart_ready"] = a.ack_steamvr_restart_readiness
             getattr(session, a.mode)(a.reviewed_plan, a.reviewed_plan_sha256, native,
-                {MAIN: a.observer, AUDIT: a.audit, ENVELOPE: a.envelope, LAYER: a.layer}, **kwargs)
+                {MAIN: a.observer, AUDIT: a.audit, SELECTOR: a.selector, ENVELOPE: a.envelope, LAYER: a.layer}, **kwargs)
         elif a.mode == "activate": session.activate(runtime_scope=a.ack_compositor_raw_diagnostic_scope,
             restart_ready=a.ack_steamvr_restart_readiness)
         elif a.mode == "rollback": session.rollback(restart_ready=a.ack_steamvr_restart_readiness)

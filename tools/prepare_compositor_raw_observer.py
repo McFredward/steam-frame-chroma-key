@@ -25,6 +25,13 @@ from run_import_native_forwarding import recorded_run
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = 'libVkLayer_frame_mask_trace.so'
 AUDIT = 'libframe_compositor_raw_audit.so'
+SELECTOR = 'libframe_compositor_launch_selector.so'
+SELECTOR_SOURCE = 'launch-configuration.c'
+SELECTOR_SCOPE = 'frame_compositor_launch_scope'
+FREEZE_IMPORTS = ('frame_compositor_launch_freeze_environment_v1',
+                  'frame_compositor_launch_frozen_status_v1', 'frame_compositor_launch_provider_mask')
+SELECTOR_EXPORTS = {'execve', 'execv', 'execvp', 'execvpe', 'posix_spawn', 'posix_spawnp',
+                    'getenv', 'secure_getenv', *FREEZE_IMPORTS}
 ENVELOPE = 'compositor-raw-envelope.bin'
 MANIFEST = 'VkLayer_FRAME_compositor_raw.json'
 PLAN = 'deployment-plan.json'
@@ -137,6 +144,11 @@ def validate_observer(data, reviewed_sha, provider_exports):
     if actual_entries != set(ENTRIES) or len(set(entries.values())) != len(ENTRIES):
         raise ValueError('Combined DSO requires exactly eleven distinct reviewed hidden veneers')
     imports = elf.imports()
+    if not set(FREEZE_IMPORTS) <= imports or any(not any(s['dynamic'] and not s['defined'] and
+            s['name'] == name and s['binding'] == 2 and s['visibility'] == 0 and s['type'] in (0, 2) and
+            s['rva'] == 0 and s['size'] == 0 and not s['version']
+            for s in elf.symbols) for name in FREEZE_IMPORTS):
+        raise ValueError('Combined observer lacks the exact weak cold-freeze handshake imports')
     required = (*ALIAS_IMPORTS, *BOOTSTRAP_IMPORTS)
     if not set(required) <= imports:
         raise ValueError('Combined DSO lacks reviewed aliases/bootstrap public providers')
@@ -164,7 +176,8 @@ def validate_observer(data, reviewed_sha, provider_exports):
                  'public_exports': sorted(exports), 'vulkan_functions': dict(VULKAN_FUNCTIONS),
                  'standard_vulkan_exports': [], 'required_aliases': list(ALIAS_IMPORTS),
                  'bootstrap_imports': list(BOOTSTRAP_IMPORTS), 'versioned_glibc_imports': sorted(versioned),
-                 'static_tls_bytes': sum(tls), 'raw_only': True, 'native_namespace_associated': False,
+                 'static_tls_bytes': sum(tls), 'cold_environment_freeze_abi': 1,
+                 'launch_provider_mask': 63, 'raw_only': True, 'native_namespace_associated': False,
                  'source_frame_associated': False, 'gpu_consumed': False}
 
 
@@ -266,8 +279,61 @@ def validate_native_providers(libc):
             raise ValueError('Pinned native public/alias provider shape changed ' + name)
 
 
+def launch_config(frame, target='/opt/steamvr/bin/linuxarm64/vrcompositor'):
+    path = PurePosixPath(target)
+    if str(path) != target or not path.is_absolute() or '..' in path.parts or path.name != 'vrcompositor' or not re.fullmatch(r'[A-Za-z0-9_./-]+', target):
+        raise ValueError('Exact normalized compositor launch pathname required')
+    return {'target': target, 'selector': str(frame / SELECTOR), 'payload': str(frame / MAIN),
+            'audit': str(frame / AUDIT), 'envelope': str(frame / ENVELOPE),
+            'output': str(frame / 'compositor-raw.jsonl'), 'journal': str(frame / 'compositor-journal.jsonl')}
+
+
+def launch_environment(config):
+    return {'LD_PRELOAD': config['selector'] + ':' + config['payload'], 'LD_AUDIT': config['audit'],
+            'GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE': config['envelope'],
+            'GHVR_FRAME_COMPOSITOR_RAW_OUTPUT': config['output'], 'FRAME_MASK_TRACE': '1',
+            'FRAME_MASK_TRACE_BINDINGS': '1', 'FRAME_MASK_TRACE_OUTPUT': config['journal']}
+
+
+def launch_marker(config):
+    canonical = json.dumps(config, sort_keys=True, separators=(',', ':')).encode()
+    return b'FCMLAU01' + struct.pack('<II', 1, 63) + digest(canonical)
+
+
+def launch_source(config):
+    values = ','.join(json.dumps(config[key]) for key in ('target', 'selector', 'payload', 'audit', 'envelope', 'output', 'journal'))
+    marker = ','.join(str(v) for v in launch_marker(config))
+    return ('#include "receiver/compositor_launch_selector.h"\n'
+            'static const struct frame_launch_config config = {1,' + values + '};\n'
+            'const struct frame_launch_config *frame_compositor_launch_config_v1(void) { return &config; }\n'
+            '__attribute__((visibility("hidden"),used)) const unsigned char ' + SELECTOR_SCOPE + '[48] = {' + marker + '};\n')
+
+
+def validate_selector(data, config, provider_exports):
+    elf = Elf(data)
+    if {s['name'] for s in elf.exported()} != SELECTOR_EXPORTS:
+        raise ValueError('Launch selector public ABI differs from reviewed freeze/getenv/exec surface')
+    if any(p[0] == 7 for p in elf.phdrs) or any(name not in ('libc.so.6', 'ld-linux-aarch64.so.1') for name in elf.needed):
+        raise ValueError('Launch selector must have no TLS or C++/foreign dependency')
+    imports = elf.imports()
+    if any(item.split('@')[0] in ('malloc', 'calloc', 'realloc', '__tls_get_addr', 'pthread_create') for item in imports):
+        raise ValueError('Launch selector may not allocate, resolve TLS or start threads')
+    if not {item for item in imports if '@GLIBC_' in item} <= provider_exports:
+        raise ValueError('Pinned native providers cannot supply the selector ABI')
+    rva = hidden_object(elf, SELECTOR_SCOPE, 48)
+    segments = [p for p in elf.phdrs if p[0] == 1 and p[1] == 4 and p[3] <= rva and rva + 48 <= p[3] + p[5]]
+    if len(segments) != 1: raise ValueError('Selector configuration marker requires exact read-only storage')
+    segment = segments[0]; offset = segment[2] + rva - segment[3]
+    if data[offset:offset + 48] != launch_marker(config): raise ValueError('Compiled selector configuration differs from reviewed launch paths')
+    return {'sha256': digest(data).hex(), 'bytes': len(data), 'public_exports': sorted(SELECTOR_EXPORTS),
+            'configuration': config, 'configuration_marker_sha256': digest(launch_marker(config)).hex(),
+            'cold_environment_freeze_abi': 1, 'launch_provider_mask': 63, 'module_tls_bytes': 0,
+            'standard_vulkan_exports': [], 'runtime_loaded_verified': False}
+
+
 def prepare(native_directory, observer, reviewed_sha256, output, observer_remote_path,
-            compiler='aarch64-linux-gnu-g++', home='/home/steamos'):
+            compiler='aarch64-linux-gnu-g++', home='/home/steamos', *, selector_compiler='aarch64-linux-gnu-gcc',
+            compositor_remote_path='/opt/steamvr/bin/linuxarm64/vrcompositor'):
     frame_observer = remote_observer(observer_remote_path, home)
     frame = frame_observer.parent
     native_directory, observer, output = Path(native_directory), Path(observer), Path(output)
@@ -297,6 +363,11 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
     logs = {}
     audit_source_files = (ROOT / 'import/compositor_startup_audit.cpp', ROOT / 'import/compositor_startup_audit.h')
     audited_source_hashes = {str(path.relative_to(ROOT)): digest(frozen_read(path)).hex() for path in audit_source_files}
+    configuration = launch_config(frame, compositor_remote_path)
+    selector_source = launch_source(configuration)
+    selector_source_files = tuple(ROOT / name for name in ('receiver/compositor_launch_selector.c',
+        'receiver/compositor_launch_selector.h', 'receiver/compositor_launch_selector.map'))
+    selector_source_hashes = {str(path.relative_to(ROOT)): digest(frozen_read(path)).hex() for path in selector_source_files}
     with tempfile.TemporaryDirectory(prefix='frame-compositor-raw-packaging-') as temporary:
         folder = Path(temporary); folder.chmod(0o700)
         source_path, target = folder / 'audit-preparation.cpp', folder / AUDIT
@@ -313,16 +384,33 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
         if any(digest(frozen_read(path)).hex() != audited_source_hashes[str(path.relative_to(ROOT))] for path in audit_source_files):
             raise ValueError('Own selective audit source changed while building the reviewed bundle')
         audit_report['source_sha256'] = audited_source_hashes
-    artifacts = {MAIN: own, AUDIT: audit_data, ENVELOPE: envelope, MANIFEST: manifest, 'audit-preparation.cpp': source.encode()}
+        config_source = folder / SELECTOR_SOURCE; config_source.write_text(selector_source)
+        selector_target = folder / SELECTOR
+        selector_command = shlex.split(selector_compiler) + ['-std=c11', '-O2', '-shared', '-fPIC', '-fvisibility=hidden',
+            '-Wl,-z,now', '-Wl,-z,separate-code', '-Wl,--build-id', '-Wl,--no-undefined', '-Wl,--version-script=' + str(ROOT / 'receiver/compositor_launch_selector.map'),
+            '-I', str(ROOT), str(ROOT / 'receiver/compositor_launch_selector.c'), str(config_source), '-ldl', '-o', str(selector_target)]
+        if not shlex.split(selector_compiler): raise ValueError('Explicit selector C compiler required')
+        built_selector = recorded_run(selector_command, folder, logs, 'selector_compile', 60, environment)
+        if built_selector.returncode: raise ValueError('Own selector compilation failed: ' + json.dumps(logs['selector_compile']))
+        selector_data = frozen_read(selector_target, common.MAX_AUDIT)
+        selector_report = validate_selector(selector_data, configuration, provider_exports)
+        if any(digest(frozen_read(path)).hex() != selector_source_hashes[str(path.relative_to(ROOT))] for path in selector_source_files):
+            raise ValueError('Own launch selector source changed during packaging')
+        selector_report['source_sha256'] = selector_source_hashes
+    artifacts = {MAIN: own, AUDIT: audit_data, SELECTOR: selector_data, ENVELOPE: envelope, MANIFEST: manifest,
+                 'audit-preparation.cpp': source.encode(), SELECTOR_SOURCE: selector_source.encode()}
     inventory = [{'name': name, 'bytes': len(value), 'sha256': digest(value).hex(),
-                  'frame_path': str(frame / name) if name != 'audit-preparation.cpp' else None,
+                  'frame_path': None if name in ('audit-preparation.cpp', SELECTOR_SOURCE) else str(frame / name),
                   'owned_source': True, 'native_bytes': False, 'mode': '0600'} for name, value in artifacts.items()]
-    plan = {'schema': 'frame-compositor-raw-offline-bundle-v1', 'prepared': True, 'installed': False, 'activated': False,
+    plan = {'schema': 'frame-compositor-raw-offline-bundle-v2', 'prepared': True, 'installed': False, 'activated': False,
             'runtime_authorized': False, 'frame_access': False, 'network_access': False, 'automatic_restart': False,
             'native_binary_or_script_changes': False, 'shader_or_mask_activation': False, 'source_frame_associated': False,
             'gpu_coherent': False, 'continuous_connection_owned': False, 'native_namespace_associated': False,
             'frame_directory': str(frame), 'frame_user_home': home, 'directory_mode': '0700',
-            'observer': observer_report, 'audit': audit_report,
+            'observer': observer_report, 'audit': audit_report, 'selector': selector_report,
+            'launch_isolation': {'schema': 'frame-compositor-startup-isolation-v1', 'target_exe': configuration['target'],
+                'selector_path': configuration['selector'], 'payload_path': configuration['payload'],
+                'audit_path': configuration['audit'], 'target_exec_environment': launch_environment(configuration)},
             'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 1,
                          'reviewed_observer_profile_identity': reviewed.hex(), 'module_count': 4, 'module_roles': list(ROLES)},
             'manifest': {'name': MANIFEST, 'bytes': len(manifest), 'sha256': digest(manifest).hex(), 'layer_name': LAYER,
@@ -333,16 +421,14 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
             'native_slots': {'compositor': {'exact_loader_name': '', 'rx_rva_begin': native_elf[7].rx()[0], 'rx_rva_end': native_elf[7].rx()[1]},
                              'libc': {'exact_loader_name': LIBC_NAME, 'rx_rva_begin': native_elf[3].rx()[0], 'rx_rva_end': native_elf[3].rx()[1]}},
             'raw_limits': dict(RAW_LIMITS), 'capture_limits': dict(CAPTURE_LIMITS), 'journal_limits': dict(JOURNAL_LIMITS),
-            'environment': {'LD_PRELOAD': str(frame_observer), 'LD_AUDIT': str(frame / AUDIT),
-                            'GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE': str(frame / ENVELOPE),
-                            'GHVR_FRAME_COMPOSITOR_RAW_OUTPUT': str(frame / 'compositor-raw.jsonl'),
-                            'FRAME_MASK_TRACE': '1', 'FRAME_MASK_TRACE_BINDINGS': '1',
-                            'FRAME_MASK_TRACE_OUTPUT': str(frame / 'compositor-journal.jsonl')},
+            'environment': {'LD_PRELOAD': configuration['selector']},
             'inventory': inventory, 'audit_source_sha256': digest(source.encode()).hex(), 'audit_compile_command': command, 'logs': logs,
             'local_receipt': {'name': PLAN, 'mode': '0600', 'frame_path': None},
             'scope': ['one current-thread native compositor import, at most 709 precisely listed scalar/reply metadata bytes',
                       'original public libc forwarding and public Vulkan image/bind/view results; no GPU pixel readback',
                       'same combined DSO for preload, three hidden Vulkan entries and the implicit Vulkan layer',
+                      'tiny C launch selector in service descendants; full observer/audit only in the exact compositor target',
+                      'cold single-threaded diagnostic environment freeze; internal system/popen children inherit clean actual environ',
                       'own cold-ready forwarding before actual la_preinit; native private reads remain unarmed until actual admission',
                       'local raw facts, not an immutable socket lease, native cross-endpoint namespace, video frame, eye, UV or GPU proof'],
             'before_activation': ['Independent final source/artifact/plan review', 'Fresh exact native Frame hashes and public loader names',
@@ -367,11 +453,14 @@ def main():
     parser.add_argument('--native-directory', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--compiler', default='aarch64-linux-gnu-g++')
+    parser.add_argument('--selector-compiler', default='aarch64-linux-gnu-gcc')
+    parser.add_argument('--compositor-remote-path', default='/opt/steamvr/bin/linuxarm64/vrcompositor')
     parser.add_argument('--frame-user-home', default='/home/steamos')
     args = parser.parse_args()
     try:
         plan = prepare(args.native_directory, args.observer, args.observer_sha256, args.output,
-                       args.observer_remote_path, args.compiler, args.frame_user_home)
+                       args.observer_remote_path, args.compiler, args.frame_user_home,
+                       selector_compiler=args.selector_compiler, compositor_remote_path=args.compositor_remote_path)
     except (OSError, ValueError, struct.error) as error:
         parser.exit(1, 'Offline compositor bundle refused: ' + str(error) + '\n')
     print(json.dumps({'prepared': True, 'installed': False, 'runtime_authorized': False,

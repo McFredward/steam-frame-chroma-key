@@ -27,11 +27,13 @@ graph. Increasing global loader/TLS reserves is not the chosen workaround.
 
 ## Implemented protection
 
-`tools/compositor_raw_session.py` refuses `activate` and `start` before publishing
-activation files or running service commands. The known-unsafe deployment
-cannot be re-enabled by an acknowledgment flag or environment setting. Offline
-bundles and inert staging are not runtime authorization. The old artifacts are
-marked not for deployment in their private evidence directories.
+At checkpoint `7db6569`, `tools/compositor_raw_session.py` refused all activation
+until the launch boundary was repaired. The known-unsafe version-1 deployment
+remains rejected. Version-2 bundles now require the reviewed cold-freeze selector,
+exact launch configuration and actual startup-isolation evidence described below.
+An acknowledgment flag or old artifact cannot bypass this package contract.
+Offline bundles and inert staging are not runtime authorization. Old artifacts
+remain marked not for deployment in their private evidence directories.
 
 `tools/compositor_startup_health.py` collects bounded read-only evidence outside
 graphics hooks. A restart is bracketed by its previous service invocation,
@@ -65,7 +67,7 @@ separately. The new CTest health registration was checked without repeating that
 whole suite. Previous raw runtime/writer and final ARM ABI results remain
 inherited evidence, not a new complete-gate or hardware pass.
 
-## Launch selector prototype and remaining requirement
+## Initial prototype and its isolation gap
 
 The C-only `receiver/compositor_launch_selector.c` prototype has no module TLS
 or C++ dependencies and uses reviewed public libc exec/spawn providers. Its
@@ -89,6 +91,59 @@ Vulkan layer's delayed activation and validate actual helper environments and
 mappings. A passing public-exec fixture alone cannot authorize it. Any changed
 hardware package and restart scope must be reviewed before asking the maintainer
 to reconnect; local package work must be finished before that coordination.
+
+## Cold-freeze replacement (2026-10-14)
+
+The selector now freezes the five exact diagnostic getter values before the
+observer reads configuration or creates either writer. It proves the exact
+executable, main PID/TID, ordinary credentials, `AT_SECURE=0`, a single-task
+phase before and after provider resolution, and restores the original signal
+mask. It then publishes a clean actual `environ` once, preserving unrelated
+entries and only the tiny selector preload. Native libc `system`/`popen` launches
+therefore inherit no full payload, audit or trace activation.
+
+`getenv` and `secure_getenv` retain the frozen diagnostic view only in that exact
+owner PID, so delayed Capture and implicit Vulkan-layer initialization still
+work. Fork children receive no virtual diagnostic values. Foreign getters and
+launches preserve native results and `errno`; secure-execution restrictions are
+not bypassed. The selector has no module TLS or C++ dependency. Kernel metadata
+reads/provider discovery occur only during the explicit cold handshake, not in
+getters, launch wrappers or rendering callbacks. The Vulkan loader uses secure
+environment queries; see the
+[Khronos loader architecture](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderInterfaceArchitecture.md).
+
+`/proc/PID/environ` describes the initial exec environment, not the changed libc
+pointer. Original stack strings are deliberately preserved. The startup probe
+therefore permits exactly the declared seven initial inputs in the one target;
+it separately requires a fresh current-PID raw header proving successful freeze
+(ABI 1, provider mask 63). Header time is only a startup-freshness check, never
+video-frame/eye association. Appending later records cannot invalidate that
+immutable header, but changing its owned node or exceeding its bounds does.
+
+The authoritative service-cgroup census checks every managed executable's
+UID/PID/start/parent/executable/cgroup brackets, initial environment and mapped
+diagnostic libraries. Non-target processes must have no full payload/audit/trace;
+unreadability, changing census or ambiguous fork copies cannot establish
+isolation. A current contamination is a fault. The probe retains cumulative
+64-MiB metadata, 64-sample and 4096-process-check bounds across checkpoints.
+Restoration disables this diagnostic-expectation probe and requires original UI
+readiness instead. A failed top-level startup receipt and its failed gate cannot
+be resumed as ready; active monitoring revalidates the frozen header.
+
+Cold denial stays fail-closed. When single-thread admission itself is unavailable,
+the selector cannot safely change a live target environment. No observer thread
+or success header starts; readiness is refused and coordinated recovery is
+required. This is a controlled diagnostic launch contract, not a sandbox against
+an arbitrary raw exec syscall with a separately saved dirty `envp`.
+
+Local evidence includes 19 real libc/loader/process controls (actual internal
+`system`/`popen`, fork and constructor order), 48 core checks with sanitizers,
+59 startup-health checks, the actual ARM64 bundle/profile validation, and inert
+final-ARM forwarding/forced-unwind controls with the pinned native providers.
+A real late Vulkan/Mesa loader run activates the actual passive layer after
+freeze, including image/bind/view and query-pool lifetimes. These results do not
+prove an ARM-kernel cold phase, clean Frame processes or a headset picture.
+New hardware package/scope approval is still required before deployment.
 
 The separate raw `InvalidEntry` retirement and missing source frame/eye/UV/GPU
 associations are still described in

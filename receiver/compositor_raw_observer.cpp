@@ -285,7 +285,7 @@ __attribute__((constructor)) void start() noexcept {
     }
     Line header;header.add("{\"schema\":1,\"capture\":\"compositor_raw_import\",\"pid\":%ld,\"observer_profile\":\"",long(owner_pid));
     header.hex(observer_identity);
-    header.add("\",\"launch_environment_frozen\":true,\"launch_freeze_abi\":%u,\"launch_provider_mask\":%u,\"launch_frozen_owner_pid\":%ld",LaunchFreezeAbi,LaunchProviderMask,long(owner_pid));
+    header.add("\",\"launch_environment_frozen\":true,\"launch_freeze_abi\":%u,\"launch_provider_mask\":%u,\"launch_frozen_owner_pid\":%ld,\"launch_frozen_observed_ns\":%llu",LaunchFreezeAbi,LaunchProviderMask,long(owner_pid),u(now()));
     header.add(",\"modules\":[");unsigned module=0;
     for(const auto& image:prepared.images()) {
         header.add("%s{\"role\":%u,\"file_sha256\":\"",module++?",":"",unsigned(image.role));header.hex(image.expected_file_identity);

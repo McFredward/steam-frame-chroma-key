@@ -242,8 +242,8 @@ if(BUILD_TESTING)
         add_test(NAME compositor_ui_startup_health COMMAND ${Python3_EXECUTABLE}
             -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_compositor_startup_health.py)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
-            # Uninstalled prototype only. Public exec/spawn coverage does not
-            # admit deployment; native system/popen launches remain unsupported.
+            # Deployment additionally requires the reviewed cold-freeze package,
+            # exact native identities and actual helper isolation/UI evidence.
             enable_language(C)
             add_executable(test_compositor_launch_selector tests/test_compositor_launch_selector.c
                 receiver/compositor_launch_selector.c)

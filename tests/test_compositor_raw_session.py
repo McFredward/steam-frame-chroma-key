@@ -24,13 +24,37 @@ class ProductionLaunchGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="raw-launch-guard-") as folder:
             root = Path(folder); run = mock.Mock()
             session = M.Session(root / "home", root / "runtime", run, environment={})
-            for mode in ("activate", "start"):
+            for mode in ("activate",):
                 with self.subTest(mode=mode), self.assertRaisesRegex(RuntimeError, "activation blocked"):
                     getattr(session, mode)(runtime_scope=True, restart_ready=True)
             run.assert_not_called()
             self.assertFalse(session.folder.exists())
             self.assertFalse(session.dropin.exists())
             self.assertFalse(session.layer.exists())
+
+    def test_legacy_manifest_cannot_bypass_the_freeze_package_guard(self):
+        for manifest in (None, {}, {"schema": "frame-compositor-raw-owned-session-v1"},
+                {"schema": M.SESSION_SCHEMA, "owned_files": {M.SELECTOR: "a" * 64}, "launch_freeze_abi": 1, "launch_provider_mask": 15}):
+            with self.subTest(manifest=manifest), self.assertRaisesRegex(RuntimeError, "activation blocked"):
+                M.require_reviewed_launch_isolation(manifest)
+
+    def test_freeze_header_must_belong_to_current_start(self):
+        with tempfile.TemporaryDirectory(prefix="raw-freeze-receipt-") as folder:
+            root = Path(folder); session = M.Session(root, root / "runtime", environment={})
+            session.health_source.clock = lambda: 3.0
+            M.private_parents(session.folder)
+            header = {"schema": 1, "capture": "compositor_raw_import", "pid": 100,
+                "launch_environment_frozen": True, "launch_freeze_abi": 1, "launch_provider_mask": 63,
+                "launch_frozen_owner_pid": 100, "launch_frozen_observed_ns": 2000000000}
+            result = {"process_identities": {"compositor": {"pid": 100}}}
+            encoded = lambda value: (json.dumps(value, separators=(",", ":")) + "\n").encode()
+            M.exclusive(session.capture, encoded(header))
+            session.verify_freeze_receipt({"monotonic": 1.0}, result)
+            for field, value in (("pid", 101), ("launch_environment_frozen", False), ("launch_provider_mask", 31),
+                    ("launch_frozen_owner_pid", 101), ("launch_frozen_observed_ns", 999999999),
+                    ("launch_frozen_observed_ns", 4000000000), ("launch_frozen_observed_ns", 2**64)):
+                changed = dict(header); changed[field] = value; session.capture.write_bytes(encoded(changed))
+                with self.subTest(field=field), self.assertRaises(RuntimeError): session.verify_freeze_receipt({"monotonic": 1.0}, result)
 
 class SessionTests(unittest.TestCase):
     def setUp(self):
@@ -60,19 +84,19 @@ class SessionTests(unittest.TestCase):
             reports.append({"role": numeric, "file_sha256": M.digest(data), "profile_sha256": profile[-32:].hex()})
         for key, value in (("NATIVE", pins), ("PROFILE_PINS", tuple(p[-32:].hex() for p in profiles))):
             patch = mock.patch.object(M, key, value); patch.start(); self.patches.append(patch)
-        main, audit = self.elf(7), self.elf(8); profiles.append(self.profile(5, main))
+        main, audit, selector = self.elf(7), self.elf(8), self.elf(9); profiles.append(self.profile(5, main))
         envelope = bytearray(8272); envelope[:8] = b"FCMRAW01"
         struct.pack_into("<II", envelope, 8, 1, 8272); envelope[16:48] = profiles[-1][-32:]
         struct.pack_into("<8Q", envelope, 48, *M.ENVELOPE_LIMITS)
         envelope[112:-32] = b"".join(profiles); envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
         layer = self.layer_bytes()
-        for name, data in ((M.MAIN, main), (M.AUDIT, audit), (M.ENVELOPE, envelope), (M.LAYER, layer)):
+        for name, data in ((M.MAIN, main), (M.AUDIT, audit), (M.SELECTOR, selector), (M.ENVELOPE, envelope), (M.LAYER, layer)):
             path = self.root / name; M.exclusive(path, bytes(data)); self.artifacts[name] = path
         self.plan = {"schema": M.SCHEMA, "prepared": True, "frame_directory": str(self.session.folder),
             "frame_user_home": str(self.home), "directory_mode": "0700", "environment": self.session.activation_values(), "native_profiles": reports,
             "observer_profile": {"role": 5, "file_sha256": M.digest(main), "profile_sha256": profiles[-1][-32:].hex()},
             "observer": {"sha256": M.digest(main), "bytes": len(main), "public_exports": sorted(M.PUBLIC_EXPORTS),
-                "vulkan_functions": dict(M.VULKAN_FUNCTIONS), "standard_vulkan_exports": []},
+                "vulkan_functions": dict(M.VULKAN_FUNCTIONS), "standard_vulkan_exports": [], "cold_environment_freeze_abi": 1, "launch_provider_mask": 63},
             "audit": {"sha256": M.digest(audit), "bytes": len(audit), "native_rvas": dict(M.NATIVE_RVAS), "early_forward_only": True},
             "envelope": {"sha256": M.digest(envelope), "bytes": len(envelope), "schema": 1, "module_count": 4,
                 "module_roles": [7, 3, 4, 5], "reviewed_observer_profile_identity": profiles[-1][-32:].hex()},
@@ -80,10 +104,17 @@ class SessionTests(unittest.TestCase):
                 "functions": dict(M.VULKAN_FUNCTIONS),
                 "staged_path": str(self.session.folder / M.LAYER), "frame_path": str(self.session.layer)},
             "capture_limits": dict(M.CAPTURE_LIMITS), "raw_limits": dict(M.RAW_LIMITS), "journal_limits": dict(M.JOURNAL_LIMITS), "inventory": []}
+        self.plan["selector"] = {"sha256": M.digest(selector), "bytes": len(selector), "public_exports": sorted(M.SELECTOR_EXPORTS),
+            "cold_environment_freeze_abi": 1, "launch_provider_mask": 63, "module_tls_bytes": 0, "standard_vulkan_exports": [],
+            "configuration": {"target": str(self.native["compositor"]), "selector": str(self.session.selector), "payload": str(self.session.library),
+                "audit": str(self.session.audit), "envelope": str(self.session.envelope), "output": str(self.session.capture), "journal": str(self.session.journal)}}
+        self.plan["launch_isolation"] = {"schema": M.health.ISOLATION_SCHEMA, "target_exe": str(self.native["compositor"]),
+            "selector_path": str(self.session.selector), "payload_path": str(self.session.library), "audit_path": str(self.session.audit),
+            "target_exec_environment": self.session.target_environment()}
         for flag in ("installed", "activated", "runtime_authorized", "frame_access", "network_access",
             "native_binary_or_script_changes", "shader_or_mask_activation", "source_frame_associated", "gpu_coherent", "automatic_restart", "continuous_connection_owned", "native_namespace_associated"):
             self.plan[flag] = False
-        for name in (*self.artifacts, "audit-preparation.cpp"):
+        for name in (*self.artifacts, "audit-preparation.cpp", "launch-configuration.c"):
             data = self.artifacts[name].read_bytes() if name in self.artifacts else b"offline source"
             self.plan["inventory"].append({"name": name, "bytes": len(data), "sha256": M.digest(data), "frame_path":
                 str(self.session.folder / name) if name in self.artifacts else None, "owned_source": True, "native_bytes": False, "mode": "0600"})
@@ -91,9 +122,11 @@ class SessionTests(unittest.TestCase):
         self.helpers = {name: M.digest(Path(module.__file__).read_bytes()) for module, name in
                         ((M, M.HELPERS[0]), (M.base, M.HELPERS[1]), (M.health, M.HELPERS[2]))}
         self.ready_result = {"schema": M.health.SCHEMA, "status": "ready", "ready": True,
-            "screen_pixels_verified": False, "automatic_restart": False, "fixture_health": True}
+            "screen_pixels_verified": False, "automatic_restart": False, "fixture_health": True, "isolation_verified": True}
         patch = mock.patch.object(M.health, "wait_ready", return_value=self.ready_result)
         self.wait_ready = patch.start(); self.patches.append(patch)
+        patch = mock.patch.object(self.session, "verify_freeze_receipt", return_value=None)
+        patch.start(); self.patches.append(patch)
 
     @staticmethod
     def elf(value): return b"\x7fELF\x02\x01\x01" + b"\0" * 9 + b"\x03\0\xb7\0" + bytes([value]) * 44
@@ -135,7 +168,7 @@ class SessionTests(unittest.TestCase):
     def restart_count(self): return sum("restart" in call for call in self.calls)
     def alter_artifact(self, name, raw):
         self.artifacts[name].unlink(); M.exclusive(self.artifacts[name], raw)
-        report = {M.MAIN: "observer", M.AUDIT: "audit", M.ENVELOPE: "envelope", M.LAYER: "manifest"}[name]
+        report = {M.MAIN: "observer", M.AUDIT: "audit", M.SELECTOR: "selector", M.ENVELOPE: "envelope", M.LAYER: "manifest"}[name]
         self.plan[report].update(sha256=M.digest(raw), bytes=len(raw))
         next(i for i in self.plan["inventory"] if i["name"] == name).update(sha256=M.digest(raw), bytes=len(raw)); self.save_plan()
 
@@ -200,11 +233,49 @@ class SessionTests(unittest.TestCase):
         result = json.loads((self.session.folder / "startup-monitor.json").read_bytes())
         self.assertFalse(result["automatic_restart"]); self.assertEqual(result["status"], "fault")
 
+    def test_freeze_failure_invalidates_both_receipt_and_resumable_gate(self):
+        self.stage()
+        self.ready_result.update(gate_checkpoint={"ready": True, "ready_since": 1.0, "failed": None})
+        self.session.verify_freeze_receipt.side_effect = RuntimeError("missing current freeze header")
+        with self.assertRaisesRegex(RuntimeError, "startup not ready"): self.activate()
+        result = json.loads((self.session.folder / "activation-startup-health.json").read_bytes())
+        self.assertFalse(result["ready"]); self.assertFalse(result["launch_freeze_receipt_verified"])
+        self.assertFalse(result["gate_checkpoint"]["ready"])
+        self.assertIn("freeze header", result["gate_checkpoint"]["failed"])
+        self.assertFalse(self.session.dropin.exists()); self.assertFalse(self.session.layer.exists())
+
+    def test_monitor_cannot_resume_a_failed_outer_startup_receipt(self):
+        self.stage(); self.activate()
+        failed = dict(self.ready_result, status="fault", ready=False,
+            gate_checkpoint={"ready": True}, source_checkpoint={"fixture": True})
+        self.session.health_receipt("activation-startup-health.json", failed)
+        with mock.patch.object(M.health.StartupGate, "resume") as resume:
+            with self.assertRaisesRegex(RuntimeError, "failed startup receipt"): self.session.monitor_startup(seconds=1)
+            resume.assert_not_called()
+        self.assertEqual(self.restart_count(), 1)
+
     def test_stage_does_not_enable_or_restart(self):
         self.stage(); self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
         self.assertEqual(self.restart_count(), 0); self.assertEqual(self.session.folder.stat().st_mode & 0o777, 0o700)
         self.assertFalse(self.session.readcheck()["active"])
         self.assertTrue(self.session.manifest()["scope_acknowledged"])
+
+    def test_legacy_environment_or_unreviewed_freeze_cannot_stage(self):
+        original = copy.deepcopy(self.plan)
+        variants = (("schema", "frame-compositor-raw-offline-bundle-v1"),
+            ("environment", self.session.target_environment()),
+            ("selector", dict(self.plan["selector"], launch_provider_mask=15)),
+            ("launch_isolation", dict(self.plan["launch_isolation"], target_exe="/foreign/vrcompositor")))
+        for key, value in variants:
+            self.plan = copy.deepcopy(original); self.plan[key] = value; self.save_plan()
+            with self.subTest(key=key), self.assertRaises(RuntimeError): self.stage()
+            self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_startup_requires_runtime_isolation_in_addition_to_ui_readiness(self):
+        self.stage(); self.ready_result["isolation_verified"] = False
+        with self.assertRaisesRegex(RuntimeError, "isolation was not established"): self.activate()
+        self.assertEqual(self.restart_count(), 1)
+        self.assertFalse(self.session.dropin.exists()); self.assertFalse(self.session.layer.exists())
     def large_main(self, size):
         # The real final ARM artifact is 3,606,520 bytes. Preserve all modeled
         # reviewed profile/envelope relationships instead of widening a toy
@@ -354,7 +425,8 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.session.layer.read_bytes(), self.artifacts[M.LAYER].read_bytes())
         self.assertEqual(self.session.dropin.read_bytes(), self.session.activation())
         self.assertTrue(self.session.readcheck()["active"])
-        self.assertEqual(json.loads(self.session.layer.read_bytes())["layer"]["library_path"], self.session.activation_values()["LD_PRELOAD"])
+        self.assertEqual(json.loads(self.session.layer.read_bytes())["layer"]["library_path"], str(self.session.library))
+        self.assertEqual(self.session.activation_values(), {"LD_PRELOAD": str(self.session.selector)})
         self.assertTrue(all(call[0:2] == ("systemctl", "--user") for call in self.calls))
         self.assertTrue(all("steam.service" not in call for call in self.calls))
     def graphical_manager(self, number, *, session_paths=False):
