@@ -168,8 +168,15 @@ def json_bytes(value):
     return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
 
 
-def compare_manager(original, restored, runtime):
-    """Native restarts can replace only these two per-session file paths."""
+def compare_manager(original, restored, runtime, *, allow_graphical_session_metadata=False):
+    """Compare exact manager state with narrowly declared restart exceptions.
+
+    Receiver sessions retain the original path-only policy by default. Only an
+    explicitly opted-in compositor recovery may also accept these two native
+    graphical-session metadata values. This never modifies/restores old values.
+    """
+    if type(allow_graphical_session_metadata) is not bool:
+        raise ValueError("Graphical session comparison opt-in must be an explicit Boolean")
     changed = sorted(key for key in original.keys() | restored.keys()
                      if key not in original or key not in restored or original[key] != restored[key])
     def session_path(key, value):
@@ -177,11 +184,25 @@ def compare_manager(original, restored, runtime):
                 and os.path.normpath(value) == value and not re.search(r"[\x00-\x1f]", value)
                 and Path(value).parent == runtime and Path(value).name.startswith(SESSION_MANAGER_PATHS[key])
                 and len(Path(value).name) > len(SESSION_MANAGER_PATHS[key]))
-    permitted = all(key in SESSION_MANAGER_PATHS and key in original and key in restored
-                    and session_path(key, original[key]) and session_path(key, restored[key]) for key in changed)
+    def metadata(key, value):
+        if not isinstance(value, str): return False
+        decimal = r"(?:0|[1-9][0-9]{0,15})"
+        if key == "XDG_SESSION_ID": return re.fullmatch(decimal, value) is not None
+        if key == "XDG_SESSION_PATH":
+            return re.fullmatch(r"/org/freedesktop/DisplayManager/Session" + decimal, value) is not None
+        return False
+    path_changes = [key for key in changed if key in SESSION_MANAGER_PATHS and key in original and key in restored
+                    and session_path(key, original[key]) and session_path(key, restored[key])]
+    metadata_changes = [key for key in changed if allow_graphical_session_metadata and key in original and key in restored
+                        and metadata(key, original[key]) and metadata(key, restored[key])]
+    path_only = len(path_changes) == len(changed)
+    combined = len(path_changes) + len(metadata_changes) == len(changed)
     return {"exact_manager": original == restored,
-            "manager_matches_except_session_paths": permitted, "manager_changed_keys": changed,
-            "permitted_path_changes": changed if permitted else []}
+            "manager_matches_except_session_paths": path_only,
+            "manager_matches_except_session_metadata": combined,
+            "manager_changed_keys": changed,
+            "permitted_path_changes": path_changes if combined else [],
+            "permitted_metadata_changes": metadata_changes if combined else []}
 
 
 class Session:

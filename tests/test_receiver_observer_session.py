@@ -869,5 +869,103 @@ class SessionTests(unittest.TestCase):
             with self.assertRaises(SystemExit): M.main(["rollback", "--ack-steam-client-restart-readiness"])
 
 
+class GraphicalSessionComparisonTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime = Path("/run/user/1000")
+        self.original = {"NATIVE_ENV": "unchanged", "XDG_SESSION_ID": "3",
+            "XDG_SESSION_PATH": "/org/freedesktop/DisplayManager/Session1",
+            "GAMESCOPE_LIMITER_FILE": "/run/user/1000/gamescope-limiter-original",
+            "MANGOHUD_CONFIGFILE": "/run/user/1000/gamescope-mangoapp-original"}
+        self.current = dict(self.original)
+        self.current.update(XDG_SESSION_ID="4", XDG_SESSION_PATH="/org/freedesktop/DisplayManager/Session13",
+            GAMESCOPE_LIMITER_FILE="/run/user/1000/gamescope-limiter-current",
+            MANGOHUD_CONFIGFILE="/run/user/1000/gamescope-mangoapp-current")
+
+    def compare(self, original=None, current=None):
+        return M.compare_manager(self.original if original is None else original,
+            self.current if current is None else current, self.runtime, allow_graphical_session_metadata=True)
+
+    def test_default_receiver_policy_remains_path_only(self):
+        result = M.compare_manager(self.original, self.current, self.runtime)
+        self.assertFalse(result["manager_matches_except_session_paths"])
+        self.assertFalse(result["manager_matches_except_session_metadata"])
+        self.assertFalse(result["exact_manager"])
+        self.assertEqual(result["permitted_path_changes"], [])
+        self.assertEqual(result["permitted_metadata_changes"], [])
+
+    def test_explicit_option_accepts_only_declared_changes_with_truthful_fields(self):
+        original, current = dict(self.original), dict(self.current)
+        result = self.compare(original, current)
+        self.assertFalse(result["exact_manager"]); self.assertFalse(result["manager_matches_except_session_paths"])
+        self.assertTrue(result["manager_matches_except_session_metadata"])
+        self.assertEqual(result["permitted_path_changes"], ["GAMESCOPE_LIMITER_FILE", "MANGOHUD_CONFIGFILE"])
+        self.assertEqual(result["permitted_metadata_changes"], ["XDG_SESSION_ID", "XDG_SESSION_PATH"])
+        self.assertEqual(result["manager_changed_keys"], sorted(result["permitted_path_changes"] + result["permitted_metadata_changes"]))
+        self.assertEqual(original, self.original); self.assertEqual(current, self.current)
+        self.assertEqual(self.compare(original, current), result)
+        identity = self.compare(current, current)
+        self.assertTrue(identity["exact_manager"]); self.assertTrue(identity["manager_matches_except_session_paths"])
+        self.assertTrue(identity["manager_matches_except_session_metadata"])
+        self.assertEqual(identity["permitted_metadata_changes"], [])
+
+    def test_independent_metadata_keys_and_bounded_decimal_values(self):
+        for key in ("XDG_SESSION_ID", "XDG_SESSION_PATH"):
+            for number in ("0", "1", "9999999999999999"):
+                current = dict(self.original)
+                current[key] = number if key == "XDG_SESSION_ID" else "/org/freedesktop/DisplayManager/Session" + number
+                with self.subTest(key=key, number=number):
+                    result = self.compare(current=current)
+                    self.assertTrue(result["manager_matches_except_session_metadata"])
+                    if current[key] != self.original[key]: self.assertEqual(result["permitted_metadata_changes"], [key])
+
+    def test_additions_and_removals_never_use_metadata_exception(self):
+        for key in ("XDG_SESSION_ID", "XDG_SESSION_PATH"):
+            for side in ("original", "current"):
+                original, current = dict(self.original), dict(self.current)
+                (original if side == "original" else current).pop(key)
+                with self.subTest(key=key, side=side):
+                    result = self.compare(original, current)
+                    self.assertFalse(result["manager_matches_except_session_metadata"])
+                    self.assertEqual(result["permitted_metadata_changes"], [])
+
+    def test_malformed_changed_metadata_refused_on_both_sides(self):
+        bad = {"XDG_SESSION_ID": ("", "-1", "+3", "c3", "03", "1.5", " 3", "3\n", "3\0", "٣", "１２", "1" * 17, 3, True, None),
+            "XDG_SESSION_PATH": ("", "/org/freedesktop/DisplayManager/Session", "/org/freedesktop/DisplayManager/Session013",
+                "/org/freedesktop/DisplayManager/Session-1", "/org/freedesktop/DisplayManager/Session13/child",
+                "/org/freedesktop/DisplayManager/Session13\n", "/org/freedesktop/DisplayManager/Session13\0",
+                "/org/freedesktop/DisplayManager/Session١٣", "/org/freedesktop/DisplayManager/Session" + "1" * 17,
+                "/org/freedesktop/Other/Session13", "/run/user/1000/Session13", "relative/Session13", 13, True, None)}
+        for key, values in bad.items():
+            for value in values:
+                for side in ("original", "current"):
+                    original, current = dict(self.original), dict(self.current)
+                    (original if side == "original" else current)[key] = value
+                    with self.subTest(key=key, side=side, value=value):
+                        self.assertFalse(self.compare(original, current)["manager_matches_except_session_metadata"])
+
+    def test_all_other_environment_keys_remain_exact(self):
+        for key in ("LD_PRELOAD", "LD_AUDIT", "VK_INSTANCE_LAYERS", "FRAME_MASK_TRACE", "NATIVE_ENV", "XDG_SESSION_TYPE", "XDG_SESSION_PATH_EXTRA"):
+            original, current = dict(self.original), dict(self.current)
+            original[key] = "original"; current[key] = "changed"
+            with self.subTest(key=key):
+                result = self.compare(original, current)
+                self.assertFalse(result["manager_matches_except_session_metadata"])
+                self.assertEqual(result["permitted_metadata_changes"], [])
+
+    def test_session_file_paths_still_require_exact_runtime_parent(self):
+        for key, value in (("GAMESCOPE_LIMITER_FILE", "/tmp/gamescope-limiter-new"),
+            ("GAMESCOPE_LIMITER_FILE", "/run/user/1000/../1000/gamescope-limiter-new"),
+            ("MANGOHUD_CONFIGFILE", "/run/user/999/gamescope-mangoapp-new"),
+            ("MANGOHUD_CONFIGFILE", "/run/user/1000/sub/gamescope-mangoapp-new")):
+            current = dict(self.current); current[key] = value
+            with self.subTest(key=key, value=value):
+                self.assertFalse(self.compare(current=current)["manager_matches_except_session_metadata"])
+
+    def test_nonboolean_opt_in_refused(self):
+        for value in (1, 0, "true", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                M.compare_manager(self.original, self.current, self.runtime, allow_graphical_session_metadata=value)
+
+
 if __name__ == "__main__":
     unittest.main()
