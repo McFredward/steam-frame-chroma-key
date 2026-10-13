@@ -20,6 +20,7 @@ UNIT = "steamvr.service"
 SCHEMA = "frame-compositor-startup-health-v1"
 LIMIT = 512 * 1024
 MAX_PROCESSES = 512
+INELIGIBLE_STATES = frozenset("TtXxZ")
 PROPERTIES = ("InvocationID", "ActiveState", "SubState", "MainPID", "ControlGroup", "NRestarts", "ExecMainStartTimestampMonotonic")
 COMPOSITOR = "/opt/steamvr/bin/linuxarm64/vrcompositor"
 WEBHELPER = "/opt/steamvr/bin/vrwebhelper/linuxarm64/vrwebhelper"
@@ -45,6 +46,15 @@ def require_process(process, *, main=False):
     if not main and (process["exe"] not in (COMPOSITOR, WEBHELPER) or
                      not isinstance(process["kind"], str) or len(process["kind"]) > 64 or type(process["libcef"]) is not bool):
         raise RuntimeError("Invalid startup executable/mapping metadata")
+
+
+def require_errors(errors):
+    if (not isinstance(errors, list) or len(errors) > 16 or
+            any(not isinstance(item, dict) or set(item) != {"pid", "reason"} or
+                type(item["pid"]) is not int or not 0 < item["pid"] < 2**64 or
+                not isinstance(item["reason"], str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", item["reason"])
+                for item in errors)):
+        raise RuntimeError("Invalid startup unreadable process report")
 
 
 def require_clock(value):
@@ -130,22 +140,27 @@ class NativeEvidenceSource:
         return int(columns[19]), columns[0]
 
     def processes(self, unit):
+        # An inactive unit with no group cannot own any of these candidates.
+        # Do not accidentally treat every absolute cgroup as its descendant.
+        if not unit["ControlGroup"]: return [], []
         entries = list(self.proc.iterdir())
         if len(entries) > 8192: raise RuntimeError("Startup process directory bound exceeded")
         result, errors = [], []
         for path in entries:
             if not path.name.isdigit(): continue
+            managed = False
             try:
                 node = path.lstat()
                 # Protected kernel/system processes are unrelated and skipped
                 # before reading anything. Unreadable managed user processes
                 # remain an explicit evidence gap, never a positive result.
                 if not stat.S_ISDIR(node.st_mode) or node.st_uid != self.uid: continue
-                comm = self.proc_read(path / "comm", 256).decode("ascii").strip()
-                if comm not in ("vrcompositor", "vrwebhelper"): continue
                 groups = self.proc_read(path / "cgroup", 8192).decode("ascii").splitlines()
                 paths = [row.split(":", 2)[2] for row in groups if len(row.split(":", 2)) == 3]
                 if not any(value == unit["ControlGroup"] or value.startswith(unit["ControlGroup"] + "/") for value in paths): continue
+                managed = True
+                comm = self.proc_read(path / "comm", 256).decode("ascii").strip()
+                if comm not in ("vrcompositor", "vrwebhelper"): continue
                 start, state = self.process_identity(path)
                 mapped_exe = os.readlink(path / "exe")
                 matches = [name for name in (COMPOSITOR, WEBHELPER) if mapped_exe in (name, self.native_paths[name])]
@@ -171,6 +186,10 @@ class NativeEvidenceSource:
                 # detected below; an unclassified transient child is not ready.
                 continue
             except (OSError, RuntimeError, UnicodeError, ValueError) as error:
+                # A scope-unknown unrelated PID is not a failed managed read.
+                # Required missing roles fail the gate; a pinned PID disappearing
+                # fails monitoring independently. The known service main is kept.
+                if not managed and int(path.name) != int(unit["MainPID"]): continue
                 if len(errors) >= 16: raise RuntimeError("Startup unreadable process bound exceeded")
                 errors.append({"pid": int(path.name), "reason": type(error).__name__})
         return result, errors
@@ -227,11 +246,16 @@ class NativeEvidenceSource:
         self.pending_lines = {name: "" for name in self.logs}
         unit = self.unit(); self.journal(initial=True)
         for name in self.logs: self.log_read(name, initial=True)
-        processes, _ = self.processes(unit)
+        processes, errors = self.processes(unit)
         try: main = self.main_process(unit)
-        except (OSError, RuntimeError): main = None
+        except (OSError, RuntimeError) as error:
+            main = None
+            pid = int(unit["MainPID"])
+            if pid > 0 and not any(item["pid"] == pid for item in errors):
+                if len(errors) >= 16: raise RuntimeError("Startup unreadable process bound exceeded")
+                errors.append({"pid": pid, "reason": type(error).__name__})
         return {"schema": SCHEMA, "unit": unit, "cursor": self.cursor, "log_offsets": dict(self.offsets),
-                "processes": processes, "main_process": main, "monotonic": self.clock(), "wall_time": self.wall_clock()}
+                "processes": processes, "main_process": main, "errors": errors, "monotonic": self.clock(), "wall_time": self.wall_clock()}
 
     def sample(self):
         unit = self.unit(); processes, errors = self.processes(unit)
@@ -243,11 +267,14 @@ class NativeEvidenceSource:
                 "logs": {name: self.log_read(name) for name in self.logs}, "monotonic": self.clock()}
 
     def checkpoint(self):
-        return {"cursor": self.cursor, "log_offsets": self.offsets, "pending_lines": self.pending_lines}
+        return {"cursor": self.cursor, "log_offsets": self.offsets, "pending_lines": self.pending_lines, "total": self.total}
 
     def resume(self, checkpoint):
-        if not isinstance(checkpoint, dict) or set(checkpoint) != {"cursor", "log_offsets", "pending_lines"}:
+        if not isinstance(checkpoint, dict) or set(checkpoint) != {"cursor", "log_offsets", "pending_lines", "total"}:
             raise RuntimeError("Invalid startup source checkpoint shape")
+        if type(checkpoint["total"]) is not int or not 0 <= checkpoint["total"] <= LIMIT:
+            raise RuntimeError("Invalid cumulative startup evidence budget")
+        self.total = checkpoint["total"]
         self.cursor = checkpoint["cursor"]
         self.offsets, self.pending_lines = checkpoint["log_offsets"], checkpoint["pending_lines"]
         if (not re.fullmatch(r"[A-Za-z0-9_=;:-]{1,4096}", self.cursor or "") or
@@ -269,13 +296,14 @@ class StartupGate:
         if not isinstance(baseline["processes"], list) or len(baseline["processes"]) > MAX_PROCESSES:
             raise RuntimeError("Invalid startup baseline process count")
         for process in baseline["processes"]: require_process(process)
+        require_errors(baseline.get("errors", []))
         if baseline.get("main_process") is not None: require_process(baseline["main_process"], main=True)
         self.baseline = baseline
         self.invocation, self.unit_identity = None, None
         self.markers, self.pinned = {}, {}
         self.ready_since, self.ready = None, False
         self.last_progress, self.progress = baseline["monotonic"], 0
-        self.failed = None
+        self.failed = "Baseline managed process metadata unreadable" if baseline.get("errors") else None
 
     def result(self, status, reason=None):
         return {"schema": SCHEMA, "status": status, "ready": status == "ready", "reason": reason,
@@ -300,8 +328,7 @@ class StartupGate:
         if len({p["pid"] for p in sample["processes"]}) != len(sample["processes"]):
             raise RuntimeError("Duplicate startup process identity")
         if sample.get("main_process") is not None: require_process(sample["main_process"], main=True)
-        if not isinstance(sample["errors"], list) or len(sample["errors"]) > 16:
-            raise RuntimeError("Invalid startup unreadable process report")
+        require_errors(sample["errors"])
         if not isinstance(sample["journal"], list) or len(sample["journal"]) >= 512:
             raise RuntimeError("Invalid startup journal bound")
         if not isinstance(sample["logs"], dict) or set(sample["logs"]) - {"vrserver", "vrcompositor"} or any(not isinstance(text, str) or len(text.encode()) > 128 * 1024 for text in sample["logs"].values()):
@@ -330,15 +357,15 @@ class StartupGate:
             if int(pid) in old_pids or int(stamp) / 1000000 < self.baseline["monotonic"]: continue
             if old_pids and re.search(r"(?:Process |pid=)(?:" + "|".join(str(p) for p in old_pids) + r")(?:\D|$)", message): continue
             if FATAL.search(message): raise RuntimeError("Fresh startup failure: " + message[:384])
-        current = {p["pid"]: p for p in sample["processes"] if identity(p) not in old_ids and p["state"] not in ("Z", "X", "x")}
+        current = {p["pid"]: p for p in sample["processes"] if identity(p) not in old_ids and p["state"] not in INELIGIBLE_STATES}
         if len(current) > MAX_PROCESSES: raise RuntimeError("Startup process evidence bound exceeded")
         main = sample.get("main_process")
-        if main and main["state"] not in ("Z", "X", "x") and main["pid"] == int(unit["MainPID"]):
+        if main and main["state"] not in INELIGIBLE_STATES and main["pid"] == int(unit["MainPID"]):
             self.pinned.setdefault("service_main", {"pid": main["pid"], "start_ticks": main["start_ticks"]})
         for role, pinned in self.pinned.items():
             process = main if role == "service_main" else current.get(pinned["pid"])
 
-            if process is None or process["state"] in ("Z", "X", "x") or identity(process) != (pinned["pid"], pinned["start_ticks"]):
+            if process is None or process["state"] in INELIGIBLE_STATES or identity(process) != (pinned["pid"], pinned["start_ticks"]):
                 raise RuntimeError("Required " + role + " process exited/replaced")
         # Replaced/truncated native logs are accepted only with post-baseline
         # timestamps and exact current PID signals; .previous is never read.

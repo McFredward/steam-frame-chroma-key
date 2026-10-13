@@ -164,6 +164,26 @@ class GateTests(unittest.TestCase):
         self.assertFalse(result["ready"]); self.assertEqual(result["status"], "fault")
         self.assertEqual(gate.consume(sample(5))["status"], "fault")
 
+    def test_stopped_or_dead_required_process_is_never_ready(self):
+        for state in "TtXxZ":
+            for index in range(5):
+                s = sample()
+                target = s["main_process"] if index == 4 else s["processes"][index]
+                target["state"] = state
+                with self.subTest(state=state, initial_role=index):
+                    self.assertFalse(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
+                gate = M.StartupGate(baseline()); gate.consume(sample(), stable_seconds=0)
+                s["monotonic"] = 4
+                with self.subTest(state=state, monitored_role=index):
+                    self.assertEqual(gate.consume(s)["status"], "fault")
+
+    def test_baseline_managed_read_gap_is_retained_and_cannot_prove_ready(self):
+        b = baseline(); b["errors"] = [{"pid": 10, "reason": "PermissionError"}]
+        gate = M.StartupGate(b)
+        self.assertEqual(gate.checkpoint()["baseline"]["errors"], b["errors"])
+        result = gate.consume(sample(), stable_seconds=0)
+        self.assertEqual(result["status"], "fault"); self.assertIn("Baseline", result["reason"])
+
     def test_same_pid_old_start_identity_cannot_satisfy_new_readiness(self):
         b = baseline(); b["processes"] = copy.deepcopy(sample()["processes"])
         self.assertFalse(M.StartupGate(b).consume(sample(), stable_seconds=0)["ready"])
@@ -268,6 +288,44 @@ class NativeSourceTests(unittest.TestCase):
         p.joinpath("exe").unlink(); p.joinpath("exe").symlink_to("/unrelated/vrwebhelper")
         self.assertFalse(self.source.processes(unit())[0])
 
+    def test_cgroup_is_checked_before_unrelated_comm_and_read_errors(self):
+        unrelated = self.procfile(200, group="/not/steamvr.service")
+        managed = self.procfile(102)
+        original = self.source.proc_read
+        seen = []
+        def selective(path, limit):
+            seen.append(path)
+            if path in (unrelated / "comm", managed / "comm"): raise PermissionError("comm denied")
+            return original(path, limit)
+        with mock.patch.object(self.source, "proc_read", side_effect=selective):
+            processes, errors = self.source.processes(unit())
+        self.assertFalse(processes)
+        self.assertNotIn(unrelated / "comm", seen)
+        self.assertEqual(errors, [{"pid": 102, "reason": "PermissionError"}])
+        with mock.patch.object(self.source, "proc_read", side_effect=selective):
+            b = self.source.baseline()
+        self.assertTrue(any(item["pid"] == 102 for item in b["errors"]))
+
+    def test_scope_unknown_unrelated_read_error_is_not_managed(self):
+        p = self.procfile(200, group="/not/steamvr.service")
+        original = self.source.proc_read
+        def deny(path, limit):
+            if path == p / "cgroup": raise PermissionError("group denied")
+            return original(path, limit)
+        with mock.patch.object(self.source, "proc_read", side_effect=deny):
+            processes, errors = self.source.processes(unit())
+        self.assertFalse(processes); self.assertFalse(errors)
+        u = unit(); u["MainPID"] = "200"
+        with mock.patch.object(self.source, "proc_read", side_effect=deny):
+            _, errors = self.source.processes(u)
+        self.assertEqual(errors, [{"pid": 200, "reason": "PermissionError"}])
+
+    def test_inactive_empty_cgroup_does_not_scan_all_user_processes(self):
+        self.procfile(102)
+        u = unit(); u.update(ControlGroup="", ActiveState="inactive", MainPID="0")
+        with mock.patch.object(self.source, "proc_read", side_effect=AssertionError("unexpected proc read")):
+            self.assertEqual(self.source.processes(u), ([], []))
+
     def test_unreadable_managed_required_process_is_explicit(self):
         p = self.procfile(102)
         original = self.source.proc_read
@@ -286,6 +344,29 @@ class NativeSourceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): self.source.baseline()
         self.source.baseline(); self.journal_rows = [{"MESSAGE": "x", "__CURSOR": "s=x"}] * 512
         with self.assertRaises(RuntimeError): self.source.sample()
+    def test_empty_journal_delta_retains_actual_cursor(self):
+        self.source.baseline()
+        previous = self.source.cursor
+        self.assertEqual(self.source.journal(), [])
+        self.assertEqual(self.source.cursor, previous)
+        # No invented success for an absent cursor, even when stdout is empty.
+        with mock.patch.object(self.source, "command", return_value=""):
+            with self.assertRaises(RuntimeError): self.source.journal()
+
+    def test_checkpoint_resume_preserves_cumulative_evidence_budget(self):
+        self.source.baseline()
+        self.source.total = M.LIMIT - 1
+        checkpoint = copy.deepcopy(self.source.checkpoint())
+        resumed = M.NativeEvidenceSource(self.home, proc_root=self.proc, run=self.command)
+        resumed.resume(checkpoint)
+        self.assertEqual(resumed.total, M.LIMIT - 1)
+        with self.assertRaises(RuntimeError): resumed.journal()
+        for invalid in (-1, M.LIMIT + 1, True):
+            checkpoint["total"] = invalid
+            with self.subTest(total=invalid), self.assertRaises(RuntimeError): resumed.resume(checkpoint)
+        checkpoint.pop("total")
+        with self.assertRaises(RuntimeError): resumed.resume(checkpoint)
+
     def test_resume_rejects_malformed_offsets(self):
         self.source.baseline(); checkpoint = self.source.checkpoint()
         checkpoint["log_offsets"]["vrserver"]["offset"] = -1
