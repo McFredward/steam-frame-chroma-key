@@ -91,6 +91,29 @@ class Source:
     def checkpoint(self): return {"fixture": True}
 
 
+class JournalMessageTests(unittest.TestCase):
+    def test_all_binary_bytes_are_preserved_without_utf8_assumptions(self):
+        raw = list(range(256))
+        self.assertEqual(M.journal_message(raw).encode("latin-1"), bytes(raw))
+
+    def test_string_semantics_and_exact_message_bounds_are_preserved(self):
+        for value in ("", "\x1b[93mReady\x1b[m", "\u00e4" * M.JOURNAL_MESSAGE_LIMIT):
+            with self.subTest(value_length=len(value)):
+                self.assertEqual(M.journal_message(value), value)
+        self.assertEqual(M.journal_message([65] * M.JOURNAL_MESSAGE_LIMIT), "A" * M.JOURNAL_MESSAGE_LIMIT)
+        self.assertEqual(M.journal_message([]), "")
+        for value in ("x" * (M.JOURNAL_MESSAGE_LIMIT + 1), [65] * (M.JOURNAL_MESSAGE_LIMIT + 1)):
+            with self.subTest(type=type(value).__name__), self.assertRaises(RuntimeError):
+                M.journal_message(value)
+
+    def test_unknown_encodings_and_non_byte_array_elements_are_refused(self):
+        for value in (None, 1, True, {}, {"bytes": [65]}, (65,), b"A",
+                      ["A"], [[65]], [65, True], [65, False], [65, -1], [65, 256],
+                      [65, 1.0], [65, None], [65, {}]):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                M.journal_message(value)
+
+
 class GateTests(unittest.TestCase):
     def test_missing_actual_main_process_cannot_pass_service_active(self):
         s = sample(); s["main_process"] = None
@@ -141,6 +164,82 @@ class GateTests(unittest.TestCase):
             "_PID": "102", "__MONOTONIC_TIMESTAMP": "2000000"}]
         s["logs"]["vrserver"] += "\n" + line("[Error] - [Input] LoadActionManifest failed. Could not find action manifest for vrwebhelper_systemui")
         self.assertTrue(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
+
+    def test_actual_shaped_ansi_binary_journal_warning_is_not_a_startup_fault(self):
+        # Same systemd byte-array shape and text as the captured Frame warning.
+        message = (b'\x1b[0;93m2026-10-14 18:37:44.453260815 [W:onnxruntime:, device_discovery.cc:211 '
+            b'DiscoverDevicesForPlatform] GPU device discovery failed: device_discovery.cc:91 '
+            b'ReadFileContents Failed to open file: "/sys/class/drm/card0/device/vendor"\x1b[m')
+        s = sample(); s["journal"] = [{"MESSAGE": list(message), "_PID": "102",
+            "_SYSTEMD_INVOCATION_ID": "b" * 32, "__MONOTONIC_TIMESTAMP": "2000000"}]
+        result = M.StartupGate(baseline()).consume(s, stable_seconds=0)
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["screen_pixels_verified"])
+
+    def test_binary_journal_fatal_evidence_is_scanned_and_stays_failed(self):
+        for message in (b"./vrwebhelper: error while loading shared libraries: " + M.LIBCEF.encode() +
+                        b": cannot allocate memory in static TLS block",
+                        b"VK_ERROR_DEVICE_LOST", b"symbol lookup error", b"renderer process crashed"):
+            s = sample(); s["journal"] = [{"MESSAGE": list(b"\xff\x00\x1b[93m" + message + b"\x1b[m"),
+                "_PID": "102", "_SYSTEMD_USER_INVOCATION_ID": "b" * 32,
+                "__MONOTONIC_TIMESTAMP": "2000000"}]
+            gate = M.StartupGate(baseline())
+            with self.subTest(message=message):
+                result = gate.consume(s, stable_seconds=0)
+                self.assertEqual(result["status"], "fault")
+                self.assertIn("Fresh startup failure:", result["reason"])
+                self.assertIn(message.decode(), result["reason"])
+                self.assertEqual(gate.consume(sample(4))["status"], "fault")
+
+    def test_ansi_control_codes_cannot_hide_fatal_text_in_either_encoding(self):
+        for text in ("\x1b[93mVK_ERROR_DEVICE_LOST\x1b[m", "cannot allocate memory in \x1b[93mstatic TLS block\x1b[m"):
+            for message in (text, list(text.encode())):
+                s = sample(); s["journal"] = [{"MESSAGE": message, "_PID": "102",
+                    "__MONOTONIC_TIMESTAMP": "2000000"}]
+                with self.subTest(text=text, encoding=type(message).__name__):
+                    result = M.StartupGate(baseline()).consume(s)
+                    self.assertEqual(result["status"], "fault")
+                    self.assertEqual(result["reason"], "Fresh startup failure: " + text)
+
+    def test_malformed_or_oversize_binary_messages_are_not_ignored_or_truncated(self):
+        for message in ([65, True], [65, -1], [65, 256], [65, 1.0], [65, None],
+                        [[65]], ["cannot allocate memory in static TLS block"],
+                        [65] * M.JOURNAL_MESSAGE_LIMIT + list(b"VK_ERROR_DEVICE_LOST"),
+                        {"bytes": [65]}):
+            s = sample(); s["journal"] = [{"MESSAGE": message, "_PID": "102",
+                "_SYSTEMD_INVOCATION_ID": "b" * 32, "__MONOTONIC_TIMESTAMP": "2000000"}]
+            gate = M.StartupGate(baseline())
+            with self.subTest(type=type(message).__name__, length=len(message)):
+                result = gate.consume(s, stable_seconds=0)
+                self.assertEqual(result["status"], "fault")
+                self.assertEqual(result["reason"], "Unsupported current journal evidence")
+                self.assertEqual(gate.consume(sample(4))["status"], "fault")
+
+    def test_binary_journal_keeps_invocation_timestamp_and_old_pid_filters(self):
+        for updates in ({"_SYSTEMD_INVOCATION_ID": "a" * 32}, {"_PID": "10"},
+                        {"__MONOTONIC_TIMESTAMP": "999999"}, {"MESSAGE": list(b"Process 10 (vrcompositor) core dumped")}):
+            s = sample(); row = {"MESSAGE": list(b"segmentation fault core dumped"),
+                "_PID": "102", "__MONOTONIC_TIMESTAMP": "2000000"}; row.update(updates)
+            s["journal"] = [row]
+            with self.subTest(updates=updates):
+                self.assertTrue(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
+        s = sample(); s["journal"] = [{"MESSAGE": list(b"cannot allocate memory in static TLS block"),
+            "_PID": "10", "_SYSTEMD_INVOCATION_ID": "b" * 32, "__MONOTONIC_TIMESTAMP": "2000000"}]
+        self.assertEqual(M.StartupGate(baseline()).consume(s, stable_seconds=0)["status"], "fault")
+
+    def test_binary_journal_does_not_relax_required_metadata_or_row_bounds(self):
+        for updates in ({"_PID": [102]}, {"_PID": "102\n"}, {"__MONOTONIC_TIMESTAMP": True},
+                        {"__MONOTONIC_TIMESTAMP": "2.0"}):
+            s = sample(); row = {"MESSAGE": [65], "_PID": "102", "__MONOTONIC_TIMESTAMP": "2000000"}
+            row.update(updates); s["journal"] = [row]
+            with self.subTest(updates=updates):
+                self.assertEqual(M.StartupGate(baseline()).consume(s)["status"], "fault")
+        s = sample(); s["journal"] = [[65]]
+        self.assertEqual(M.StartupGate(baseline()).consume(s)["status"], "fault")
+        s["journal"] = [{"MESSAGE": [65], "_PID": "102", "__MONOTONIC_TIMESTAMP": "2000000"}] * 512
+        result = M.StartupGate(baseline()).consume(s)
+        self.assertEqual(result["status"], "fault")
+        self.assertEqual(result["reason"], "Invalid startup journal bound")
 
     def test_old_invocation_pid_or_pre_baseline_journal_errors_are_not_current(self):
         for updates in ({"_SYSTEMD_INVOCATION_ID": "a" * 32}, {"_PID": "10"}, {"__MONOTONIC_TIMESTAMP": "999999"}):
@@ -385,6 +484,23 @@ class NativeSourceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): self.source.baseline()
         self.source.baseline(); self.journal_rows = [{"MESSAGE": "x", "__CURSOR": "s=x"}] * 512
         with self.assertRaises(RuntimeError): self.source.sample()
+
+    def test_json_byte_arrays_keep_current_invocation_and_budget_checks(self):
+        self.source.baseline()
+        self.journal_rows = [
+            {"MESSAGE": list(b"\x1b[93mcannot allocate memory in static TLS block\x1b[m"),
+             "_PID": "10", "_SYSTEMD_USER_INVOCATION_ID": "a" * 32, "__MONOTONIC_TIMESTAMP": "2000000"},
+            {"MESSAGE": list(b"\x1b[0;93m[W:onnxruntime:] GPU device discovery failed\x1b[m"),
+             "_PID": "102", "_SYSTEMD_USER_INVOCATION_ID": "b" * 32, "__MONOTONIC_TIMESTAMP": "2000000"}]
+        s = sample(); s["journal"] = self.source.journal()
+        self.assertEqual(s["journal"], self.journal_rows)
+        self.assertTrue(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
+        self.journal_rows[1]["MESSAGE"] = list(b"\x1b[93mVK_ERROR_DEVICE_LOST\x1b[m")
+        s["journal"] = self.source.journal()
+        self.assertEqual(M.StartupGate(baseline()).consume(s)["status"], "fault")
+        self.source.total = M.LIMIT
+        with self.assertRaises(RuntimeError):
+            self.source.journal()
     def test_empty_journal_delta_retains_actual_cursor(self):
         self.source.baseline()
         previous = self.source.cursor

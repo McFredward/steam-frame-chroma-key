@@ -22,6 +22,7 @@ import time
 UNIT = "steamvr.service"
 SCHEMA = "frame-compositor-startup-health-v1"
 LIMIT = 512 * 1024
+JOURNAL_MESSAGE_LIMIT = 32768
 MAX_PROCESSES = 512
 ISOLATION_SCHEMA = "frame-compositor-startup-isolation-v1"
 ISOLATION_BYTE_LIMIT = 64 * 1024 * 1024
@@ -43,7 +44,24 @@ FATAL = re.compile(r"cannot allocate memory in static TLS block|error while load
     r"(?:FATAL|fatal error).*?(?:renderer|Vulkan|graphics|CEF)|"
     r"(?:renderer|GPU process).*?(?:crashed|crash loop|failed to start)|"
     r"(?:segmentation fault|segfault|core dumped)", re.I)
+ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 DATE = re.compile(r"^\w{3} (\w{3} +\d{1,2} \d{4} \d{2}:\d{2}:\d{2}\.\d{6}) ")
+
+
+def journal_message(value):
+    """Read systemd's string or binary-byte-array MESSAGE without dropping bytes.
+
+    journalctl encodes binary fields, including ANSI-coloured messages, as byte
+    arrays. Latin-1 maps each byte to one character, keeping both the allocation
+    bound and ASCII fatal evidence intact even when the field is not UTF-8.
+    Repeated string fields and other encodings are not admitted as a MESSAGE.
+    """
+    if isinstance(value, str) and len(value) <= JOURNAL_MESSAGE_LIMIT:
+        return value
+    if (isinstance(value, list) and len(value) <= JOURNAL_MESSAGE_LIMIT and
+            all(type(byte) is int and 0 <= byte <= 255 for byte in value)):
+        return bytes(value).decode("latin-1")
+    raise RuntimeError("Unsupported current journal evidence")
 
 
 def reviewed_absolute_path(value):
@@ -685,11 +703,13 @@ class StartupGate:
         old_pids = {p["pid"] for p in self.baseline["processes"]}
         if self.baseline.get("main_process"): old_pids.add(self.baseline["main_process"]["pid"])
         for entry in sample["journal"]:
-            message = entry.get("MESSAGE")
+            if not isinstance(entry, dict):
+                raise RuntimeError("Unsupported current journal evidence")
+            message = journal_message(entry.get("MESSAGE"))
             invocation = entry.get("_SYSTEMD_INVOCATION_ID", entry.get("_SYSTEMD_USER_INVOCATION_ID"))
             pid = entry.get("_PID", "0")
             stamp = entry.get("__MONOTONIC_TIMESTAMP")
-            if (not isinstance(message, str) or len(message) > 32768 or not isinstance(pid, str) or not re.fullmatch(r"[0-9]{1,20}", pid) or not isinstance(stamp, str) or not re.fullmatch(r"[0-9]{1,20}", stamp)):
+            if (not isinstance(pid, str) or not re.fullmatch(r"[0-9]{1,20}", pid) or not isinstance(stamp, str) or not re.fullmatch(r"[0-9]{1,20}", stamp)):
                 raise RuntimeError("Unsupported current journal evidence")
             if invocation and invocation != self.invocation: continue
             if int(stamp) / 1000000 < self.baseline["monotonic"]: continue
@@ -698,7 +718,9 @@ class StartupGate:
             if invocation != self.invocation:
                 if int(pid) in old_pids: continue
                 if old_pids and re.search(r"(?:Process |pid=)(?:" + "|".join(str(p) for p in old_pids) + r")(?:\D|$)", message): continue
-            if FATAL.search(message): raise RuntimeError("Fresh startup failure: " + message[:384])
+            # Colour/control sequences must not hide a fatal word boundary or
+            # split its text; preserve the original message in the receipt.
+            if FATAL.search(ANSI_CSI.sub("", message)): raise RuntimeError("Fresh startup failure: " + message[:384])
         current = {p["pid"]: p for p in sample["processes"] if identity(p) not in old_ids and p["state"] not in INELIGIBLE_STATES}
         if len(current) > MAX_PROCESSES: raise RuntimeError("Startup process evidence bound exceeded")
         main = sample.get("main_process")
