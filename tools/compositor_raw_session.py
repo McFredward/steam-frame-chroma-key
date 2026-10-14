@@ -71,6 +71,9 @@ ARM_CONTENTS = b"FRAME_COMPOSITOR_RAW/1\n"
 LEGACY_ARM_RECEIPT_SCHEMA = "frame-compositor-operator-arm-v1"
 ARM_RECEIPT_SCHEMA = "frame-compositor-operator-arm-v2"
 STREAM_SELECTION_PHASES = ("visible", "start-intent")
+RAW_TRACE_SAMPLING = {"intentional": True, "draw_call_limit": 32,
+    "execute_child_limit": 16, "submit_command_limit": 16,
+    "binding_snapshots_require_import_request": True, "lifecycle_survives_trace_cap": True}
 STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-startup-health.json",
     "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"})
 
@@ -309,6 +312,7 @@ class Session(base.Session):
             any(type(v) is not int for v in plan.get("journal_limits", {}).values())):
             raise RuntimeError("Exact bounded raw diagnostic limits required")
         self.validate_operator_arm(plan.get("operator_arm"))
+        self.validate_raw_trace_sampling(plan)
         inventory = plan.get("inventory")
         sources = {"audit-preparation.cpp", "launch-configuration.c"}
         names = {MAIN, AUDIT, SELECTOR, ENVELOPE, LAYER} | sources
@@ -405,6 +409,22 @@ class Session(base.Session):
         if (not isinstance(descriptor, dict) or descriptor != expected or
                 any(type(descriptor[key]) is not type(value) for key, value in expected.items())):
             raise RuntimeError("Exact protected operator-arm descriptor required")
+
+    @staticmethod
+    def validate_raw_trace_sampling(plan, journal_header=None):
+        # A v2 selection contract must not relabel the old collector that could
+        # exhaust its output before a subsequent import. Legacy visible-only
+        # plans retain their original journal contract and recovery evidence.
+        if plan["operator_arm"]["schema"] == LEGACY_ARM_RECEIPT_SCHEMA:
+            return
+        observer = plan.get("observer")
+        reports = [("observer", observer.get("raw_trace_sampling") if isinstance(observer, dict) else None)]
+        if journal_header is not None:
+            reports.append(("protected journal header", journal_header.get("raw_trace_sampling")))
+        for source, actual in reports:
+            if (not isinstance(actual, dict) or actual != RAW_TRACE_SAMPLING or
+                    any(type(actual[key]) is not type(value) for key, value in RAW_TRACE_SAMPLING.items())):
+                raise RuntimeError("Exact v2 raw trace sampling metadata required in " + source)
 
     def require_fresh_capture_paths(self):
         for path in (self.marker, self.arm_receipt, self.capture, self.journal):
@@ -540,6 +560,7 @@ class Session(base.Session):
                 plan.get("envelope", {}).get("schema") != 3):
             raise RuntimeError("Stored acquisition scope cannot authorize this artifact")
         self.validate_operator_arm(plan.get("operator_arm"))
+        self.validate_raw_trace_sampling(plan)
         observer = read_regular(self.library, MAX_INPUT, private=True)
         self.validate_scope_marker(observer, plan.get("observer", {}).get("scope_marker"))
         envelope = read_regular(self.envelope, MAX_INPUT, private=True)
@@ -781,6 +802,7 @@ class Session(base.Session):
         if any(journal[0].get(key) != value or type(journal[0].get(key)) is not type(value)
                 for key, value in expected_journal.items()):
             raise RuntimeError("Passive journal is not the reserved unarmed production capture")
+        self.validate_raw_trace_sampling(plan, journal[0])
         if len(journal) >= 2048:
             raise RuntimeError("Passive journal record budget exhausted before operator arming")
         for row in journal[1:]:

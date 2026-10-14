@@ -63,6 +63,32 @@ the native service. A damaged dynamic receipt cannot prevent removal of the
 owned activation and the coordinated original-service restart; evidence is
 preserved and its refusal reported afterward.
 
+## Reserved raw trace sampling
+
+A v2 plan also requires the observer report and actual protected journal header
+to contain the same exact typed `raw_trace_sampling` metadata:
+
+```json
+{
+  "intentional": true,
+  "draw_call_limit": 32,
+  "execute_child_limit": 16,
+  "submit_command_limit": 16,
+  "binding_snapshots_require_import_request": true,
+  "lifecycle_survives_trace_cap": true
+}
+```
+
+Missing fields, foreign caps, coerced number/boolean types and disabled lifecycle
+preservation are refused before publishing the arm marker. Stage and acquisition
+readmission check the observer report; arming additionally checks the live
+journal header. The artifact preparer authenticates this collector's owned
+sampling marker in the actual ELF. These bounded trace samples do not prove
+complete GPU coverage, video-frame association or absence of unsampled calls.
+Legacy v1 visible-only plans keep their original behavior. Sampling checks never
+prevent the authorized original-service recovery before dynamic evidence is
+validated.
+
 ## Software validation and remaining hardware work
 
 Focused session tests exercise mutually exclusive boolean acknowledgments, CLI

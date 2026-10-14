@@ -98,7 +98,8 @@ class SessionTests(unittest.TestCase):
             "observer_profile": {"role": 5, "file_sha256": M.digest(main), "profile_sha256": profiles[-1][-32:].hex()},
             "observer": {"sha256": M.digest(main), "bytes": len(main), "public_exports": sorted(M.PUBLIC_EXPORTS),
                 "scope_marker": {"symbol": "frame_compositor_raw_scope", "rva": 0x1080, "bytes": 16, "sha256": M.digest(M.SCOPE_MARKER)},
-                "vulkan_functions": dict(M.VULKAN_FUNCTIONS), "standard_vulkan_exports": [], "cold_environment_freeze_abi": 1, "launch_provider_mask": 63},
+                "vulkan_functions": dict(M.VULKAN_FUNCTIONS), "standard_vulkan_exports": [], "cold_environment_freeze_abi": 1, "launch_provider_mask": 63,
+                "raw_trace_sampling": dict(M.RAW_TRACE_SAMPLING)},
             "audit": {"sha256": M.digest(audit), "bytes": len(audit), "native_rvas": dict(M.NATIVE_RVAS), "early_forward_only": True},
             "envelope": {"sha256": M.digest(envelope), "bytes": len(envelope), "schema": 3, "module_count": 4,
                 "module_roles": [7, 3, 4, 5], "reviewed_observer_profile_identity": profiles[-1][-32:].hex()},
@@ -692,7 +693,8 @@ class OperatorArmTests(unittest.TestCase):
             "scope": "passive_pipeline_metadata", "limit_bytes": 1048576,
             "binding_metadata_version": 1, "limit_binding_snapshots": 32,
             "binding_arm_required": True, "pre_arm_draws_recorded": False,
-            "binding_ready_at_header": False, "deadline_seconds": 120}
+            "binding_ready_at_header": False, "deadline_seconds": 120,
+            "raw_trace_sampling": dict(M.RAW_TRACE_SAMPLING)}
         self.save_live_records([self.header], [self.journal_header], create=True)
         rows = []
         for index, path in enumerate((self.session.capture, self.session.journal)):
@@ -795,7 +797,10 @@ class OperatorArmTests(unittest.TestCase):
 
     def test_legacy_visible_descriptor_and_receipt_still_restore(self):
         self.plan["operator_arm"] = self.session.operator_arm_descriptor(schema=M.LEGACY_ARM_RECEIPT_SCHEMA)
+        self.plan["observer"].pop("raw_trace_sampling")
         self.save_plan(); self.live_fixture()
+        self.journal_header.pop("raw_trace_sampling")
+        self.save_live_records([self.header], [self.journal_header])
         result = self.session.arm(stream_ready=True)
         self.assertEqual(result["schema"], M.LEGACY_ARM_RECEIPT_SCHEMA)
         self.assertTrue(result["stream_ready_acknowledged"])
@@ -804,6 +809,60 @@ class OperatorArmTests(unittest.TestCase):
         self.session.rollback(restart_ready=True)
         self.assertEqual(self.restart_count(), 2)
         self.assertEqual(json.loads((self.session.folder / "archive" / self.session.arm_receipt.name).read_bytes()), result)
+
+    def test_v2_sampling_metadata_must_be_exact_before_staging(self):
+        original = copy.deepcopy(self.plan)
+        variants = (None, {}, dict(M.RAW_TRACE_SAMPLING, intentional=False),
+            dict(M.RAW_TRACE_SAMPLING, draw_call_limit=33), dict(M.RAW_TRACE_SAMPLING, draw_call_limit=32.0),
+            dict(M.RAW_TRACE_SAMPLING, execute_child_limit=17), dict(M.RAW_TRACE_SAMPLING, submit_command_limit=17),
+            dict(M.RAW_TRACE_SAMPLING, binding_snapshots_require_import_request=False),
+            dict(M.RAW_TRACE_SAMPLING, lifecycle_survives_trace_cap=False),
+            dict(M.RAW_TRACE_SAMPLING, lifecycle_survives_trace_cap=1), dict(M.RAW_TRACE_SAMPLING, foreign_cap=1))
+        for metadata in variants:
+            self.plan = copy.deepcopy(original)
+            if metadata is None: self.plan["observer"].pop("raw_trace_sampling")
+            else: self.plan["observer"]["raw_trace_sampling"] = metadata
+            self.save_plan()
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(RuntimeError, "sampling metadata.*observer"):
+                self.stage()
+            self.assertFalse(self.session.folder.exists())
+            self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+            self.assertEqual(self.restart_count(), 0)
+
+    def test_live_v2_journal_sampling_must_match_reviewed_report_before_arming(self):
+        self.live_fixture(); prior = self.restart_count()
+        for metadata in (None, {}, dict(M.RAW_TRACE_SAMPLING, intentional=1),
+                dict(M.RAW_TRACE_SAMPLING, draw_call_limit=512), dict(M.RAW_TRACE_SAMPLING, execute_child_limit=16.0),
+                dict(M.RAW_TRACE_SAMPLING, submit_command_limit=17),
+                dict(M.RAW_TRACE_SAMPLING, binding_snapshots_require_import_request=False),
+                dict(M.RAW_TRACE_SAMPLING, lifecycle_survives_trace_cap=False),
+                dict(M.RAW_TRACE_SAMPLING, unknown_flag=True)):
+            header = dict(self.journal_header)
+            if metadata is None: header.pop("raw_trace_sampling")
+            else: header["raw_trace_sampling"] = metadata
+            self.save_live_records([self.header], [header])
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(RuntimeError, "sampling metadata.*protected journal header"):
+                self.session.arm(stream_start_intent=True)
+            self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+            self.assertEqual(self.restart_count(), prior)
+
+    def test_invalid_stored_v2_sampling_refuses_arm_without_obstructing_native_recovery(self):
+        self.live_fixture()
+        plan = copy.deepcopy(self.plan)
+        plan["observer"]["raw_trace_sampling"]["lifecycle_survives_trace_cap"] = False
+        path = self.session.folder / "deployment-plan.json"
+        path.unlink(); M.exclusive(path, M.json_bytes(plan))
+        manifest_path = self.session.folder / "owned.json"
+        manifest = json.loads(manifest_path.read_bytes()); manifest["plan_sha256"] = M.digest(path.read_bytes())
+        manifest["owned_files"]["deployment-plan.json"] = manifest["plan_sha256"]
+        manifest_path.unlink(); M.exclusive(manifest_path, M.json_bytes(manifest))
+        with self.assertRaisesRegex(RuntimeError, "sampling metadata.*observer"):
+            self.session.arm(stream_start_intent=True)
+        self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+        self.assertEqual(self.restart_count(), 1)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
 
     def test_legacy_descriptor_cannot_silently_admit_pre_stream_intent(self):
         self.plan["operator_arm"] = self.session.operator_arm_descriptor(schema=M.LEGACY_ARM_RECEIPT_SCHEMA)
