@@ -27,7 +27,9 @@ struct Budget {
     static constexpr std::uint32_t Version = 2;
     static constexpr std::uint32_t DrawLimit = 32, ExecuteLimit = 16, SubmitLimit = 16, SnapshotLimit = 32, ProbeLimit = 4096;
     // Bit 0 reserves snapshots until import publication; bit 1 preserves the
-    // lifecycle owner when optional trace output reaches its existing cap.
+    // lifecycle owner when optional trace output reaches its existing cap. Bit 2
+    // requires exact imported image/view/memory generations at ordered replay;
+    // the inspected descriptor subset remains set 0 / frame_bindings::TargetBindings.
     static constexpr std::uint32_t Flags = 7;
     Quota<ProbeLimit> probes;
     Quota<DrawLimit> draws;

@@ -42,7 +42,7 @@ VKAPI_ATTR VkResult VKAPI_CALL nativeSubmit2(VkQueue,std::uint32_t count,const V
 void wait_replayed(Capture& c) {
     for(unsigned i=0;i<2000;++i) {
         const auto counters=c.bindings.transportCounters();
-        if(counters.published==counters.replayed)return;
+        if(counters.published==counters.replayed && c.bindings.empty())return;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     require(false);
@@ -231,6 +231,7 @@ int main(int argc,char** argv) {
     require(text.size()<1048576 && text.find("\"binding_arm_required\":true")!=std::string::npos);
     require(text.find("\"binding_ready_at_header\":false")!=std::string::npos);
     require(text.find("\"raw_trace_sampling\":{\"intentional\":true")!=std::string::npos);
+    require(text.find("\"target_descriptor_set\":0,\"target_bindings\":[0,2,3,4,6,9,25,31]")!=std::string::npos);
     require(text.find("\"deadline_seconds\":120")!=std::string::npos);
     require((text.find("\"byte_cap_reached\":true")!=std::string::npos)==byte_cap);
     require((text.find("\"event\":\"bindings_armed\"")!=std::string::npos)==armed_run);

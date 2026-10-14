@@ -447,9 +447,13 @@ struct Capture {
             ",\"raw_trace_sampling\":{\"intentional\":true,\"draw_call_limit\":%u,"
             "\"execute_child_limit\":%u,\"submit_command_limit\":%u,"
             "\"binding_snapshots_require_import_request\":true,"
-            "\"lifecycle_survives_trace_cap\":true,\"binding_probe_limit\":%u,\"binding_probe_slots\":256,\"binding_snapshots_require_target_match\":true}",
+            "\"lifecycle_survives_trace_cap\":true,\"binding_probe_limit\":%u,\"binding_probe_slots\":256,"
+            "\"binding_snapshots_require_target_match\":true,\"target_descriptor_set\":0,\"target_bindings\":[",
             frame_compositor_sampling::Budget::DrawLimit, frame_compositor_sampling::Budget::ExecuteLimit,
             frame_compositor_sampling::Budget::SubmitLimit, frame_compositor_sampling::Budget::ProbeLimit);
+        for (std::size_t i = 0; headerValid && i < frame_bindings::TargetBindings.size(); ++i)
+            headerValid = append(header, sizeof(header), total, "%s%u", i ? "," : "", frame_bindings::TargetBindings[i]);
+        headerValid = headerValid && append(header, sizeof(header), total, "]}");
 #endif
         headerValid = headerValid && append(header, sizeof(header), total, "}\n");
         bool ioGood = headerValid && writeAll(fd, header, total), capped = false;
