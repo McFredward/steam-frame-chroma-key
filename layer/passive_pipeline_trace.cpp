@@ -5,6 +5,7 @@
 #ifdef FRAME_MASK_COMPOSITOR_RAW
 #include "../import/compositor_journal_bridge.h"
 #include "../receiver/compositor_arm_marker.h"
+#include "raw_trace_sampling.h"
 #endif
 #ifdef FRAME_MASK_IMPORT_ENTRY
 #include "../import/import_vulkan_forwarding.h"
@@ -43,6 +44,28 @@
 #define vkNegotiateLoaderLayerInterfaceVersion frame_compositor_raw_vkNegotiateLoaderLayerInterfaceVersion
 #endif
 
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+// Offline staging authenticates this hidden, read-only collector identity.
+// It introduces no runtime getter, environment option or native admission.
+#define SAMPLING_LE(value) \
+    static_cast<unsigned char>((value) & 255), \
+    static_cast<unsigned char>(((value) >> 8) & 255), \
+    static_cast<unsigned char>(((value) >> 16) & 255), \
+    static_cast<unsigned char>(((value) >> 24) & 255)
+extern "C" {
+__attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_trace_sampling_scope[32] = {
+    'F','C','M','S','M','P','0','1',
+    SAMPLING_LE(frame_compositor_sampling::Budget::Version),
+    SAMPLING_LE(frame_compositor_sampling::Budget::DrawLimit),
+    SAMPLING_LE(frame_compositor_sampling::Budget::ExecuteLimit),
+    SAMPLING_LE(frame_compositor_sampling::Budget::SubmitLimit),
+    SAMPLING_LE(frame_compositor_sampling::Budget::SnapshotLimit),
+    SAMPLING_LE(frame_compositor_sampling::Budget::Flags)
+};
+}
+#undef SAMPLING_LE
+#endif
+
 namespace {
 using namespace frame_trace;
 constexpr std::size_t OutputLimit = 1024 * 1024;
@@ -60,6 +83,11 @@ struct Capture {
     // Set only by the file-owning background writer after its protected header.
     std::atomic<unsigned> importWriterReady{0};
     std::atomic<bool> importProcessAdmitted{false}, importChildRetired{false};
+    // File/event quotas apply only to the optional trace, never to the owning
+    // lifecycle replay needed by a later tagged native import in this window.
+    std::atomic<bool> importJournalOpen{false}, importRequestPublished{false};
+    frame_compositor_sampling::Budget rawSampling;
+    std::atomic<std::uint64_t> snapshotsDeferredBeforeImport{0};
 #endif
     std::atomic<bool> stop{false};
     std::thread writer;
@@ -69,7 +97,11 @@ struct Capture {
     bool bindingsEnabled = false;
     std::atomic<bool> bindingsArmed{false};
     std::atomic<std::uint32_t> bindingSnapshots{0};
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+    static constexpr std::uint32_t BindingSnapshotLimit = frame_compositor_sampling::Budget::SnapshotLimit;
+#else
     static constexpr std::uint32_t BindingSnapshotLimit = 32;
+#endif
     // Writer-owned results; a request is published before its placeholder event.
     // Keep the event's draw-time serial, even when background replay is delayed.
     std::array<frame_bindings::Snapshot, BindingSnapshotLimit> bindingResults{};
@@ -101,6 +133,16 @@ struct Capture {
         // Keep lifecycle metadata before arming, but reserve draw/submit event
         // capacity for the operator's actual stream instead of native Home.
         return core.enabled() && (!bindingsEnabled || bindingsArmed.load(std::memory_order_acquire));
+    }
+
+    bool lifecycleReady() const noexcept {
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        return bindingsEnabled && importProcessAdmitted.load(std::memory_order_acquire) &&
+            importWriterReady.load(std::memory_order_acquire) == 1 &&
+            importJournalOpen.load(std::memory_order_acquire);
+#else
+        return bindingsEnabled && core.enabled();
+#endif
     }
 
     void start() {
@@ -166,10 +208,16 @@ struct Capture {
 #endif
 #ifdef FRAME_MASK_COMPOSITOR_RAW
             importProcessAdmitted.store(true, std::memory_order_release);
+            importJournalOpen.store(true, std::memory_order_release);
 #endif
             core.enable(true);
             try { writer = std::thread([this, path, armPath] { write(path, armPath); }); }
-            catch (...) { core.enable(false); processAllowed = false; }
+            catch (...) {
+                core.enable(false); processAllowed = false;
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+                importJournalOpen.store(false, std::memory_order_release);
+#endif
+            }
         });
     }
     ~Capture() {
@@ -183,6 +231,9 @@ struct Capture {
         }
 #endif
         core.enable(false);
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        importJournalOpen.store(false, std::memory_order_release);
+#endif
         stop.store(true);
         if (writer.joinable()) writer.join(); // Process/layer teardown only.
 #ifdef FRAME_MASK_COMPOSITOR_RAW
@@ -298,6 +349,7 @@ struct Capture {
         if (fd < 0) {
             core.enable(false);
 #ifdef FRAME_MASK_COMPOSITOR_RAW
+            importJournalOpen.store(false, std::memory_order_release);
             importWriterReady.store(2, std::memory_order_release);
 #endif
             return;
@@ -307,6 +359,7 @@ struct Capture {
         if (flock(fd, LOCK_EX | LOCK_NB)) {
             core.enable(false);
 #ifdef FRAME_MASK_COMPOSITOR_RAW
+            importJournalOpen.store(false, std::memory_order_release);
             importWriterReady.store(2, std::memory_order_release);
 #endif
             close(fd); return;
@@ -320,7 +373,7 @@ struct Capture {
 #else
         const unsigned deadlineSeconds = fragmentFilter ? 120 : 30;
 #endif
-        char header[1024];
+        char header[2048];
         const auto headerLength = std::snprintf(header, sizeof(header),
             "{\"event\":\"header\",\"version\":1,\"layer\":\"VK_LAYER_FRAME_MASK_trace\","
             "\"scope\":\"passive_pipeline_metadata\",\"hash\":\"fnv1a64_standard\","
@@ -332,16 +385,33 @@ struct Capture {
             "\"binding_arm_required\":%s,"
             "\"pre_arm_draws_recorded\":false,"
             "\"binding_ready_at_header\":%s,"
-            "\"deadline_seconds\":%u}\n", static_cast<unsigned long long>(fragmentFilter),
+            "\"deadline_seconds\":%u", static_cast<unsigned long long>(fragmentFilter),
             bindingsEnabled ? 1 : 0, bindingsEnabled ? BindingSnapshotLimit : 0,
             frame_bindings::Journal::LaneCapacity,
             frame_bindings::Journal::ByteCapacity,
             armPath.empty() ? "false" : "true", bindingsArmed.load() ? "true" : "false", deadlineSeconds);
-        std::size_t total = static_cast<std::size_t>(headerLength);
-        bool ioGood = writeAll(fd, header, total), capped = false;
+        std::size_t total = headerLength > 0 ? static_cast<std::size_t>(headerLength) : sizeof(header);
+        bool headerValid = total < sizeof(header);
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        headerValid = headerValid && append(header, sizeof(header), total,
+            ",\"raw_trace_sampling\":{\"intentional\":true,\"draw_call_limit\":%u,"
+            "\"execute_child_limit\":%u,\"submit_command_limit\":%u,"
+            "\"binding_snapshots_require_import_request\":true,"
+            "\"lifecycle_survives_trace_cap\":true}",
+            frame_compositor_sampling::Budget::DrawLimit, frame_compositor_sampling::Budget::ExecuteLimit,
+            frame_compositor_sampling::Budget::SubmitLimit);
+#endif
+        headerValid = headerValid && append(header, sizeof(header), total, "}\n");
+        bool ioGood = headerValid && writeAll(fd, header, total), capped = false;
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        std::uint64_t traceOutputOmitted = 0;
+#endif
 #ifdef FRAME_MASK_COMPOSITOR_RAW
         importWriterReady.store(ioGood ? 1 : 2, std::memory_order_release);
-        if (!ioGood) { core.enable(false); close(fd); return; }
+        if (!ioGood) {
+            importJournalOpen.store(false, std::memory_order_release);
+            core.enable(false); close(fd); return;
+        }
 #endif
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(deadlineSeconds);
         auto armCheck = std::chrono::steady_clock::now();
@@ -378,8 +448,14 @@ struct Capture {
             // Check even while records arrive continuously. Disabling producers
             // leaves only the fixed-capacity ring and bounded in-flight records
             // to drain before the footer; queue traffic cannot defer expiration.
-            if (!draining && (stop.load() || events.finished() ||
+            if (!draining && (stop.load() ||
+#ifndef FRAME_MASK_COMPOSITOR_RAW
+                              events.finished() ||
+#endif
                               std::chrono::steady_clock::now() >= deadline)) {
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+                importJournalOpen.store(false, std::memory_order_release);
+#endif
                 core.enable(false);
                 events.close();
                 bindings.close();
@@ -422,7 +498,16 @@ struct Capture {
                 if (!bytes || total + bytes > OutputLimit - FooterReserve) {
                     capped = true;
                     core.enable(false);
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+                    // Exhausting optional JSON evidence does not close the
+                    // actual immutable lifecycle/receipt owner. Keep draining
+                    // until the original deadline, recording the omissions.
+                    ++traceOutputOmitted;
+                    pending = false;
+                    continue;
+#else
                     break;
+#endif
                 }
                 const auto outputStart = std::chrono::steady_clock::now();
                 const bool written = writeAll(fd, line, bytes);
@@ -442,6 +527,9 @@ struct Capture {
             }
         }
         core.enable(false);
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        importJournalOpen.store(false, std::memory_order_release);
+#endif
         events.close();
         bindings.close();
         // Byte/time/event closure must include admitted metadata in the stable
@@ -493,7 +581,26 @@ struct Capture {
             static_cast<unsigned long long>(journal.headerQueue), static_cast<unsigned long long>(journal.byteQueue));
 #undef TABLE
         std::size_t footerBytes = count > 0 ? static_cast<std::size_t>(count) : sizeof(footer);
-        bool footerValid = append(footer, sizeof(footer), footerBytes,
+        bool samplingValid = footerBytes < sizeof(footer);
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        samplingValid = samplingValid && append(footer, sizeof(footer), footerBytes,
+            ",\"raw_trace_sampling\":{\"intentional\":true,"
+            "\"draw_calls_sampled\":%llu,\"draw_calls_omitted\":%llu,"
+            "\"execute_children_sampled\":%llu,\"execute_children_omitted\":%llu,"
+            "\"submit_commands_sampled\":%llu,\"submit_commands_omitted\":%llu,"
+            "\"snapshots_deferred_before_import\":%llu,\"import_request_published\":%s,"
+            "\"output_records_omitted\":%llu,\"exhaustive_draw_trace\":false}",
+            static_cast<unsigned long long>(rawSampling.draws.sampled()),
+            static_cast<unsigned long long>(rawSampling.draws.omitted()),
+            static_cast<unsigned long long>(rawSampling.executes.sampled()),
+            static_cast<unsigned long long>(rawSampling.executes.omitted()),
+            static_cast<unsigned long long>(rawSampling.submits.sampled()),
+            static_cast<unsigned long long>(rawSampling.submits.omitted()),
+            static_cast<unsigned long long>(snapshotsDeferredBeforeImport.load(std::memory_order_relaxed)),
+            importRequestPublished.load(std::memory_order_acquire) ? "true" : "false",
+            static_cast<unsigned long long>(traceOutputOmitted));
+#endif
+        bool footerValid = samplingValid && append(footer, sizeof(footer), footerBytes,
             ",\"binding_writer\":{\"iterations\":%llu,\"replayed\":%llu,\"replay_ns\":%llu,"
             "\"max_replay_batch_ns\":%llu,\"snapshot_waits\":%llu,\"idle_waits\":%llu,"
             "\"serialization_ns\":%llu,\"output_ns\":%llu,\"max_output_ns\":%llu,\"max_lane_occupancy\":%llu,"
@@ -534,21 +641,26 @@ template <typename T> void* dispatchKey(T handle) { return *reinterpret_cast<voi
 
 template <typename Observer> void observeBindings(Observer observer) {
     auto& c = capture();
-    if (!c.bindingsEnabled || !c.core.enabled()) return;
-#ifdef FRAME_MASK_COMPOSITOR_RAW
-    if (!c.importProcessAdmitted.load(std::memory_order_acquire)) return;
-#endif
+    if (!c.lifecycleReady()) return;
     // Admission includes owned scalar journal publications in the stable footer.
     // Object-table lookup/mutation is exclusively replayed by the writer. This
     // scope never spans a driver call or waits for the writer.
     const auto admission = c.events.admit();
-    if (admission && c.core.enabled()) observer(c.bindings);
+    if (admission && c.lifecycleReady()) observer(c.bindings);
 }
 void recordedDraw(std::uint64_t device, VkCommandBuffer command, std::uint32_t kind) {
     auto& c = capture();
     const auto admission = c.events.admit();
     if (!admission || !c.drawsReady()) return;
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+    if (c.rawSampling.draws.take()) c.core.draw(device, number(command), kind);
+    if (!c.importRequestPublished.load(std::memory_order_acquire)) {
+        c.snapshotsDeferredBeforeImport.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+#else
     c.core.draw(device, number(command), kind);
+#endif
     if (!c.bindingsEnabled || !c.bindingsArmed.load(std::memory_order_acquire) ||
         c.bindingSnapshots.load(std::memory_order_relaxed) >= Capture::BindingSnapshotLimit) return;
     Event event;
@@ -662,8 +774,13 @@ bool request(std::uint64_t device, VkImage image, VkImageView view,
     // Retain the existing event admission so closure accounts for an in-flight
     // request. This does not span a native provider or wait for replay.
     const auto admission = c.events.admit();
-    if (!admission || !c.core.enabled() || !c.bindingsEnabled) return false;
-    return c.importReceipts.request(device, image, view, tag, cookie);
+    if (!admission || !c.lifecycleReady()) return false;
+    const bool published = c.importReceipts.request(device, image, view, tag, cookie);
+    // The existing reviewed adapter invokes this after its successful tagged
+    // view publication. This reserves snapshots until an actual request exists;
+    // it does not assert that a later draw consumes that image or a video frame.
+    if (published) c.importRequestPublished.store(true, std::memory_order_release);
+    return published;
 }
 bool validate(const Receipt& receipt) noexcept { return capture().importReceipts.validate(receipt); }
 void stop() noexcept { capture().importReceipts.stop(); }
@@ -674,6 +791,7 @@ void retire_child_atomically() noexcept {
     if (!c) return;
     c->importChildRetired.store(true, std::memory_order_release);
     c->importProcessAdmitted.store(false, std::memory_order_release);
+    c->importJournalOpen.store(false, std::memory_order_release);
     c->core.enable(false);
     c->stop.store(true, std::memory_order_release);
     c->importReceipts.retire_child_atomically();
@@ -971,8 +1089,14 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirectCount(VkCommandBuffer comm
 VKAPI_ATTR void VKAPI_CALL traceCmdExecuteCommands(VkCommandBuffer command, std::uint32_t count,
     const VkCommandBuffer* children) {
     auto* d = deviceFor(command);
-    if (capture().drawsReady())
-        for (std::uint32_t i = 0; i < limited(d, count); ++i) capture().core.execute(d->id, number(command), number(children[i]));
+    if (capture().drawsReady()) {
+        for (std::uint32_t i = 0; i < limited(d, count); ++i) {
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+            if (!capture().rawSampling.executes.take()) continue;
+#endif
+            capture().core.execute(d->id, number(command), number(children[i]));
+        }
+    }
     if (count) observeBindings([&](auto& b) { b.executeCommands(d->id, command); });
     d->CmdExecuteCommands(command, count, children);
 }
@@ -984,8 +1108,12 @@ VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit(VkQueue queue, std::uint32_t cou
     std::uint32_t ticketCount = 0;
     for (std::uint32_t i = 0; i < limited(d, count); ++i) {
         const auto tracked = std::min(CallRecordLimit - ticketCount, info[i].commandBufferCount);
-        for (std::uint32_t j = 0; j < tracked; ++j)
+        for (std::uint32_t j = 0; j < tracked; ++j) {
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+            if (!capture().rawSampling.submits.take()) continue;
+#endif
             tickets[ticketCount++] = capture().core.prepareSubmit(d->id, number(info[i].pCommandBuffers[j]));
+        }
         if (tracked != info[i].commandBufferCount) capture().core.report(d->id, Core::Capacity);
     }
     const auto result = d->QueueSubmit(queue, count, info, fence);
@@ -1003,8 +1131,12 @@ VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit2(VkQueue queue, std::uint32_t co
     std::uint32_t ticketCount = 0;
     for (std::uint32_t i = 0; i < limited(d, count); ++i) {
         const auto tracked = std::min(CallRecordLimit - ticketCount, info[i].commandBufferInfoCount);
-        for (std::uint32_t j = 0; j < tracked; ++j)
+        for (std::uint32_t j = 0; j < tracked; ++j) {
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+            if (!capture().rawSampling.submits.take()) continue;
+#endif
             tickets[ticketCount++] = capture().core.prepareSubmit(d->id, number(info[i].pCommandBufferInfos[j].commandBuffer));
+        }
         if (tracked != info[i].commandBufferInfoCount) capture().core.report(d->id, Core::Capacity);
     }
     const auto result = d->QueueSubmit2(queue, count, info, fence);
