@@ -40,7 +40,8 @@ READY = 'frame_compositor_raw_ready'
 BRIDGE = 'frame_compositor_raw_bridge'
 LAYER = 'VK_LAYER_FRAME_MASK_trace'
 ENVELOPE_BYTES = 8272
-MARKER = b'FCMRAW02' + struct.pack('<II', 2, ENVELOPE_BYTES)
+MARKER = b'FCMRAW03' + struct.pack('<II', 3, ENVELOPE_BYTES)
+ARM_CONTENTS = b'FRAME_COMPOSITOR_RAW/1\n'
 LIMIT_WORDS = (720, 21, 16, 8, 32, 65536, 120, 4)
 CAPTURE_LIMITS = {'records': 32, 'bytes': 65536, 'seconds': 120}
 RAW_LIMITS = {'transactions': 1, 'writes': 8, 'scalar_bytes': 720, 'wire_bytes': 21,
@@ -77,6 +78,14 @@ def remote_observer(value, home='/home/steamos'):
     common.loader_name(value)
     return path
 
+
+def operator_arm_descriptor(frame):
+    return {'schema': 'frame-compositor-operator-arm-v1', 'required': True,
+            'marker_path': str(frame / 'capture-arm.marker'), 'marker_bytes': len(ARM_CONTENTS),
+            'marker_sha256': digest(ARM_CONTENTS).hex(), 'marker_mode': '0600',
+            'pc_vr_stream_acknowledgment_required': True, 'restart_required': False,
+            'deadline_from_capture_start_seconds': 120, 'deadline_reset_allowed': False,
+            'source_frame_associated': False}
 
 def hidden_object(elf, name, size):
     symbols = [s for s in elf.symbols if s['name'] == name and s['defined']]
@@ -211,7 +220,7 @@ def decode_envelope(data, expected_profile=None):
         raise ValueError('Compositor envelope acquisition/capture limits changed')
     blobs = tuple(data[112 + 2032 * i:112 + 2032 * (i + 1)] for i in range(4))
     validate_profiles(blobs, reviewed)
-    return {'schema': 2, 'bytes': ENVELOPE_BYTES, 'reviewed_observer_profile_identity': reviewed.hex(),
+    return {'schema': 3, 'bytes': ENVELOPE_BYTES, 'reviewed_observer_profile_identity': reviewed.hex(),
             'module_roles': list(ROLES), 'module_count': 4, 'raw_limits': dict(RAW_LIMITS),
             'capture_limits': dict(CAPTURE_LIMITS), 'profiles': blobs, 'sha256': digest(data).hex(),
             'independent_observer_checked': expected_profile is not None}
@@ -402,7 +411,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
     inventory = [{'name': name, 'bytes': len(value), 'sha256': digest(value).hex(),
                   'frame_path': None if name in ('audit-preparation.cpp', SELECTOR_SOURCE) else str(frame / name),
                   'owned_source': True, 'native_bytes': False, 'mode': '0600'} for name, value in artifacts.items()]
-    plan = {'schema': 'frame-compositor-raw-offline-bundle-v3', 'prepared': True, 'installed': False, 'activated': False,
+    plan = {'schema': 'frame-compositor-raw-offline-bundle-v4', 'prepared': True, 'installed': False, 'activated': False,
             'runtime_authorized': False, 'frame_access': False, 'network_access': False, 'automatic_restart': False,
             'native_binary_or_script_changes': False, 'shader_or_mask_activation': False, 'source_frame_associated': False,
             'gpu_coherent': False, 'continuous_connection_owned': False, 'native_namespace_associated': False,
@@ -411,7 +420,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
             'launch_isolation': {'schema': 'frame-compositor-startup-isolation-v1', 'target_exe': configuration['target'],
                 'selector_path': configuration['selector'], 'payload_path': configuration['payload'],
                 'audit_path': configuration['audit'], 'target_exec_environment': launch_environment(configuration)},
-            'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 2,
+            'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 3,
                          'reviewed_observer_profile_identity': reviewed.hex(), 'module_count': 4, 'module_roles': list(ROLES)},
             'manifest': {'name': MANIFEST, 'bytes': len(manifest), 'sha256': digest(manifest).hex(), 'layer_name': LAYER,
                          'functions': dict(VULKAN_FUNCTIONS),
@@ -421,6 +430,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
             'native_slots': {'compositor': {'exact_loader_name': '', 'rx_rva_begin': native_elf[7].rx()[0], 'rx_rva_end': native_elf[7].rx()[1]},
                              'libc': {'exact_loader_name': LIBC_NAME, 'rx_rva_begin': native_elf[3].rx()[0], 'rx_rva_end': native_elf[3].rx()[1]}},
             'raw_limits': dict(RAW_LIMITS), 'capture_limits': dict(CAPTURE_LIMITS), 'journal_limits': dict(JOURNAL_LIMITS),
+            'operator_arm': operator_arm_descriptor(frame),
             'environment': {'LD_PRELOAD': configuration['selector']},
             'inventory': inventory, 'audit_source_sha256': digest(source.encode()).hex(), 'audit_compile_command': command, 'logs': logs,
             'local_receipt': {'name': PLAN, 'mode': '0600', 'frame_path': None},
@@ -430,7 +440,8 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
                       'same combined DSO for preload, three hidden Vulkan entries and the implicit Vulkan layer',
                       'tiny C launch selector in service descendants; full observer/audit only in the exact compositor target',
                       'cold single-threaded diagnostic environment freeze; internal system/popen children inherit clean actual environ',
-                      'own cold-ready forwarding before actual la_preinit; native private reads remain unarmed until actual admission',
+                      'own cold-ready forwarding before actual la_preinit; private candidate and draw budgets wait for protected operator arming',
+                      'operator arming only after healthy UI and visible PC-VR stream; one absolute 120-second boot deadline without reset',
                       'local raw facts, not an immutable socket lease, native cross-endpoint namespace, video frame, eye, UV or GPU proof'],
             'before_activation': ['Independent final source/artifact/plan review', 'Fresh exact native Frame hashes and public loader names',
                                   'Exact user-owned staging files and no foreign service/preload/audit/layer state',

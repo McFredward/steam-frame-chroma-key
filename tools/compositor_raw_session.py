@@ -6,6 +6,9 @@ native patches, shader/mask activation or automatic recovery restart.
 """
 from __future__ import annotations
 import argparse
+from contextlib import contextmanager, ExitStack
+import errno
+import fcntl
 import importlib.util
 import json
 import os
@@ -31,8 +34,8 @@ _health_spec.loader.exec_module(health)
 safe_path, read_regular, exclusive = base.safe_path, base.read_regular, base.exclusive
 digest, json_bytes, private_parents = base.digest, base.json_bytes, base.private_parents
 UNIT = "steamvr.service"
-SCHEMA = "frame-compositor-raw-offline-bundle-v3"
-SESSION_SCHEMA = "frame-compositor-raw-owned-session-v3"
+SCHEMA = "frame-compositor-raw-offline-bundle-v4"
+SESSION_SCHEMA = "frame-compositor-raw-owned-session-v4"
 MAIN, AUDIT, ENVELOPE = "libVkLayer_frame_mask_trace.so", "libframe_compositor_raw_audit.so", "compositor-raw-envelope.bin"
 SELECTOR = "libframe_compositor_launch_selector.so"
 SELECTOR_EXPORTS = {"execve", "execv", "execvp", "execvpe", "posix_spawn", "posix_spawnp", "getenv", "secure_getenv",
@@ -63,7 +66,9 @@ RAW_LIMITS = {"transactions": 1, "writes": 8, "scalar_bytes": 720, "wire_bytes":
     "parent_bytes": 16, "private_bytes": 757, "bootstrap_poll_bytes": 0}
 NATIVE_RVAS = {"lock": "0x87370", "unlock": "0x88f74", "write": "0xdfee0"}
 ENVELOPE_LIMITS = (720, 21, 16, 8, 32, 65536, 120, 4)
-SCOPE_MARKER = b"FCMRAW02" + struct.pack("<II", 2, 8272)
+SCOPE_MARKER = b"FCMRAW03" + struct.pack("<II", 3, 8272)
+ARM_CONTENTS = b"FRAME_COMPOSITOR_RAW/1\n"
+ARM_RECEIPT_SCHEMA = "frame-compositor-operator-arm-v1"
 STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-startup-health.json",
     "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"})
 
@@ -96,6 +101,8 @@ class Session(base.Session):
         self.selector = self.folder / SELECTOR
         self.capture = self.folder / "compositor-raw.jsonl"
         self.journal = self.folder / "compositor-journal.jsonl"
+        self.marker = self.folder / "capture-arm.marker"
+        self.arm_receipt = self.folder / "operator-arm.json"
         self._owned_caller = None
         self.health_source = health_source or health.NativeEvidenceSource(self.home, proc_root=self.proc, run=self.run)
         self.native_layer_node_drift = {}
@@ -261,7 +268,7 @@ class Session(base.Session):
 
     @staticmethod
     def validate_envelope(data, plan, files, observer):
-        if (len(data) != 8272 or data[:8] != b"FCMRAW02" or struct.unpack_from("<II", data, 8) != (2, 8272) or
+        if (len(data) != 8272 or data[:8] != b"FCMRAW03" or struct.unpack_from("<II", data, 8) != (3, 8272) or
             struct.unpack_from("<8Q", data, 48) != ENVELOPE_LIMITS or digest(data[:-32]) != data[-32:].hex()):
             raise RuntimeError("Exact raw envelope schema/limits/checksum required")
         reviewed = data[16:48].hex()
@@ -299,6 +306,7 @@ class Session(base.Session):
             any(type(v) is not int for v in plan.get("raw_limits", {}).values()) or
             any(type(v) is not int for v in plan.get("journal_limits", {}).values())):
             raise RuntimeError("Exact bounded raw diagnostic limits required")
+        self.validate_operator_arm(plan.get("operator_arm"))
         inventory = plan.get("inventory")
         sources = {"audit-preparation.cpp", "launch-configuration.c"}
         names = {MAIN, AUDIT, SELECTOR, ENVELOPE, LAYER} | sources
@@ -345,7 +353,7 @@ class Session(base.Session):
             "audit": str(self.audit), "envelope": str(self.envelope), "output": str(self.capture), "journal": str(self.journal)}
         if isolation != expected_isolation or plan["selector"].get("configuration") != expected_config:
             raise RuntimeError("Reviewed exact launch/isolation paths differ from staged natives/artifacts")
-        if (plan["envelope"].get("schema") != 2 or plan["envelope"].get("module_count") != 4 or
+        if (plan["envelope"].get("schema") != 3 or plan["envelope"].get("module_count") != 4 or
             plan["envelope"].get("module_roles") != [7, 3, 4, 5]):
             raise RuntimeError("Exact envelope module report required")
         self.validate_envelope(payloads[ENVELOPE], plan, files, payloads[MAIN])
@@ -375,6 +383,26 @@ class Session(base.Session):
 
     def activation_files(self, layer_data):
         return {self.dropin: self.activation(), self.layer: layer_data}
+
+    def operator_arm_descriptor(self):
+        return {"schema": ARM_RECEIPT_SCHEMA, "required": True,
+            "marker_path": str(self.marker), "marker_bytes": len(ARM_CONTENTS),
+            "marker_sha256": digest(ARM_CONTENTS), "marker_mode": "0600",
+            "pc_vr_stream_acknowledgment_required": True, "restart_required": False,
+            "deadline_from_capture_start_seconds": 120, "deadline_reset_allowed": False,
+            "source_frame_associated": False}
+
+    def validate_operator_arm(self, descriptor):
+        expected = self.operator_arm_descriptor()
+        if (not isinstance(descriptor, dict) or descriptor != expected or
+                any(type(descriptor[key]) is not type(value) for key, value in expected.items())):
+            raise RuntimeError("Exact protected operator-arm descriptor required")
+
+    def require_fresh_capture_paths(self):
+        for path in (self.marker, self.arm_receipt, self.capture, self.journal):
+            safe_path(path)
+            if path.exists() or path.is_symlink():
+                raise RuntimeError("Existing capture or operator-arm node cannot reset the diagnostic scope")
 
     def stage(self, path, expected, native, artifacts, *, runtime_scope=False, reviewed_helpers=None, reviewed_environment_files=None, reviewed_native_layers=None):
         if runtime_scope is not True: raise RuntimeError("Separate compositor-private-scope acknowledgment required")
@@ -456,6 +484,7 @@ class Session(base.Session):
         with self.lock():
             m = self.manifest(); self.verify_owned(m)
             self.verify_acquisition_scope(m)
+            self.require_fresh_capture_paths()
             require_reviewed_launch_isolation(m)
             self.reject_old_activation({name: item["sha256"] for name, item in m["original_native_layers"].items()})
             self.revalidate_native_layers(m)
@@ -499,8 +528,9 @@ class Session(base.Session):
         plan = json.loads(read_regular(self.folder / "deployment-plan.json", private=True))
         if (plan.get("schema") != SCHEMA or plan.get("raw_limits") != RAW_LIMITS or
                 plan.get("capture_limits") != CAPTURE_LIMITS or plan.get("journal_limits") != JOURNAL_LIMITS or
-                plan.get("envelope", {}).get("schema") != 2):
+                plan.get("envelope", {}).get("schema") != 3):
             raise RuntimeError("Stored acquisition scope cannot authorize this artifact")
+        self.validate_operator_arm(plan.get("operator_arm"))
         observer = read_regular(self.library, MAX_INPUT, private=True)
         self.validate_scope_marker(observer, plan.get("observer", {}).get("scope_marker"))
         envelope = read_regular(self.envelope, MAX_INPUT, private=True)
@@ -622,6 +652,264 @@ class Session(base.Session):
                 self.recovery_event("startup_monitor_not_ready", reason=result.get("reason"), automatic_restart=False)
                 raise RuntimeError("SteamVR compositor/UI health lost: " + str(result.get("reason")))
             return result
+
+    def current_arm_health(self):
+        """Revalidate the existing passed invocation; never wait for a new one."""
+        saved = json.loads(read_regular(self.folder / "activation-startup-health.json", 262144, private=True))
+        previous = self.folder / "startup-monitor.json"
+        if previous.exists() or previous.is_symlink():
+            observed = json.loads(read_regular(previous, 262144, private=True))
+            if observed.get("startup_receipt") == "activation-startup-health.json": saved = observed
+        if (saved.get("status") != "ready" or saved.get("ready") is not True or
+                saved.get("isolation_verified") is not True or saved.get("launch_freeze_receipt_verified") is not True):
+            raise RuntimeError("Passed cold-freeze startup/isolation required before operator arming")
+        gate = health.StartupGate.resume(saved["gate_checkpoint"])
+        self.health_source.resume(saved["source_checkpoint"])
+        result = gate.consume(self.health_source.sample(), stable_seconds=0)
+        result.update(startup_receipt="activation-startup-health.json", monitor_samples=1,
+            gate_checkpoint=gate.checkpoint(), source_checkpoint=self.health_source.checkpoint(),
+            launch_freeze_receipt_verified=False)
+        if result.get("ready") is True and result.get("isolation_verified") is True:
+            try:
+                self.verify_freeze_receipt(gate.baseline, result)
+                result["launch_freeze_receipt_verified"] = True
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+                self.deny_startup_result(result, "Current cold-freeze evidence refused: " + str(error)[:384])
+        self.health_receipt("startup-monitor.json", result)
+        if (result.get("ready") is not True or result.get("isolation_verified") is not True or
+                result.get("launch_freeze_receipt_verified") is not True or result.get("invocation") != saved.get("invocation") or
+                result.get("process_identities", {}).get("compositor") != saved.get("process_identities", {}).get("compositor")):
+            raise RuntimeError("Current compositor/UI health or invocation changed before operator arming")
+        return result
+
+    @contextmanager
+    def live_output(self, path, limit, pid):
+        """Keep a protected output open and bracket the same writer lock."""
+        safe_path(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb", buffering=0) as stream:
+            before = os.fstat(fd)
+            node = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid, item.st_nlink)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or
+                    stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1 or not 0 < before.st_size < limit):
+                raise RuntimeError("Protected live capture must retain remaining output budget")
+            def check_writer():
+                current, opened = path.lstat(), os.fstat(fd)
+                if (node(current) != node(before) or node(opened) != node(before) or
+                        opened.st_size < before.st_size or not opened.st_size < limit or
+                        current.st_size < before.st_size or not current.st_size < limit):
+                    raise RuntimeError("Capture node changed, truncated or exhausted its output budget")
+                try: fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except OSError as error:
+                    if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise RuntimeError("Capture exclusive writer lock cannot be checked") from error
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    raise RuntimeError("Capture writer is closed; budgets cannot be reopened")
+                if self.capture_owner(opened) != pid:
+                    raise RuntimeError("Capture lock does not belong to the admitted compositor")
+            def snapshot():
+                check_writer(); stream.seek(0); raw = stream.read(limit + 1); check_writer()
+                if len(raw) > limit or not raw.endswith(b"\n"):
+                    raise RuntimeError("Capture requires a complete bounded live snapshot")
+                lines = raw.splitlines()
+                if len(lines) > 2049: raise RuntimeError("Capture record count exceeded")
+                rows = [json.loads(line) for line in lines]
+                if not rows or any(not isinstance(row, dict) for row in rows):
+                    raise RuntimeError("Capture records must be bounded JSON objects")
+                return rows
+            # Both snapshots bracket lock/node identity before publication.
+            # A legitimate one-shot may close immediately after the marker;
+            # do not misreport that successful retirement as an arm failure.
+            yield snapshot, before
+
+    def validate_prearm_outputs(self, raw, journal, manifest, current):
+        header, now = raw[0], int(self.health_source.clock() * 1000000000)
+        pid = current["process_identities"]["compositor"]["pid"]
+        plan = json.loads(read_regular(self.folder / "deployment-plan.json", private=True))
+        expected = {"schema": 1, "capture": "compositor_raw_import", "pid": pid,
+            "operator_arm_required": True, "operator_armed": False, "pre_arm_private_bytes": 0,
+            "launch_environment_frozen": True, "launch_freeze_abi": 1, "launch_provider_mask": 63,
+            "launch_frozen_owner_pid": pid, "transactions": 1, "parent_byte_limit": 16,
+            "scalar_byte_limit": 720, "wire_byte_limit": 21, "private_byte_limit": 757,
+            "write_limit": 8, "record_limit": 32, "byte_limit": 65536, "seconds_limit": 120,
+            "observer_profile": plan["envelope"]["reviewed_observer_profile_identity"],
+            "native_cross_endpoint_associated": False, "native_namespace_associated": False,
+            "source_frame_associated": False, "uv_owned": False, "accepted_submit": False,
+            "gpu_consumed": False, "mask_enabled": False}
+        if any(header.get(key) != value or type(header.get(key)) is not type(value) for key, value in expected.items()):
+            raise RuntimeError("Raw output is not the admitted unarmed production capture")
+        start, deadline = header.get("capture_started_ns"), header.get("capture_deadline_ns")
+        observed = header.get("launch_frozen_observed_ns")
+        if (any(type(value) is not int or not 0 < value < 2**64 for value in (start, deadline, observed)) or
+                not observed <= start <= now < deadline or deadline - start != 120000000000):
+            raise RuntimeError("Absolute boot capture deadline expired or was reset")
+        modules = header.get("modules")
+        expected_modules = [{"role": role, "file_sha256": manifest["native_files"][name]["sha256"],
+            "profile_sha256": PROFILE_PINS[index]} for index, (name, role) in enumerate((("compositor", 7), ("libc", 3), ("loader", 4)))]
+        expected_modules.append({"role": 5, "file_sha256": manifest["owned_files"][MAIN],
+            "profile_sha256": plan["envelope"]["reviewed_observer_profile_identity"]})
+        if modules != expected_modules or len(raw) >= 32:
+            raise RuntimeError("Current native/observer header pins or remaining raw record budget changed")
+        for row in raw[1:]:
+            if (row.get("schema") != 1 or row.get("kind") not in (0, 1, 2) or
+                    type(row.get("kind")) is not int or row.get("refusal") != 0 or
+                    any(key in row for key in ("capture", "end", "operator_armed", "raw", "parent_bytes", "scalar_bytes", "wire_bytes"))):
+                raise RuntimeError("Raw capture already armed, claimed, refused or finalized")
+        expected_journal = {"event": "header", "version": 1, "layer": "VK_LAYER_FRAME_MASK_trace",
+            "scope": "passive_pipeline_metadata", "limit_bytes": 1048576,
+            "binding_metadata_version": 1, "limit_binding_snapshots": 32,
+            "binding_arm_required": True, "pre_arm_draws_recorded": False,
+            "binding_ready_at_header": False, "deadline_seconds": 120}
+        if any(journal[0].get(key) != value or type(journal[0].get(key)) is not type(value)
+                for key, value in expected_journal.items()):
+            raise RuntimeError("Passive journal is not the reserved unarmed production capture")
+        if len(journal) >= 2048:
+            raise RuntimeError("Passive journal record budget exhausted before operator arming")
+        for row in journal[1:]:
+            if (row.get("event") in ("header", "footer", "bindings_armed", "draw", "binding_snapshot", "bindings_recorded", "submit_accepted", "incomplete") or
+                    row.get("complete") is False or row.get("io_ok") is False or
+                    any(type(row.get(key)) is not int or row[key] != 0 for key in
+                        ("lost_state", "lost_binding_state", "dropped_events") if key in row)):
+                raise RuntimeError("Passive journal armed, lost state or finished before the operator signal")
+        return {"capture_started_ns": start, "capture_deadline_ns": deadline,
+            "pre_arm_private_bytes": 0, "journal_no_recorded_loss": True,
+            "continuous_transport_loss_proven": False}
+
+    def mapped_compositor(self, manifest, current):
+        """Check public proc/file identities only; never read process memory."""
+        identity = current["process_identities"]["compositor"]
+        pid, start = identity["pid"], identity["start_ticks"]
+        process = self.proc / str(pid)
+        def bracket():
+            info = process.lstat()
+            text = self.proc_bytes(process / "stat", 8192).decode("ascii")
+            end = text.rfind(")"); fields = text[end + 2:].split()
+            groups = self.proc_bytes(process / "cgroup", 8192).decode("ascii").splitlines()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or end < 0 or
+                    text.split(" ", 1)[0] != str(pid) or len(fields) < 20 or int(fields[19]) != start or
+                    fields[0] in health.INELIGIBLE_STATES or not groups or len(groups) > 32 or
+                    any(len(row.split(":", 2)) != 3 or UNIT not in Path(row.split(":", 2)[2]).parts for row in groups) or
+                    os.readlink(process / "exe") != manifest["native_files"]["compositor"]["path"]):
+                raise RuntimeError("Admitted compositor PID/start/UID/cgroup/executable changed")
+            return groups
+        groups = bracket()
+        def mappings():
+            rows = self.proc_bytes(process / "maps", 1048576).decode("utf-8").splitlines()
+            if len(rows) > 8192: raise RuntimeError("Compositor map row bound exceeded")
+            selected = {}
+            for row in rows:
+                fields = row.split(None, 5)
+                if len(fields) != 6 or fields[1][2:3] != "x": continue
+                path = fields[5]
+                if path in (str(self.library), str(self.audit), str(self.selector)):
+                    parts = fields[3].split(":")
+                    if len(parts) != 2 or path in selected or not fields[4].isdigit():
+                        raise RuntimeError("Ambiguous compositor diagnostic mapping")
+                    selected[path] = (int(parts[0], 16), int(parts[1], 16), int(fields[4]))
+            return selected
+        mapped = mappings()
+        if set(mapped) != {str(self.library), str(self.audit), str(self.selector)}:
+            raise RuntimeError("Actual compositor is missing the exact diagnostic mappings")
+        for name, actual in mapped.items():
+            disk = Path(name).stat(); rooted = (process / "root" / name.lstrip("/")).stat()
+            if (not stat.S_ISREG(disk.st_mode) or disk.st_ino != actual[2] or
+                    (rooted.st_dev, rooted.st_ino) != (disk.st_dev, disk.st_ino)):
+                raise RuntimeError("Diagnostic mapping does not match the pinned on-disk node")
+            expected_device = (os.major(disk.st_dev), os.minor(disk.st_dev))
+            if actual[:2] != expected_device:
+                # The same reviewed top-level Btrfs reconciliation as the
+                # receiver helper: stat reports anon_dev, proc maps s_dev.
+                entries = base.mountinfo_entries(self.proc_bytes(process / "mountinfo", base.MOUNTINFO_LIMIT))
+                mount = base.effective_mount(entries, name); root = (process / "root").stat()
+                if (actual[0] != 0 or actual[1] == 0 or expected_device[0] != 0 or expected_device[1] == 0 or
+                        mount["type"] != "btrfs" or mount["device"] != actual[:2] or
+                        mount["root"] != "/" or mount["point"] != "/" or
+                        [value for value in mount["options"] if value.startswith("subvolid=")] != ["subvolid=5"] or
+                        [value for value in mount["options"] if value.startswith("subvol=")] != ["subvol=/"] or
+                        not stat.S_ISDIR(root.st_mode) or root.st_ino != 256 or root.st_dev != disk.st_dev):
+                    raise RuntimeError("Diagnostic mapping lacks the reviewed Btrfs root identity")
+        if bracket() != groups or mappings() != mapped:
+            raise RuntimeError("Compositor process/mappings changed during operator-arm verification")
+        return {"pid": pid, "start_ticks": start, "invocation": current["invocation"],
+            "mapped_observer_sha256": manifest["owned_files"][MAIN],
+            "verification_scope": "bounded current public proc metadata and pinned files; not GPU lifetime or video-frame proof"}
+
+    def arm(self, *, stream_ready=False):
+        if stream_ready is not True:
+            raise RuntimeError("Visible PC-VR stream acknowledgment required before operator arming")
+        with self.lock():
+            m = self.manifest(); self.verify_owned(m); self.verify_acquisition_scope(m)
+            for path in (self.marker, self.arm_receipt, self.folder / "rollback-complete.json"):
+                safe_path(path)
+                if path.exists() or path.is_symlink(): raise RuntimeError("Operator arm is single-use; existing or restored session refused")
+            for name, item in m["activation"].items():
+                if read_regular(Path(name), private=True) != bytes.fromhex(item["bytes_hex"]):
+                    raise RuntimeError("Owned active diagnostic configuration changed")
+            self.command("is-active", UNIT)
+            self.active_environment(m, post_restart=True)
+            self.configure_startup_isolation(m, active=True)
+            current = self.current_arm_health()
+            process = self.mapped_compositor(m, current)
+            pid = process["pid"]
+            with ExitStack() as opened:
+                raw_snapshot, _ = opened.enter_context(self.live_output(self.capture, CAPTURE_LIMITS["bytes"], pid))
+                journal_snapshot, _ = opened.enter_context(self.live_output(self.journal, JOURNAL_LIMITS["bytes"], pid))
+                evidence = self.validate_prearm_outputs(raw_snapshot(), journal_snapshot(), m, current)
+                # No marker is written until both live writers and the same
+                # invocation have passed. Arming does not reopen either file,
+                # restart a service or extend their existing absolute deadline.
+                process = self.mapped_compositor(m, current)
+                evidence = self.validate_prearm_outputs(raw_snapshot(), journal_snapshot(), m, current)
+                requested_ns = int(self.health_source.clock() * 1000000000)
+                if not evidence["capture_started_ns"] <= requested_ns < evidence["capture_deadline_ns"]:
+                    raise RuntimeError("Capture expired before the operator marker could be published")
+                exclusive(self.marker, ARM_CONTENTS)
+                directory_sync(self.folder)
+            receipt = {"schema": ARM_RECEIPT_SCHEMA, "plan_sha256": m["plan_sha256"],
+                "stream_ready_acknowledged": True, "operator_arm_requested": True,
+                "operator_arm_ns": requested_ns,
+                "marker_sha256": digest(ARM_CONTENTS), "marker_bytes": len(ARM_CONTENTS),
+                "marker_path": str(self.marker), "process": process, **evidence,
+                "automatic_restart": False, "source_frame_associated": False,
+                "accepted_submit": False, "gpu_consumed": False, "mask_enabled": False}
+            exclusive(self.arm_receipt, json_bytes(receipt)); directory_sync(self.folder)
+            self.event("operator_arm_requested", stream_ready_acknowledged=True, source_frame_associated=False,
+                accepted_submit=False, automatic_restart=False, receiver_process=process)
+            return receipt
+
+    def validate_arm_archive(self, payloads):
+        """Dynamic owned evidence is checked after native restoration, not before it."""
+        marker, receipt = payloads.get(self.marker.name), payloads.get(self.arm_receipt.name)
+        if marker is not None and marker != ARM_CONTENTS:
+            raise RuntimeError("Changed operator-arm marker preserved after native recovery")
+        if receipt is None: return  # A failed receipt write must not prevent recovery.
+        value = json.loads(receipt)
+        manifest = json.loads(payloads["owned.json"])
+        keys = {"schema", "plan_sha256", "stream_ready_acknowledged", "operator_arm_requested",
+            "operator_arm_ns", "marker_sha256", "marker_bytes", "marker_path", "process",
+            "capture_started_ns", "capture_deadline_ns", "pre_arm_private_bytes", "journal_no_recorded_loss",
+            "continuous_transport_loss_proven", "automatic_restart", "source_frame_associated",
+            "accepted_submit", "gpu_consumed", "mask_enabled"}
+        fixed = {"schema": ARM_RECEIPT_SCHEMA, "plan_sha256": manifest["plan_sha256"],
+            "stream_ready_acknowledged": True, "operator_arm_requested": True,
+            "marker_sha256": digest(ARM_CONTENTS), "marker_bytes": len(ARM_CONTENTS), "marker_path": str(self.marker),
+            "pre_arm_private_bytes": 0, "journal_no_recorded_loss": True,
+            "continuous_transport_loss_proven": False, "automatic_restart": False,
+            "source_frame_associated": False, "accepted_submit": False, "gpu_consumed": False, "mask_enabled": False}
+        if (not isinstance(value, dict) or set(value) != keys or marker != ARM_CONTENTS or
+                any(value[key] != item or type(value[key]) is not type(item) for key, item in fixed.items())):
+            raise RuntimeError("Changed operator-arm receipt preserved after native recovery")
+        start, end, requested = (value[key] for key in ("capture_started_ns", "capture_deadline_ns", "operator_arm_ns"))
+        process = value["process"]
+        if (any(type(item) is not int or not 0 < item < 2**64 for item in (start, end, requested)) or
+                end - start != 120000000000 or not start <= requested < end or
+                not isinstance(process, dict) or set(process) != {"pid", "start_ticks", "invocation", "mapped_observer_sha256", "verification_scope"} or
+                any(type(process[key]) is not int or not 0 < process[key] < 2**64 for key in ("pid", "start_ticks")) or
+                not re.fullmatch(r"[0-9a-f]{32}", process.get("invocation", "")) or
+                process["mapped_observer_sha256"] != manifest["owned_files"][MAIN] or
+                process["verification_scope"] != "bounded current public proc metadata and pinned files; not GPU lifetime or video-frame proof"):
+            raise RuntimeError("Changed operator-arm identity/deadline preserved after native recovery")
 
     def start(self, *args, runtime_scope=False, restart_ready=False, **kwargs):
         if runtime_scope is not True or restart_ready is not True: raise RuntimeError("Scope and coordinated restart required")
@@ -798,15 +1086,18 @@ class Session(base.Session):
         info = destination.lstat()
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700 or not stat.S_ISDIR(info.st_mode):
             raise RuntimeError("Archive directory ownership changed")
-        names = {"owned.json", "deployment-plan.json", "session.jsonl", "compositor-raw.jsonl", "compositor-journal.jsonl"} | STARTUP_RECEIPTS
+        names = {"owned.json", "deployment-plan.json", "session.jsonl", "compositor-raw.jsonl", "compositor-journal.jsonl",
+                 self.marker.name, self.arm_receipt.name} | STARTUP_RECEIPTS
         if any(p.name not in names | {"expected.json"} for p in destination.iterdir()): raise RuntimeError("Foreign archive preserved")
         payloads, items = {}, {}
         for name in sorted(names):
             source = self.folder / name
-            if not source.exists(): continue
-            limit = 65536 if name == "compositor-raw.jsonl" else 262144 if name in STARTUP_RECEIPTS else base.LIMIT
+            if not source.exists() and not source.is_symlink(): continue
+            limit = (len(ARM_CONTENTS) if name == self.marker.name else 16384 if name == self.arm_receipt.name else
+                     65536 if name == "compositor-raw.jsonl" else 262144 if name in STARTUP_RECEIPTS else base.LIMIT)
             raw = read_regular(source, limit, private=True)
             payloads[name] = raw; items[name] = {"bytes": len(raw), "sha256": digest(raw)}
+        self.validate_arm_archive(payloads)
         expected = destination / "expected.json"
         if expected.exists():
             if json.loads(read_regular(expected, private=True)) != items: raise RuntimeError("Archive source changed")
@@ -822,7 +1113,7 @@ class Session(base.Session):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=("stage", "readcheck", "activate", "start", "rollback", "verify-unloaded", "monitor-startup"))
+    p.add_argument("mode", choices=("stage", "readcheck", "activate", "start", "rollback", "verify-unloaded", "monitor-startup", "arm"))
     p.add_argument("--reviewed-plan", type=Path); p.add_argument("--reviewed-plan-sha256")
     for role in NATIVE: p.add_argument("--native-" + role, type=Path)
     for artifact in ("observer", "audit", "selector", "envelope", "layer"): p.add_argument("--" + artifact, type=Path)
@@ -832,6 +1123,7 @@ def main(argv=None):
     p.add_argument("--reviewed-native-layer", action="append", default=[], metavar="PATH=SHA256")
     p.add_argument("--ack-compositor-raw-diagnostic-scope", action="store_true")
     p.add_argument("--ack-steamvr-restart-readiness", action="store_true")
+    p.add_argument("--ack-pc-vr-stream-visible", action="store_true")
     a = p.parse_args(argv)
     try:
         if platform.system() != "Linux" or platform.machine().lower() not in ("aarch64", "arm64"):
@@ -856,6 +1148,7 @@ def main(argv=None):
         elif a.mode == "activate": session.activate(runtime_scope=a.ack_compositor_raw_diagnostic_scope,
             restart_ready=a.ack_steamvr_restart_readiness)
         elif a.mode == "rollback": session.rollback(restart_ready=a.ack_steamvr_restart_readiness)
+        elif a.mode == "arm": print(json.dumps(session.arm(stream_ready=a.ack_pc_vr_stream_visible), sort_keys=True))
         elif a.mode == "monitor-startup": print(json.dumps(session.monitor_startup(seconds=a.monitor_seconds), sort_keys=True))
         elif a.mode == "verify-unloaded": print(json.dumps(session.verify_unloaded(), sort_keys=True))
         else: print(json.dumps(session.readcheck(), sort_keys=True))

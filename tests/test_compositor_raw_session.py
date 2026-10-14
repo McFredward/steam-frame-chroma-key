@@ -4,6 +4,7 @@ Only this fixture replaces native/profile pins and the blocked legacy activation
 guard. Production has no bypass flag; its guard is independently checked below.
 """
 import copy
+import fcntl
 import importlib.util
 import json
 import os
@@ -85,8 +86,8 @@ class SessionTests(unittest.TestCase):
         for key, value in (("NATIVE", pins), ("PROFILE_PINS", tuple(p[-32:].hex() for p in profiles))):
             patch = mock.patch.object(M, key, value); patch.start(); self.patches.append(patch)
         main, audit, selector = self.elf(7), self.elf(8), self.elf(9); profiles.append(self.profile(5, main))
-        envelope = bytearray(8272); envelope[:8] = b"FCMRAW02"
-        struct.pack_into("<II", envelope, 8, 2, 8272); envelope[16:48] = profiles[-1][-32:]
+        envelope = bytearray(8272); envelope[:8] = b"FCMRAW03"
+        struct.pack_into("<II", envelope, 8, 3, 8272); envelope[16:48] = profiles[-1][-32:]
         struct.pack_into("<8Q", envelope, 48, *M.ENVELOPE_LIMITS)
         envelope[112:-32] = b"".join(profiles); envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
         layer = self.layer_bytes()
@@ -99,12 +100,13 @@ class SessionTests(unittest.TestCase):
                 "scope_marker": {"symbol": "frame_compositor_raw_scope", "rva": 0x1080, "bytes": 16, "sha256": M.digest(M.SCOPE_MARKER)},
                 "vulkan_functions": dict(M.VULKAN_FUNCTIONS), "standard_vulkan_exports": [], "cold_environment_freeze_abi": 1, "launch_provider_mask": 63},
             "audit": {"sha256": M.digest(audit), "bytes": len(audit), "native_rvas": dict(M.NATIVE_RVAS), "early_forward_only": True},
-            "envelope": {"sha256": M.digest(envelope), "bytes": len(envelope), "schema": 2, "module_count": 4,
+            "envelope": {"sha256": M.digest(envelope), "bytes": len(envelope), "schema": 3, "module_count": 4,
                 "module_roles": [7, 3, 4, 5], "reviewed_observer_profile_identity": profiles[-1][-32:].hex()},
             "manifest": {"sha256": M.digest(layer), "bytes": len(layer), "library_path": str(self.session.library),
                 "functions": dict(M.VULKAN_FUNCTIONS),
                 "staged_path": str(self.session.folder / M.LAYER), "frame_path": str(self.session.layer)},
             "capture_limits": dict(M.CAPTURE_LIMITS), "raw_limits": dict(M.RAW_LIMITS), "journal_limits": dict(M.JOURNAL_LIMITS), "inventory": []}
+        self.plan["operator_arm"] = self.session.operator_arm_descriptor()
         self.plan["selector"] = {"sha256": M.digest(selector), "bytes": len(selector), "public_exports": sorted(M.SELECTOR_EXPORTS),
             "cold_environment_freeze_abi": 1, "launch_provider_mask": 63, "module_tls_bytes": 0, "standard_vulkan_exports": [],
             "configuration": {"target": str(self.native["compositor"]), "selector": str(self.session.selector), "payload": str(self.session.library),
@@ -637,6 +639,268 @@ class SessionTests(unittest.TestCase):
         source = Path(M.__file__).read_text()
         self.assertNotIn('"watchdog"', source); self.assertNotIn('"sudo"', source); self.assertNotIn('"timer"', source)
         with mock.patch.object(M.platform, "machine", return_value="x86_64"), self.assertRaises(SystemExit): M.main(["stage"])
+
+class OperatorArmTests(unittest.TestCase):
+    """Actual flock/node checks with synthetic, bounded proc records; no Frame access."""
+    def setUp(self):
+        SessionTests.setUp(self)
+        self.descriptors = []
+
+    def tearDown(self):
+        for fd in self.descriptors: os.close(fd)
+        SessionTests.tearDown(self)
+
+    elf, profile = staticmethod(SessionTests.elf), staticmethod(SessionTests.profile)
+    layer_bytes, save_plan, command = SessionTests.layer_bytes, SessionTests.save_plan, SessionTests.command
+    stage, activate, restart_count = SessionTests.stage, SessionTests.activate, SessionTests.restart_count
+
+    def live_fixture(self):
+        self.stage(); self.activate()
+        self.pid = os.getpid()
+        self.current = {"status": "ready", "ready": True, "isolation_verified": True,
+            "launch_freeze_receipt_verified": True, "invocation": "a" * 32,
+            "process_identities": {"compositor": {"pid": self.pid, "start_ticks": 500}}}
+        self.proc = self.root / "proc"; self.proc.mkdir(mode=0o700)
+        self.session.proc = self.proc
+        process = self.proc / str(self.pid); process.mkdir(mode=0o700)
+        os.symlink(self.native["compositor"], process / "exe")
+        os.symlink("/", process / "root")
+        values = ["S"] + ["0"] * 18 + ["500"]
+        (process / "stat").write_text(str(self.pid) + " (vrcompositor) " + " ".join(values) + "\n")
+        (process / "cgroup").write_text("0::/app/steamvr.service\n")
+        maprows = []
+        for index, path in enumerate((self.session.library, self.session.audit, self.session.selector)):
+            info = path.stat()
+            maprows.append(f"{4096 + index * 4096:x}-{8192 + index * 4096:x} r-xp 0000 {os.major(info.st_dev):x}:{os.minor(info.st_dev):x} {info.st_ino} {path}")
+        (process / "maps").write_text("\n".join(maprows) + "\n")
+        self.header = {"schema": 1, "capture": "compositor_raw_import", "pid": self.pid,
+            "operator_arm_required": True, "operator_armed": False, "pre_arm_private_bytes": 0,
+            "launch_environment_frozen": True, "launch_freeze_abi": 1, "launch_provider_mask": 63,
+            "launch_frozen_owner_pid": self.pid, "launch_frozen_observed_ns": 1000000000,
+            "capture_started_ns": 1000000000, "capture_deadline_ns": 121000000000,
+            "transactions": 1, "parent_byte_limit": 16, "scalar_byte_limit": 720, "wire_byte_limit": 21,
+            "private_byte_limit": 757, "write_limit": 8, "record_limit": 32, "byte_limit": 65536,
+            "seconds_limit": 120, "observer_profile": self.plan["envelope"]["reviewed_observer_profile_identity"],
+            "native_cross_endpoint_associated": False, "native_namespace_associated": False,
+            "source_frame_associated": False, "uv_owned": False, "accepted_submit": False,
+            "gpu_consumed": False, "mask_enabled": False}
+        self.header["modules"] = [{"role": role, "file_sha256": M.NATIVE[name][1], "profile_sha256": M.PROFILE_PINS[index]}
+            for index, (name, role) in enumerate((("compositor", 7), ("libc", 3), ("loader", 4)))]
+        self.header["modules"].append({"role": 5, "file_sha256": self.plan["observer"]["sha256"],
+            "profile_sha256": self.plan["envelope"]["reviewed_observer_profile_identity"]})
+        self.journal_header = {"event": "header", "version": 1, "layer": "VK_LAYER_FRAME_MASK_trace",
+            "scope": "passive_pipeline_metadata", "limit_bytes": 1048576,
+            "binding_metadata_version": 1, "limit_binding_snapshots": 32,
+            "binding_arm_required": True, "pre_arm_draws_recorded": False,
+            "binding_ready_at_header": False, "deadline_seconds": 120}
+        self.save_live_records([self.header], [self.journal_header], create=True)
+        rows = []
+        for index, path in enumerate((self.session.capture, self.session.journal)):
+            fd = os.open(path, os.O_RDWR); self.descriptors.append(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            info = path.stat()
+            rows.append(f"{index}: FLOCK ADVISORY WRITE {self.pid} {os.major(info.st_dev):x}:{os.minor(info.st_dev):x}:{info.st_ino} 0 EOF")
+        (self.proc / "locks").write_text("\n".join(rows) + "\n")
+        patch = mock.patch.object(self.session, "current_arm_health", return_value=self.current)
+        patch.start(); self.patches.append(patch)
+        self.health_source.clock = lambda: 3.0
+
+    def save_live_records(self, raw, journal, create=False):
+        for path, value in ((self.session.capture, raw), (self.session.journal, journal)):
+            data = b"".join((json.dumps(row, separators=(",", ":")) + "\n").encode() for row in value)
+            if create: M.exclusive(path, data)
+            else: path.write_bytes(data)
+
+    def test_protected_signal_arms_once_without_restart_or_extra_environment(self):
+        self.live_fixture(); prior = self.restart_count()
+        result = self.session.arm(stream_ready=True)
+        self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
+        self.assertEqual(self.session.marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.restart_count(), prior)
+        self.assertEqual(result["process"]["pid"], self.pid)
+        self.assertFalse(result["source_frame_associated"]); self.assertFalse(result["mask_enabled"])
+        self.assertFalse(result["continuous_transport_loss_proven"])
+        self.assertEqual(result["capture_deadline_ns"] - result["capture_started_ns"], 120000000000)
+        self.assertEqual(json.loads(self.session.arm_receipt.read_bytes()), result)
+        with self.assertRaisesRegex(RuntimeError, "single-use"): self.session.arm(stream_ready=True)
+        self.assertEqual(self.restart_count(), prior)
+        self.assertEqual(len(self.session.target_environment()), 7)
+
+    def test_arm_acknowledgment_is_an_actual_boolean_before_any_io(self):
+        for value in (False, 0, 1, None, "yes"):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "acknowledgment"):
+                self.session.arm(stream_ready=value)
+        self.assertEqual(self.restart_count(), 0); self.assertFalse(self.session.folder.exists())
+
+    def test_arm_cli_requires_visible_stream_ack_and_does_not_request_a_restart(self):
+        fake = mock.Mock(); fake.arm.return_value = {"operator_arm_requested": True}
+        with mock.patch.object(M.platform, "machine", return_value="aarch64"), \
+             mock.patch.dict(M.os.environ, {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}), \
+             mock.patch.object(M, "Session", return_value=fake), mock.patch("builtins.print"):
+            M.main(["arm", "--ack-pc-vr-stream-visible"])
+            fake.arm.assert_called_once_with(stream_ready=True)
+            fake.activate.assert_not_called(); fake.command.assert_not_called()
+            fake.arm.reset_mock()
+            M.main(["arm"])
+            fake.arm.assert_called_once_with(stream_ready=False)
+
+    def test_missing_arm_descriptor_or_legacy_unarmed_artifact_cannot_stage(self):
+        original = copy.deepcopy(self.plan)
+        variants = (None, {}, dict(original["operator_arm"], required=False),
+            dict(original["operator_arm"], required=1), dict(original["operator_arm"], marker_path="/foreign"),
+            dict(original["operator_arm"], deadline_reset_allowed=True),
+            dict(original["operator_arm"], marker_sha256="f" * 64),
+            dict(original["operator_arm"], pc_vr_stream_acknowledgment_required=False))
+        for descriptor in variants:
+            self.plan = copy.deepcopy(original)
+            if descriptor is None: self.plan.pop("operator_arm")
+            else: self.plan["operator_arm"] = descriptor
+            self.save_plan()
+            with self.subTest(descriptor=descriptor), self.assertRaisesRegex(RuntimeError, "operator-arm descriptor"):
+                self.stage()
+            self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_staged_marker_or_captures_cannot_be_reused_on_activation(self):
+        self.stage()
+        for path in (self.session.marker, self.session.arm_receipt, self.session.capture, self.session.journal):
+            M.exclusive(path, b"stale")
+            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, "cannot reset"):
+                self.activate()
+            path.unlink()
+        self.assertEqual(self.restart_count(), 0)
+
+    def test_raw_deadline_owner_limits_pins_and_retired_states_refuse_without_marker(self):
+        self.live_fixture()
+        variants = (("operator_arm_required", False), ("operator_armed", True), ("pre_arm_private_bytes", 1),
+            ("pid", self.pid + 1), ("launch_frozen_owner_pid", self.pid + 1), ("private_byte_limit", 758),
+            ("seconds_limit", 121), ("capture_deadline_ns", 3000000000),
+            ("capture_started_ns", 4000000000), ("capture_deadline_ns", 121000000001),
+            ("launch_frozen_observed_ns", 1000000001), ("modules", []), ("capture_started_ns", True))
+        for field, value in variants:
+            bad = dict(self.header); bad[field] = value
+            self.save_live_records([bad], [self.journal_header])
+            with self.subTest(field=field), self.assertRaises(RuntimeError): self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+        for row in ({"schema": 1, "end": "deadline"}, {"schema": 1, "operator_armed": True},
+                {"schema": 1, "kind": 3, "refusal": 0}, {"schema": 1, "kind": 8, "refusal": 12}):
+            self.save_live_records([self.header, row], [self.journal_header])
+            with self.subTest(row=row), self.assertRaises(RuntimeError): self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+
+    def test_journal_loss_footer_prearm_draws_and_wrong_protocol_refuse(self):
+        self.live_fixture()
+        for row in ({"event": "footer"}, {"event": "bindings_armed"}, {"event": "draw"},
+                {"event": "submit_accepted"}, {"event": "state", "lost_binding_state": 1},
+                {"event": "state", "complete": False}):
+            self.save_live_records([self.header], [self.journal_header, row])
+            with self.subTest(row=row), self.assertRaises(RuntimeError): self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+        for field, value in (("binding_arm_required", False), ("binding_ready_at_header", True),
+                ("deadline_seconds", 121), ("pre_arm_draws_recorded", True)):
+            bad = dict(self.journal_header); bad[field] = value
+            self.save_live_records([self.header], [bad])
+            with self.subTest(field=field), self.assertRaises(RuntimeError): self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+
+    def test_closed_or_wrong_owner_writer_cannot_be_armed(self):
+        self.live_fixture()
+        rows = (self.proc / "locks").read_text()
+        (self.proc / "locks").write_text(rows.replace(f"WRITE {self.pid} ", f"WRITE {self.pid + 1} "))
+        with self.assertRaisesRegex(RuntimeError, "admitted compositor"): self.session.arm(stream_ready=True)
+        self.assertFalse(self.session.marker.exists())
+        (self.proc / "locks").write_text(rows)
+        fcntl.flock(self.descriptors[1], fcntl.LOCK_UN)
+        with self.assertRaisesRegex(RuntimeError, "writer is closed"): self.session.arm(stream_ready=True)
+        self.assertFalse(self.session.marker.exists())
+
+    def test_mapping_missing_changed_or_pid_reused_refuses(self):
+        self.live_fixture()
+        process = self.proc / str(self.pid); maps = (process / "maps").read_text()
+        for content in ("", maps.replace(str(self.session.library), "/other.so"),
+                maps.replace(" r-xp ", " rw-p ")):
+            (process / "maps").write_text(content)
+            with self.subTest(content=content), self.assertRaises(RuntimeError): self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+        (process / "maps").write_text(maps)
+        original = (process / "stat").read_text()
+        (process / "stat").write_text(original.replace("500", "501"))
+        with self.assertRaisesRegex(RuntimeError, "PID/start"): self.session.arm(stream_ready=True)
+        self.assertFalse(self.session.marker.exists())
+
+    def test_arm_marker_or_receipt_foreign_nodes_are_not_replaced(self):
+        self.live_fixture()
+        for path in (self.session.marker, self.session.arm_receipt):
+            os.symlink(self.session.capture, path)
+            with self.subTest(path=path), self.assertRaises(RuntimeError):
+                self.session.arm(stream_ready=True)
+            self.assertTrue(path.is_symlink()); path.unlink()
+        self.assertFalse(self.session.marker.exists())
+
+    def test_arm_dynamic_evidence_is_archived_after_safe_original_restart(self):
+        self.live_fixture(); result = self.session.arm(stream_ready=True)
+        self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertEqual(self.restart_count(), 2)
+        self.assertEqual((self.session.folder / "archive" / self.session.marker.name).read_bytes(), M.ARM_CONTENTS)
+        self.assertEqual(json.loads((self.session.folder / "archive" / self.session.arm_receipt.name).read_bytes()), result)
+
+    def test_missing_receipt_and_tampered_signal_never_block_authorized_recovery(self):
+        self.live_fixture(); self.session.arm(stream_ready=True)
+        self.session.arm_receipt.unlink(); self.session.marker.write_bytes(b"foreign")
+        with self.assertRaisesRegex(RuntimeError, "marker preserved"):
+            self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertEqual(self.restart_count(), 2)
+        self.assertEqual(self.session.marker.read_bytes(), b"foreign")
+
+    def test_receipt_storage_failure_keeps_a_valid_one_shot_for_safe_recovery(self):
+        self.live_fixture(); original = M.exclusive
+        def failing(path, value):
+            if path == self.session.arm_receipt: raise OSError("receipt storage unavailable")
+            return original(path, value)
+        with mock.patch.object(M, "exclusive", side_effect=failing), self.assertRaises(OSError):
+            self.session.arm(stream_ready=True)
+        self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
+        with self.assertRaisesRegex(RuntimeError, "single-use"): self.session.arm(stream_ready=True)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertFalse(self.session.layer.exists())
+
+    def test_current_arm_health_uses_one_fresh_sample_without_wait_or_restart(self):
+        self.stage(); self.activate()
+        pinned = {"compositor": {"pid": 123, "start_ticks": 500}}
+        saved = dict(self.ready_result, invocation="a" * 32, process_identities=pinned,
+            launch_freeze_receipt_verified=True, gate_checkpoint={"fixture": True}, source_checkpoint={"fixture": True})
+        self.session.health_receipt("activation-startup-health.json", saved)
+        gate = mock.Mock(); gate.baseline = {"monotonic": 1.0}
+        gate.consume.return_value = dict(saved); gate.checkpoint.return_value = {"fixture": True}
+        self.health_source.sample.return_value = {"fresh": True}
+        self.health_source.checkpoint.return_value = {"continued": True}
+        before = self.restart_count()
+        with mock.patch.object(M.health.StartupGate, "resume", return_value=gate):
+            result = self.session.current_arm_health()
+        gate.consume.assert_called_once_with({"fresh": True}, stable_seconds=0)
+        self.assertEqual(result["invocation"], saved["invocation"])
+        self.assertEqual(self.restart_count(), before)
+        self.assertEqual(json.loads((self.session.folder / "startup-monitor.json").read_bytes())["source_checkpoint"], {"continued": True})
+
+    def test_lost_current_ui_or_new_invocation_cannot_authorize_signal(self):
+        self.stage(); self.activate()
+        saved = dict(self.ready_result, invocation="a" * 32,
+            process_identities={"compositor": {"pid": 123, "start_ticks": 500}},
+            launch_freeze_receipt_verified=True, gate_checkpoint={"fixture": True}, source_checkpoint={"fixture": True})
+        gate = mock.Mock(); gate.baseline = {"monotonic": 1.0}; gate.checkpoint.return_value = {"fixture": True}
+        self.health_source.checkpoint.return_value = {"continued": True}
+        for change in ({"ready": False}, {"isolation_verified": False}, {"invocation": "b" * 32},
+                {"process_identities": {"compositor": {"pid": 124, "start_ticks": 501}}}):
+            self.session.health_receipt("activation-startup-health.json", saved)
+            monitor = self.session.folder / "startup-monitor.json"
+            if monitor.exists(): monitor.unlink()
+            gate.consume.return_value = dict(saved, **change)
+            with self.subTest(change=change), mock.patch.object(M.health.StartupGate, "resume", return_value=gate), \
+                    self.assertRaisesRegex(RuntimeError, "health or invocation changed"):
+                self.session.current_arm_health()
+            self.assertFalse(self.session.marker.exists())
 
 class NativeLayerTests(unittest.TestCase):
     setUp, tearDown = SessionTests.setUp, SessionTests.tearDown

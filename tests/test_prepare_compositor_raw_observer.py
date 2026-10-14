@@ -137,8 +137,23 @@ class PackageControls(unittest.TestCase):
                 self.validate(fixture(missing_import=name))
 
     def test_old_creation_route_scope_cannot_use_the_new_acquisition_contract(self):
-        old = b'FCMRAW01' + struct.pack('<II', 1, tool.ENVELOPE_BYTES)
-        with self.assertRaises(ValueError): self.validate(fixture(marker=old))
+        for version in (1, 2):
+            old = ('FCMRAW0' + str(version)).encode() + struct.pack('<II', version, tool.ENVELOPE_BYTES)
+            with self.subTest(version=version), self.assertRaises(ValueError): self.validate(fixture(marker=old))
+
+    def test_operator_arm_descriptor_reserves_the_existing_budget_without_new_environment(self):
+        frame = Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw')
+        descriptor = tool.operator_arm_descriptor(frame)
+        self.assertEqual(descriptor['schema'], 'frame-compositor-operator-arm-v1')
+        self.assertIs(descriptor['required'], True)
+        self.assertEqual(descriptor['marker_path'], str(frame / 'capture-arm.marker'))
+        self.assertEqual(descriptor['marker_bytes'], len(b'FRAME_COMPOSITOR_RAW/1\n'))
+        self.assertEqual(descriptor['marker_sha256'], tool.digest(b'FRAME_COMPOSITOR_RAW/1\n').hex())
+        self.assertEqual(descriptor['deadline_from_capture_start_seconds'], 120)
+        self.assertIs(descriptor['deadline_reset_allowed'], False)
+        self.assertIs(descriptor['restart_required'], False)
+        self.assertIs(descriptor['source_frame_associated'], False)
+        self.assertEqual(len(tool.launch_environment(tool.launch_config(frame))), 7)
 
     def test_launch_configuration_is_exact_and_child_service_only_preloads_selector(self):
         config = tool.launch_config(Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw'))
@@ -241,6 +256,7 @@ class PackageControls(unittest.TestCase):
             self.assertEqual(struct.unpack_from('<8Q', envelope, 48), tool.LIMIT_WORDS)
             self.assertEqual(envelope[112:8240], b''.join(blobs))
             parsed = tool.decode_envelope(envelope, reviewed)
+            self.assertEqual(parsed['schema'], 3)
             self.assertTrue(parsed['independent_observer_checked'])
             self.assertEqual(parsed['raw_limits']['private_bytes'], 757)
             self.assertEqual(parsed['raw_limits']['bootstrap_poll_bytes'], 0)
@@ -262,9 +278,10 @@ class PackageControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='frame-compositor-preparer-controls-') as temporary:
             output = Path(temporary) / 'bundle'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, REMOTE)
-            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v3')
+            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v4')
             self.assertEqual(plan['raw_limits'], tool.RAW_LIMITS)
             self.assertEqual(plan['capture_limits'], tool.CAPTURE_LIMITS)
+            self.assertEqual(plan['operator_arm'], tool.operator_arm_descriptor(Path(REMOTE).parent))
             for field in ('installed', 'activated', 'runtime_authorized', 'frame_access', 'network_access', 'automatic_restart',
                           'native_binary_or_script_changes', 'shader_or_mask_activation', 'source_frame_associated', 'gpu_coherent'):
                 self.assertIs(plan[field], False)
