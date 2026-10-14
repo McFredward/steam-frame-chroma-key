@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <fstream>
 #include <string>
+#include <thread>
 
 extern "C" void frame_import_lock_entry() {}
 extern "C" void frame_import_unlock_entry() {}
@@ -19,18 +20,24 @@ std::size_t count=0,drained=0;
 std::atomic<bool> current{true};
 bool validate_result=true,retire_during_validate=false,finalized=false,child_retired=false;
 unsigned validates=0;
+std::atomic<bool> arm_required{false},armed{false};
+std::atomic<unsigned> arm_calls{0};
 }
 namespace frame_compositor_runtime {
 bool initialize(const frame_compositor_main::Prepared&,Setup) noexcept {return false;}
 frame_compositor_audit::BridgeResponse bridge(frame_compositor_audit::BridgeRequest) noexcept {return {};}
 bool pop(Record& r) noexcept {
+    if(writer_stubs::arm_required && !writer_stubs::armed)return false;
     if(writer_stubs::drained>=writer_stubs::count)return false;
     r=writer_stubs::records[writer_stubs::drained++];return true;
 }
 Status status() noexcept {
-    return {false,false,writer_stubs::finalized,true,writer_stubs::count==2,Refusal::Finalized,
-        writer_stubs::count,writer_stubs::drained,16,364,21};
+    const bool active=!writer_stubs::arm_required || writer_stubs::armed;
+    return {false,false,writer_stubs::finalized,active,active && writer_stubs::count==2,Refusal::Finalized,
+        writer_stubs::count,writer_stubs::drained,active?16u:0u,active?364u:0u,active?21u:0u,
+        writer_stubs::arm_required,writer_stubs::armed,writer_stubs::armed};
 }
+bool arm_candidate_once() noexcept {++writer_stubs::arm_calls;writer_stubs::armed=true;return true;}
 void finalize() noexcept {writer_stubs::finalized=true;writer_stubs::current=false;}
 bool quiescent() noexcept {return true;}
 bool association_current() noexcept {return writer_stubs::current.load();}
@@ -185,11 +192,70 @@ void output_controls() {
     writer_stubs::records[0].kind=runtime::Kind::RawMatched;writer_stubs::records[0].raw=raw_fixture();writer_stubs::records[0].ordinal=0;
     writer_stubs::records[1].kind=runtime::Kind::Receipt;writer_stubs::records[1].receipt=receipt_fixture();writer_stubs::records[1].ordinal=1;
     writer_stubs::count=2;writer_stubs::drained=0;writer_stubs::finalized=false;writer_stubs::current=true;stopping=false;
+    capture_started_ns=now();
     check(write_background(nullptr)==nullptr && output_fd==-1 && writer_stubs::finalized);
     const auto written=read_file(name);check(written.size()<=OutputBytes && std::count(written.begin(),written.end(),'\n')==4);
     check(written.find("\"local_cpu_resource_join\":true")!=std::string::npos && written.find("\"quiescent\":true")!=std::string::npos);
     check(written.find("\"incomplete\":false")!=std::string::npos);
     check(!unlink(name.c_str()) && !rmdir(dir.c_str()));
+}
+void marker_controls() {
+    using namespace frame_compositor_arm;
+    char pattern[]="/tmp/frame-compositor-marker-XXXXXX";char* directory=mkdtemp(pattern);check(directory);
+    const std::string dir(directory),raw=dir+"/compositor-raw.jsonl",marker=dir+"/capture-arm.marker";
+    char derived[1024]{};check(frame_compositor_arm::path(raw.c_str(),derived,sizeof(derived)) && derived==marker);
+    for(const char* bad:{"relative/compositor-raw.jsonl","/compositor-raw.jsonl","/a//compositor-raw.jsonl",
+            "/a/../compositor-raw.jsonl","/a/./compositor-raw.jsonl","/a/foreign.jsonl","/a b/compositor-raw.jsonl"})
+        check(!frame_compositor_arm::path(bad,derived,sizeof(derived)));
+    check(!frame_compositor_arm::path(raw.c_str(),derived,marker.size()));
+    errno=E2BIG;check(frame_compositor_arm::read(marker.c_str())==Result::Missing && errno==E2BIG);
+    const auto put=[&](const char* bytes,std::size_t length,mode_t mode) {
+        const int fd=open(marker.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,mode);check(fd>=0);
+        check(write(fd,bytes,length)==static_cast<ssize_t>(length));check(!close(fd));
+    };
+    put(Contents,sizeof(Contents)-1,0600);errno=E2BIG;
+    check(frame_compositor_arm::read(marker.c_str())==Result::Valid && errno==E2BIG);
+    check(!chmod(marker.c_str(),0644));check(frame_compositor_arm::read(marker.c_str())==Result::Invalid);
+    check(!chmod(marker.c_str(),0600));const auto linked=dir+"/linked";
+    check(!link(marker.c_str(),linked.c_str()));check(frame_compositor_arm::read(marker.c_str())==Result::Invalid);
+    check(!unlink(linked.c_str()) && !unlink(marker.c_str()));
+    put(Contents,sizeof(Contents),0600);check(frame_compositor_arm::read(marker.c_str())==Result::Invalid);check(!unlink(marker.c_str()));
+    const std::string wrong(sizeof(Contents)-1,'x');put(wrong.data(),wrong.size(),0600);
+    check(frame_compositor_arm::read(marker.c_str())==Result::Invalid);check(!unlink(marker.c_str()));
+    check(!symlink("foreign",marker.c_str()));check(frame_compositor_arm::read(marker.c_str())==Result::Invalid);check(!unlink(marker.c_str()));
+    check(!mkfifo(marker.c_str(),0600));check(frame_compositor_arm::read(marker.c_str())==Result::Invalid);check(!unlink(marker.c_str()));
+    check(!chmod(dir.c_str(),0755));check(frame_compositor_arm::read(marker.c_str())==Result::Invalid);check(!chmod(dir.c_str(),0700));
+    const auto alias=dir+"-alias";check(!symlink(dir.c_str(),alias.c_str()));
+    check(frame_compositor_arm::read((alias+"/capture-arm.marker").c_str())==Result::Invalid);check(!unlink(alias.c_str()));
+
+    // Exercise the production background loop and protected file. Transport
+    // stubs below only assert sequencing, not native import/frame ownership.
+    check(::path(raw.c_str(),output_path,sizeof(output_path)) && frame_compositor_arm::path(raw.c_str(),arm_path,sizeof(arm_path)));
+    const auto run=[&](bool expired,bool invalid) {
+        output_fd=open_output();check(output_fd>=0);owner_pid=getpid();capture_started_ns=now()-(expired?DurationNs:0);
+        stopping=false;writer_stubs::finalized=false;writer_stubs::current=true;writer_stubs::drained=0;
+        writer_stubs::arm_required=true;writer_stubs::armed=false;writer_stubs::arm_calls=0;
+        if(invalid)put(wrong.data(),wrong.size(),0600);
+        if(!expired && !invalid) {
+            std::thread background([]{write_background(nullptr);});
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            check(writer_stubs::arm_calls==0 && !writer_stubs::armed);
+            put(Contents,sizeof(Contents)-1,0600);background.join();
+        } else write_background(nullptr);
+        const auto text=read_file(raw);check(text.size()<=OutputBytes && output_fd==-1);
+        if(!expired && !invalid) {
+            check(writer_stubs::arm_calls==1 && text.find("\"operator_armed\":true")!=std::string::npos);
+            check(text.find("\"local_cpu_resource_join\":true")!=std::string::npos);
+            check(text.find("\"candidate_armed\":true")!=std::string::npos);
+        } else {
+            check(writer_stubs::arm_calls==0 && !writer_stubs::armed);
+            check(text.find(expired?"\"end\":\"deadline\"":"\"end\":\"invalid_operator_marker\"")!=std::string::npos);
+        }
+        check(!unlink(raw.c_str()));if(!expired)check(!unlink(marker.c_str()));
+    };
+    run(false,false);run(false,true);run(true,false);
+    writer_stubs::arm_required=false;writer_stubs::armed=false;
+    check(!rmdir(dir.c_str()));
 }
 void fork_controls() {
     writer_stubs::finalized=false;writer_stubs::child_retired=false;stopping=false;writer_started=true;errno=E2BIG;
@@ -198,6 +264,6 @@ void fork_controls() {
 }
 int main() {
     check(!writer_started && output_fd==-1); // Actual production constructor inert on host.
-    launch_controls();join_controls();formatter_controls();output_controls();fork_controls();
+    launch_controls();join_controls();formatter_controls();output_controls();marker_controls();fork_controls();
     std::printf("compositor observer: %u pure/writer controls passed; transport stubs are not owning-resource or hardware proof\n",checks);
 }

@@ -1,8 +1,9 @@
 # Combined compositor import diagnostic
 
-The next concrete step towards explicit-mask Steam Link passthrough is a local
-association between a genuinely sent import-reply token and the compositor's
-actual public Vulkan image, memory binding and image view. This artifact does
+The diagnostic associates a genuinely sent import-reply token with the
+compositor's actual public Vulkan image, memory binding and image view. The
+2026-10-14 hardware run established this local join for a startup UI import;
+the next capture must observe the running PC-VR stream. This artifact does
 not activate a shader, mask, passthrough, colour replacement or PC Steam patch.
 The first Frame startup attempt on 2026-10-13 failed before a VR stream was
 requested. The temporary activation and input files were removed, and the
@@ -23,7 +24,10 @@ manifest selects `frame_compositor_raw_` aliases instead. Eleven native
 forwarding entries and the readiness marker remain hidden. The raw build cannot
 opt back into the unsafe ordinary names.
 
-The current offline/owned package schema is v3 with envelope/source marker v2.
+The current operator-reserved offline/owned package schema is v4 with
+envelope/source marker v3. The automatic v3 artifact is historical evidence,
+not the next deployment package. See the [hardware result and arming
+contract](COMPOSITOR-RAW-HARDWARE-20261014.md).
 It includes the source-proven Vulkan and Facet creation routes described in the
 [2026-10-14 analysis](COMPOSITOR-RAW-FIRST-CANDIDATE-20261013.md).
 Its 757-byte maximum is a newly reviewed acquisition scope, not an extension of

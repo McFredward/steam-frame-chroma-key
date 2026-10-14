@@ -4,6 +4,7 @@
 #include "passive_binding_journal.h"
 #ifdef FRAME_MASK_COMPOSITOR_RAW
 #include "../import/compositor_journal_bridge.h"
+#include "../receiver/compositor_arm_marker.h"
 #endif
 #ifdef FRAME_MASK_IMPORT_ENTRY
 #include "../import/import_vulkan_forwarding.h"
@@ -122,6 +123,16 @@ struct Capture {
                 return;
             }
             std::string armPath = bindingsEnabled && arm ? arm : "";
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+            // Reuse the frozen raw-output getter; no additional diagnostic
+            // environment is allowed to leak into native helper launches.
+            char operatorPath[1024]{};
+            if (!bindingsEnabled || arm || !frame_compositor_arm::path(
+                    std::getenv("GHVR_FRAME_COMPOSITOR_RAW_OUTPUT"), operatorPath, sizeof(operatorPath))) {
+                processAllowed = false; return;
+            }
+            armPath = operatorPath;
+#endif
             bindingsArmed.store(bindingsEnabled && armPath.empty());
             const auto* filter = std::getenv("FRAME_MASK_TRACE_FRAGMENT_HASH");
             std::uint64_t parsedFilter = 0;
@@ -252,6 +263,9 @@ struct Capture {
         return true;
     }
     static bool armRequested(const std::string& path) {
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        return frame_compositor_arm::read(path.c_str()) == frame_compositor_arm::Result::Valid;
+#else
         // Writer thread only. Do not spend the bounded binding budget on native
         // Home rendering while the operator reconnects the actual VR stream.
         const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
@@ -265,6 +279,7 @@ struct Capture {
             !std::memcmp(bytes, expected, sizeof(expected) - 1);
         close(fd);
         return valid;
+#endif
     }
     static bool threadCpuNanos(std::uint64_t& result) {
         // Background writer only, once at each end of the measurement window.
@@ -352,7 +367,7 @@ struct Capture {
             maxReplayNanos = std::max(maxReplayNanos, replayElapsed);
             const auto now = std::chrono::steady_clock::now();
             if (!draining && bindingsEnabled && !bindingsArmed.load() && !armPath.empty() && now >= armCheck) {
-                if (now < deadline && armRequested(armPath)) {
+                if (now < deadline && armRequested(armPath) && std::chrono::steady_clock::now() < deadline) {
                     Event armed;
                     armed.kind = Kind::BindingsArmed;
                     armed.complete = true;

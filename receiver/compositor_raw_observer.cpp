@@ -1,4 +1,5 @@
 #include "compositor_raw_runtime.h"
+#include "compositor_arm_marker.h"
 #include "sha256.h"
 #include <array>
 #include <cstdarg>
@@ -19,7 +20,7 @@ __attribute__((weak)) int frame_compositor_launch_freeze_environment_v1(unsigned
 __attribute__((weak)) unsigned frame_compositor_launch_provider_mask(void);
 __attribute__((weak)) unsigned frame_compositor_launch_frozen_status_v1(void);
 __attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_raw_scope[16]={
-    'F','C','M','R','A','W','0','2',2,0,0,0,0x50,0x20,0,0};
+    'F','C','M','R','A','W','0','3',3,0,0,0,0x50,0x20,0,0};
 __attribute__((visibility("hidden"))) std::atomic<unsigned> frame_compositor_raw_ready{0};
 __attribute__((visibility("hidden"))) void frame_import_lock_entry();
 __attribute__((visibility("hidden"))) void frame_import_unlock_entry();
@@ -38,6 +39,8 @@ bool writer_started=false;
 pid_t owner_pid=0;
 int output_fd=-1;
 char output_path[1024]{};
+char arm_path[1024]{};
+std::uint64_t capture_started_ns=0;
 frame_compositor_main::Digest observer_identity{};
 
 using LaunchFreeze=int(*)(unsigned);
@@ -226,10 +229,28 @@ bool join(const frame_compositor_raw::RawRecord& raw,const frame_compositor_jour
 std::uint64_t now() noexcept {timespec t{};return clock_gettime(CLOCK_MONOTONIC,&t)?0:std::uint64_t(t.tv_sec)*1000000000+std::uint64_t(t.tv_nsec);}
 void* write_background(void* argument) noexcept {
     auto total=reinterpret_cast<std::uintptr_t>(argument);
-    const auto start=now();const char* end="stopped";unsigned records=0;
+    const auto start=capture_started_ns;const char* end="stopped";unsigned records=0;
+    std::uint64_t arm_check=0;
     frame_compositor_raw::RawRecord raw{};frame_compositor_journal::Receipt receipt{};bool got_raw=false,got_receipt=false,joined=false;
     while(owned() && !stopping.load(std::memory_order_acquire)) {
         const auto time=now();if(!start || !time || time<start || time-start>=DurationNs){end="deadline";break;}
+        const auto state=runtime::status();
+        if(state.candidate_arm_required && !state.candidate_armed && !state.retired && time>=arm_check) {
+            // Only this existing background writer checks the protected control
+            // file. Native callbacks never perform filesystem access or waits.
+            const auto signal=frame_compositor_arm::read(arm_path);
+            if(signal==frame_compositor_arm::Result::Invalid){end="invalid_operator_marker";break;}
+            const auto observed=now();
+            if(!observed || observed<start || observed-start>=DurationNs){end="deadline";break;}
+            if(signal==frame_compositor_arm::Result::Valid && runtime::arm_candidate_once()) {
+                Line armed;
+                armed.add("{\"schema\":1,\"operator_armed\":true,\"operator_arm_ns\":%llu,\"pid\":%ld,\"pre_arm_private_bytes\":0",
+                    u(observed),long(owner_pid));proofs(armed);armed.add("}\n");
+                if(!write_line(armed,total)){end="write_or_byte_limit";break;}
+                if(++records==runtime::kRecordLimit){end="record_limit";break;}
+            }
+            arm_check=observed+100000000;
+        }
         runtime::Record r{};
         if(runtime::pop(r)) {
             Line line;record(line,r);if(!write_line(line,total)){end="write_or_byte_limit";break;}++records;
@@ -258,9 +279,10 @@ void* write_background(void* argument) noexcept {
     const auto s=runtime::status();Line footer;
     footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%u,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,"
         "\"started\":%s,\"raw_terminal\":%s,\"incomplete\":%s,\"refusal\":%u,\"parent_bytes\":%zu,\"scalar_bytes\":%zu,\"wire_bytes\":%zu,"
-        "\"quiescent\":%s,\"local_cpu_resource_join\":%s",
+        "\"quiescent\":%s,\"local_cpu_resource_join\":%s,\"operator_arm_required\":%s,\"candidate_armed\":%s,\"candidate_claimed\":%s",
         end,records,total,u(s.queued),u(s.drained),s.started?"true":"false",s.terminal?"true":"false",s.started&&!s.terminal?"true":"false",unsigned(s.refusal),
-        s.parent_bytes,s.scalar_bytes,s.wire_bytes,quiet?"true":"false",joined?"true":"false");
+        s.parent_bytes,s.scalar_bytes,s.wire_bytes,quiet?"true":"false",joined?"true":"false",
+        s.candidate_arm_required?"true":"false",s.candidate_armed?"true":"false",s.candidate_claimed?"true":"false");
     proofs(footer);footer.add("}\n");write_line(footer,total,0);close(output_fd);output_fd=-1;return nullptr;
 }
 void finish_owned() noexcept {
@@ -272,26 +294,36 @@ __attribute__((constructor)) void start() noexcept {
     const int saved=errno;char input[1024]{};
     if(!freeze_before_observation(frame_compositor_launch_freeze_environment_v1,
         frame_compositor_launch_provider_mask,frame_compositor_launch_frozen_status_v1)){errno=saved;return;}
+    const auto frozen_observed_ns=now();if(!frozen_observed_ns){errno=saved;return;}
     if(!path(std::getenv("GHVR_FRAME_COMPOSITOR_RAW_ENVELOPE"),input,sizeof(input)) ||
-       !path(std::getenv("GHVR_FRAME_COMPOSITOR_RAW_OUTPUT"),output_path,sizeof(output_path))){errno=saved;return;}
+       !path(std::getenv("GHVR_FRAME_COMPOSITOR_RAW_OUTPUT"),output_path,sizeof(output_path)) ||
+       !frame_compositor_arm::path(output_path,arm_path,sizeof(arm_path)) ||
+       frame_compositor_arm::read(arm_path)!=frame_compositor_arm::Result::Missing){errno=saved;return;}
     frame_compositor_main::Profiles profiles{};
     if(!envelope(input,profiles)){errno=saved;return;}
     const auto prepared=frame_compositor_main::prepare(profiles);runtime::Setup s{};
     if(!prepared.ready() || !setup(prepared,profiles,s)){errno=saved;return;}
     owner_pid=getpid();observer_identity=profiles.reviewed_observer_identity;
+    s.require_operator_arm=true;
     output_fd=open_output();
     if(output_fd<0 || !frame_compositor_journal::initialize_before_main() || !runtime::initialize(prepared,s)) {
         runtime::finalize();if(output_fd>=0)close(output_fd);output_fd=-1;errno=saved;return;
     }
+    capture_started_ns=now();
+    if(!capture_started_ns || capture_started_ns>UINT64_MAX-DurationNs) {
+        runtime::finalize();close(output_fd);output_fd=-1;errno=saved;return;
+    }
     Line header;header.add("{\"schema\":1,\"capture\":\"compositor_raw_import\",\"pid\":%ld,\"observer_profile\":\"",long(owner_pid));
     header.hex(observer_identity);
-    header.add("\",\"launch_environment_frozen\":true,\"launch_freeze_abi\":%u,\"launch_provider_mask\":%u,\"launch_frozen_owner_pid\":%ld,\"launch_frozen_observed_ns\":%llu",LaunchFreezeAbi,LaunchProviderMask,long(owner_pid),u(now()));
+    header.add("\",\"launch_environment_frozen\":true,\"launch_freeze_abi\":%u,\"launch_provider_mask\":%u,\"launch_frozen_owner_pid\":%ld,\"launch_frozen_observed_ns\":%llu",LaunchFreezeAbi,LaunchProviderMask,long(owner_pid),u(frozen_observed_ns));
     header.add(",\"modules\":[");unsigned module=0;
     for(const auto& image:prepared.images()) {
         header.add("%s{\"role\":%u,\"file_sha256\":\"",module++?",":"",unsigned(image.role));header.hex(image.expected_file_identity);
         header.add("\",\"profile_sha256\":\"");header.hex(image.profile_identity);header.add("\"}");
     }
     header.add("]");
+    header.add(",\"operator_arm_required\":true,\"operator_armed\":false,\"pre_arm_private_bytes\":0,\"capture_started_ns\":%llu,\"capture_deadline_ns\":%llu",
+        u(capture_started_ns),u(capture_started_ns+DurationNs));
     header.add(",\"transactions\":1,\"parent_byte_limit\":16,\"scalar_byte_limit\":%llu,\"wire_byte_limit\":21,\"private_byte_limit\":%llu,"
         "\"creation_routes\":[\"Vulkan\",\"Facet\"],\"write_limit\":8,\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120",
         u(frame_compositor_raw::kMaxScalarBytes),u(16+frame_compositor_raw::kMaxScalarBytes+21));proofs(header);header.add("}\n");
