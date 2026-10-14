@@ -96,6 +96,44 @@ void equivalent(const Scalars& a,const Scalars& b) {
 }
 
 int main() {
+    for(auto route:{CreationRoute::Vulkan,CreationRoute::Facet}) {
+        Fixture f(route);const auto image=f.entry(Boundary::Image);const Expected prelude{f.dispatch,pipe,0};
+        f.put(f.dispatch+128,std::uint64_t{0xdeadbeef});
+        const auto selected=[&](const Entry& e,const Expected& ex) {
+            return frame_compositor_sparse::decode_selected_image(e,bias,ex,Fixture::reader,&f);
+        };
+        const auto full=[&] {
+            return frame_import_native::decode_selected_image(image,
+                {f.bytes.data(),base,route==CreationRoute::Facet?1856U:1552U},bias,prelude);
+        };
+        const auto good=selected(image,prelude);check(good.valid());equivalent(good.scalars,full());
+        const auto budget=route==CreationRoute::Facet?96U:80U;
+        check(good.bytes_requested==budget && good.bytes_confirmed==budget && good.scalars.invocation.sequence==sequence);
+        const auto reads=f.reads;
+        for(unsigned fail=1;fail<=reads;++fail) {
+            f.reset();f.fail_at=fail;const auto bad=selected(image,prelude);
+            check(!bad.valid() && bad.refusal==frame_compositor_sparse::Refusal::Reader);
+            check(bad.bytes_requested==f.requested && bad.bytes_confirmed==f.confirmed && f.reads==fail);
+            check(bad.bytes_requested<=budget && bad.bytes_confirmed<bad.bytes_requested);
+        }
+        // Exact current creation dependencies, including sequence, and all
+        // holes: no late read of the overwritten old dispatch saved-pipe slot.
+        for(std::size_t at=0;at<f.bytes.size();++at) {
+            f.bytes[at]^=0xff;f.reset();const auto sparse=selected(image,prelude);
+            equivalent(sparse.scalars,full());check(sparse.bytes_requested==budget);
+            f.bytes[at]^=0xff;
+        }
+        for(unsigned mutation=0;mutation<4;++mutation) {
+            auto wrong=prelude;
+            if(mutation==0)wrong.dispatch_frame+=16;else if(mutation==1)wrong.pipe=0;
+            else if(mutation==2)wrong.sequence=1;else wrong.pipe=pipe+1;
+            f.reset();check(!selected(image,wrong).valid() && !f.reads && !f.requested);
+        }
+        auto wrong=prelude;wrong.pipe+=16;f.reset();check(!selected(image,wrong).valid());check(f.requested==budget);
+        for(auto boundary:{Boundary::Begin,Boundary::EarlyUnlock,Boundary::Bind,Boundary::View}) {
+            const auto other=f.entry(boundary);f.reset();check(!selected(other,prelude).valid() && !f.reads);
+        }
+    }
     for (auto b : {Boundary::Image,Boundary::Bind,Boundary::View}) {
         Fixture f(CreationRoute::Facet);const auto e=f.entry(b);const auto ex=f.expected();
         const auto good=f.sparse(b,e,ex);check(good.valid());equivalent(good.scalars,f.full(b,e,ex));

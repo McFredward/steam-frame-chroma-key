@@ -145,10 +145,12 @@ struct Fixture {
         }
         if(e.boundary==Boundary::Image) {
             e.public_result_available=true; e.image={journal_device,10,123,37,1152,4608,1,1,static_cast<int>(result),true,native_device};
+            if(scope.record().selected_at_image)e.image.format=scope.record().selected_image.format;
         } else if(e.boundary==Boundary::Bind) {
             e.public_result_available=true; e.bind={journal_device,10,20,16,static_cast<int>(result),native_device};
         } else if(e.boundary==Boundary::View) {
             e.public_result_available=true; e.view={journal_device,10,30,37,static_cast<int>(result),native_device};
+            if(scope.record().selected_at_image)e.view.format=scope.record().selected_image.format;
         }
         return e;
     }
@@ -360,7 +362,10 @@ struct SparseReader {
     Event copy(Event e) {
         admitted=fixture.observer.can_acquire(e,fixture.scope);check(admitted);
         const auto before=actual_bytes;
-        const auto result=frame_compositor_sparse::decode(e.boundary,e.entry,e.load_bias,
+        const bool selected_image=fixture.scope.record().selected_at_image &&
+            !fixture.scope.record().private_acquisition_started_at_image && e.boundary==Boundary::Image;
+        const auto result=selected_image ? frame_compositor_sparse::decode_selected_image(e.entry,e.load_bias,
+            fixture.scope.expected(),read,this) : frame_compositor_sparse::decode(e.boundary,e.entry,e.load_bias,
             fixture.scope.expected(),read,this);
         e.scalar_bytes_copied=actual_bytes-before;e.decoded_available=result.valid();e.scalars=result.scalars;
         if(result.valid())check(result.bytes_requested==result.bytes_confirmed && result.bytes_confirmed==e.scalar_bytes_copied);
@@ -442,9 +447,164 @@ void facet_route_controls() {
     }
 }
 
+SourcePrelude public_prelude(Fixture& f) {
+    SourcePrelude p;
+    p.begin_before=f.bare(Boundary::Begin);p.begin_after=p.begin_before;
+    p.begin_after.phase=Phase::After;p.begin_after.native_result_available=true;
+    p.begin_after.preserved_errno=EBUSY;
+    p.early_before=f.bare(Boundary::EarlyUnlock);p.early_after=p.early_before;
+    p.early_after.phase=Phase::After;p.early_after.native_result_available=true;
+    p.early_after.preserved_errno=EAGAIN;
+    return p;
 }
-int main() {
+constexpr ImageSelection stream_shape{1000156013U,1152,4608,1,1};
+Event selected_first_copy(Fixture& f, SparseReader& reader, Event image) {
+    check(f.scope.record().selected_at_image && !f.scope.record().scalar_bytes_copied);
+    check(!f.scope.record().private_acquisition_started_at_image);
+    auto e=reader.copy(image);
+    check(e.scalars.valid() && e.scalars.invocation.sequence==sequence);
+    check(f.observer.observe(e,f.scope).kind==Kind::None);
+    check(f.scope.record().private_acquisition_started_at_image);
+    auto a=f.after(e,0);a.image.format=stream_shape.format;
+    check(f.observer.observe(a,f.scope).kind==Kind::None);
+    return e;
+}
+void selected_image_controls() {
+    using Route=frame_import_native::CreationRoute;
+    for (auto route:{Route::Vulkan,Route::Facet}) {
+        Fixture f(route);const auto prelude=public_prelude(f);const auto image=f.bare(Boundary::Image);
+        // The real dispatcher overwrites this slot before Image. Even poison
+        // here must never cause a late replay of the old private Begin/Early.
+        f.put(f.dispatch+128,std::uint64_t{0xdeadbeef});
+        check(selected_image_eligible(image,stream_shape));
+        check(f.observer.begin_selected_image(image,prelude,stream_shape,f.scope).kind==Kind::None);
+        check(f.scope.active() && !f.scope.finished() && f.scope.expected().sequence==0);
+        const auto& r=f.scope.record();
+        check(r.selected_at_image && !r.private_acquisition_started_at_image && !r.scalar_bytes_copied && !r.wire_bytes_copied);
+        check(r.begin_lock_succeeded && r.early_unlock_succeeded && r.native_payload_read);
+        check(r.selected_begin_entry.x==prelude.begin_before.entry.x && r.selected_begin_entry.sp==prelude.begin_before.entry.sp);
+        check(r.selected_early_entry.x==prelude.early_before.entry.x && r.selected_early_entry.sp==prelude.early_before.entry.sp);
+        check(r.selected_begin_result==0 && r.selected_early_result==0);
+        check(f.observer.can_acquire(image,f.scope) && !f.observer.can_acquire(prelude.begin_after,f.scope));
+        SparseReader reader{f};selected_first_copy(f,reader,image);
+        check(reader.actual_bytes==f.budget(Boundary::Image) && reader.calls==(route==Route::Facet?8U:7U));
+        check(f.scope.expected().sequence==sequence && f.scope.record().creation_route==route);
+        for(auto b:{Boundary::Bind,Boundary::View,Boundary::SendLock})check(f.pair(b).kind==Kind::None);
+        // Eight actual prefixes still fit the unchanged absolute private
+        // ceiling, including the independent runtime's parent16 acquisition.
+        for(unsigned n=0;n<7;++n)check(f.pair(Boundary::Write,n,1).kind==Kind::None);
+        check(f.pair(Boundary::Write,7,14).kind==Kind::None);
+        const auto result=f.end();check(result.kind==Kind::Matched && result.record.matched);
+        no_proof(result.record);
+        check(result.record.scalar_bytes_copied==(route==Route::Facet?696U:648U));
+        check(result.record.scalar_bytes_copied+result.record.wire_bytes_copied+16<=757);
+    }
+    for(auto format:{1000156003U,1000156013U}) {
+        Fixture f;auto image=f.bare(Boundary::Image);auto shape=stream_shape;shape.format=format;
+        check(selected_image_eligible(image,shape));
+    }
+    for(unsigned mutation=0;mutation<11;++mutation) {
+        Fixture f;auto image=f.bare(Boundary::Image);auto shape=stream_shape;
+        switch(mutation) {
+        case 0:shape.format=50;break;case 1:shape.width=0;break;case 2:shape.height=0;break;
+        case 3:shape.width=1153;break;case 4:shape.height=4607;break;
+        case 5:shape.depth=2;break;case 6:shape.layers=2;break;
+        case 7:image.entry.x[30]+=4;break;case 8:image.phase=Phase::After;break;
+        case 9:image.scalar_bytes_copied=4;break;case 10:image.boundary=Boundary::View;break;
+        }
+        check(!selected_image_eligible(image,shape));
+        const auto prelude=public_prelude(f);
+        refused(f,f.observer.begin_selected_image(image,prelude,shape,f.scope));
+        check(!f.observer.can_acquire(f.bare(Boundary::Image),f.scope));
+    }
+    // Every prelude event is a genuine zero-read same-source same-thread
+    // Before/After pair. Missing, changed, failed and borrowed pairs refuse.
+    for(unsigned event_index=0;event_index<4;++event_index)
+    for(unsigned mutation=0;mutation<13;++mutation) {
+        Fixture f;auto prelude=public_prelude(f);const auto image=f.bare(Boundary::Image);
+        Event* events[]{&prelude.begin_before,&prelude.begin_after,&prelude.early_before,&prelude.early_after};
+        auto& e=*events[event_index];
+        switch(mutation) {
+        case 0:e={};break;case 1:e.entry.x[3]^=1;break;case 2:e.thread_identity+=16;break;
+        case 3:e.load_bias+=4096;break;case 4:e.source_current=false;break;
+        case 5:e.native_module_current=false;break;case 6:e.native_provider_current=false;break;
+        case 7:e.current_thread_owned=false;break;case 8:e.thread_reason=4;break;
+        case 9:e.scalar_bytes_copied=12;break;case 10:e.decoded_available=true;break;
+        case 11:e.phase=event_index%2?Phase::Before:Phase::After;break;
+        case 12:e.native_result_available=event_index%2?false:true;break;
+        }
+        refused(f,f.observer.begin_selected_image(image,prelude,stream_shape,f.scope));
+        check(f.scope.record().scalar_bytes_copied==(mutation==9?12U:0U));
+        check(f.observer.begin_selected_image(image,public_prelude(f),stream_shape,f.scope).kind==Kind::None);
+        check(f.scope.finished() && !f.observer.can_acquire(image,f.scope));
+    }
+    for(unsigned mutation=0;mutation<8;++mutation) {
+        Fixture f;auto p=public_prelude(f);const auto image=f.bare(Boundary::Image);
+        switch(mutation) {
+        case 0:p.begin_after.native_result=1;break;case 1:p.early_after.native_result=1;break;
+        case 2:p.begin_before.entry.x[19]+=16;p.begin_after.entry=p.begin_before.entry;break;
+        case 3:p.early_before.entry.x[0]+=16;p.early_after.entry=p.early_before.entry;break;
+        case 4:p.early_before.entry.x[25]=256;p.early_after.entry=p.early_before.entry;break;
+        case 5:p.begin_before.entry.sp+=16;p.begin_before.entry.x[29]+=16;p.begin_after.entry=p.begin_before.entry;break;
+        case 6:p.begin_before.entry.x[30]+=4;p.begin_after.entry=p.begin_before.entry;break;
+        case 7:p.early_before.entry.x[30]+=4;p.early_after.entry=p.early_before.entry;break;
+        }
+        refused(f,f.observer.begin_selected_image(image,p,stream_shape,f.scope));
+        check(!f.scope.record().scalar_bytes_copied);
+    }
+    for(unsigned mutation=0;mutation<4;++mutation) {
+        Fixture f;const auto p=public_prelude(f);auto image=f.bare(Boundary::Image);
+        check(f.observer.begin_selected_image(image,p,stream_shape,f.scope).kind==Kind::None);
+        switch(mutation) {
+        case 0:image.entry.x[0]+=16;break;case 1:image.entry.x[7]^=1;break;
+        case 2:image.entry.x[30]+=4;break;case 3:image.entry.sp-=16;break;
+        }
+        check(!f.observer.can_acquire(image,f.scope));
+        refused(f,f.observer.observe(image,f.scope));check(!f.scope.record().scalar_bytes_copied);
+    }
+    for(auto route:{Route::Vulkan,Route::Facet}) {
+        for(unsigned fail=1;fail<=(route==Route::Facet?8U:7U);++fail)
+        for(bool postcheck:{false,true}) {
+            Fixture f(route);const auto p=public_prelude(f);const auto image=f.bare(Boundary::Image);
+            check(f.observer.begin_selected_image(image,p,stream_shape,f.scope).kind==Kind::None);
+            SparseReader reader{f};reader.fail_at=fail;reader.fail_after_copy=postcheck;
+            const auto e=reader.copy(image);check(!e.decoded_available);
+            refused(f,f.observer.observe(e,f.scope));
+            check(f.scope.record().scalar_bytes_copied==reader.actual_bytes);
+            check(f.scope.record().private_acquisition_started_at_image==(reader.actual_bytes!=0));
+            check(!f.observer.can_acquire(image,f.scope));
+        }
+        for(auto later:{Boundary::Bind,Boundary::View,Boundary::SendLock}) {
+            Fixture f(route);const auto p=public_prelude(f);const auto image=f.bare(Boundary::Image);
+            check(f.observer.begin_selected_image(image,p,stream_shape,f.scope).kind==Kind::None);
+            SparseReader reader{f};selected_first_copy(f,reader,image);
+            if(later==Boundary::View || later==Boundary::SendLock)check(f.pair(Boundary::Bind).kind==Kind::None);
+            if(later==Boundary::SendLock)check(f.pair(Boundary::View).kind==Kind::None);
+            auto e=f.bare(later);
+            if(later==Boundary::SendLock) {
+                check(f.observer.observe(e,f.scope).kind==Kind::None);
+                e=f.after(e,0);
+            } else e=f.decoded(e,f.budget(later));
+            ++e.scalars.invocation.sequence;
+            refused(f,f.observer.observe(e,f.scope),InvalidDecode);
+        }
+    }
+    {Fixture f;const auto p=public_prelude(f);const auto image=f.bare(Boundary::Image);
+      check(f.observer.begin_selected_image(image,p,stream_shape,f.scope).kind==Kind::None);
+      SparseReader reader{f};auto e=reader.copy(image);check(f.observer.observe(e,f.scope).kind==Kind::None);
+      auto a=f.after(e,0);a.image.format=stream_shape.format;++a.image.height;
+      refused(f,f.observer.observe(a,f.scope),PublicMetadata);}
+}
+
+}
+int main(int argc, char** argv) {
     forbid_allocations=true;
+    selected_image_controls();
+    if(argc==2 && std::strcmp(argv[1],"--selected-image")==0) {
+        check(allocations.load()==0);forbid_allocations=false;
+        std::printf("%u selected-image public-prelude, private-ledger and refusal controls passed; no allocations or frame/GPU proof\n",checks);
+        return 0;
+    }
     {Fixture f;f.through(Boundary::SendLock);f.writes();matched(f,f.end());}
     admission_controls();lifecycle_controls();paired_controls();metadata_controls();write_controls();sparse_adapter_controls();facet_route_controls();
     unsigned partition_count=0;std::array<unsigned,8> parts{};complete_partitions(21,0,0,parts,partition_count);

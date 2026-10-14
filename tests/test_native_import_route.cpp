@@ -94,6 +94,22 @@ int main() {
         Fixture f; auto e=creation(f,stage);
         auto out=decode(stage,e,f.stack(),kBias,expected());
         require(out.valid() && out.client_available && out.client==0 && out.invocation.pipe==kPipe);
+        const Expected public_prelude{kDispatch,kPipe,0};
+        if(stage==Boundary::Image) {
+            f.put(kDispatch+128,std::uint64_t{0xdeadbeef});
+            const auto selected=decode_selected_image(e,f.stack(),kBias,public_prelude);
+            require(selected.valid() && selected.invocation.sequence==kSequence && selected.creation_route==CreationRoute::Vulkan);
+            for(unsigned mutation=0;mutation<4;++mutation) {
+                auto wrong=public_prelude;
+                if(mutation==0)wrong.pipe+=16;else if(mutation==1)wrong.dispatch_frame+=16;
+                else if(mutation==2)wrong.sequence=1;else wrong.pipe=0;
+                require(!decode_selected_image(e,f.stack(),kBias,wrong).valid());
+            }
+            f.put(kDispatch+108,std::uint32_t{0});
+            require(decode_selected_image(e,f.stack(),kBias,public_prelude).valid());
+            require(decode_selected_image(e,f.stack(),kBias,public_prelude).invocation.sequence==0);
+            f.put(kDispatch+108,kSequence);
+        } else require(!decode_selected_image(e,f.stack(),kBias,public_prelude).valid());
         f.put(kBase+152,std::uint64_t{0x87654321fedcba98});
         require(decode(stage,e,f.stack(),kBias,expected()).client==0xfedcba98);
         f.put(kBase+760,std::uint64_t{kBias+0x13bc8c});
@@ -104,6 +120,9 @@ int main() {
             f.put(at,saved+16); require(!decode(stage,e,f.stack(),kBias,expected()).valid()); f.put(at,saved);
             std::memcpy(&saved,f.bytes.data()+at+8-kBase,8);
             f.put(at+8,saved+4); require(!decode(stage,e,f.stack(),kBias,expected()).valid()); f.put(at+8,saved);
+            if(stage==Boundary::Image) {
+                f.put(at+8,saved+4);require(!decode_selected_image(e,f.stack(),kBias,public_prelude).valid());f.put(at+8,saved);
+            }
         }
         auto bad=expected(); bad.sequence=0; require(!decode(stage,e,f.stack(),kBias,bad).valid());
         bad=expected(); bad.pipe++; require(!decode(stage,e,f.stack(),kBias,bad).valid());
@@ -131,12 +150,23 @@ int main() {
         const StackBytes stack{bytes.data(),kBase,bytes.size()};
         const auto run=[&] {return decode(stage,e,stack,kBias,ex);};
         auto r=run();require(r.valid() && r.creation_route==CreationRoute::Facet && r.client_available && r.client==0xfedcba98);
+        const Expected public_prelude{kBase+1536,kPipe,0};
+        if(stage==Boundary::Image) {
+            put(1664,std::uint64_t{0xdeadbeef});
+            const auto selected=decode_selected_image(e,stack,kBias,public_prelude);
+            require(selected.valid() && selected.invocation.sequence==kSequence && selected.creation_route==CreationRoute::Facet);
+            auto wrong=public_prelude;wrong.pipe+=16;require(!decode_selected_image(e,stack,kBias,wrong).valid());
+            wrong=public_prelude;wrong.dispatch_frame+=16;require(!decode_selected_image(e,stack,kBias,wrong).valid());
+            wrong=public_prelude;wrong.sequence=1;require(!decode_selected_image(e,stack,kBias,wrong).valid());
+        } else require(!decode_selected_image(e,stack,kBias,public_prelude).valid());
         require(r.invocation.dispatch_frame==ex.dispatch_frame && r.invocation.pipe==ex.pipe && r.invocation.sequence==ex.sequence);
         require(creation_route(stage,e,kBias)==CreationRoute::Facet && creation_dispatch_offset(CreationRoute::Facet)==1536);
         for (std::size_t at : {0U,688U,1056U,1216U,1312U}) {
             for (std::size_t field : {0U,8U}) {
                 std::uint64_t saved=0;std::memcpy(&saved,bytes.data()+at+field,8);
-                put(at+field,saved+16);require(!run().valid());put(at+field,saved);
+                put(at+field,saved+16);require(!run().valid());
+                if(stage==Boundary::Image)require(!decode_selected_image(e,stack,kBias,public_prelude).valid());
+                put(at+field,saved);
             }
         }
         put(1064,std::uint64_t{kBias+0x13bc8c});require(run().valid());
