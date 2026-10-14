@@ -24,9 +24,11 @@ manifest selects `frame_compositor_raw_` aliases instead. Eleven native
 forwarding entries and the readiness marker remain hidden. The raw build cannot
 opt back into the unsafe ordinary names.
 
-The current operator-reserved offline/owned package schema is v4 with
-envelope/source marker v3. The automatic v3 artifact is historical evidence,
-not the next deployment package. See the [hardware result and arming
+The current offline package schema is v6, with FCMRAW05 / envelope version 5
+and the FCMSMP02 target-probe marker. The owned session/recovery schema remains
+v4; historical v4/v5 packages retain their original markers and contracts.
+The envelope still has exactly four module profiles and its eight limit words
+remain unchanged. See the [hardware result and arming
 contract](COMPOSITOR-RAW-HARDWARE-20261014.md).
 It includes the source-proven Vulkan and Facet creation routes described in the
 [2026-10-14 analysis](COMPOSITOR-RAW-FIRST-CANDIDATE-20261013.md).

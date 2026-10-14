@@ -259,3 +259,54 @@ files and the PC sender remained unchanged. Private evidence is retained under
 analysis under `build/private-compositor-stream-image-join-review-20261014/`.
 Passthrough remains disabled; neither the recorded import nor the refused final
 join establishes frame, eye, UV or coherent GPU association.
+
+## Bounded currentness repair and exact-resource draw probes
+
+The next v6 offline package retains the v5 public image selection, one private
+candidate, 757-byte acquisition bound, 32 raw records, 64-KiB raw output,
+1-MiB journal output and original absolute 120-second capture deadline. Its
+FCMRAW05 / envelope version 5 marker authenticates the changed diagnostic
+contract; the four module profiles and all eight envelope limit words remain
+unchanged. No new launch environment getter, native provider or PC sender
+modification is introduced.
+
+The owning journal now reports its actual pre/post validation stages and exact
+refusal reason. Before initial delivery, only transient active publication,
+pending replay or changed publication can retain the same immutable pending
+receipt for up to 64 validations. A permanent generation mismatch, recorded
+loss, closure, halt or bridge retirement is never retried into validity. An
+exhausted invalid delivered receipt cannot subsequently be relabelled current.
+Pending queue waits and exhausted initial delivery are separately counted.
+
+The raw consumer retains all 31 original immutable compatibility checks. It
+rechecks runtime currentness before and after the unchanged owning-journal
+validator. Only the same three typed transient journal outcomes permit another
+check of the same raw record and receipt: at most 64 validations, 1-ms pauses
+and the same original absolute capture deadline. The final report includes all
+comparison fields, initial delivery decisions, final consumer decisions and
+which stages were actually observed. These sampled CPU decisions are neither
+an atomic native-resource lease nor GPU-completion evidence. The source-proven
+race is a possible explanation for the v5 refusal; that capture does not prove
+which conjunct failed.
+
+The FCMSMP02 collector submits at most 4096 lightweight ordered public draw
+probes. It retains draw metadata in 256 fixed slots (less than 512 KiB) while the
+existing journal replays each probe at its exact observation order. Only a match
+to the selected tag, cookie, device and exact image/view/memory generations and
+generation links spends one of the 32 full snapshot slots. Unrelated UI probes
+release their slots without an output placeholder or full snapshot. Filtering,
+unknown state, quota/slot omissions and output cancellation are separately
+reported; deliberate sampling is not an exhaustive draw history.
+
+The inspected descriptor subset is explicitly set 0, bindings
+`{0,2,3,4,6,9,25,31}`. A filtered result means no exact match in that subset,
+not absence from every possible descriptor. No graphics callback reads mutable
+Core state, allocates, waits for the background owner or performs file I/O.
+Source-frame, eye, UV, accepted-submit, GPU coherence and mask admission remain
+false even after a successful CPU or descriptor join.
+
+Focused software and final artifact evidence are retained privately under
+`build/private-compositor-join-target-integration-20261014/`, with worker evidence
+and independent review beside it. Passing software checks do not demonstrate a
+headset-visible result. The previous diagnostic has been fully removed; this
+new package requires fresh operator permission and readiness before deployment.
