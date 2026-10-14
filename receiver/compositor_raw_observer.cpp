@@ -1,6 +1,7 @@
 #include "compositor_raw_runtime.h"
 #include "compositor_arm_marker.h"
 #include "sha256.h"
+#include <algorithm>
 #include <array>
 #include <cstdarg>
 #include <cstdio>
@@ -20,7 +21,7 @@ __attribute__((weak)) int frame_compositor_launch_freeze_environment_v1(unsigned
 __attribute__((weak)) unsigned frame_compositor_launch_provider_mask(void);
 __attribute__((weak)) unsigned frame_compositor_launch_frozen_status_v1(void);
 __attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_raw_scope[16]={
-    'F','C','M','R','A','W','0','4',4,0,0,0,0x50,0x20,0,0};
+    'F','C','M','R','A','W','0','5',5,0,0,0,0x50,0x20,0,0};
 __attribute__((visibility("hidden"))) std::atomic<unsigned> frame_compositor_raw_ready{0};
 __attribute__((visibility("hidden"))) void frame_import_lock_entry();
 __attribute__((visibility("hidden"))) void frame_import_unlock_entry();
@@ -33,6 +34,14 @@ namespace runtime=frame_compositor_runtime;
 constexpr unsigned LaunchFreezeAbi=1,LaunchProviderMask=63;
 constexpr std::size_t EnvelopeBytes=8272,OutputBytes=65536;
 constexpr std::uint64_t DurationNs=120ULL*1000000000;
+constexpr unsigned JoinAttemptLimit=64;
+constexpr std::uint64_t JoinRetryDelayNs=1000000;
+constexpr std::size_t FooterReserve=4096;
+static_assert(frame_compositor_journal::DeliveryValidationAttemptLimit==64);
+constexpr char ResourceJoinValidation[]=
+    "{\"schema\":\"frame-compositor-resource-join-validation-v1\",\"attempt_limit\":64,\"delivery_attempt_limit\":64,"
+    "\"retry_delay_ns\":1000000,\"same_capture_deadline\":true,\"immutable_snapshot\":true,"
+    "\"unchanged_owning_journal_validator\":true,\"journal_refusal_cause_classified\":true}";
 constexpr char CandidateSelection[]=
     "{\"schema\":\"frame-compositor-public-image-selection-v1\","
     "\"public_formats\":[1000156003,1000156013],\"even_extent\":true,"
@@ -169,7 +178,7 @@ struct Line {
     template<class T> void hex(const T& data) noexcept {for(auto v:data)add("%02x",unsigned(v));}
 };
 unsigned long long u(std::uint64_t v) noexcept {return static_cast<unsigned long long>(v);}
-bool write_line(const Line& line,std::size_t& total,std::size_t reserve=1536) noexcept {
+bool write_line(const Line& line,std::size_t& total,std::size_t reserve=FooterReserve) noexcept {
     if(!owned() || !line.valid || total>OutputBytes || reserve>OutputBytes-total || line.used>OutputBytes-total-reserve)return false;
     std::size_t sent=0;
     for(unsigned tries=0;sent<line.used && tries<32;++tries) {
@@ -182,6 +191,7 @@ void proofs(Line& l) noexcept {
     l.add(",\"native_cross_endpoint_associated\":false,\"native_namespace_associated\":false,\"source_frame_associated\":false,"
         "\"uv_owned\":false,\"accepted_submit\":false,\"gpu_consumed\":false,\"mask_enabled\":false");
 }
+void validation_details(Line&,const char*,const frame_compositor_journal::Validation&,bool) noexcept;
 void record(Line& l,const runtime::Record& r) noexcept {
     l.add("{\"schema\":1,\"ordinal\":%llu,\"kind\":%u,\"refusal\":%u,\"thread_reason\":%u,\"forward_only\":%s,"
         "\"entry_lr\":\"%llx\",\"entry_sp\":\"%llx\",\"entry_fp\":\"%llx\",\"audit_function\":%u,\"audit_original\":\"%llx\"",
@@ -225,29 +235,241 @@ void record(Line& l,const runtime::Record& r) noexcept {
         const auto& c=r.receipt.resource;
         l.add(",\"receipt\":{\"journal\":%llu,\"replay_order\":%llu,\"resource_cursor\":%llu,\"tag\":\"%llx\",\"cookie\":\"%llx\","
             "\"device\":%llu,\"image\":\"%llx\",\"image_generation\":%llu,\"view\":\"%llx\",\"view_generation\":%llu,"
-            "\"memory\":\"%llx\",\"memory_generation\":%llu,\"complete\":%s,\"errors\":%u,\"loss\":%llu,\"current_after_drain\":%s}",
+            "\"memory\":\"%llx\",\"memory_generation\":%llu,\"complete\":%s,\"errors\":%u,\"loss\":%llu,\"current_after_drain\":%s,"
+            "\"requested_image\":\"%llx\",\"requested_view\":\"%llx\",\"image_tag\":\"%llx\",\"view_tag\":\"%llx\","
+            "\"image_memory\":{\"handle\":\"%llx\",\"generation\":%llu},"
+            "\"view_image\":{\"handle\":\"%llx\",\"generation\":%llu},\"memory_offset\":%llu,"
+            "\"image_format\":%u,\"view_format\":%u,\"extent\":[%u,%u,%u],\"layers\":%u,\"reason\":%u,"
+            "\"image_complete\":%s,\"view_complete\":%s,\"memory_complete\":%s,\"allocation_size\":%llu,"
+            "\"native_import_accepted\":%s,\"source_frame_associated\":%s,\"native_cross_process_namespace\":%s,"
+            "\"accepted_submit\":%s,\"gpu_consumed_coherent\":%s",
             u(c.journalInstance),u(c.localReplayOrder),u(c.resourceGenerationCursor),u(c.invocationTag),u(c.cookie),u(c.device),u(c.image.identity.handle),u(c.image.identity.generation),
-            u(c.view.identity.handle),u(c.view.identity.generation),u(c.memory.identity.handle),u(c.memory.identity.generation),c.resourceComplete?"true":"false",c.errors,u(c.lossCount),r.receipt.current_after_drain?"true":"false");
+            u(c.view.identity.handle),u(c.view.identity.generation),u(c.memory.identity.handle),u(c.memory.identity.generation),c.resourceComplete?"true":"false",c.errors,u(c.lossCount),r.receipt.current_after_drain?"true":"false",
+            u(c.requestedImage),u(c.requestedView),u(c.imageInvocationTag),u(c.viewInvocationTag),u(c.image.memory.handle),u(c.image.memory.generation),
+            u(c.view.image.handle),u(c.view.image.generation),u(c.image.memoryOffset),unsigned(c.image.format),unsigned(c.view.format),
+            c.image.extent.width,c.image.extent.height,c.image.extent.depth,c.image.arrayLayers,unsigned(c.reason),
+            c.image.complete?"true":"false",c.view.complete?"true":"false",c.memory.complete?"true":"false",u(c.memory.allocationSize),
+            c.nativeImportAccepted?"true":"false",c.sourceFrameAssociated?"true":"false",c.nativeCrossProcessNamespace?"true":"false",c.acceptedSubmit?"true":"false",c.gpuConsumedCoherent?"true":"false");
+        l.add(",\"delivery_validation_attempts\":%u",r.receipt.delivery_validation_attempts);
+        validation_details(l,"delivery_validation",r.receipt.delivery_validation,r.receipt.delivery_validation_attempts!=0);
+        l.add("}");
     }
     proofs(l);l.add("}\n");
 }
-bool join(const frame_compositor_raw::RawRecord& raw,const frame_compositor_journal::Receipt& value) noexcept {
-    const auto& r=value.resource;
-    return runtime::association_current() && raw.matched && raw.native_send_success && raw.reply_token && value.current_after_drain && r.resourceComplete && !r.errors && !r.lossCount &&
-        !r.nativeImportAccepted && !r.sourceFrameAssociated && !r.nativeCrossProcessNamespace && !r.acceptedSubmit && !r.gpuConsumedCoherent &&
-        r.invocationTag==runtime::kTag && r.cookie==runtime::kCookie && r.imageInvocationTag==runtime::kTag && r.viewInvocationTag==runtime::kTag &&
-        r.device==raw.image.device && r.requestedImage==raw.image.image && r.requestedView==raw.view.view &&
-        r.image.identity.handle==raw.image.image && r.view.identity.handle==raw.view.view && frame_bindings::same(r.view.image,r.image.identity) &&
-        r.memory.identity.handle==raw.bind.memory && frame_bindings::same(r.image.memory,r.memory.identity) && r.image.memoryOffset==raw.bind.offset &&
-        unsigned(r.image.format)==raw.image.format && unsigned(r.view.format)==raw.view.format &&
-        r.image.extent.width==raw.image.width && r.image.extent.height==raw.image.height && r.image.extent.depth==raw.image.depth && r.image.arrayLayers==raw.image.layers &&
-        frame_compositor_journal::validate(value) && runtime::association_current();
+// Immutable compatibility and live currentness are deliberately separate. A
+// typed owning validation separates momentary publication/replay changes from
+// permanent refusal; only that unchanged validator may later accept the same
+// immutable receipt. No retry can refresh a handle, generation or private read.
+enum class JoinPredicate : unsigned {
+    RawMatched,NativeSendSuccess,ReplyToken,ReceiptCurrentAfterDrain,ResourceComplete,ReceiptErrors,ReceiptLoss,
+    NativeImportAccepted,SourceFrameAssociated,NativeCrossProcessNamespace,AcceptedSubmit,GpuConsumedCoherent,
+    InvocationTag,Cookie,ImageInvocationTag,ViewInvocationTag,Device,RequestedImage,RequestedView,
+    ImageHandle,ViewHandle,ViewImageIdentity,MemoryHandle,ImageMemoryIdentity,MemoryOffset,
+    ImageFormat,ViewFormat,ExtentWidth,ExtentHeight,ExtentDepth,ArrayLayers
+};
+constexpr std::uint64_t join_bit(JoinPredicate predicate) noexcept {return std::uint64_t(1)<<unsigned(predicate);}
+std::uint64_t compatibility(const frame_compositor_raw::RawRecord& raw,
+    const frame_compositor_journal::Receipt& value) noexcept {
+    const auto& r=value.resource;std::uint64_t refused=0;
+    const auto require=[&](bool accepted,JoinPredicate predicate) {if(!accepted)refused|=join_bit(predicate);};
+    require(raw.matched,JoinPredicate::RawMatched);
+    require(raw.native_send_success,JoinPredicate::NativeSendSuccess);
+    require(raw.reply_token,JoinPredicate::ReplyToken);
+    require(value.current_after_drain,JoinPredicate::ReceiptCurrentAfterDrain);
+    require(r.resourceComplete,JoinPredicate::ResourceComplete);
+    require(!r.errors,JoinPredicate::ReceiptErrors);require(!r.lossCount,JoinPredicate::ReceiptLoss);
+    require(!r.nativeImportAccepted,JoinPredicate::NativeImportAccepted);
+    require(!r.sourceFrameAssociated,JoinPredicate::SourceFrameAssociated);
+    require(!r.nativeCrossProcessNamespace,JoinPredicate::NativeCrossProcessNamespace);
+    require(!r.acceptedSubmit,JoinPredicate::AcceptedSubmit);require(!r.gpuConsumedCoherent,JoinPredicate::GpuConsumedCoherent);
+    require(r.invocationTag==runtime::kTag,JoinPredicate::InvocationTag);
+    require(r.cookie==runtime::kCookie,JoinPredicate::Cookie);
+    require(r.imageInvocationTag==runtime::kTag,JoinPredicate::ImageInvocationTag);
+    require(r.viewInvocationTag==runtime::kTag,JoinPredicate::ViewInvocationTag);
+    require(r.device==raw.image.device,JoinPredicate::Device);
+    require(r.requestedImage==raw.image.image,JoinPredicate::RequestedImage);
+    require(r.requestedView==raw.view.view,JoinPredicate::RequestedView);
+    require(r.image.identity.handle==raw.image.image,JoinPredicate::ImageHandle);
+    require(r.view.identity.handle==raw.view.view,JoinPredicate::ViewHandle);
+    require(frame_bindings::same(r.view.image,r.image.identity),JoinPredicate::ViewImageIdentity);
+    require(r.memory.identity.handle==raw.bind.memory,JoinPredicate::MemoryHandle);
+    require(frame_bindings::same(r.image.memory,r.memory.identity),JoinPredicate::ImageMemoryIdentity);
+    require(r.image.memoryOffset==raw.bind.offset,JoinPredicate::MemoryOffset);
+    require(unsigned(r.image.format)==raw.image.format,JoinPredicate::ImageFormat);
+    require(unsigned(r.view.format)==raw.view.format,JoinPredicate::ViewFormat);
+    require(r.image.extent.width==raw.image.width,JoinPredicate::ExtentWidth);
+    require(r.image.extent.height==raw.image.height,JoinPredicate::ExtentHeight);
+    require(r.image.extent.depth==raw.image.depth,JoinPredicate::ExtentDepth);
+    require(r.image.arrayLayers==raw.image.layers,JoinPredicate::ArrayLayers);
+    return refused;
+}
+enum class JoinEnd : unsigned {Unobserved,Joined,Incompatible,RuntimeBefore,RuntimeAfter,
+    JournalCurrentness,AttemptLimit,Deadline,ClockInvalid,Stopped,ForeignOwner};
+const char* join_end(JoinEnd end) noexcept {
+    switch(end) {
+    case JoinEnd::Unobserved:return "unobserved";case JoinEnd::Joined:return "joined";
+    case JoinEnd::Incompatible:return "incompatible";case JoinEnd::RuntimeBefore:return "runtime_currentness_before";
+    case JoinEnd::RuntimeAfter:return "runtime_currentness_after";case JoinEnd::JournalCurrentness:return "journal_currentness";
+    case JoinEnd::AttemptLimit:return "journal_validation_limit";case JoinEnd::Deadline:return "capture_deadline";
+    case JoinEnd::ClockInvalid:return "invalid_monotonic_clock";case JoinEnd::Stopped:return "stopped";
+    case JoinEnd::ForeignOwner:return "foreign_owner";
+    }return "invalid";
+}
+struct JoinValidation {
+    std::uint64_t compatibility_reason_bits=0,first_ns=0,finished_ns=0;
+    unsigned attempts=0,journal_refusals=0,transient_refusals=0;
+    frame_compositor_journal::Validation journal_validation{};
+    bool compatibility_checked=false;
+    bool runtime_before_checked=false,runtime_current_before=false;
+    bool journal_checked=false,journal_current=false;
+    bool runtime_after_checked=false,runtime_current_after=false;
+    bool joined=false;
+    JoinEnd end=JoinEnd::Unobserved;
+};
+bool join(const frame_compositor_raw::RawRecord& raw,const frame_compositor_journal::Receipt& value,
+    JoinValidation* output=nullptr) noexcept {
+    JoinValidation local;auto& validation=output?*output:local;
+    validation.joined=false;
+    validation.runtime_before_checked=validation.runtime_current_before=false;
+    validation.journal_checked=validation.journal_current=false;
+    validation.journal_validation={};
+    validation.runtime_after_checked=validation.runtime_current_after=false;
+    validation.compatibility_checked=true;
+    validation.compatibility_reason_bits=compatibility(raw,value);
+    if(validation.compatibility_reason_bits){validation.end=JoinEnd::Incompatible;return false;}
+    validation.runtime_before_checked=true;
+    validation.runtime_current_before=runtime::association_current();
+    if(!validation.runtime_current_before){validation.end=JoinEnd::RuntimeBefore;return false;}
+    ++validation.attempts;validation.journal_checked=true;
+    validation.journal_validation=frame_compositor_journal::validate_detailed(value);
+    validation.journal_current=validation.journal_validation.valid;
+    if(!validation.journal_current) {
+        ++validation.journal_refusals;
+        if(validation.journal_validation.transient)++validation.transient_refusals;
+    }
+    validation.runtime_after_checked=true;
+    validation.runtime_current_after=runtime::association_current();
+    if(!validation.runtime_current_after){validation.end=JoinEnd::RuntimeAfter;return false;}
+    validation.joined=validation.journal_current;
+    validation.end=validation.joined?JoinEnd::Joined:JoinEnd::JournalCurrentness;
+    return validation.joined;
 }
 std::uint64_t now() noexcept {timespec t{};return clock_gettime(CLOCK_MONOTONIC,&t)?0:std::uint64_t(t.tv_sec)*1000000000+std::uint64_t(t.tv_nsec);}
+bool join_window(JoinValidation& validation,std::uint64_t start,std::uint64_t time) noexcept {
+    if(!owned()){validation.end=JoinEnd::ForeignOwner;return false;}
+    if(stopping.load(std::memory_order_acquire)){validation.end=JoinEnd::Stopped;return false;}
+    if(!start || !time || time<start || start>UINT64_MAX-DurationNs){validation.end=JoinEnd::ClockInvalid;return false;}
+    if(time-start>=DurationNs){validation.end=JoinEnd::Deadline;return false;}
+    return true;
+}
+JoinValidation join_bounded(const frame_compositor_raw::RawRecord& raw,
+    const frame_compositor_journal::Receipt& receipt,std::uint64_t capture_start) noexcept {
+    JoinValidation validation;validation.compatibility_checked=true;
+    validation.compatibility_reason_bits=compatibility(raw,receipt);
+    // This function runs only on the existing background owner. The raw record
+    // and receipt remain the same immutable values through all 64 validations.
+    for(;;) {
+        const auto time=now();validation.finished_ns=time;
+        if(!validation.first_ns)validation.first_ns=time;
+        if(!join_window(validation,capture_start,time))return validation;
+        const bool accepted=join(raw,receipt,&validation);
+        const auto after=now();validation.finished_ns=after;
+        // Validation may wait on the owning background drain mutex. A success
+        // that returns after expiry must never revive the observation window.
+        if(!join_window(validation,capture_start,after)){validation.joined=false;return validation;}
+        if(accepted || validation.end!=JoinEnd::JournalCurrentness || !validation.journal_validation.transient)return validation;
+        if(validation.attempts>=JoinAttemptLimit){validation.end=JoinEnd::AttemptLimit;return validation;}
+        const auto retry_at=after+std::min(JoinRetryDelayNs,capture_start+DurationNs-after);
+        for(;;) {
+            const auto observed=now();validation.finished_ns=observed;
+            if(!join_window(validation,capture_start,observed))return validation;
+            if(observed>=retry_at)break;
+            const auto remaining=std::min(retry_at-observed,capture_start+DurationNs-observed);
+            const timespec pause{static_cast<time_t>(remaining/1000000000),static_cast<long>(remaining%1000000000)};
+            nanosleep(&pause,nullptr); // Interrupted sleeps recheck the same deadline.
+        }
+    }
+}
+const char* bridge_reason(frame_compositor_journal::BridgeValidationReason reason) noexcept {
+    using Reason=frame_compositor_journal::BridgeValidationReason;
+    switch(reason) {
+    case Reason::None:return "valid";case Reason::ChildRetired:return "child_retired";
+    case Reason::Uninitialized:return "uninitialized";case Reason::Stopped:return "stopped";
+    case Reason::Loss:return "notification_loss";case Reason::ReceiptNotCurrent:return "receipt_not_current";
+    case Reason::Journal:return "journal";
+    }return "invalid";
+}
+const char* journal_reason(frame_bindings::ImportReceiptValidationReason reason) noexcept {
+    using Reason=frame_bindings::ImportReceiptValidationReason;
+    switch(reason) {
+    case Reason::Valid:return "valid";case Reason::Closed:return "closed";case Reason::Halted:return "halted";
+    case Reason::JournalLoss:return "journal_loss";case Reason::ActivePublication:return "active_publication";
+    case Reason::PendingReplay:return "pending_replay";case Reason::PublicationChanged:return "publication_changed";
+    case Reason::CoreGenerationMismatch:return "core_generation_mismatch";
+    }return "invalid";
+}
+void validation_details(Line& l,const char* label,const frame_compositor_journal::Validation& decision,bool checked) noexcept {
+    const auto& journal=decision.journal;
+    // The Journal itself marks which short-circuit stages were observed. Later
+    // default fields are never mislabeled as sampled state or inferred checks.
+    l.add(",\"%s\":{\"checked\":%s,\"valid\":%s,\"transient\":%s,"
+        "\"bridge_reason\":%u,\"bridge_reason_name\":\"%s\",\"journal_reason\":%u,\"journal_reason_name\":\"%s\","
+        "\"before_checks_observed\":%s,\"after_checks_observed\":%s,\"core_checked\":%s,"
+        "\"active_before\":%llu,\"active_after\":%llu,\"expected_before\":%llu,\"expected_after\":%llu,"
+        "\"tickets_before\":%llu,\"tickets_after\":%llu,\"loss_before\":%llu,\"loss_after\":%llu,"
+        "\"empty_before\":%s,\"empty_after\":%s,\"closed_before\":%s,\"closed_after\":%s,"
+        "\"halted_before\":%s,\"halted_after\":%s}",
+        label,checked?"true":"false",decision.valid?"true":"false",decision.transient?"true":"false",
+        unsigned(decision.bridge_reason),bridge_reason(decision.bridge_reason),unsigned(journal.reason),journal_reason(journal.reason),
+        journal.before_observed?"true":"false",journal.after_observed?"true":"false",journal.core_checked?"true":"false",
+        u(journal.active_before),u(journal.active_after),u(journal.expected_before),u(journal.expected_after),u(journal.tickets_before),u(journal.tickets_after),
+        u(journal.loss_before),u(journal.loss_after),journal.empty_before?"true":"false",journal.empty_after?"true":"false",
+        journal.closed_before?"true":"false",journal.closed_after?"true":"false",journal.halted_before?"true":"false",journal.halted_after?"true":"false");
+}
+void join_diagnostics(Line& l,const JoinValidation& validation) noexcept {
+    l.add(",\"join_validation\":{\"schema\":\"frame-compositor-resource-join-validation-v1\","
+        "\"compatibility_checked\":%s,\"compatibility_reason_bits\":%llu,\"compatibility_predicate_version\":1,\"attempt_count\":%u,"
+        "\"attempt_limit\":%u,\"retry_delay_ns\":%llu,\"journal_validation_refusals\":%u,"
+        "\"transient_validation_refusals\":%u,\"recovered_validation_refusals\":%u,\"journal_refusal_cause_classified\":true,"
+        "\"runtime_before_checked\":%s,\"runtime_current_before\":%s,\"journal_validation_checked\":%s,"
+        "\"journal_current\":%s,\"runtime_after_checked\":%s,\"runtime_current_after\":%s,"
+        "\"last_outcome\":\"%s\",\"retry_limit_reached\":%s,\"deadline_reached\":%s,"
+        "\"first_ns\":%llu,\"finished_ns\":%llu,\"same_capture_deadline\":true}",
+        validation.compatibility_checked?"true":"false",u(validation.compatibility_reason_bits),validation.attempts,JoinAttemptLimit,u(JoinRetryDelayNs),validation.journal_refusals,
+        validation.transient_refusals,validation.joined?validation.transient_refusals:0,validation.runtime_before_checked?"true":"false",
+        validation.runtime_current_before?"true":"false",validation.journal_checked?"true":"false",validation.journal_current?"true":"false",
+        validation.runtime_after_checked?"true":"false",validation.runtime_current_after?"true":"false",join_end(validation.end),
+        validation.end==JoinEnd::AttemptLimit?"true":"false",validation.end==JoinEnd::Deadline?"true":"false",
+        u(validation.first_ns),u(validation.finished_ns));
+    validation_details(l,"owning_journal_validation",validation.journal_validation,validation.journal_checked);
+}
+void footer_record(Line& footer,const runtime::Status& s,const JoinValidation& validation,
+    const char* end,unsigned records,std::size_t total,bool quiet,bool joined,const frame_compositor_journal::Counters& progress) noexcept {
+    footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%u,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,"
+        "\"started\":%s,\"raw_terminal\":%s,\"incomplete\":%s,\"refusal\":%u,\"parent_bytes\":%zu,\"scalar_bytes\":%zu,\"wire_bytes\":%zu,"
+        "\"quiescent\":%s,\"local_cpu_resource_join\":%s,\"operator_arm_required\":%s,\"candidate_armed\":%s,\"candidate_claimed\":%s",
+        end,records,total,u(s.queued),u(s.drained),s.started?"true":"false",s.terminal?"true":"false",s.started&&!s.terminal?"true":"false",unsigned(s.refusal),
+        s.parent_bytes,s.scalar_bytes,s.wire_bytes,quiet?"true":"false",joined?"true":"false",
+        s.candidate_arm_required?"true":"false",s.candidate_armed?"true":"false",s.candidate_claimed?"true":"false");
+    footer.add(",\"public_begin_counts\":{\"before_candidate_arm\":%llu,\"after_candidate_arm\":%llu,\"skipped_prearm_afters\":%llu,"
+        "\"overflow\":%s,\"scope\":\"validated_supplied_notifications_not_packet_or_frame_proof\"}",
+        u(s.begins_before_arm),u(s.begins_after_arm),u(s.skipped_prearm_afters),s.begin_counts_overflow?"true":"false");
+    footer.add(",\"image_selection_counts\":{\"required\":%s,\"staged_begins\":%llu,\"excluded_images\":%llu,"
+        "\"eligible_images\":%llu,\"staging_refusals\":%llu,\"reserved_thread_slots\":%llu,\"thread_limit\":16,"
+        "\"abandoned_zero_read_stages\":%llu,"
+        "\"scope\":\"public_creation_eligibility_not_stream_origin_proof\"}",
+        s.stream_image_required?"true":"false",u(s.staged_begins),u(s.excluded_images),
+        u(s.eligible_images),u(s.staging_refusals),u(s.staging_threads),u(s.abandoned_stages));
+    footer.add(",\"initial_receipt_delivery\":{\"attempt_limit\":%u,\"requested\":%llu,\"delivered\":%llu,"
+        "\"invalid_after_drain\":%llu,\"refused\":%llu,\"transient_deferred\":%llu,\"delivery_exhausted\":%llu,\"pending_waits\":%llu}",
+        frame_compositor_journal::DeliveryValidationAttemptLimit,u(progress.requested),u(progress.delivered),u(progress.invalid_after_drain),u(progress.refused),
+        u(progress.transient_deferred),u(progress.delivery_exhausted),u(progress.pending_waits));
+    join_diagnostics(footer,validation);proofs(footer);footer.add("}\n");
+}
 void* write_background(void* argument) noexcept {
     auto total=reinterpret_cast<std::uintptr_t>(argument);
     const auto start=capture_started_ns;const char* end="stopped";unsigned records=0;
-    std::uint64_t arm_check=0;
+    std::uint64_t arm_check=0;JoinValidation validation;
     frame_compositor_raw::RawRecord raw{};frame_compositor_journal::Receipt receipt{};bool got_raw=false,got_receipt=false,joined=false;
     while(owned() && !stopping.load(std::memory_order_acquire)) {
         const auto time=now();if(!start || !time || time<start || time-start>=DurationNs){end="deadline";break;}
@@ -274,11 +496,12 @@ void* write_background(void* argument) noexcept {
             if(r.kind==runtime::Kind::RawMatched){raw=r.raw;got_raw=true;}
             if(r.kind==runtime::Kind::Receipt){receipt=r.receipt;got_receipt=true;}
             if(got_raw && got_receipt) {
-                joined=join(raw,receipt);Line association;
+                validation=join_bounded(raw,receipt,start);joined=validation.joined;Line association;
                 association.add("{\"schema\":1,\"local_cpu_resource_join\":%s,\"reply_token\":\"%llx\",\"journal\":%llu,\"image_generation\":%llu,\"view_generation\":%llu",
                     joined?"true":"false",u(raw.reply_token),u(receipt.resource.journalInstance),u(receipt.resource.image.identity.generation),u(receipt.resource.view.identity.generation));
-                proofs(association);association.add("}\n");
-                if(!write_line(association,total))end="write_or_byte_limit";else end=joined?"local_resource_join":"join_refused";
+                join_diagnostics(association,validation);proofs(association);association.add("}\n");
+                if(!write_line(association,total))end="write_or_byte_limit";else end=joined?"local_resource_join":
+                    validation.end==JoinEnd::Deadline?"deadline":"join_refused";
                 break;
             }
             if(records==runtime::kRecordLimit){end="record_limit";break;}
@@ -294,22 +517,7 @@ void* write_background(void* argument) noexcept {
         Line line;record(line,tail);if(!write_line(line,total))break;++records;
     }
     const auto s=runtime::status();Line footer;
-    footer.add("{\"schema\":1,\"end\":\"%s\",\"records\":%u,\"bytes_before_footer\":%zu,\"queued\":%llu,\"drained\":%llu,"
-        "\"started\":%s,\"raw_terminal\":%s,\"incomplete\":%s,\"refusal\":%u,\"parent_bytes\":%zu,\"scalar_bytes\":%zu,\"wire_bytes\":%zu,"
-        "\"quiescent\":%s,\"local_cpu_resource_join\":%s,\"operator_arm_required\":%s,\"candidate_armed\":%s,\"candidate_claimed\":%s",
-        end,records,total,u(s.queued),u(s.drained),s.started?"true":"false",s.terminal?"true":"false",s.started&&!s.terminal?"true":"false",unsigned(s.refusal),
-        s.parent_bytes,s.scalar_bytes,s.wire_bytes,quiet?"true":"false",joined?"true":"false",
-        s.candidate_arm_required?"true":"false",s.candidate_armed?"true":"false",s.candidate_claimed?"true":"false");
-    footer.add(",\"public_begin_counts\":{\"before_candidate_arm\":%llu,\"after_candidate_arm\":%llu,\"skipped_prearm_afters\":%llu,"
-        "\"overflow\":%s,\"scope\":\"validated_supplied_notifications_not_packet_or_frame_proof\"}",
-        u(s.begins_before_arm),u(s.begins_after_arm),u(s.skipped_prearm_afters),s.begin_counts_overflow?"true":"false");
-    footer.add(",\"image_selection_counts\":{\"required\":%s,\"staged_begins\":%llu,\"excluded_images\":%llu,"
-        "\"eligible_images\":%llu,\"staging_refusals\":%llu,\"reserved_thread_slots\":%llu,\"thread_limit\":16,"
-        "\"abandoned_zero_read_stages\":%llu,"
-        "\"scope\":\"public_creation_eligibility_not_stream_origin_proof\"}",
-        s.stream_image_required?"true":"false",u(s.staged_begins),u(s.excluded_images),
-        u(s.eligible_images),u(s.staging_refusals),u(s.staging_threads),u(s.abandoned_stages));
-    proofs(footer);footer.add("}\n");write_line(footer,total,0);close(output_fd);output_fd=-1;return nullptr;
+    footer_record(footer,s,validation,end,records,total,quiet,joined,frame_compositor_journal::counters());write_line(footer,total,0);close(output_fd);output_fd=-1;return nullptr;
 }
 void finish_owned() noexcept {
     if(!owned())return;
@@ -352,6 +560,7 @@ __attribute__((constructor)) void start() noexcept {
     header.add(",\"operator_arm_required\":true,\"operator_armed\":false,\"pre_arm_private_bytes\":0,\"capture_started_ns\":%llu,\"capture_deadline_ns\":%llu",
         u(capture_started_ns),u(capture_started_ns+DurationNs));
     header.add(",\"candidate_selection\":%s",CandidateSelection);
+    header.add(",\"resource_join_validation\":%s",ResourceJoinValidation);
     header.add(",\"transactions\":1,\"parent_byte_limit\":16,\"scalar_byte_limit\":%llu,\"wire_byte_limit\":21,\"private_byte_limit\":%llu,"
         "\"creation_routes\":[\"Vulkan\",\"Facet\"],\"write_limit\":8,\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120",
         u(frame_compositor_raw::kMaxScalarBytes),u(16+frame_compositor_raw::kMaxScalarBytes+21));proofs(header);header.add("}\n");
