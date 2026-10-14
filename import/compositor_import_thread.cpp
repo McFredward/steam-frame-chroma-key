@@ -141,6 +141,47 @@ Outcome Gate::after_first_begin(const Entry& e,int result,const unsigned char& m
         return {Kind::Refused,reason(),original,kParentCopyBytes,confirmed};
     return {Kind::BeginAdmitted,Reason::None,original,kParentCopyBytes,confirmed};
 }
+Outcome Gate::admit_staged_image(const Entry& begin,const Entry& current,Stack stack,
+                                unsigned char& marker,Read reader,void* owner) noexcept {
+    const ErrnoGuard saved_errno;
+    const Entry original=begin,image_entry=current;
+    auto expected=State::Armed;
+    if(!state_.compare_exchange_strong(expected,State::CheckingBegin,std::memory_order_acq_rel))
+        return failure(image_entry,expected==State::Ready?Reason::RepeatedBegin:Reason::Preparing);
+    if(!current_marker_ || current_marker_(marker_owner_)!=&marker)
+        return failure(image_entry,Reason::WrongThread);
+    if(marker&kMarkerBit)return failure(image_entry,Reason::MarkerAlreadyUsed);
+    const auto route=frame_import_native::creation_route(frame_import_native::Boundary::Image,image_entry,compositor_.bias);
+    const auto offset=frame_import_native::creation_dispatch_offset(route);
+    if(!begin_shape(original) || original.x[30]!=compositor_.bias+kBeginReturn || !offset ||
+       image_entry.sp>kMax-offset || image_entry.sp+offset!=original.sp ||
+       image_entry.x[30]<compositor_.code_begin || image_entry.x[30]>=compositor_.code_end)
+        return failure(image_entry,Reason::Entry);
+    if(!stack.current() || !contains(stack.region(),image_entry.sp,offset+kBeginFrameBytes))
+        return failure(image_entry,Reason::Stack);
+    if(!reader || !owner)return failure(image_entry,Reason::MissingReader);
+    begin_entry_=original;marker_address_=&marker;stack_=stack;
+    marker=static_cast<unsigned char>(marker|kMarkerBit);
+    if(state_.load(std::memory_order_acquire)!=State::CheckingBegin || !stack_owned(marker))
+        return failure(image_entry,Reason::ChangedEntry);
+    std::array<std::uint64_t,2> parent{};
+    requested_.fetch_add(kParentCopyBytes,std::memory_order_relaxed);
+    const bool copied=reader(original.sp,parent.data(),kParentCopyBytes,owner);
+    const auto confirmed=copied?kParentCopyBytes:std::size_t{0};
+    if(copied)confirmed_.fetch_add(kParentCopyBytes,std::memory_order_relaxed);
+    if(state_.load(std::memory_order_acquire)!=State::CheckingBegin)
+        return {Kind::Refused,reason(),image_entry,kParentCopyBytes,confirmed};
+    if(!copied)return failure(image_entry,Reason::Reader,kParentCopyBytes,confirmed);
+    if(!stack_owned(marker))return failure(image_entry,Reason::WrongThread,kParentCopyBytes,confirmed);
+    if(!same(begin,original) || !same(current,image_entry))
+        return failure(image_entry,Reason::ChangedEntry,kParentCopyBytes,confirmed);
+    if(parent[0]!=original.sp+kBeginFrameBytes || parent[1]!=compositor_.bias+kDispatchReturn)
+        return failure(image_entry,Reason::SourceLink,kParentCopyBytes,confirmed);
+    expected=State::CheckingBegin;
+    if(!state_.compare_exchange_strong(expected,State::Ready,std::memory_order_release))
+        return {Kind::Refused,reason(),image_entry,kParentCopyBytes,confirmed};
+    return {Kind::BeginAdmitted,Reason::None,image_entry,kParentCopyBytes,confirmed};
+}
 bool Gate::pending_current(const unsigned char& marker) const noexcept {
     const ErrnoGuard saved_errno;
     return state_.load(std::memory_order_acquire)==State::PendingBegin && stack_owned(marker) &&

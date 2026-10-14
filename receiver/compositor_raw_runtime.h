@@ -9,6 +9,7 @@
 
 namespace frame_compositor_runtime {
 constexpr std::size_t kRecordLimit=32;
+constexpr unsigned kStagingThreadLimit=16;
 constexpr std::uint64_t kTag=0xc000000000000001ULL,kCookie=0xc100000000000001ULL;
 // These labels are local diagnostic ownership, never resource/frame generations.
 using Self=pthread_t (*)();
@@ -24,6 +25,9 @@ struct Setup {
     // Production operator-controlled captures reserve their only candidate
     // until an authenticated writer publishes the arm signal.
     bool require_operator_arm=false;
+    // Opt-in metadata staging reserves the one private acquisition for an
+    // actual source-pinned NV12/P010 Image, rather than the first UI import.
+    bool require_stream_image=false;
 };
 enum class Kind : unsigned { Prepared,Attached,Bound,BeginStaged,ThreadAdmitted,RawMatched,
     RawRefused,Receipt,Refused,Retired };
@@ -48,6 +52,10 @@ struct Status {
     bool candidate_arm_required=false,candidate_armed=false,candidate_claimed=false;
     std::uint64_t begins_before_arm=0,begins_after_arm=0,skipped_prearm_afters=0;
     bool begin_counts_overflow=false;
+    bool stream_image_required=false;
+    std::uint64_t staged_begins=0,excluded_images=0,eligible_images=0,staging_refusals=0;
+    unsigned staging_threads=0;
+    std::uint64_t abandoned_stages=0;
 };
 bool initialize(const frame_compositor_main::Prepared&,Setup) noexcept;
 // Metadata publication only, after cold initialization and audit attachment.

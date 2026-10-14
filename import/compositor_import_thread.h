@@ -50,6 +50,13 @@ public:
     Outcome after_first_begin(const Entry&, int original_lock_result,
                               const unsigned char& existing_marker,
                               Read, void* reader_owner) noexcept;
+    // Deferred diagnostic selection: the root staged real Begin/Early pairs
+    // and cached this thread's stack before the native lock. At the actual
+    // Image call, check only the still-live Begin parent FP/LR pair. No Begin
+    // scalar replay or first-time stack discovery occurs at this boundary.
+    Outcome admit_staged_image(const Entry& staged_begin, const Entry& current_image,
+                               Stack cached_stack, unsigned char& existing_marker,
+                               Read, void* reader_owner) noexcept;
     // Metadata pairing only: never use this as native memory read permission.
     bool pending_current(const unsigned char& existing_marker) const noexcept;
     bool current(const unsigned char& existing_marker) const noexcept;

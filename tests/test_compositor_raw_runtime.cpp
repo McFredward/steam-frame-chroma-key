@@ -91,25 +91,26 @@ int actual_attributes(pthread_t t,pthread_attr_t* a) {
     return fixture_stubs::fail_attributes?EINVAL: ::pthread_getattr_np(t,a);
 }
 frame_import_startup::PreparedImage image() {
-    frame_import_startup::PreparedImage p{bias,bias+0x10000,bias+0x300000,{}};
+    frame_import_startup::PreparedImage p{bias,bias+0x10000,bias+0x400000,{}};
     constexpr char text[]="0bb148eda6b5e54e2fbed09d475a43671f5ff6fcb6c2b4f48345b1a9fe8d6f96";
     const auto nibble=[](char c){return unsigned(c>='a'?c-'a'+10:c-'0');};
     for(unsigned i=0;i<32;++i)p.file_identity[i]=std::uint8_t((nibble(text[i*2])<<4)|nibble(text[i*2+1]));
     return p;
 }
-audit::ModuleView module(std::uintptr_t b,std::uint64_t generation) {return {b,b+0x10000,b+0x300000,generation,0,0};}
-void model_cold_adapter_only(bool operator_arm=false) {
+audit::ModuleView module(std::uintptr_t b,std::uint64_t generation) {return {b,b+0x10000,b+(b==bias?0x400000:0x300000),generation,0,0};}
+void model_cold_adapter_only(bool operator_arm=false,bool stream_image=false) {
     auto& r=rt::runtime;
     // Direct internal fixture state models already authenticated immutable
     // geometry. It cannot construct/seal Ready production Prepared and is not
     // compiled into the observer or a runtime interface.
-    r.images[0]={bias,bias+0x10000,bias+0x300000,frame_import_main::Role::Compositor,{},image().file_identity,{}};
+    r.images[0]={bias,bias+0x10000,bias+0x400000,frame_import_main::Role::Compositor,{},image().file_identity,{}};
     r.images[1]={libc_bias,libc_bias+0x10000,libc_bias+0x300000,frame_import_main::Role::Libc,{},{},{}};
     r.images[3]={self_bias,self_bias+0x10000,self_bias+0x300000,frame_import_main::Role::Observer,{},{},{}};
     r.setup.lock_entry=self_bias+0x10100;r.setup.unlock_entry=self_bias+0x10200;r.setup.write_entry=self_bias+0x10300;
     r.setup.self=::pthread_self;r.setup.main_thread=fixture_cold_main;r.setup.attributes=actual_attributes;r.setup.get_stack=::pthread_attr_getstack;
     r.setup.destroy_attributes=::pthread_attr_destroy;r.setup.self_data_begin=self_bias+0x400000;r.setup.self_data_end=self_bias+0x500000;
     r.setup.require_operator_arm=operator_arm;r.arm_required.store(operator_arm);
+    r.setup.require_stream_image=stream_image;
     if(!operator_arm)r.candidate.store(rt::Candidate::Armed);
     r.originals={libc_bias+0x87370,libc_bias+0x88f74,libc_bias+0xdfee0};
     r.gate=new(r.thread_storage.data())gate::Gate(image(),marker_current,&r);
@@ -121,8 +122,8 @@ audit::BoundProvider provider(audit::Function f=audit::Function::None) {
     b.original=f==audit::Function::MutexLock?rt::runtime.originals[0]:f==audit::Function::MutexUnlock?rt::runtime.originals[1]:
         f==audit::Function::Write?rt::runtime.originals[2]:0;return b;
 }
-void attach(bool bindings=true,bool operator_arm=false) {
-    model_cold_adapter_only(operator_arm);check(rt::bridge({audit::Stage::Prepare,provider(),false,{}}).ready);
+void attach(bool bindings=true,bool operator_arm=false,bool stream_image=false) {
+    model_cold_adapter_only(operator_arm,stream_image);check(rt::bridge({audit::Stage::Prepare,provider(),false,{}}).ready);
     if(bindings)for(const auto f:{audit::Function::MutexLock,audit::Function::MutexUnlock,audit::Function::Write})
         check(rt::bridge({audit::Stage::Bind,provider(f),false,{}}).ready);
 }
@@ -130,6 +131,7 @@ struct Fixture {
     alignas(16)std::array<std::uint8_t,1856> bytes{};
     std::uintptr_t base=reinterpret_cast<std::uintptr_t>(bytes.data()),dispatch=base+1232,pipe=0x700000;
     frame_import_native::CreationRoute selected=frame_import_native::CreationRoute::Vulkan;
+    VkFormat format=VK_FORMAT_R8G8B8A8_UNORM;
     std::array<std::uint8_t,21> packet{};
     explicit Fixture(frame_import_native::CreationRoute route=frame_import_native::CreationRoute::Vulkan):
         dispatch(base+frame_import_native::creation_dispatch_offset(route)),selected(route) {
@@ -189,7 +191,7 @@ struct Fixture {
         using O=frame_import_vulkan::Operation;
         frame_import_vulkan::Notification n{};n.operation=b==Boundary::Image?O::Image:b==Boundary::Bind?O::Bind:O::View;
         n.phase=phase;n.entry=entry(b);n.device=device;n.image=10;n.memory=20;n.view=30;n.memory_offset=16;
-        n.format=VK_FORMAT_R8G8B8A8_UNORM;n.extent={1152,4608,1};n.layers=1;n.result=VK_SUCCESS;
+        n.format=format;n.extent={1152,4608,1};n.layers=1;n.result=VK_SUCCESS;
         n.invocation_tag=rt::kTag;n.preserved_errno=EBUSY;return n;
     }
     void vulkan_pair(Boundary b) {
@@ -503,6 +505,167 @@ void main_thread_rejected() {
     f.libc_pair(Boundary::Begin);check(rt::status().retired && rt::status().refusal==rt::Refusal::Thread);
     check(!fixture_stubs::attributes_calls && !rt::status().parent_bytes && !rt::status().scalar_bytes);
 }
+void stream_staged_without_private() {
+    const auto s=rt::status();
+    check(s.stream_image_required && !s.candidate_claimed && !s.started && !s.terminal && !s.retired);
+    check(!s.parent_bytes && !s.scalar_bytes && !s.wire_bytes && !rt::runtime.scope.active());
+    check(s.queued==4); // Internal fixture models Attached and three initial provider binds.
+}
+void stream_complete(Fixture& f) {
+    for(auto b:{Boundary::Image,Boundary::Bind,Boundary::View})f.vulkan_pair(b);
+    f.libc_pair(Boundary::SendLock);f.libc_pair(Boundary::Write,0,21);f.libc_pair(Boundary::Finish);
+    const auto s=rt::status();check(s.started && s.terminal && !s.retired && s.candidate_claimed);
+    check(s.parent_bytes==16 && s.wire_bytes==21 && s.scalar_bytes+s.parent_bytes+s.wire_bytes<=757);
+    rt::Record r;check(drain(rt::Kind::RawMatched,&r)==1);
+    check(r.raw.selected_at_image && r.raw.private_acquisition_started_at_image);
+    check(r.raw.selected_begin_result==0 && r.raw.selected_early_result==0 && r.raw.reply_token==token);
+    check(r.raw.selected_image.format==static_cast<std::uint32_t>(f.format));
+    no_proof(r.raw);
+}
+void stream_ui_then_video(unsigned ui_count,frame_import_native::CreationRoute route=frame_import_native::CreationRoute::Vulkan) {
+    attach(true,true,true);check(rt::arm_candidate_once());
+    for(unsigned i=0;i<ui_count;++i) {
+        Fixture ui;ui.libc_pair(Boundary::Begin);ui.libc_pair(Boundary::EarlyUnlock);
+        stream_staged_without_private();
+        auto image=ui.vnote(Boundary::Image,frame_import_vulkan::Phase::Before);
+        check(!rt::vulkan_notification(image,&rt::runtime));
+        image.phase=frame_import_vulkan::Phase::After;check(!rt::vulkan_notification(image,&rt::runtime));
+        stream_staged_without_private();ui.libc_pair(Boundary::Finish);
+    }
+    Fixture video(route);video.format=VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+    video.libc_pair(Boundary::Begin);video.libc_pair(Boundary::EarlyUnlock);
+    stream_staged_without_private();
+    // Source review found this saved pipe is overwritten by the time Image
+    // runs. Deferred selection must never replay either old 12-byte decoder.
+    video.put(video.dispatch+128,std::uint64_t{0xdeadbeef});
+    const auto before=fixture_stubs::attributes_calls.load();stream_complete(video);
+    check(fixture_stubs::attributes_calls==before && before==1);
+    const auto s=rt::status();check(s.staged_begins==ui_count+1 && s.excluded_images==ui_count && s.eligible_images==1 && s.staging_threads==1);
+}
+void stream_reject(unsigned problem) {
+    attach(true,true,true);check(rt::arm_candidate_once());Fixture f;
+    f.format=VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    auto begin=f.note(Boundary::Begin,raw::Phase::Before);
+    rt::libc_notification(begin,&rt::runtime);
+    begin.phase=raw::Phase::After;
+    if(problem==0)begin.result_bits=EAGAIN;
+    if(problem==1)begin.entry.x[19]+=16;
+    rt::libc_notification(begin,&rt::runtime);
+    auto early=f.note(Boundary::EarlyUnlock,raw::Phase::Before);
+    if(problem==2)early.entry.x[0]+=16;
+    rt::libc_notification(early,&rt::runtime);early.phase=raw::Phase::After;
+    if(problem==3)early.result_bits=EAGAIN;
+    if(problem==4)early.entry.x[25]^=1;
+    rt::libc_notification(early,&rt::runtime);
+    if(problem==5)f.libc_pair(Boundary::Finish);
+    if(problem==6)f.libc_pair(Boundary::Begin);
+    auto image=f.vnote(Boundary::Image,frame_import_vulkan::Phase::Before);
+    if(problem==7)image.entry.sp+=16;
+    if(problem==8)image.extent.width=1153;
+    if(problem==9)image.extent.depth=2;
+    if(problem==10)image.layers=2;
+    if(problem==11)image.entry.x[30]+=4;
+    if(problem==12)fixture_stubs::vulkan_loss.store(true);
+    if(problem==13)rt::finalize();
+    if(problem==14) {
+        std::thread foreign([&]{check(!rt::vulkan_notification(image,&rt::runtime));});foreign.join();
+    } else check(!rt::vulkan_notification(image,&rt::runtime));
+    const auto s=rt::status();
+    check(!s.candidate_claimed && !s.started && !s.parent_bytes && !s.scalar_bytes && !s.wire_bytes);
+    check(s.queued==4);
+}
+void stream_parent_mismatch() {
+    attach(true,true,true);check(rt::arm_candidate_once());Fixture f;
+    f.format=VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    f.libc_pair(Boundary::Begin);f.libc_pair(Boundary::EarlyUnlock);
+    f.put(f.dispatch+8,std::uint64_t{bias+0x24fee4});
+    auto n=f.vnote(Boundary::Image,frame_import_vulkan::Phase::Before);
+    check(!rt::vulkan_notification(n,&rt::runtime));
+    const auto s=rt::status();check(s.candidate_claimed && s.retired && s.parent_bytes==16 && !s.scalar_bytes && !s.wire_bytes);
+}
+void stream_cached_stack_budget() {
+    attach(true,true,true);check(rt::arm_candidate_once());
+    for(unsigned i=0;i<rt::kStagingThreadLimit+4;++i) {
+        std::thread owner([]{Fixture f;f.libc_pair(Boundary::Begin);f.libc_pair(Boundary::EarlyUnlock);});owner.join();
+    }
+    const auto s=rt::status();check(s.staging_threads==rt::kStagingThreadLimit && fixture_stubs::attributes_calls==rt::kStagingThreadLimit);
+    check(s.staging_refusals>=4 && !s.candidate_claimed && !s.parent_bytes && !s.scalar_bytes && !s.wire_bytes && s.queued==4);
+}
+void stream_arm_crossing() {
+    attach(true,true,true);Fixture f;
+    auto n=f.note(Boundary::Begin,raw::Phase::Before);rt::libc_notification(n,&rt::runtime);
+    check(rt::arm_candidate_once());n.phase=raw::Phase::After;rt::libc_notification(n,&rt::runtime);
+    f.libc_pair(Boundary::EarlyUnlock);f.format=VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    check(!rt::vulkan_notification(f.vnote(Boundary::Image,frame_import_vulkan::Phase::Before),&rt::runtime));
+    check(!fixture_stubs::attributes_calls && rt::status().skipped_prearm_afters==1);
+    stream_staged_without_private();f.libc_pair(Boundary::Finish);
+    f.libc_pair(Boundary::Begin);f.libc_pair(Boundary::EarlyUnlock);stream_complete(f);
+}
+void stream_nested_finish_not_reused() {
+    attach(true,true,true);check(rt::arm_candidate_once());Fixture f;
+    f.format=VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    f.libc_pair(Boundary::Begin);f.libc_pair(Boundary::EarlyUnlock);
+    auto nested=f.note(Boundary::Begin,raw::Phase::Before);
+    nested.entry.sp-=320;nested.entry.x[29]=nested.entry.sp;
+    rt::libc_notification(nested,&rt::runtime);nested.phase=raw::Phase::After;rt::libc_notification(nested,&rt::runtime);
+    f.libc_pair(Boundary::Finish); // The outer call is still in flight.
+    f.libc_pair(Boundary::EarlyUnlock);
+    check(!rt::vulkan_notification(f.vnote(Boundary::Image,frame_import_vulkan::Phase::Before),&rt::runtime));
+    stream_staged_without_private();f.libc_pair(Boundary::Finish);
+    f.libc_pair(Boundary::Begin);f.libc_pair(Boundary::EarlyUnlock);stream_complete(f);
+}
+void stream_abandoned_import(unsigned failure) {
+    attach(true,true,true);check(rt::arm_candidate_once());Fixture ui;
+    ui.libc_pair(Boundary::Begin);
+    auto early=ui.note(Boundary::EarlyUnlock,raw::Phase::Before);
+    if(failure==0)early.entry.x[25]=0; // Native payload read fails; no Finish.
+    rt::libc_notification(early,&rt::runtime);early.phase=raw::Phase::After;
+    rt::libc_notification(early,&rt::runtime);
+    if(failure==1) { // Public Image fails; native method omits the send/Finish.
+        auto image=ui.vnote(Boundary::Image,frame_import_vulkan::Phase::Before);
+        check(!rt::vulkan_notification(image,&rt::runtime));image.phase=frame_import_vulkan::Phase::After;
+        image.result=VK_ERROR_OUT_OF_HOST_MEMORY;check(!rt::vulkan_notification(image,&rt::runtime));
+    }
+    stream_staged_without_private();
+    // Same source stack frame is reused only after that native import returns.
+    ui.libc_pair(Boundary::Begin);ui.libc_pair(Boundary::EarlyUnlock);
+    ui.format=VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;stream_complete(ui);
+    check(rt::status().abandoned_stages==1 && fixture_stubs::attributes_calls==1);
+}
+void stream_pending_begin_not_abandoned() {
+    attach(true,true,true);check(rt::arm_candidate_once());Fixture f;
+    const auto before=f.note(Boundary::Begin,raw::Phase::Before);
+    rt::libc_notification(before,&rt::runtime);
+    auto repeated=before;rt::libc_notification(repeated,&rt::runtime);
+    repeated.phase=raw::Phase::After;rt::libc_notification(repeated,&rt::runtime);
+    f.libc_pair(Boundary::EarlyUnlock);f.format=VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    check(!rt::vulkan_notification(f.vnote(Boundary::Image,frame_import_vulkan::Phase::Before),&rt::runtime));
+    stream_staged_without_private();check(!rt::status().abandoned_stages);
+}
+void stream_retire_during_parent() {
+    attach(true,true,true);check(rt::arm_candidate_once());Fixture f;
+    f.format=VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    f.libc_pair(Boundary::Begin);f.libc_pair(Boundary::EarlyUnlock);
+    cancel_after_parent.store(16);
+    check(!rt::vulkan_notification(f.vnote(Boundary::Image,frame_import_vulkan::Phase::Before),&rt::runtime));
+    const auto s=rt::status();check(s.candidate_claimed && s.retired && s.parent_bytes==16 && !s.scalar_bytes && !s.wire_bytes);
+}
+void stream_fork_retired() {
+    attach(true,true,true);check(rt::arm_candidate_once());Fixture f;
+    f.format=VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    f.libc_pair(Boundary::Begin);f.libc_pair(Boundary::EarlyUnlock);
+    const auto pid=::fork();check(pid>=0);
+    if(!pid) {
+        // The production atfork child route calls finalize; test that neither
+        // inherited slot metadata nor cached stack can reopen its child state.
+        rt::finalize();
+        check(!rt::vulkan_notification(f.vnote(Boundary::Image,frame_import_vulkan::Phase::Before),&rt::runtime));
+        check(!rt::arm_candidate_once() && !rt::status().candidate_claimed && !rt::status().parent_bytes);
+        _exit(0);
+    }
+    int status=0;check(::waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);
+    stream_complete(f);
+}
 void run(void(*work)(),unsigned& passed) {
     const auto pid=::fork();check(pid>=0);
     if(!pid){checks=0;std::thread worker(work);worker.join();std::printf("runtime fixture controls: %u\n",checks);std::fflush(stdout);_exit(0);}
@@ -520,7 +683,7 @@ int main(int argc,char** argv) {
     check(reinterpret_cast<std::uintptr_t>(&::pthread_attr_destroy)==mapped_libc+0x81420);
     std::printf("Actual retained ARM libc pthread helpers: %s\n",provider.dli_fname);
 #endif
-    constexpr std::array<void(*)(),49> cases{
+    constexpr std::array<void(*)(),76> cases{
         inert_production,forwarding_only,+[]{success(21);},+[]{success(3);},
         native_failure,incomplete_finalization,parent_mismatch,+[]{ownership_postcheck(0);},
         +[]{ownership_postcheck(1);},queue_budget,foreign_begin,
@@ -544,7 +707,15 @@ int main(int argc,char** argv) {
             f.libc_pair(Boundary::Begin);
             check(rt::status().begin_counts_overflow && !rt::status().candidate_claimed && !rt::status().started);
             check(!rt::status().parent_bytes && !rt::status().scalar_bytes && !rt::status().wire_bytes && !fixture_stubs::attributes_calls);
-        }};
+        },+[]{stream_ui_then_video(1);},+[]{stream_ui_then_video(2);},
+        +[]{stream_ui_then_video(2,frame_import_native::CreationRoute::Facet);},
+        +[]{stream_reject(0);},+[]{stream_reject(1);},+[]{stream_reject(2);},+[]{stream_reject(3);},
+        +[]{stream_reject(4);},+[]{stream_reject(5);},+[]{stream_reject(6);},+[]{stream_reject(7);},
+        +[]{stream_reject(8);},+[]{stream_reject(9);},+[]{stream_reject(10);},+[]{stream_reject(11);},
+        +[]{stream_reject(12);},+[]{stream_reject(13);},+[]{stream_reject(14);},
+        stream_parent_mismatch,stream_cached_stack_budget,stream_arm_crossing,
+        stream_nested_finish_not_reused,stream_retire_during_parent,stream_fork_retired,
+        +[]{stream_abandoned_import(0);},+[]{stream_abandoned_import(1);},stream_pending_begin_not_abandoned};
     unsigned passed=0;
     if(argc==2) {char* end=nullptr;const auto n=std::strtoul(argv[1],&end,10);check(end && !*end && n<cases.size());run(cases[n],passed);}
     else {check(argc==1);for(unsigned n=0;n<cases.size();++n){std::printf("runtime case %u\n",n);std::fflush(stdout);run(cases[n],passed);}}

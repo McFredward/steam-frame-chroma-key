@@ -27,7 +27,7 @@ unsigned char* current_marker(void* owner) noexcept {
     check(owner==&marker_owner);errno=EDOM;return &marker;
 }
 frame_import_startup::PreparedImage image() {
-    frame_import_startup::PreparedImage p{bias,bias+0x10000,bias+0x300000,{}};
+    frame_import_startup::PreparedImage p{bias,bias+0x10000,bias+0x400000,{}};
     constexpr char text[]="0bb148eda6b5e54e2fbed09d475a43671f5ff6fcb6c2b4f48345b1a9fe8d6f96";
     const auto nibble=[](char c){return unsigned(c>='a'?c-'a'+10:c-'0');};
     for(unsigned i=0;i<32;++i)p.file_identity[i]=std::uint8_t((nibble(text[i*2])<<4)|nibble(text[i*2+1]));
@@ -50,6 +50,14 @@ struct Fixture {
         put(begin.sp,begin.sp+kBeginFrameBytes);put(begin.sp+8,bias+kDispatchReturn);
     }
     void put(std::uintptr_t at,std::uint64_t v){std::memcpy(reinterpret_cast<void*>(at),&v,8);}
+    Entry current_image(frame_import_native::CreationRoute route=frame_import_native::CreationRoute::Vulkan) const {
+        Entry e{};
+        const auto offset=frame_import_native::creation_dispatch_offset(route);
+        e.sp=begin.sp-offset;
+        e.x[29]=route==frame_import_native::CreationRoute::Facet?e.sp:e.sp+96;
+        e.x[30]=bias+(route==frame_import_native::CreationRoute::Facet?0x3076a0:0x2c75ac);
+        e.x[0]=0xabc0;return e;
+    }
 };
 enum class Mode {Normal,Empty,Foreign,ReenterPrepare,CancelPrepare,RetirePrepare,
     ChangePrepare,ChangeMarkerPrepare,RetireRead,ChangeRead,ChangeMarkerRead,ReenterRead};
@@ -279,6 +287,57 @@ int main() {
         g.retire();check(g.reason()==Reason::Retired);unavailable(g);
         check(before(g,c).kind==Kind::Refused && after(g,c).kind==Kind::Refused && !g.arm_before_compositor_threads());
         check(c.prepares==(phase?1U:0U) && c.reads==(phase==2?1U:0U));
+    });
+    for(const auto route:{frame_import_native::CreationRoute::Vulkan,frame_import_native::CreationRoute::Facet})child([route] {
+        Fixture f;Gate g(image(),current_marker,&marker_owner);Control c{&g,&f};check(g.arm_before_compositor_threads());
+        const auto stack=actual_stack();const auto current=f.current_image(route);errno=E2BIG;
+        const auto out=g.admit_staged_image(f.begin,current,stack,marker,read,&c);
+        check(out.kind==Kind::BeginAdmitted && out.reason==Reason::None && out.bytes_requested==16 && out.bytes_confirmed==16);
+        check(!c.prepares && c.reads==1 && c.actual_copied==16 && errno==E2BIG);
+        check(out.entry.sp==current.sp && out.entry.x==current.x && g.current(marker));
+        check(g.begin_frame_current(marker)==f.begin.sp && g.window_current(marker,f.begin.sp,320));
+        check(g.admit_staged_image(f.begin,current,stack,marker,read,&c).kind==Kind::Refused && c.reads==1);
+    });
+    for(unsigned problem=0;problem<10;++problem)child([problem] {
+        Fixture f;Gate g(image(),current_marker,&marker_owner);Control c{&g,&f};
+        if(problem!=0)check(g.arm_before_compositor_threads());
+        auto stack=actual_stack();auto current=f.current_image();unsigned char foreign=0;
+        if(problem==1)f.begin.x[19]+=16;
+        if(problem==2)current.x[30]+=4;
+        if(problem==3)current.sp+=16;
+        if(problem==4)stack={};
+        if(problem==5)marker=kMarkerBit;
+        if(problem==8)g.cancel();
+        if(problem==9)g.retire();
+        const auto out=g.admit_staged_image(f.begin,current,stack,problem==6?foreign:marker,problem==7?nullptr:read,&c);
+        check(out.kind==Kind::Refused && !c.prepares && !c.reads && !g.bytes_requested());unavailable(g);
+    });
+    for(unsigned partial=0;partial<=16;++partial)child([partial] {
+        Fixture f;Gate g(image(),current_marker,&marker_owner);Control c{&g,&f};
+        c.reader_fail=true;c.partial=partial;check(g.arm_before_compositor_threads());
+        const auto out=g.admit_staged_image(f.begin,f.current_image(),actual_stack(),marker,read,&c);
+        check(out.kind==Kind::Refused && out.reason==Reason::Reader && out.bytes_requested==16 && !out.bytes_confirmed);
+        check(c.reads==1 && c.actual_copied==partial && !c.prepares);unavailable(g);
+    });
+    for(unsigned byte=0;byte<16;++byte)child([byte] {
+        Fixture f;Gate g(image(),current_marker,&marker_owner);Control c{&g,&f};
+        f.bytes[byte]^=0x80;check(g.arm_before_compositor_threads());
+        const auto out=g.admit_staged_image(f.begin,f.current_image(),actual_stack(),marker,read,&c);
+        check(out.kind==Kind::Refused && out.reason==Reason::SourceLink && out.bytes_requested==16 && out.bytes_confirmed==16);
+        check(c.reads==1 && c.actual_copied==16 && !c.prepares);unavailable(g);
+    });
+    for(const auto mode:{Mode::RetireRead,Mode::ChangeRead,Mode::ChangeMarkerRead,Mode::ReenterRead})child([mode] {
+        Fixture f;Gate g(image(),current_marker,&marker_owner);Control c{&g,&f,mode};
+        check(g.arm_before_compositor_threads());errno=E2BIG;
+        const auto stack=actual_stack();errno=E2BIG;
+        const auto out=g.admit_staged_image(f.begin,f.current_image(),stack,marker,read,&c);
+        check(out.kind==Kind::Refused && out.bytes_requested==16 && out.bytes_confirmed==16);
+        check(c.reads==1 && !c.prepares && c.actual_copied==16 && errno==E2BIG);unavailable(g);
+    });
+    child([&] {
+        Fixture f;Gate g(image(),current_marker,&marker_owner);Control c{&g,&f};check(g.arm_before_compositor_threads());
+        check(g.admit_staged_image(f.begin,f.current_image(),foreign,marker,read,&c).reason==Reason::Stack);
+        check(!c.prepares && !c.reads);unavailable(g);
     });
     std::printf("first-import thread gate: %u checks passed\n",checks.load());
 }
