@@ -201,6 +201,58 @@ class SessionTests(unittest.TestCase):
         self.plan[report].update(sha256=M.digest(raw), bytes=len(raw))
         next(i for i in self.plan["inventory"] if i["name"] == name).update(sha256=M.digest(raw), bytes=len(raw)); self.save_plan()
 
+    def promote_stream_image_plan(self):
+        self.plan['schema'] = M.STREAM_IMAGE_SCHEMA
+        self.plan['observer']['candidate_selection'] = copy.deepcopy(M.CANDIDATE_SELECTION)
+        self.plan['observer']['scope_marker']['sha256'] = M.digest(M.STREAM_IMAGE_MARKER)
+        main = bytearray(self.artifacts[M.MAIN].read_bytes()); main[128:144] = M.STREAM_IMAGE_MARKER
+        SessionTests.alter_artifact(self, M.MAIN, bytes(main))
+        profile = self.profile(5, main)
+        self.plan['observer_profile'].update(file_sha256=M.digest(main), profile_sha256=profile[-32:].hex())
+        self.plan['envelope'].update(schema=4, reviewed_observer_profile_identity=profile[-32:].hex())
+        envelope = bytearray(self.artifacts[M.ENVELOPE].read_bytes())
+        envelope[:16] = M.STREAM_IMAGE_MARKER; envelope[16:48] = profile[-32:]
+        envelope[112 + 2032 * 3:-32] = profile; envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
+        SessionTests.alter_artifact(self, M.ENVELOPE, bytes(envelope))
+
+    def test_v5_current_image_plan_stages_and_readmits_without_changing_recovery(self):
+        self.promote_stream_image_plan(); self.stage(); self.activate()
+        self.assertTrue(self.session.readcheck()['active'])
+        self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertTrue(json.loads((self.session.folder / 'rollback-complete.json').read_text())['restored'])
+
+    def test_v5_requires_exact_typed_selection_scope_before_any_staging(self):
+        self.promote_stream_image_plan(); original = copy.deepcopy(self.plan)
+        variants = [None, {}, dict(M.CANDIDATE_SELECTION, even_extent=1),
+            dict(M.CANDIDATE_SELECTION, thread_slots=17), dict(M.CANDIDATE_SELECTION, depth=True),
+            dict(M.CANDIDATE_SELECTION, stream_origin_proven=True),
+            dict(M.CANDIDATE_SELECTION, begin_early_private_replay=True),
+            dict(M.CANDIDATE_SELECTION, public_formats=[50, 1000156013]),
+            dict(M.CANDIDATE_SELECTION, private_acquisition='begin-after')]
+        for selection in variants:
+            self.plan = copy.deepcopy(original)
+            self.plan['observer']['candidate_selection'] = selection; self.save_plan()
+            with self.subTest(selection=selection), self.assertRaisesRegex(RuntimeError, 'public image selection'):
+                self.stage()
+            self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_v5_cannot_relabel_an_actual_first_begin_artifact_as_image_selection(self):
+        self.promote_stream_image_plan()
+        main = bytearray(self.artifacts[M.MAIN].read_bytes()); main[128:144] = M.SCOPE_MARKER
+        self.alter_artifact(M.MAIN, bytes(main))
+        with self.assertRaisesRegex(RuntimeError, 'acquisition marker'): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_legacy_plan_cannot_admit_the_new_actual_image_artifact_or_selection_report(self):
+        self.plan['observer']['candidate_selection'] = dict(M.CANDIDATE_SELECTION); self.save_plan()
+        with self.assertRaisesRegex(RuntimeError, 'Legacy acquisition'): self.stage()
+        self.plan['observer'].pop('candidate_selection'); self.save_plan()
+        main = bytearray(self.artifacts[M.MAIN].read_bytes()); main[128:144] = M.STREAM_IMAGE_MARKER
+        self.alter_artifact(M.MAIN, bytes(main))
+        with self.assertRaisesRegex(RuntimeError, 'acquisition marker'): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
     def test_activation_requires_current_ui_health_and_fault_removes_only_own_activation(self):
         self.stage()
         self.wait_ready.return_value = {"status": "fault", "ready": False,
@@ -671,6 +723,16 @@ class OperatorArmTests(unittest.TestCase):
     elf, profile = staticmethod(SessionTests.elf), staticmethod(SessionTests.profile)
     layer_bytes, save_plan, command = SessionTests.layer_bytes, SessionTests.save_plan, SessionTests.command
     stage, activate, restart_count = SessionTests.stage, SessionTests.activate, SessionTests.restart_count
+
+    def test_v5_arm_requires_the_matching_live_selection_header(self):
+        SessionTests.promote_stream_image_plan(self); self.live_fixture()
+        with self.assertRaisesRegex(RuntimeError, 'public image selection'):
+            self.session.validate_prearm_outputs([self.header], [self.journal_header], self.session.manifest(), self.current)
+        self.header['candidate_selection'] = dict(M.CANDIDATE_SELECTION)
+        self.save_live_records([self.header], [self.journal_header])
+        receipt = self.session.arm(stream_start_intent=True)
+        self.assertTrue(receipt['operator_arm_requested'])
+        self.assertFalse(receipt['source_frame_associated'])
 
     def live_fixture(self):
         self.stage(); self.activate()

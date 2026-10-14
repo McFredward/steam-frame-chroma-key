@@ -40,7 +40,12 @@ READY = 'frame_compositor_raw_ready'
 BRIDGE = 'frame_compositor_raw_bridge'
 LAYER = 'VK_LAYER_FRAME_MASK_trace'
 ENVELOPE_BYTES = 8272
-MARKER = b'FCMRAW03' + struct.pack('<II', 3, ENVELOPE_BYTES)
+MARKER = b'FCMRAW04' + struct.pack('<II', 4, ENVELOPE_BYTES)
+CANDIDATE_SELECTION = {'schema': 'frame-compositor-public-image-selection-v1',
+    'public_formats': [1000156003, 1000156013], 'even_extent': True,
+    'depth': 1, 'layers': 1, 'private_acquisition': 'image-before',
+    'begin_early_private_replay': False, 'thread_slots': 16,
+    'stream_origin_proven': False}
 ARM_CONTENTS = b'FRAME_COMPOSITOR_RAW/1\n'
 SAMPLING_SCOPE = 'frame_compositor_trace_sampling_scope'
 SAMPLING_MARKER = b'FCMSMP01' + struct.pack('<6I', 1, 32, 16, 16, 32, 3)
@@ -203,6 +208,7 @@ def validate_observer(data, reviewed_sha, provider_exports):
                  'data_rva_begin': ready['data_rva_begin'], 'data_rva_end': ready['data_rva_end'],
                  'hidden_entries': entries, 'scope_marker': marker, 'ready_object': ready,
                  'raw_trace_sampling': dict(RAW_TRACE_SAMPLING), 'trace_sampling_marker': sampling,
+                 'candidate_selection': dict(CANDIDATE_SELECTION),
                  'public_exports': sorted(exports), 'vulkan_functions': dict(VULKAN_FUNCTIONS),
                  'standard_vulkan_exports': [], 'required_aliases': list(ALIAS_IMPORTS),
                  'bootstrap_imports': list(BOOTSTRAP_IMPORTS), 'versioned_glibc_imports': sorted(versioned),
@@ -241,7 +247,7 @@ def decode_envelope(data, expected_profile=None):
         raise ValueError('Compositor envelope acquisition/capture limits changed')
     blobs = tuple(data[112 + 2032 * i:112 + 2032 * (i + 1)] for i in range(4))
     validate_profiles(blobs, reviewed)
-    return {'schema': 3, 'bytes': ENVELOPE_BYTES, 'reviewed_observer_profile_identity': reviewed.hex(),
+    return {'schema': 4, 'bytes': ENVELOPE_BYTES, 'reviewed_observer_profile_identity': reviewed.hex(),
             'module_roles': list(ROLES), 'module_count': 4, 'raw_limits': dict(RAW_LIMITS),
             'capture_limits': dict(CAPTURE_LIMITS), 'profiles': blobs, 'sha256': digest(data).hex(),
             'independent_observer_checked': expected_profile is not None}
@@ -432,7 +438,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
     inventory = [{'name': name, 'bytes': len(value), 'sha256': digest(value).hex(),
                   'frame_path': None if name in ('audit-preparation.cpp', SELECTOR_SOURCE) else str(frame / name),
                   'owned_source': True, 'native_bytes': False, 'mode': '0600'} for name, value in artifacts.items()]
-    plan = {'schema': 'frame-compositor-raw-offline-bundle-v4', 'prepared': True, 'installed': False, 'activated': False,
+    plan = {'schema': 'frame-compositor-raw-offline-bundle-v5', 'prepared': True, 'installed': False, 'activated': False,
             'runtime_authorized': False, 'frame_access': False, 'network_access': False, 'automatic_restart': False,
             'native_binary_or_script_changes': False, 'shader_or_mask_activation': False, 'source_frame_associated': False,
             'gpu_coherent': False, 'continuous_connection_owned': False, 'native_namespace_associated': False,
@@ -441,7 +447,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
             'launch_isolation': {'schema': 'frame-compositor-startup-isolation-v1', 'target_exe': configuration['target'],
                 'selector_path': configuration['selector'], 'payload_path': configuration['payload'],
                 'audit_path': configuration['audit'], 'target_exec_environment': launch_environment(configuration)},
-            'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 3,
+            'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 4,
                          'reviewed_observer_profile_identity': reviewed.hex(), 'module_count': 4, 'module_roles': list(ROLES)},
             'manifest': {'name': MANIFEST, 'bytes': len(manifest), 'sha256': digest(manifest).hex(), 'layer_name': LAYER,
                          'functions': dict(VULKAN_FUNCTIONS),
@@ -462,6 +468,8 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
                       'tiny C launch selector in service descendants; full observer/audit only in the exact compositor target',
                       'cold single-threaded diagnostic environment freeze; internal system/popen children inherit clean actual environ',
                       'own cold-ready forwarding before actual la_preinit; private candidate and draw budgets wait for protected operator arming',
+                      'claim only at a source-validated public two-plane 420 image; retained lock results are public observations, not late private replay',
+                      'fixed 16 worker metadata slots; cold stack preparation at native Begin, never in graphics callbacks',
                       'operator arming after healthy UI with an explicit ready-to-connect or visible PC-VR stream acknowledgment; one absolute 120-second boot deadline without reset',
                       'local raw facts, not an immutable socket lease, native cross-endpoint namespace, video frame, eye, UV or GPU proof'],
             'before_activation': ['Independent final source/artifact/plan review', 'Fresh exact native Frame hashes and public loader names',

@@ -227,7 +227,8 @@ if(BUILD_TESTING)
         target_link_libraries(test_compositor_bootstrap PRIVATE ${CMAKE_DL_LIBS})
         add_test(NAME compositor_cold_bootstrap COMMAND test_compositor_bootstrap)
         add_executable(test_compositor_import_thread tests/test_compositor_import_thread.cpp
-            import/compositor_import_thread.cpp import/import_startup_gate.cpp import/native_client_birth.cpp import/import_pipe_epoch.cpp)
+            import/compositor_import_thread.cpp import/native_import_route.cpp
+            import/import_startup_gate.cpp import/native_client_birth.cpp import/import_pipe_epoch.cpp)
         target_include_directories(test_compositor_import_thread PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME compositor_first_import_thread COMMAND test_compositor_import_thread)
         add_executable(test_compositor_raw_receipt tests/test_compositor_raw_receipt.cpp

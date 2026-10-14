@@ -35,6 +35,7 @@ safe_path, read_regular, exclusive = base.safe_path, base.read_regular, base.exc
 digest, json_bytes, private_parents = base.digest, base.json_bytes, base.private_parents
 UNIT = "steamvr.service"
 SCHEMA = "frame-compositor-raw-offline-bundle-v4"
+STREAM_IMAGE_SCHEMA = "frame-compositor-raw-offline-bundle-v5"
 SESSION_SCHEMA = "frame-compositor-raw-owned-session-v4"
 MAIN, AUDIT, ENVELOPE = "libVkLayer_frame_mask_trace.so", "libframe_compositor_raw_audit.so", "compositor-raw-envelope.bin"
 SELECTOR = "libframe_compositor_launch_selector.so"
@@ -67,6 +68,12 @@ RAW_LIMITS = {"transactions": 1, "writes": 8, "scalar_bytes": 720, "wire_bytes":
 NATIVE_RVAS = {"lock": "0x87370", "unlock": "0x88f74", "write": "0xdfee0"}
 ENVELOPE_LIMITS = (720, 21, 16, 8, 32, 65536, 120, 4)
 SCOPE_MARKER = b"FCMRAW03" + struct.pack("<II", 3, 8272)
+STREAM_IMAGE_MARKER = b"FCMRAW04" + struct.pack("<II", 4, 8272)
+CANDIDATE_SELECTION = {"schema": "frame-compositor-public-image-selection-v1",
+    "public_formats": [1000156003, 1000156013], "even_extent": True,
+    "depth": 1, "layers": 1, "private_acquisition": "image-before",
+    "begin_early_private_replay": False, "thread_slots": 16,
+    "stream_origin_proven": False}
 ARM_CONTENTS = b"FRAME_COMPOSITOR_RAW/1\n"
 LEGACY_ARM_RECEIPT_SCHEMA = "frame-compositor-operator-arm-v1"
 ARM_RECEIPT_SCHEMA = "frame-compositor-operator-arm-v2"
@@ -246,13 +253,14 @@ class Session(base.Session):
         return len(data) >= 64 and data[:7] == b"\x7fELF\x02\x01\x01" and data[16:20] == b"\x03\x00\xb7\x00"
 
     @staticmethod
-    def validate_scope_marker(data, report):
+    def validate_scope_marker(data, report, plan=None):
         # Recheck the actual bounded ELF bytes; a relabelled plan must not
         # convert an old acquisition artifact into the new reviewed scope.
+        marker = STREAM_IMAGE_MARKER if plan and plan.get("schema") == STREAM_IMAGE_SCHEMA else SCOPE_MARKER
         rva = report.get("rva") if isinstance(report, dict) else None
         if (not isinstance(report, dict) or report.get("symbol") != "frame_compositor_raw_scope" or
                 type(rva) is not int or not 0 < rva < 2**64 - 16 or report.get("bytes") != 16 or
-                report.get("sha256") != digest(SCOPE_MARKER) or not Session.elf(data)):
+                report.get("sha256") != digest(marker) or not Session.elf(data)):
             raise RuntimeError("Exact actual observer acquisition marker required")
         phoff = struct.unpack_from("<Q", data, 32)[0]
         ehsize, entsize, count = struct.unpack_from("<3H", data, 52)
@@ -270,8 +278,23 @@ class Session(base.Session):
                 if flags != 4 or rva - vaddr > file_bytes or 16 > file_bytes - (rva - vaddr):
                     raise RuntimeError("Observer scope marker must be file-backed read-only data")
                 matches.append(offset + rva - vaddr)
-        if len(matches) != 1 or data[matches[0]:matches[0] + 16] != SCOPE_MARKER:
+        if len(matches) != 1 or data[matches[0]:matches[0] + 16] != marker:
             raise RuntimeError("Actual observer acquisition marker changed")
+
+    @staticmethod
+    def validate_candidate_selection(plan, header=None):
+        report = plan.get("observer", {}).get("candidate_selection")
+        if plan.get("schema") != STREAM_IMAGE_SCHEMA:
+            if report is not None or header is not None and "candidate_selection" in header:
+                raise RuntimeError("Legacy acquisition cannot be relabelled as public image selection")
+            return
+        # Canonical JSON preserves bool/int and nested array types as well as
+        # exact keys. A report never substitutes for the actual ELF marker.
+        expected = json.dumps(CANDIDATE_SELECTION, sort_keys=True)
+        if (json.dumps(report, sort_keys=True) != expected or
+                plan.get("operator_arm", {}).get("schema") != ARM_RECEIPT_SCHEMA or
+                header is not None and json.dumps(header.get("candidate_selection"), sort_keys=True) != expected):
+            raise RuntimeError("Exact bounded public image selection scope required")
 
     @staticmethod
     def validate_trace_sampling_marker(data, plan):
@@ -346,7 +369,8 @@ class Session(base.Session):
 
     @staticmethod
     def validate_envelope(data, plan, files, observer):
-        if (len(data) != 8272 or data[:8] != b"FCMRAW03" or struct.unpack_from("<II", data, 8) != (3, 8272) or
+        marker = STREAM_IMAGE_MARKER if plan.get("schema") == STREAM_IMAGE_SCHEMA else SCOPE_MARKER
+        if (len(data) != 8272 or data[:16] != marker or
             struct.unpack_from("<8Q", data, 48) != ENVELOPE_LIMITS or digest(data[:-32]) != data[-32:].hex()):
             raise RuntimeError("Exact raw envelope schema/limits/checksum required")
         reviewed = data[16:48].hex()
@@ -370,7 +394,7 @@ class Session(base.Session):
         if not re.fullmatch(r"[0-9a-f]{64}", expected or "") or digest(raw) != expected:
             raise RuntimeError("Separately reviewed plan SHA required")
         plan = json.loads(raw)
-        if (plan.get("schema") != SCHEMA or plan.get("prepared") is not True or
+        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA) or plan.get("prepared") is not True or
             plan.get("frame_directory") != str(self.folder) or plan.get("frame_user_home") != str(self.home) or
             plan.get("directory_mode") != "0700" or plan.get("environment") != self.activation_values()):
             raise RuntimeError("Unsupported compositor raw bundle scope/paths")
@@ -386,6 +410,7 @@ class Session(base.Session):
             raise RuntimeError("Exact bounded raw diagnostic limits required")
         self.validate_operator_arm(plan.get("operator_arm"))
         self.validate_raw_trace_sampling(plan)
+        self.validate_candidate_selection(plan)
         inventory = plan.get("inventory")
         sources = {"audit-preparation.cpp", "launch-configuration.c"}
         names = {MAIN, AUDIT, SELECTOR, ENVELOPE, LAYER} | sources
@@ -412,7 +437,7 @@ class Session(base.Session):
             report = plan.get(report_name, {})
             if report.get("sha256") != digest(payloads[name]) or report.get("bytes") != len(payloads[name]):
                 raise RuntimeError("Artifact report changed")
-        self.validate_scope_marker(payloads[MAIN], plan["observer"].get("scope_marker"))
+        self.validate_scope_marker(payloads[MAIN], plan["observer"].get("scope_marker"), plan)
         self.validate_trace_sampling_marker(payloads[MAIN], plan)
         if plan["audit"].get("native_rvas") != NATIVE_RVAS or plan["audit"].get("early_forward_only") is not True:
             raise RuntimeError("Canonical audited providers required")
@@ -433,7 +458,8 @@ class Session(base.Session):
             "audit": str(self.audit), "envelope": str(self.envelope), "output": str(self.capture), "journal": str(self.journal)}
         if isolation != expected_isolation or plan["selector"].get("configuration") != expected_config:
             raise RuntimeError("Reviewed exact launch/isolation paths differ from staged natives/artifacts")
-        if (plan["envelope"].get("schema") != 3 or plan["envelope"].get("module_count") != 4 or
+        envelope_schema = 4 if plan["schema"] == STREAM_IMAGE_SCHEMA else 3
+        if (plan["envelope"].get("schema") != envelope_schema or plan["envelope"].get("module_count") != 4 or
             plan["envelope"].get("module_roles") != [7, 3, 4, 5]):
             raise RuntimeError("Exact envelope module report required")
         self.validate_envelope(payloads[ENVELOPE], plan, files, payloads[MAIN])
@@ -629,14 +655,16 @@ class Session(base.Session):
         # does not use this extra guard: removing exact owned activation and
         # restarting the original service takes priority over proof failures.
         plan = json.loads(read_regular(self.folder / "deployment-plan.json", private=True))
-        if (plan.get("schema") != SCHEMA or plan.get("raw_limits") != RAW_LIMITS or
+        envelope_schema = 4 if plan.get("schema") == STREAM_IMAGE_SCHEMA else 3
+        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA) or plan.get("raw_limits") != RAW_LIMITS or
                 plan.get("capture_limits") != CAPTURE_LIMITS or plan.get("journal_limits") != JOURNAL_LIMITS or
-                plan.get("envelope", {}).get("schema") != 3):
+                plan.get("envelope", {}).get("schema") != envelope_schema):
             raise RuntimeError("Stored acquisition scope cannot authorize this artifact")
         self.validate_operator_arm(plan.get("operator_arm"))
         self.validate_raw_trace_sampling(plan)
+        self.validate_candidate_selection(plan)
         observer = read_regular(self.library, MAX_INPUT, private=True)
-        self.validate_scope_marker(observer, plan.get("observer", {}).get("scope_marker"))
+        self.validate_scope_marker(observer, plan.get("observer", {}).get("scope_marker"), plan)
         self.validate_trace_sampling_marker(observer, plan)
         envelope = read_regular(self.envelope, MAX_INPUT, private=True)
         self.validate_envelope(envelope, plan, manifest["native_files"], observer)
@@ -850,6 +878,7 @@ class Session(base.Session):
             "native_cross_endpoint_associated": False, "native_namespace_associated": False,
             "source_frame_associated": False, "uv_owned": False, "accepted_submit": False,
             "gpu_consumed": False, "mask_enabled": False}
+        self.validate_candidate_selection(plan, header)
         if any(header.get(key) != value or type(header.get(key)) is not type(value) for key, value in expected.items()):
             raise RuntimeError("Raw output is not the admitted unarmed production capture")
         start, deadline = header.get("capture_started_ns"), header.get("capture_deadline_ns")

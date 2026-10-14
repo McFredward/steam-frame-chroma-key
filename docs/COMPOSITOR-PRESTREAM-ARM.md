@@ -101,3 +101,41 @@ receipts, write-fault retry refusal and recovery before rejecting an inconsisten
 receipt. These are synthetic session controls with real file locks; they do not
 prove a native stream import or GPU/frame association. A new authorized headset
 attempt is required to establish whether pre-stream arming observes an import.
+
+## Current-image acquisition scope
+
+The following hardware attempt captured a later UI import, despite correct
+pre-connect arming. New `frame-compositor-raw-offline-bundle-v5` plans therefore
+require the actual `FCMRAW04` acquisition object and envelope version 4. The
+envelope length and all private, record, output and time ceilings remain
+unchanged. Legacy v4/FCMRAW03 plans retain their original acquisition and recovery
+contract; neither a changed JSON report nor a new helper may relabel that ELF.
+
+The production observer retains paired, actual public Begin and EarlyUnlock
+notifications in at most 16 preallocated worker slots. It prepares stack
+ownership once per worker at the authenticated native Begin, outside graphics
+callbacks. Only a small existing-owner slot index lives in initial-exec TLS;
+the 128-byte artifact TLS ceiling is unchanged. No private parent, dispatch or
+reply bytes are copied for excluded images.
+
+The one irreversible claim now waits for a source-validated public Image Before
+with NV12 or P010 format, even nonzero extent, depth 1 and one array layer. These
+are stream-compatible resource inputs, not proof of a selected stream. Native
+YUV UI surfaces also exist, so eligibility never sets source session/frame, eye,
+UV, GPU or mask admissions. Missing or invalid association stays opaque.
+
+After selection, the observer validates the live parent and current native
+creation chain. It checks the pipe against the retained public lock arguments
+and the creation method's saved dispatch register, and establishes the sequence
+from the current creation frame. It never rereads the old lock-time saved-pipe
+slot: the pinned dispatcher overwrites that slot before calling the image
+creation method. Raw results explicitly distinguish actual retained public
+lock outcomes from private acquisition beginning at Image. All later memory,
+view, send and reply checks retain the complete invocation comparison.
+
+The separately reviewed selection descriptor must match the actual protected
+capture header. Public counters report staged calls, excluded/eligible images
+and preparation/refusal counts without adding a private retry or extending the
+deadline. Stage and acquisition readmission validate the actual scope marker;
+arming additionally validates the current capture. Original-service recovery
+still takes priority over changed or missing diagnostic evidence.

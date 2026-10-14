@@ -142,9 +142,17 @@ class PackageControls(unittest.TestCase):
                 self.validate(fixture(missing_import=name))
 
     def test_old_creation_route_scope_cannot_use_the_new_acquisition_contract(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             old = ('FCMRAW0' + str(version)).encode() + struct.pack('<II', version, tool.ENVELOPE_BYTES)
             with self.subTest(version=version), self.assertRaises(ValueError): self.validate(fixture(marker=old))
+
+    def test_public_image_selection_requires_the_new_actual_acquisition_marker(self):
+        _, report = self.validate(fixture())
+        self.assertEqual(report['candidate_selection'], tool.CANDIDATE_SELECTION)
+        self.assertEqual(report['scope_marker']['sha256'], tool.digest(tool.MARKER).hex())
+        self.assertFalse(report['candidate_selection']['stream_origin_proven'])
+        self.assertFalse(report['candidate_selection']['begin_early_private_replay'])
+        self.assertEqual(tool.LIMIT_WORDS, (720, 21, 16, 8, 32, 65536, 120, 4))
 
     def test_operator_arm_descriptor_reserves_the_existing_budget_without_new_environment(self):
         frame = Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw')
@@ -273,7 +281,7 @@ class PackageControls(unittest.TestCase):
             self.assertEqual(struct.unpack_from('<8Q', envelope, 48), tool.LIMIT_WORDS)
             self.assertEqual(envelope[112:8240], b''.join(blobs))
             parsed = tool.decode_envelope(envelope, reviewed)
-            self.assertEqual(parsed['schema'], 3)
+            self.assertEqual(parsed['schema'], 4)
             self.assertTrue(parsed['independent_observer_checked'])
             self.assertEqual(parsed['raw_limits']['private_bytes'], 757)
             self.assertEqual(parsed['raw_limits']['bootstrap_poll_bytes'], 0)
@@ -295,7 +303,7 @@ class PackageControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='frame-compositor-preparer-controls-') as temporary:
             output = Path(temporary) / 'bundle'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, REMOTE)
-            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v4')
+            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v5')
             self.assertEqual(plan['raw_limits'], tool.RAW_LIMITS)
             self.assertEqual(plan['capture_limits'], tool.CAPTURE_LIMITS)
             self.assertEqual(plan['operator_arm'], tool.operator_arm_descriptor(Path(REMOTE).parent))

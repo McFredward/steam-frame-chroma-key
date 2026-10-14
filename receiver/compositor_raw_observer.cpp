@@ -20,7 +20,7 @@ __attribute__((weak)) int frame_compositor_launch_freeze_environment_v1(unsigned
 __attribute__((weak)) unsigned frame_compositor_launch_provider_mask(void);
 __attribute__((weak)) unsigned frame_compositor_launch_frozen_status_v1(void);
 __attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_raw_scope[16]={
-    'F','C','M','R','A','W','0','3',3,0,0,0,0x50,0x20,0,0};
+    'F','C','M','R','A','W','0','4',4,0,0,0,0x50,0x20,0,0};
 __attribute__((visibility("hidden"))) std::atomic<unsigned> frame_compositor_raw_ready{0};
 __attribute__((visibility("hidden"))) void frame_import_lock_entry();
 __attribute__((visibility("hidden"))) void frame_import_unlock_entry();
@@ -33,6 +33,11 @@ namespace runtime=frame_compositor_runtime;
 constexpr unsigned LaunchFreezeAbi=1,LaunchProviderMask=63;
 constexpr std::size_t EnvelopeBytes=8272,OutputBytes=65536;
 constexpr std::uint64_t DurationNs=120ULL*1000000000;
+constexpr char CandidateSelection[]=
+    "{\"schema\":\"frame-compositor-public-image-selection-v1\","
+    "\"public_formats\":[1000156003,1000156013],\"even_extent\":true,"
+    "\"depth\":1,\"layers\":1,\"private_acquisition\":\"image-before\","
+    "\"begin_early_private_replay\":false,\"thread_slots\":16,\"stream_origin_proven\":false}";
 std::atomic<bool> stopping{false};
 pthread_t writer{};
 bool writer_started=false;
@@ -164,7 +169,7 @@ struct Line {
     template<class T> void hex(const T& data) noexcept {for(auto v:data)add("%02x",unsigned(v));}
 };
 unsigned long long u(std::uint64_t v) noexcept {return static_cast<unsigned long long>(v);}
-bool write_line(const Line& line,std::size_t& total,std::size_t reserve=1024) noexcept {
+bool write_line(const Line& line,std::size_t& total,std::size_t reserve=1536) noexcept {
     if(!owned() || !line.valid || total>OutputBytes || reserve>OutputBytes-total || line.used>OutputBytes-total-reserve)return false;
     std::size_t sent=0;
     for(unsigned tries=0;sent<line.used && tries<32;++tries) {
@@ -203,6 +208,18 @@ void record(Line& l,const runtime::Record& r) noexcept {
             c.invocation.sequence,u(c.invocation.pipe),u(c.invocation.dispatch_frame),u(c.image.device),u(c.image.native_device),u(c.image.image),u(c.bind.memory),u(c.bind.offset),u(c.view.view),c.image.format,
             c.image.width,c.image.height,c.image.depth,c.image.layers,c.native_payload_read?"true":"false",c.begin_lock_succeeded?"true":"false",
             c.early_unlock_succeeded?"true":"false",c.send_lock_succeeded?"true":"false",c.finish_unlock_succeeded?"true":"false",c.native_send_success?"true":"false");
+        if(c.selected_at_image) {
+            l.add(",\"public_image_selection\":{\"selected_at_image\":true,\"private_acquisition_started_at_image\":%s,"
+                "\"begin_early_private_replay\":false,\"format\":%u,\"extent\":[%u,%u,%u],\"layers\":%u,"
+                "\"begin\":{\"sp\":\"%llx\",\"lr\":\"%llx\",\"pipe\":\"%llx\",\"result\":%lld},"
+                "\"early\":{\"sp\":\"%llx\",\"lr\":\"%llx\",\"pipe\":\"%llx\",\"result\":%lld},"
+                "\"scope\":\"retained_actual_public_pairs_and_current_creation_scalars\",\"stream_origin_proven\":false}",
+                c.private_acquisition_started_at_image?"true":"false",c.selected_image.format,
+                c.selected_image.width,c.selected_image.height,c.selected_image.depth,c.selected_image.layers,
+                u(c.selected_begin_entry.sp),u(c.selected_begin_entry.x[30]),u(c.selected_begin_entry.x[0]),
+                static_cast<long long>(c.selected_begin_result),u(c.selected_early_entry.sp),
+                u(c.selected_early_entry.x[30]),u(c.selected_early_entry.x[0]),static_cast<long long>(c.selected_early_result));
+        }
     }
     if(r.kind==runtime::Kind::Receipt) {
         const auto& c=r.receipt.resource;
@@ -286,6 +303,12 @@ void* write_background(void* argument) noexcept {
     footer.add(",\"public_begin_counts\":{\"before_candidate_arm\":%llu,\"after_candidate_arm\":%llu,\"skipped_prearm_afters\":%llu,"
         "\"overflow\":%s,\"scope\":\"validated_supplied_notifications_not_packet_or_frame_proof\"}",
         u(s.begins_before_arm),u(s.begins_after_arm),u(s.skipped_prearm_afters),s.begin_counts_overflow?"true":"false");
+    footer.add(",\"image_selection_counts\":{\"required\":%s,\"staged_begins\":%llu,\"excluded_images\":%llu,"
+        "\"eligible_images\":%llu,\"staging_refusals\":%llu,\"reserved_thread_slots\":%llu,\"thread_limit\":16,"
+        "\"abandoned_zero_read_stages\":%llu,"
+        "\"scope\":\"public_creation_eligibility_not_stream_origin_proof\"}",
+        s.stream_image_required?"true":"false",u(s.staged_begins),u(s.excluded_images),
+        u(s.eligible_images),u(s.staging_refusals),u(s.staging_threads),u(s.abandoned_stages));
     proofs(footer);footer.add("}\n");write_line(footer,total,0);close(output_fd);output_fd=-1;return nullptr;
 }
 void finish_owned() noexcept {
@@ -308,6 +331,7 @@ __attribute__((constructor)) void start() noexcept {
     if(!prepared.ready() || !setup(prepared,profiles,s)){errno=saved;return;}
     owner_pid=getpid();observer_identity=profiles.reviewed_observer_identity;
     s.require_operator_arm=true;
+    s.require_stream_image=true;
     output_fd=open_output();
     if(output_fd<0 || !frame_compositor_journal::initialize_before_main() || !runtime::initialize(prepared,s)) {
         runtime::finalize();if(output_fd>=0)close(output_fd);output_fd=-1;errno=saved;return;
@@ -327,6 +351,7 @@ __attribute__((constructor)) void start() noexcept {
     header.add("]");
     header.add(",\"operator_arm_required\":true,\"operator_armed\":false,\"pre_arm_private_bytes\":0,\"capture_started_ns\":%llu,\"capture_deadline_ns\":%llu",
         u(capture_started_ns),u(capture_started_ns+DurationNs));
+    header.add(",\"candidate_selection\":%s",CandidateSelection);
     header.add(",\"transactions\":1,\"parent_byte_limit\":16,\"scalar_byte_limit\":%llu,\"wire_byte_limit\":21,\"private_byte_limit\":%llu,"
         "\"creation_routes\":[\"Vulkan\",\"Facet\"],\"write_limit\":8,\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120",
         u(frame_compositor_raw::kMaxScalarBytes),u(16+frame_compositor_raw::kMaxScalarBytes+21));proofs(header);header.add("}\n");
