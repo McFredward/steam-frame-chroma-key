@@ -40,7 +40,7 @@ READY = 'frame_compositor_raw_ready'
 BRIDGE = 'frame_compositor_raw_bridge'
 LAYER = 'VK_LAYER_FRAME_MASK_trace'
 ENVELOPE_BYTES = 8272
-MARKER = b'FCMRAW04' + struct.pack('<II', 4, ENVELOPE_BYTES)
+MARKER = b'FCMRAW05' + struct.pack('<II', 5, ENVELOPE_BYTES)
 CANDIDATE_SELECTION = {'schema': 'frame-compositor-public-image-selection-v1',
     'public_formats': [1000156003, 1000156013], 'even_extent': True,
     'depth': 1, 'layers': 1, 'private_acquisition': 'image-before',
@@ -48,11 +48,17 @@ CANDIDATE_SELECTION = {'schema': 'frame-compositor-public-image-selection-v1',
     'stream_origin_proven': False}
 ARM_CONTENTS = b'FRAME_COMPOSITOR_RAW/1\n'
 SAMPLING_SCOPE = 'frame_compositor_trace_sampling_scope'
-SAMPLING_MARKER = b'FCMSMP01' + struct.pack('<6I', 1, 32, 16, 16, 32, 3)
+SAMPLING_MARKER = b'FCMSMP02' + struct.pack('<8I', 2, 40, 32, 16, 16, 32, 4096, 7)
 RAW_TRACE_SAMPLING = {'intentional': True, 'draw_call_limit': 32,
                       'execute_child_limit': 16, 'submit_command_limit': 16,
                       'binding_snapshots_require_import_request': True,
-                      'lifecycle_survives_trace_cap': True}
+                      'lifecycle_survives_trace_cap': True, 'binding_probe_limit': 4096,
+                      'binding_probe_slots': 256, 'binding_snapshots_require_target_match': True,
+                      'target_descriptor_set': 0, 'target_bindings': [0, 2, 3, 4, 6, 9, 25, 31]}
+RESOURCE_JOIN_VALIDATION = {'schema': 'frame-compositor-resource-join-validation-v1',
+    'attempt_limit': 64, 'retry_delay_ns': 1000000, 'same_capture_deadline': True,
+    'immutable_snapshot': True, 'unchanged_owning_journal_validator': True,
+    'journal_refusal_cause_classified': True, 'delivery_attempt_limit': 64}
 LIMIT_WORDS = (720, 21, 16, 8, 32, 65536, 120, 4)
 CAPTURE_LIMITS = {'records': 32, 'bytes': 65536, 'seconds': 120}
 RAW_LIMITS = {'transactions': 1, 'writes': 8, 'scalar_bytes': 720, 'wire_bytes': 21,
@@ -209,6 +215,7 @@ def validate_observer(data, reviewed_sha, provider_exports):
                  'hidden_entries': entries, 'scope_marker': marker, 'ready_object': ready,
                  'raw_trace_sampling': dict(RAW_TRACE_SAMPLING), 'trace_sampling_marker': sampling,
                  'candidate_selection': dict(CANDIDATE_SELECTION),
+                 'resource_join_validation': dict(RESOURCE_JOIN_VALIDATION),
                  'public_exports': sorted(exports), 'vulkan_functions': dict(VULKAN_FUNCTIONS),
                  'standard_vulkan_exports': [], 'required_aliases': list(ALIAS_IMPORTS),
                  'bootstrap_imports': list(BOOTSTRAP_IMPORTS), 'versioned_glibc_imports': sorted(versioned),
@@ -247,7 +254,7 @@ def decode_envelope(data, expected_profile=None):
         raise ValueError('Compositor envelope acquisition/capture limits changed')
     blobs = tuple(data[112 + 2032 * i:112 + 2032 * (i + 1)] for i in range(4))
     validate_profiles(blobs, reviewed)
-    return {'schema': 4, 'bytes': ENVELOPE_BYTES, 'reviewed_observer_profile_identity': reviewed.hex(),
+    return {'schema': 5, 'bytes': ENVELOPE_BYTES, 'reviewed_observer_profile_identity': reviewed.hex(),
             'module_roles': list(ROLES), 'module_count': 4, 'raw_limits': dict(RAW_LIMITS),
             'capture_limits': dict(CAPTURE_LIMITS), 'profiles': blobs, 'sha256': digest(data).hex(),
             'independent_observer_checked': expected_profile is not None}
@@ -438,7 +445,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
     inventory = [{'name': name, 'bytes': len(value), 'sha256': digest(value).hex(),
                   'frame_path': None if name in ('audit-preparation.cpp', SELECTOR_SOURCE) else str(frame / name),
                   'owned_source': True, 'native_bytes': False, 'mode': '0600'} for name, value in artifacts.items()]
-    plan = {'schema': 'frame-compositor-raw-offline-bundle-v5', 'prepared': True, 'installed': False, 'activated': False,
+    plan = {'schema': 'frame-compositor-raw-offline-bundle-v6', 'prepared': True, 'installed': False, 'activated': False,
             'runtime_authorized': False, 'frame_access': False, 'network_access': False, 'automatic_restart': False,
             'native_binary_or_script_changes': False, 'shader_or_mask_activation': False, 'source_frame_associated': False,
             'gpu_coherent': False, 'continuous_connection_owned': False, 'native_namespace_associated': False,
@@ -447,7 +454,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
             'launch_isolation': {'schema': 'frame-compositor-startup-isolation-v1', 'target_exe': configuration['target'],
                 'selector_path': configuration['selector'], 'payload_path': configuration['payload'],
                 'audit_path': configuration['audit'], 'target_exec_environment': launch_environment(configuration)},
-            'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 4,
+            'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 5,
                          'reviewed_observer_profile_identity': reviewed.hex(), 'module_count': 4, 'module_roles': list(ROLES)},
             'manifest': {'name': MANIFEST, 'bytes': len(manifest), 'sha256': digest(manifest).hex(), 'layer_name': LAYER,
                          'functions': dict(VULKAN_FUNCTIONS),

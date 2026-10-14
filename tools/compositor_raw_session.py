@@ -36,6 +36,7 @@ digest, json_bytes, private_parents = base.digest, base.json_bytes, base.private
 UNIT = "steamvr.service"
 SCHEMA = "frame-compositor-raw-offline-bundle-v4"
 STREAM_IMAGE_SCHEMA = "frame-compositor-raw-offline-bundle-v5"
+JOIN_TARGET_SCHEMA = "frame-compositor-raw-offline-bundle-v6"
 SESSION_SCHEMA = "frame-compositor-raw-owned-session-v4"
 MAIN, AUDIT, ENVELOPE = "libVkLayer_frame_mask_trace.so", "libframe_compositor_raw_audit.so", "compositor-raw-envelope.bin"
 SELECTOR = "libframe_compositor_launch_selector.so"
@@ -69,6 +70,7 @@ NATIVE_RVAS = {"lock": "0x87370", "unlock": "0x88f74", "write": "0xdfee0"}
 ENVELOPE_LIMITS = (720, 21, 16, 8, 32, 65536, 120, 4)
 SCOPE_MARKER = b"FCMRAW03" + struct.pack("<II", 3, 8272)
 STREAM_IMAGE_MARKER = b"FCMRAW04" + struct.pack("<II", 4, 8272)
+JOIN_TARGET_MARKER = b"FCMRAW05" + struct.pack("<II", 5, 8272)
 CANDIDATE_SELECTION = {"schema": "frame-compositor-public-image-selection-v1",
     "public_formats": [1000156003, 1000156013], "even_extent": True,
     "depth": 1, "layers": 1, "private_acquisition": "image-before",
@@ -83,6 +85,25 @@ RAW_TRACE_SAMPLING = {"intentional": True, "draw_call_limit": 32,
     "binding_snapshots_require_import_request": True, "lifecycle_survives_trace_cap": True}
 TRACE_SAMPLING_SYMBOL = "frame_compositor_trace_sampling_scope"
 TRACE_SAMPLING_MARKER = b"FCMSMP01" + struct.pack("<6I", 1, 32, 16, 16, 32, 3)
+TARGET_TRACE_SAMPLING = dict(RAW_TRACE_SAMPLING, binding_probe_limit=4096,
+    binding_probe_slots=256, binding_snapshots_require_target_match=True,
+    target_descriptor_set=0, target_bindings=[0, 2, 3, 4, 6, 9, 25, 31])
+TARGET_SAMPLING_MARKER = b"FCMSMP02" + struct.pack("<8I", 2, 40, 32, 16, 16, 32, 4096, 7)
+RESOURCE_JOIN_VALIDATION = {"schema": "frame-compositor-resource-join-validation-v1",
+    "attempt_limit": 64, "retry_delay_ns": 1000000, "same_capture_deadline": True,
+    "immutable_snapshot": True, "unchanged_owning_journal_validator": True,
+    "journal_refusal_cause_classified": True, "delivery_attempt_limit": 64}
+
+
+def acquisition_marker(plan):
+    return {SCHEMA: SCOPE_MARKER, STREAM_IMAGE_SCHEMA: STREAM_IMAGE_MARKER,
+            JOIN_TARGET_SCHEMA: JOIN_TARGET_MARKER}.get((plan or {}).get("schema"), SCOPE_MARKER)
+
+
+def envelope_schema(plan):
+    return {SCHEMA: 3, STREAM_IMAGE_SCHEMA: 4, JOIN_TARGET_SCHEMA: 5}.get(plan.get("schema"))
+
+
 STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-startup-health.json",
     "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"})
 
@@ -256,7 +277,7 @@ class Session(base.Session):
     def validate_scope_marker(data, report, plan=None):
         # Recheck the actual bounded ELF bytes; a relabelled plan must not
         # convert an old acquisition artifact into the new reviewed scope.
-        marker = STREAM_IMAGE_MARKER if plan and plan.get("schema") == STREAM_IMAGE_SCHEMA else SCOPE_MARKER
+        marker = acquisition_marker(plan)
         rva = report.get("rva") if isinstance(report, dict) else None
         if (not isinstance(report, dict) or report.get("symbol") != "frame_compositor_raw_scope" or
                 type(rva) is not int or not 0 < rva < 2**64 - 16 or report.get("bytes") != 16 or
@@ -284,7 +305,7 @@ class Session(base.Session):
     @staticmethod
     def validate_candidate_selection(plan, header=None):
         report = plan.get("observer", {}).get("candidate_selection")
-        if plan.get("schema") != STREAM_IMAGE_SCHEMA:
+        if plan.get("schema") not in (STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA):
             if report is not None or header is not None and "candidate_selection" in header:
                 raise RuntimeError("Legacy acquisition cannot be relabelled as public image selection")
             return
@@ -300,13 +321,15 @@ class Session(base.Session):
     def validate_trace_sampling_marker(data, plan):
         if plan["operator_arm"]["schema"] == LEGACY_ARM_RECEIPT_SCHEMA:
             return
+        marker = TARGET_SAMPLING_MARKER if plan.get("schema") == JOIN_TARGET_SCHEMA else TRACE_SAMPLING_MARKER
+        marker_bytes = len(marker)
         observer = plan.get("observer")
         report = observer.get("trace_sampling_marker") if isinstance(observer, dict) else None
         rva = report.get("rva") if isinstance(report, dict) else None
         if (not isinstance(report, dict) or set(report) != {"symbol", "rva", "bytes", "sha256"} or
                 report.get("symbol") != TRACE_SAMPLING_SYMBOL or type(rva) is not int or
-                not 0 < rva < 2**64 - 32 or type(report.get("bytes")) is not int or report["bytes"] != 32 or
-                report.get("sha256") != digest(TRACE_SAMPLING_MARKER) or not Session.elf(data) or
+                not 0 < rva < 2**64 - marker_bytes or type(report.get("bytes")) is not int or report["bytes"] != marker_bytes or
+                report.get("sha256") != digest(marker) or not Session.elf(data) or
                 not 64 <= len(data) <= MAX_INPUT or struct.unpack_from("<I", data, 20)[0] != 1):
             raise RuntimeError("Exact actual observer trace sampling marker required")
         phoff, shoff = struct.unpack_from("<2Q", data, 32)
@@ -323,11 +346,11 @@ class Session(base.Session):
             if (file_bytes > memory_bytes or offset > len(data) or file_bytes > len(data) - offset or
                     vaddr > 2**64 - memory_bytes):
                 raise RuntimeError("Invalid trace sampling load segment")
-            if vaddr <= rva and rva - vaddr < memory_bytes and 32 <= memory_bytes - (rva - vaddr):
-                if flags != 4 or rva - vaddr > file_bytes or 32 > file_bytes - (rva - vaddr):
+            if vaddr <= rva and rva - vaddr < memory_bytes and marker_bytes <= memory_bytes - (rva - vaddr):
+                if flags != 4 or rva - vaddr > file_bytes or marker_bytes > file_bytes - (rva - vaddr):
                     raise RuntimeError("Trace sampling marker must be file-backed read-only non-executing data")
                 spans.append(offset + rva - vaddr)
-        if len(spans) != 1 or data[spans[0]:spans[0] + 32] != TRACE_SAMPLING_MARKER:
+        if len(spans) != 1 or data[spans[0]:spans[0] + marker_bytes] != marker:
             raise RuntimeError("Actual trace sampling marker changed or is ambiguous")
         sections = []
         for index in range(shcount):
@@ -355,12 +378,12 @@ class Session(base.Session):
                     raise RuntimeError("Unterminated trace sampling symbol name")
                 if data[start:end] != TRACE_SAMPLING_SYMBOL.encode("ascii"): continue
                 if (table[1] == 11 or info & 15 != 1 or (info >> 4 != 0 and other & 3 != 2) or
-                        not 0 < index < shcount or value != rva or size != 32):
+                        not 0 < index < shcount or value != rva or size != marker_bytes):
                     raise RuntimeError("Trace sampling symbol must be the exact hidden/local non-dynamic object")
                 section = sections[index]
                 if (section[1] != 1 or not section[2] & 2 or section[2] & 5 or
                         section[3] > 2**64 - section[5] or not section[3] <= rva or
-                        rva - section[3] > section[5] or 32 > section[5] - (rva - section[3]) or
+                        rva - section[3] > section[5] or marker_bytes > section[5] - (rva - section[3]) or
                         section[4] + rva - section[3] != spans[0]):
                     raise RuntimeError("Trace sampling object section must match its read-only file range")
                 found = True
@@ -369,7 +392,7 @@ class Session(base.Session):
 
     @staticmethod
     def validate_envelope(data, plan, files, observer):
-        marker = STREAM_IMAGE_MARKER if plan.get("schema") == STREAM_IMAGE_SCHEMA else SCOPE_MARKER
+        marker = acquisition_marker(plan)
         if (len(data) != 8272 or data[:16] != marker or
             struct.unpack_from("<8Q", data, 48) != ENVELOPE_LIMITS or digest(data[:-32]) != data[-32:].hex()):
             raise RuntimeError("Exact raw envelope schema/limits/checksum required")
@@ -394,7 +417,7 @@ class Session(base.Session):
         if not re.fullmatch(r"[0-9a-f]{64}", expected or "") or digest(raw) != expected:
             raise RuntimeError("Separately reviewed plan SHA required")
         plan = json.loads(raw)
-        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA) or plan.get("prepared") is not True or
+        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA) or plan.get("prepared") is not True or
             plan.get("frame_directory") != str(self.folder) or plan.get("frame_user_home") != str(self.home) or
             plan.get("directory_mode") != "0700" or plan.get("environment") != self.activation_values()):
             raise RuntimeError("Unsupported compositor raw bundle scope/paths")
@@ -411,6 +434,7 @@ class Session(base.Session):
         self.validate_operator_arm(plan.get("operator_arm"))
         self.validate_raw_trace_sampling(plan)
         self.validate_candidate_selection(plan)
+        self.validate_resource_join(plan)
         inventory = plan.get("inventory")
         sources = {"audit-preparation.cpp", "launch-configuration.c"}
         names = {MAIN, AUDIT, SELECTOR, ENVELOPE, LAYER} | sources
@@ -458,8 +482,8 @@ class Session(base.Session):
             "audit": str(self.audit), "envelope": str(self.envelope), "output": str(self.capture), "journal": str(self.journal)}
         if isolation != expected_isolation or plan["selector"].get("configuration") != expected_config:
             raise RuntimeError("Reviewed exact launch/isolation paths differ from staged natives/artifacts")
-        envelope_schema = 4 if plan["schema"] == STREAM_IMAGE_SCHEMA else 3
-        if (plan["envelope"].get("schema") != envelope_schema or plan["envelope"].get("module_count") != 4 or
+        expected_envelope_schema = envelope_schema(plan)
+        if (plan["envelope"].get("schema") != expected_envelope_schema or plan["envelope"].get("module_count") != 4 or
             plan["envelope"].get("module_roles") != [7, 3, 4, 5]):
             raise RuntimeError("Exact envelope module report required")
         self.validate_envelope(payloads[ENVELOPE], plan, files, payloads[MAIN])
@@ -517,14 +541,27 @@ class Session(base.Session):
         # plans retain their original journal contract and recovery evidence.
         if plan["operator_arm"]["schema"] == LEGACY_ARM_RECEIPT_SCHEMA:
             return
+        expected = TARGET_TRACE_SAMPLING if plan.get("schema") == JOIN_TARGET_SCHEMA else RAW_TRACE_SAMPLING
         observer = plan.get("observer")
         reports = [("observer", observer.get("raw_trace_sampling") if isinstance(observer, dict) else None)]
         if journal_header is not None:
             reports.append(("protected journal header", journal_header.get("raw_trace_sampling")))
         for source, actual in reports:
-            if (not isinstance(actual, dict) or actual != RAW_TRACE_SAMPLING or
-                    any(type(actual[key]) is not type(value) for key, value in RAW_TRACE_SAMPLING.items())):
-                raise RuntimeError("Exact v2 raw trace sampling metadata required in " + source)
+            if (not isinstance(actual, dict) or
+                    json.dumps(actual, sort_keys=True) != json.dumps(expected, sort_keys=True)):
+                raise RuntimeError("Exact versioned raw trace sampling metadata required in " + source)
+
+    @staticmethod
+    def validate_resource_join(plan, header=None):
+        report = plan.get("observer", {}).get("resource_join_validation")
+        if plan.get("schema") != JOIN_TARGET_SCHEMA:
+            if report is not None or header is not None and "resource_join_validation" in header:
+                raise RuntimeError("Legacy acquisition cannot be relabelled as bounded resource join")
+            return
+        expected = json.dumps(RESOURCE_JOIN_VALIDATION, sort_keys=True)
+        if (json.dumps(report, sort_keys=True) != expected or
+                header is not None and json.dumps(header.get("resource_join_validation"), sort_keys=True) != expected):
+            raise RuntimeError("Exact bounded resource join validation required")
 
     def require_fresh_capture_paths(self):
         for path in (self.marker, self.arm_receipt, self.capture, self.journal):
@@ -655,14 +692,15 @@ class Session(base.Session):
         # does not use this extra guard: removing exact owned activation and
         # restarting the original service takes priority over proof failures.
         plan = json.loads(read_regular(self.folder / "deployment-plan.json", private=True))
-        envelope_schema = 4 if plan.get("schema") == STREAM_IMAGE_SCHEMA else 3
-        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA) or plan.get("raw_limits") != RAW_LIMITS or
+        expected_envelope_schema = envelope_schema(plan)
+        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA) or plan.get("raw_limits") != RAW_LIMITS or
                 plan.get("capture_limits") != CAPTURE_LIMITS or plan.get("journal_limits") != JOURNAL_LIMITS or
-                plan.get("envelope", {}).get("schema") != envelope_schema):
+                plan.get("envelope", {}).get("schema") != expected_envelope_schema):
             raise RuntimeError("Stored acquisition scope cannot authorize this artifact")
         self.validate_operator_arm(plan.get("operator_arm"))
         self.validate_raw_trace_sampling(plan)
         self.validate_candidate_selection(plan)
+        self.validate_resource_join(plan)
         observer = read_regular(self.library, MAX_INPUT, private=True)
         self.validate_scope_marker(observer, plan.get("observer", {}).get("scope_marker"), plan)
         self.validate_trace_sampling_marker(observer, plan)
@@ -879,6 +917,7 @@ class Session(base.Session):
             "source_frame_associated": False, "uv_owned": False, "accepted_submit": False,
             "gpu_consumed": False, "mask_enabled": False}
         self.validate_candidate_selection(plan, header)
+        self.validate_resource_join(plan, header)
         if any(header.get(key) != value or type(header.get(key)) is not type(value) for key, value in expected.items()):
             raise RuntimeError("Raw output is not the admitted unarmed production capture")
         start, deadline = header.get("capture_started_ns"), header.get("capture_deadline_ns")

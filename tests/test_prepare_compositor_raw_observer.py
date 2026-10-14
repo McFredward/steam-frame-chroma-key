@@ -26,7 +26,7 @@ def fixture(*, missing_entry=None, missing_import=None, extra_export=None, extra
             ready_flags=6, ready_size=4, ready_value=0, entry_size=156, entry_visibility=2,
             dynamic_tls=False, tls_bytes=0, extra_scope=None, dependency='libc.so.6', standard_exports=False,
             missing_export=None, sampling=tool.SAMPLING_MARKER, sampling_rva=0x6040,
-            sampling_visibility=2, sampling_size=32):
+            sampling_visibility=2, sampling_size=len(tool.SAMPLING_MARKER)):
     """Only ELF metadata and zero-filled own synthetic instruction slots."""
     raw = bytearray(0x8000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
@@ -149,6 +149,7 @@ class PackageControls(unittest.TestCase):
     def test_public_image_selection_requires_the_new_actual_acquisition_marker(self):
         _, report = self.validate(fixture())
         self.assertEqual(report['candidate_selection'], tool.CANDIDATE_SELECTION)
+        self.assertEqual(report['resource_join_validation'], tool.RESOURCE_JOIN_VALIDATION)
         self.assertEqual(report['scope_marker']['sha256'], tool.digest(tool.MARKER).hex())
         self.assertFalse(report['candidate_selection']['stream_origin_proven'])
         self.assertFalse(report['candidate_selection']['begin_early_private_replay'])
@@ -281,7 +282,7 @@ class PackageControls(unittest.TestCase):
             self.assertEqual(struct.unpack_from('<8Q', envelope, 48), tool.LIMIT_WORDS)
             self.assertEqual(envelope[112:8240], b''.join(blobs))
             parsed = tool.decode_envelope(envelope, reviewed)
-            self.assertEqual(parsed['schema'], 4)
+            self.assertEqual(parsed['schema'], 5)
             self.assertTrue(parsed['independent_observer_checked'])
             self.assertEqual(parsed['raw_limits']['private_bytes'], 757)
             self.assertEqual(parsed['raw_limits']['bootstrap_poll_bytes'], 0)
@@ -303,7 +304,7 @@ class PackageControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='frame-compositor-preparer-controls-') as temporary:
             output = Path(temporary) / 'bundle'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, REMOTE)
-            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v5')
+            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v6')
             self.assertEqual(plan['raw_limits'], tool.RAW_LIMITS)
             self.assertEqual(plan['capture_limits'], tool.CAPTURE_LIMITS)
             self.assertEqual(plan['operator_arm'], tool.operator_arm_descriptor(Path(REMOTE).parent))

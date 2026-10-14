@@ -215,6 +215,82 @@ class SessionTests(unittest.TestCase):
         envelope[112 + 2032 * 3:-32] = profile; envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
         SessionTests.alter_artifact(self, M.ENVELOPE, bytes(envelope))
 
+    def promote_join_target_plan(self):
+        SessionTests.promote_stream_image_plan(self)
+        self.plan['schema'] = M.JOIN_TARGET_SCHEMA
+        self.plan['observer']['scope_marker']['sha256'] = M.digest(M.JOIN_TARGET_MARKER)
+        self.plan['observer']['resource_join_validation'] = copy.deepcopy(M.RESOURCE_JOIN_VALIDATION)
+        self.plan['observer']['raw_trace_sampling'] = copy.deepcopy(M.TARGET_TRACE_SAMPLING)
+        self.plan['observer']['trace_sampling_marker'].update(bytes=40, sha256=M.digest(M.TARGET_SAMPLING_MARKER))
+        main = bytearray(self.artifacts[M.MAIN].read_bytes())
+        main[128:144] = M.JOIN_TARGET_MARKER
+        main[160:200] = M.TARGET_SAMPLING_MARKER
+        strings = b"\0" + M.TRACE_SAMPLING_SYMBOL.encode("ascii") + b"\0"
+        main[208:208 + len(strings)] = strings
+        struct.pack_into("<IBBHQQ", main, 280, 1, 1, 0, 1, 0x10a0, 40)
+        struct.pack_into("<II4QII2Q", main, 384, 0, 1, 2, 0x1080, 128, 80, 0, 0, 8, 0)
+        struct.pack_into("<II4QII2Q", main, 448, 0, 3, 0, 0, 208, len(strings), 0, 0, 1, 0)
+        SessionTests.alter_artifact(self, M.MAIN, bytes(main))
+        profile = self.profile(5, main)
+        self.plan['observer_profile'].update(file_sha256=M.digest(main), profile_sha256=profile[-32:].hex())
+        self.plan['envelope'].update(schema=5, reviewed_observer_profile_identity=profile[-32:].hex())
+        envelope = bytearray(self.artifacts[M.ENVELOPE].read_bytes())
+        envelope[:16] = M.JOIN_TARGET_MARKER; envelope[16:48] = profile[-32:]
+        envelope[112 + 2032 * 3:-32] = profile; envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
+        SessionTests.alter_artifact(self, M.ENVELOPE, bytes(envelope))
+
+    def test_v6_target_join_stage_activate_and_original_restore(self):
+        self.promote_join_target_plan(); self.stage(); self.activate()
+        self.assertTrue(self.session.readcheck()['active'])
+        self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+
+    def test_v6_rejects_missing_mistyped_or_unbounded_join(self):
+        self.promote_join_target_plan(); original = copy.deepcopy(self.plan)
+        for metadata in (None, {}, dict(M.RESOURCE_JOIN_VALIDATION, attempt_limit=65),
+                dict(M.RESOURCE_JOIN_VALIDATION, delivery_attempt_limit=65),
+                dict(M.RESOURCE_JOIN_VALIDATION, delivery_attempt_limit=64.0),
+                dict(M.RESOURCE_JOIN_VALIDATION, same_capture_deadline=1),
+                dict(M.RESOURCE_JOIN_VALIDATION, immutable_snapshot=False)):
+            self.plan = copy.deepcopy(original)
+            self.plan['observer']['resource_join_validation'] = metadata; self.save_plan()
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(RuntimeError, 'resource join'):
+                self.stage()
+            self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_v6_rejects_wrong_target_probe_sampling_contract(self):
+        self.promote_join_target_plan(); original = copy.deepcopy(self.plan)
+        for metadata in (dict(M.RAW_TRACE_SAMPLING), dict(M.TARGET_TRACE_SAMPLING, binding_probe_limit=4097),
+                dict(M.TARGET_TRACE_SAMPLING, binding_probe_slots=257),
+                dict(M.TARGET_TRACE_SAMPLING, target_bindings=[0, 2, 3]),
+                dict(M.TARGET_TRACE_SAMPLING, target_bindings=[False, 2, 3, 4, 6, 9, 25, 31]),
+                dict(M.TARGET_TRACE_SAMPLING, target_descriptor_set=True)):
+            self.plan = copy.deepcopy(original)
+            self.plan['observer']['raw_trace_sampling'] = metadata; self.save_plan()
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(RuntimeError, 'sampling metadata'):
+                self.stage()
+            self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_v6_cannot_admit_old_actual_image_or_sampling_marker(self):
+        self.promote_join_target_plan()
+        main = bytearray(self.artifacts[M.MAIN].read_bytes()); main[128:144] = M.STREAM_IMAGE_MARKER
+        self.alter_artifact(M.MAIN, bytes(main))
+        with self.assertRaisesRegex(RuntimeError, 'acquisition marker'): self.stage()
+        main[128:144] = M.JOIN_TARGET_MARKER; main[160:200] = M.TRACE_SAMPLING_MARKER + bytes(8)
+        self.alter_artifact(M.MAIN, bytes(main))
+        with self.assertRaisesRegex(RuntimeError, 'sampling marker'): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_join_header_must_match_current_scope_without_legacy_relabelling(self):
+        self.promote_join_target_plan()
+        M.Session.validate_resource_join(self.plan, {'resource_join_validation': M.RESOURCE_JOIN_VALIDATION})
+        for header in ({}, {'resource_join_validation': dict(M.RESOURCE_JOIN_VALIDATION, attempt_limit=65)}):
+            with self.assertRaisesRegex(RuntimeError, 'resource join'):
+                M.Session.validate_resource_join(self.plan, header)
+        self.plan['schema'] = M.STREAM_IMAGE_SCHEMA
+        with self.assertRaisesRegex(RuntimeError, 'Legacy acquisition'):
+            M.Session.validate_resource_join(self.plan)
+
     def test_v5_current_image_plan_stages_and_readmits_without_changing_recovery(self):
         self.promote_stream_image_plan(); self.stage(); self.activate()
         self.assertTrue(self.session.readcheck()['active'])
@@ -733,6 +809,23 @@ class OperatorArmTests(unittest.TestCase):
         receipt = self.session.arm(stream_start_intent=True)
         self.assertTrue(receipt['operator_arm_requested'])
         self.assertFalse(receipt['source_frame_associated'])
+
+    def test_v6_live_arm_rechecks_join_and_target_contracts_before_marker(self):
+        SessionTests.promote_join_target_plan(self); self.live_fixture()
+        self.header['candidate_selection'] = copy.deepcopy(M.CANDIDATE_SELECTION)
+        self.journal_header['raw_trace_sampling'] = copy.deepcopy(M.TARGET_TRACE_SAMPLING)
+        with self.assertRaisesRegex(RuntimeError, 'resource join'):
+            self.session.validate_prearm_outputs([self.header], [self.journal_header], self.session.manifest(), self.current)
+        self.header['resource_join_validation'] = copy.deepcopy(M.RESOURCE_JOIN_VALIDATION)
+        wrong = copy.deepcopy(self.journal_header)
+        wrong['raw_trace_sampling']['binding_probe_limit'] = 4097
+        with self.assertRaisesRegex(RuntimeError, 'sampling metadata'):
+            self.session.validate_prearm_outputs([self.header], [wrong], self.session.manifest(), self.current)
+        self.save_live_records([self.header], [self.journal_header])
+        receipt = self.session.arm(stream_start_intent=True)
+        self.assertTrue(receipt['operator_arm_requested'])
+        self.assertFalse(receipt['source_frame_associated'])
+        self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
 
     def live_fixture(self):
         self.stage(); self.activate()
