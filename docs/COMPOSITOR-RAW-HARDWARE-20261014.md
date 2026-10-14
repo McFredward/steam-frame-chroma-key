@@ -174,3 +174,44 @@ An operator acknowledgment selects the recording period; it is not source-frame
 association proof. Missing, invalid, stale or lost evidence keeps rendering
 opaque. Capture expiry stops recording only. Installation removal and a native
 service restart remain coordinated recovery operations, with no timed restart.
+
+## Pre-connect capture selected a later UI import
+
+The authorized pre-connect attempt on `b5098ae` passed native startup and armed
+about 3.98 seconds into the unchanged absolute window, before asking the operator
+to connect. The operator subsequently confirmed a visible, normally functioning
+PC-VR stream. Unlike the earlier post-visible attempt, the first armed Begin
+produced a successful native reply and a current local CPU resource join.
+
+That candidate was a **64 by 24, format-50 Facet UI surface**, not an identified
+video buffer. The capture observed 27 authenticated public Begin calls before
+arming and one after it; their paired pre-arm After callbacks remained inert.
+Private acquisition stayed at 16 parent, 412 scalar and 21 wire bytes (449 total),
+with ten bounded records and a quiescent successful terminal result. A successful
+import is not sufficient stream eligibility: unrelated native UI imports can
+still arrive between readiness and the actual stream allocation burst.
+
+The raw-only sampling/lifecycle repair worked within its stated scope. The final
+journal stayed open for its full 120-second window, emitted 387,263 bytes instead
+of reaching its 1-MiB cap, and replayed all 645,863 public metadata publications
+with no recorded loss. It intentionally omitted 198,062 draw and 10,430 submit
+observations. These counts are not an exhaustive draw trace or a performance
+comparison. Its 32 descriptor snapshot attempts were again spent after the UI
+import request; they do not establish a draw of a selected stream candidate.
+
+The next change must select stream-compatible public image metadata **before**
+the irreversible one-candidate claim and private acquisition. Moving a format
+predicate after the existing Begin claim cannot solve this: that Begin already
+copies its parent and dispatch scalars. Any deferred selection must retain exact
+same-thread/source pairing and prepare stack ownership outside graphics
+callbacks. Historical scalar values must not be invented or treated as observed
+at an earlier boundary. Format/extent eligibility remains weaker than source
+session, frame, eye, UV or GPU association; those admissions stay false.
+
+Coordinated recovery passed original SteamVR's native UI gate, confirmed the old
+compositor had exited, and found no diagnostic mappings in all 15 observed
+current managed processes. Twelve archived evidence files were copied and
+hash-verified before removing all 45 exact owned session/input files. Native
+files were preserved; no additional automatic restart, image/shader change or
+PC Steam sender modification occurred. Private evidence is retained under
+`build/private-compositor-prestream-integration-20261014/`.
