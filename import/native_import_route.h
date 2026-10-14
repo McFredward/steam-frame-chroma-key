@@ -63,4 +63,12 @@ struct Scalars {
 Scalars decode(Boundary, const Entry&, const StackBytes&, std::uintptr_t load_bias,
                const Expected& expected = {}) noexcept;
 
+// A separate Image-only entry point establishes the sequence from the current
+// authenticated creation chain. expected.sequence must be zero because no
+// earlier private Begin/EarlyUnlock scalar copy was made. The dispatch and pipe
+// still have to match the actual retained public prelude; every later decode()
+// retains its complete, including sequence, invocation comparison.
+Scalars decode_selected_image(const Entry&, const StackBytes&, std::uintptr_t load_bias,
+                              const Expected& public_prelude) noexcept;
+
 } // namespace frame_import_native

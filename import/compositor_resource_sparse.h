@@ -24,4 +24,11 @@ std::size_t scalar_budget(frame_import_native::Boundary,
 Result decode(frame_import_native::Boundary, const frame_import_native::Entry&,
               std::uintptr_t compositor_bias, const frame_import_native::Expected&,
               Read, void*) noexcept;
+// Same bounded current Image spans, without replaying overwritten earlier
+// dispatch slots. No private read is permitted until the root admits the actual
+// owned Image entry. Sequence is established only by this current copy.
+Result decode_selected_image(const frame_import_native::Entry&,
+                             std::uintptr_t compositor_bias,
+                             const frame_import_native::Expected& public_prelude,
+                             Read, void*) noexcept;
 } // namespace frame_compositor_sparse

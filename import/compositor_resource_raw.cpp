@@ -51,6 +51,21 @@ bool source_entry(const Event& e) noexcept {
         return e.entry.sp <= kMaxAddress - 32 && e.entry.x[29] == e.entry.sp + 32;
     return e.entry.sp == e.entry.x[29];
 }
+bool current_owner(const Event& e, const Event& current) noexcept {
+    return e.current_thread_owned && e.native_module_current && e.native_provider_current &&
+        e.source_current && !e.thread_reason && e.thread_identity != 0 &&
+        e.thread_identity == current.thread_identity && e.load_bias == current.load_bias;
+}
+bool public_pair(const Event& before, const Event& after, Boundary boundary,
+                 const Event& current) noexcept {
+    return before.boundary == boundary && after.boundary == boundary &&
+        before.phase == Phase::Before && after.phase == Phase::After &&
+        !before.native_result_available && after.native_result_available && after.native_result == 0 &&
+        undecoded(before) && undecoded(after) &&
+        !before.public_result_available && !after.public_result_available &&
+        current_owner(before, current) && current_owner(after, current) &&
+        source_entry(before) && source_entry(after) && same_entry(before.entry, after.entry);
+}
 bool entry_route(const Event& e, const RawRecord& r) noexcept {
     const auto& x = e.entry.x;
     const auto dispatch = r.invocation.dispatch_frame, pipe = r.invocation.pipe;
@@ -105,6 +120,14 @@ std::uint64_t le64(const std::uint8_t* p) noexcept {
 }
 }
 
+bool selected_image_eligible(const Event& e, const ImageSelection& image) noexcept {
+    return e.boundary == Boundary::Image && e.phase == Phase::Before &&
+        !e.native_result_available && !e.public_result_available && undecoded(e) && source_entry(e) &&
+        (image.format == 1000156003U || image.format == 1000156013U) &&
+        image.width != 0 && image.height != 0 && !(image.width & 1U) && !(image.height & 1U) &&
+        image.depth == 1 && image.layers == 1;
+}
+
 bool Scope::active() const noexcept { return state_ != State::Fresh && state_ != State::Terminal; }
 bool Scope::finished() const noexcept { return state_ == State::Terminal; }
 Outcome Observer::refuse(std::uint64_t why, Scope& s) const noexcept {
@@ -127,6 +150,47 @@ Outcome Observer::expire(unsigned reason, Scope& s) const noexcept {
     return refuse(ThreadUnavailable | (s.owner_ && s.owner_ != this ? OwnerMismatch : None), s);
 }
 
+Outcome Observer::begin_selected_image(const Event& image, const SourcePrelude& prelude,
+                                      const ImageSelection& selection, Scope& s) const noexcept {
+    if (s.finished()) return {};
+    if (s.owner_ && s.owner_ != this) return refuse(OwnerMismatch, s);
+    if (s.state_ != Scope::State::Fresh) return refuse(NestedImport | Order, s);
+    auto& r = s.record_;
+    // Invalid supplied evidence is still charged truthfully; valid admission
+    // contains no private bytes. Never replay old Begin/Early scalar copies.
+    for (const auto* event : {&image, &prelude.begin_before, &prelude.begin_after,
+                              &prelude.early_before, &prelude.early_after}) {
+        add_truthful(event->scalar_bytes_copied, r.scalar_bytes_copied);
+        add_truthful(event->prefix.count, r.wire_bytes_copied);
+    }
+    r.last_boundary = image.boundary; r.last_phase = image.phase;
+    if (r.scalar_bytes_copied || r.wire_bytes_copied) return refuse(AcquisitionBudget, s);
+    if (!selected_image_eligible(image, selection)) return refuse(PublicMetadata | InvalidEntry, s);
+    if (!current_owner(image, image)) return refuse(ThreadUnavailable | SourceUnavailable, s);
+    if (!public_pair(prelude.begin_before, prelude.begin_after, Boundary::Begin, image) ||
+        !public_pair(prelude.early_before, prelude.early_after, Boundary::EarlyUnlock, image))
+        return refuse(ChangedEntry | NativeFailure | SourceUnavailable, s);
+    const auto& begin = prelude.begin_before.entry;
+    const auto& early = prelude.early_before.entry;
+    const auto route = frame_import_native::creation_route(Boundary::Image, image.entry, image.load_bias);
+    const auto dispatch = image.entry.sp + frame_import_native::creation_dispatch_offset(route);
+    if (begin.sp != dispatch || early.sp != dispatch || !address(begin.x[0]) ||
+        begin.x[0] != begin.x[19] || early.x[0] != begin.x[0])
+        return refuse(ChangedInvocation | InvalidEntry, s);
+    if (!(early.x[25] & 255)) return refuse(MissingPayload, s);
+    s.owner_ = this; s.thread_identity_ = image.thread_identity; s.load_bias_ = image.load_bias;
+    r.invocation = {dispatch, static_cast<std::uintptr_t>(begin.x[0]), 0};
+    r.begin_lock_succeeded = r.early_unlock_succeeded = r.native_payload_read = true;
+    r.selected_at_image = true;
+    r.selected_begin_entry = begin; r.selected_early_entry = early;
+    r.selected_begin_result = prelude.begin_after.native_result;
+    r.selected_early_result = prelude.early_after.native_result;
+    r.selected_image = selection;
+    s.paired_entry_ = image.entry; s.paired_boundary_ = Boundary::Image;
+    s.state_ = Scope::State::ImageBefore;
+    return {};
+}
+
 bool Observer::can_acquire(const Event& e, const Scope& s) const noexcept {
     if (s.finished() || s.owner_ != this || !e.current_thread_owned || !e.native_module_current ||
         !e.native_provider_current || !e.source_current || e.thread_reason || !e.thread_identity ||
@@ -135,6 +199,8 @@ bool Observer::can_acquire(const Event& e, const Scope& s) const noexcept {
     const auto count = scalar_budget(e);
     if (!count || s.record_.scalar_bytes_copied > kMaxScalarBytes ||
         count > kMaxScalarBytes - s.record_.scalar_bytes_copied) return false;
+    if (s.record_.selected_at_image && s.state_ == Scope::State::ImageBefore &&
+        !same_entry(e.entry, s.paired_entry_)) return false;
     if (e.phase == Phase::Before) {
         if (e.native_result_available) return false;
         switch (e.boundary) {
@@ -165,6 +231,9 @@ Outcome Observer::observe(const Event& e, Scope& s) const noexcept {
     // fails. No malformed event can trigger a new read or an out-of-bounds copy.
     add_truthful(e.scalar_bytes_copied, r.scalar_bytes_copied);
     add_truthful(e.prefix.count, r.wire_bytes_copied);
+    if (r.selected_at_image && s.state_ == Scope::State::ImageBefore &&
+        e.boundary == Boundary::Image && e.scalar_bytes_copied)
+        r.private_acquisition_started_at_image = true;
     r.last_boundary = e.boundary; r.last_phase = e.phase;
     r.last_native_result = e.native_result; r.last_preserved_errno = e.preserved_errno;
     r.last_native_result_available = e.native_result_available;
@@ -181,6 +250,8 @@ Outcome Observer::observe(const Event& e, Scope& s) const noexcept {
     if (!e.source_current) return refuse(SourceUnavailable, s);
     if (static_cast<unsigned>(e.boundary) >= 8) return refuse(UnsupportedBoundary, s);
     if (e.phase != Phase::Before && e.phase != Phase::After) return refuse(Order, s);
+    if (r.selected_at_image && s.state_ == Scope::State::ImageBefore &&
+        !same_entry(e.entry, s.paired_entry_)) return refuse(ChangedEntry, s);
     if (!entry_route(e, r)) return refuse(InvalidEntry, s);
     if (e.phase == Phase::Before && e.native_result_available) return refuse(NativeFailure, s);
     if (e.phase == Phase::After && !e.native_result_available) return refuse(NativeFailure, s);
@@ -192,7 +263,18 @@ Outcome Observer::observe(const Event& e, Scope& s) const noexcept {
         if (!same_entry(e.entry, s.paired_entry_)) return refuse(ChangedEntry, s);
     }
     auto decode_checked = [&](std::size_t count, bool beginning = false) noexcept {
-        if (e.scalar_bytes_copied != count || !route(e, r, beginning)) {
+        bool valid_route = route(e, r, beginning);
+        if (r.selected_at_image && s.state_ == Scope::State::ImageBefore &&
+            e.boundary == Boundary::Image && e.phase == Phase::Before) {
+            // Sequence is acquired here, from the current exact source chain;
+            // subsequent events use the ordinary complete route() comparison.
+            valid_route = e.decoded_available && e.scalars.valid() &&
+                e.scalars.client_available && e.scalars.creation_route ==
+                    frame_import_native::creation_route(Boundary::Image, e.entry, e.load_bias) &&
+                e.scalars.invocation.dispatch_frame == r.invocation.dispatch_frame &&
+                e.scalars.invocation.pipe == r.invocation.pipe;
+        }
+        if (e.scalar_bytes_copied != count || !valid_route) {
             r.decoder_refusal = e.scalars.refusal;
             return false;
         }
@@ -237,7 +319,10 @@ Outcome Observer::observe(const Event& e, Scope& s) const noexcept {
             if (!decode_checked(scalar_budget(e)) || !no_prefix(e)) return refuse(InvalidDecode | AcquisitionBudget, s);
             if (vulkan(e.boundary)) {
                 if (r.client_available && e.scalars.client != r.client) return refuse(ChangedClient, s);
-                if (e.boundary == Boundary::Image) r.creation_route = e.scalars.creation_route;
+                if (e.boundary == Boundary::Image) {
+                    r.creation_route = e.scalars.creation_route;
+                    if (r.selected_at_image) r.invocation = e.scalars.invocation;
+                }
                 r.client = e.scalars.client; r.client_available = true;
             }
             s.paired_snapshot_ = e.scalars;
@@ -266,6 +351,10 @@ Outcome Observer::observe(const Event& e, Scope& s) const noexcept {
             if (e.image.result != e.native_result || !e.image.device || !e.image.native_device ||
                 e.image.native_device != e.entry.x[0] || !e.image.image || !e.image.format ||
                 !e.image.width || !e.image.height || !e.image.depth || !e.image.layers) return refuse(PublicMetadata, s);
+            if (r.selected_at_image && (e.image.format != r.selected_image.format ||
+                e.image.width != r.selected_image.width || e.image.height != r.selected_image.height ||
+                e.image.depth != r.selected_image.depth || e.image.layers != r.selected_image.layers))
+                return refuse(PublicMetadata, s);
             r.image_succeeded = true; s.state_ = Scope::State::BindBefore;
         } else if (s.state_ == Scope::State::BindAfter) {
             r.bind = e.bind;

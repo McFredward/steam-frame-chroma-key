@@ -71,6 +71,19 @@ struct Event {
     BindResult bind{};
     ViewResult view{};
 };
+// Retained actual public notification pairs. No earlier private stack scalar
+// is acquired or reconstructed at Image time; the dispatcher may already have
+// overwritten its former saved-pipe slot. The entry owner supplies only true
+// paired callbacks under the same independently validated source/thread owner.
+struct SourcePrelude {
+    Event begin_before{}, begin_after{}, early_before{}, early_after{};
+};
+struct ImageSelection {
+    std::uint32_t format = 0, width = 0, height = 0, depth = 0, layers = 0;
+};
+// Public stream-shaped image eligibility only, never selected session, video
+// frame, eye, UV mapping, decoder output or GPU consumption proof.
+bool selected_image_eligible(const Event&, const ImageSelection&) noexcept;
 struct RawRecord {
     frame_import_native::Expected invocation{};
     frame_import_native::CreationRoute creation_route = frame_import_native::CreationRoute::None;
@@ -92,6 +105,12 @@ struct RawRecord {
     bool send_lock_succeeded = false, reply_complete = false;
     bool finish_unlock_succeeded = false, native_send_success = false;
     bool raw_only = true, matched = false, terminal = false;
+    bool selected_at_image = false, private_acquisition_started_at_image = false;
+    // These are actual retained public entries/results, not lock-time private
+    // scalar snapshots. Before/After equality is checked before retention.
+    Entry selected_begin_entry{}, selected_early_entry{};
+    std::int64_t selected_begin_result = 0, selected_early_result = 0;
+    ImageSelection selected_image{};
     std::uint64_t reason = None;
     frame_import_native::Refusal decoder_refusal = frame_import_native::Refusal::None;
     unsigned thread_reason = 0;
@@ -135,6 +154,12 @@ private:
 };
 class Observer {
 public:
+    // Claim exactly one eligible current Image route after its authentic public
+    // prelude. On success the next can_acquire() permits only this Image's first
+    // private read; sequence is still unavailable until observe() sees its
+    // source-validated current creation scalars. Failure is terminal, no retry.
+    Outcome begin_selected_image(const Event&, const SourcePrelude&,
+                                 const ImageSelection&, Scope&) const noexcept;
     // Pure zero-read admission before private scalar/wire acquisition. Public
     // result After and reused unlock After are never admitted for private reads.
     // False must be submitted unchanged to observe() to terminate safely.

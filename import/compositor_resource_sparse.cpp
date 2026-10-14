@@ -31,9 +31,9 @@ std::size_t scalar_budget(frame_import_native::Boundary boundary,
     }
 }
 
-Result decode(frame_import_native::Boundary boundary, const frame_import_native::Entry& entry,
-              std::uintptr_t bias, const frame_import_native::Expected& expected,
-              Read reader, void* owner) noexcept {
+static Result decode_impl(frame_import_native::Boundary boundary, const frame_import_native::Entry& entry,
+                          std::uintptr_t bias, const frame_import_native::Expected& expected,
+                          Read reader, void* owner, bool selected_image) noexcept {
     Result out{};
     const auto which=static_cast<unsigned>(boundary);
     if(which>=8) {out.refusal=Refusal::Boundary;return out;}
@@ -45,6 +45,9 @@ Result decode(frame_import_native::Boundary boundary, const frame_import_native:
     if(bias<4096 || bias%4096 || entry.sp<4096 || entry.sp%16 || entry.sp>kMax-kScratchBytes ||
        (creating ? selected==frame_import_native::CreationRoute::None :
         bias>kMax-sites[which] || entry.x[30]!=bias+sites[which] || entry.x[29]!=entry.sp+fp_offset)) return out;
+    if (selected_image && (boundary != B::Image || expected.sequence != 0 ||
+        expected.dispatch_frame != entry.sp + frame_import_native::creation_dispatch_offset(selected) ||
+        expected.pipe < 4096 || expected.pipe > kMax || expected.pipe % 16)) return out;
 
     std::array<Span,8> spans{};
     std::size_t count=0,extent=0;
@@ -68,8 +71,20 @@ Result decode(frame_import_native::Boundary boundary, const frame_import_native:
         }
         out.bytes_confirmed+=span.size;
     }
-    out.scalars=frame_import_native::decode(boundary,entry,{scratch.data(),entry.sp,extent},bias,expected);
+    const frame_import_native::StackBytes stack{scratch.data(),entry.sp,extent};
+    out.scalars=selected_image ? frame_import_native::decode_selected_image(entry,stack,bias,expected) :
+        frame_import_native::decode(boundary,entry,stack,bias,expected);
     out.refusal=out.scalars.valid()?Refusal::None:Refusal::Decode;
     return out;
+}
+Result decode(frame_import_native::Boundary boundary, const frame_import_native::Entry& entry,
+              std::uintptr_t bias, const frame_import_native::Expected& expected,
+              Read reader, void* owner) noexcept {
+    return decode_impl(boundary,entry,bias,expected,reader,owner,false);
+}
+Result decode_selected_image(const frame_import_native::Entry& entry, std::uintptr_t bias,
+                             const frame_import_native::Expected& public_prelude,
+                             Read reader, void* owner) noexcept {
+    return decode_impl(frame_import_native::Boundary::Image,entry,bias,public_prelude,reader,owner,true);
 }
 } // namespace frame_compositor_sparse

@@ -79,8 +79,9 @@ std::size_t creation_dispatch_offset(CreationRoute route) noexcept {
     }
 }
 
-Scalars decode(Boundary boundary, const Entry& entry, const StackBytes& stack,
-               std::uintptr_t bias, const Expected& expected) noexcept {
+static Scalars decode_impl(Boundary boundary, const Entry& entry, const StackBytes& stack,
+                           std::uintptr_t bias, const Expected& expected,
+                           bool selected_image) noexcept {
     Scalars out{};
     const auto index = static_cast<unsigned>(boundary);
     const bool creation = boundary == Boundary::Image || boundary == Boundary::Bind || boundary == Boundary::View;
@@ -154,7 +155,15 @@ Scalars decode(Boundary boundary, const Entry& entry, const StackBytes& stack,
             out.refusal = Refusal::OutsideWindow; return out;
         }
         out.client_available = true;
-        if (!sequence(stack, out) || !matches(out, expected)) return out;
+        if (!sequence(stack, out)) return out;
+        if (selected_image) {
+            if (boundary != Boundary::Image || expected.sequence != 0 ||
+                !address(expected.dispatch_frame) || !address(expected.pipe) ||
+                out.invocation.dispatch_frame != expected.dispatch_frame ||
+                out.invocation.pipe != expected.pipe) {
+                out.refusal = Refusal::ChangedInvocation; return out;
+            }
+        } else if (!matches(out, expected)) return out;
         out.creation_route = selected;
     } else {
         std::uintptr_t send = fp, dispatch = 0;
@@ -201,5 +210,13 @@ Scalars decode(Boundary boundary, const Entry& entry, const StackBytes& stack,
     }
     out.refusal = Refusal::None;
     return out;
+}
+Scalars decode(Boundary boundary, const Entry& entry, const StackBytes& stack,
+               std::uintptr_t bias, const Expected& expected) noexcept {
+    return decode_impl(boundary, entry, stack, bias, expected, false);
+}
+Scalars decode_selected_image(const Entry& entry, const StackBytes& stack,
+                              std::uintptr_t bias, const Expected& public_prelude) noexcept {
+    return decode_impl(Boundary::Image, entry, stack, bias, public_prelude, true);
 }
 } // namespace frame_import_native
