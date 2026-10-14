@@ -39,6 +39,12 @@ RECEIPT_NOINLINE void operator delete[](void* p, std::size_t) noexcept { std::fr
 
 namespace frame_bindings {
 struct JournalTestAccess {
+    // Exercise the actual validator's producer-entry window before a ticket
+    // is assigned. No fake validation result or second resource table is used.
+    static void entering(Journal& journal, bool active) {
+        if (active) journal.active_.fetch_add(1, std::memory_order_acq_rel);
+        else journal.active_.fetch_sub(1, std::memory_order_release);
+    }
     static void delayed(Journal& journal, std::atomic<bool>& entered, std::atomic<bool>& release) {
         journal.publish(Journal::Op::Snapshot, 1, [&](Journal::Record& record) {
             record.payload.snapshot = {};
@@ -190,6 +196,51 @@ void concurrentUnpublishedPredecessor() {
     require(f.results.count == 1 && f.results.snapshots == 1 && f.results.receipts[0].current_after_drain &&
             f.bridge.validate(f.results.receipts[0]), "owned receipt failed after real producer quiescence");
 }
+void boundedInitialDeliveryRaces() {
+    Fixture f; f.create(); f.request();
+    JournalTestAccess::entering(*f.journal, true);
+    require(f.bridge.drain(nullptr, nullptr) == 5 && !f.results.count,
+            "transient producer entry irreversibly delivered an invalid receipt");
+    require(f.bridge.counters().transient_deferred == 1 && !f.bridge.notification_loss(),
+            "typed transient delivery was lost or unbounded");
+    JournalTestAccess::entering(*f.journal, false);
+    f.bridge.drain(nullptr, nullptr);
+    require(f.results.count == 1 && f.results.receipts[0].current_after_drain &&
+            f.results.receipts[0].delivery_validation_attempts == 2 &&
+            f.results.receipts[0].delivery_validation.valid && f.bridge.validate(f.results.receipts[0]),
+            "same pending immutable receipt did not recover at actual quiescence");
+    denyProof(f.results.receipts[0]);
+
+    Fixture exhausted; exhausted.create(); exhausted.request();
+    JournalTestAccess::entering(*exhausted.journal, true);
+    for (unsigned i = 0; i < DeliveryValidationAttemptLimit; ++i)
+        exhausted.bridge.drain(nullptr, nullptr);
+    require(exhausted.results.count == 1 && !exhausted.results.receipts[0].current_after_drain &&
+            exhausted.results.receipts[0].delivery_validation_attempts == DeliveryValidationAttemptLimit &&
+            exhausted.results.receipts[0].delivery_validation.transient &&
+            exhausted.results.receipts[0].delivery_validation.journal.reason ==
+                ImportReceiptValidationReason::ActivePublication &&
+            exhausted.bridge.counters().delivery_exhausted == 1 &&
+            exhausted.bridge.counters().transient_deferred == DeliveryValidationAttemptLimit - 1,
+            "initial delivery retry exceeded its fixed limit or hid exhaustion");
+    JournalTestAccess::entering(*exhausted.journal, false);
+    exhausted.bridge.drain(nullptr, nullptr);
+    require(exhausted.results.count == 1 && !exhausted.bridge.validate(exhausted.results.receipts[0]),
+            "exhausted invalid receipt was later relabelled current");
+
+    Fixture retired; retired.create(); retired.request();
+    JournalTestAccess::entering(*retired.journal, true);
+    retired.bridge.drain(nullptr, nullptr);
+    JournalTestAccess::entering(*retired.journal, false);
+    retired.journal->destroyImage(retired.device, retired.image);
+    retired.drain();
+    require(retired.results.count == 1 && !retired.results.receipts[0].current_after_drain &&
+            retired.results.receipts[0].delivery_validation_attempts == 2 &&
+            !retired.results.receipts[0].delivery_validation.transient &&
+            retired.results.receipts[0].delivery_validation.journal.reason ==
+                ImportReceiptValidationReason::CoreGenerationMismatch,
+            "retained receipt concealed permanent lifecycle invalidity");
+}
 Owner* childOwner = nullptr;
 frame_trace::EventRing* childEvents = nullptr;
 void retireForkedChild() noexcept {
@@ -268,7 +319,7 @@ void registrationAndBoundedRequests() {
 }
 int main() {
     realJournalSuccess(); deferredReplayAndRetirement(); missingTagsAndClosure();
-    concurrentUnpublishedPredecessor(); registrationAndBoundedRequests();
+    concurrentUnpublishedPredecessor(); boundedInitialDeliveryRaces(); registrationAndBoundedRequests();
     forkWhileBackgroundOwnerIsLocked();
     std::cout << "compositor raw owning-journal bridge: " << checks << " checks passed\n";
 }

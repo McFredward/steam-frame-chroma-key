@@ -14,10 +14,6 @@ namespace frame_bindings { struct TargetSnapshotProbeResult; }
 // Invocation labels, cookies and replay order are not native generations,
 // accepted submissions, video-frame identities or GPU-completion evidence.
 namespace frame_compositor_journal {
-struct Receipt {
-    frame_bindings::ImportResourceReceipt resource{};
-    bool current_after_drain = false;
-};
 enum class BridgeValidationReason : unsigned {
     None, ChildRetired, Uninitialized, Stopped, Loss, ReceiptNotCurrent, Journal
 };
@@ -26,12 +22,20 @@ struct Validation {
     BridgeValidationReason bridge_reason = BridgeValidationReason::Uninitialized;
     frame_bindings::ImportReceiptValidation journal{};
 };
+inline constexpr unsigned DeliveryValidationAttemptLimit = 64;
+struct Receipt {
+    frame_bindings::ImportResourceReceipt resource{};
+    bool current_after_drain = false;
+    unsigned delivery_validation_attempts = 0;
+    Validation delivery_validation{};
+};
 using Notify = void (*)(const Receipt&, void*) noexcept;
 struct Callbacks { Notify notify = nullptr; void* context = nullptr; };
 using SnapshotNotify = void (*)(std::uint32_t, const frame_bindings::Snapshot&, void*) noexcept;
 using TargetProbeNotify = void (*)(std::uint32_t, const frame_bindings::TargetSnapshotProbeResult&, void*) noexcept;
 struct Counters {
     std::uint64_t requested = 0, delivered = 0, invalid_after_drain = 0, refused = 0;
+    std::uint64_t transient_deferred = 0, delivery_exhausted = 0, pending_waits = 0;
 };
 
 // The layer supplies exactly its existing Journal. This class creates no
@@ -46,6 +50,8 @@ public:
                  std::uint64_t tag, std::uint64_t cookie) noexcept;
     // Background writer only. The typed drain callback only copies immutable
     // receipts. Currentness is checked after drain() returns, before delivery.
+    // Only typed transient publication races retain the same pending value for
+    // another bounded check. Permanent failures are delivered as invalid.
     // The notification may enqueue a fixed owned value, but must not reenter
     // validate(), drain() or stop() while this background-owner lock is held.
     std::size_t drain(SnapshotNotify, void* context, std::size_t max_records = 256,
@@ -71,6 +77,8 @@ private:
     std::array<Receipt, frame_bindings::ImportTagCapacity> pending_{};
     std::size_t pending_count_ = 0;
     std::atomic<std::uint64_t> requested_{0}, delivered_{0}, invalid_{0}, refused_{0};
+    std::atomic<std::uint64_t> deferred_{0}, exhausted_{0}, pending_waits_{0};
+    Validation validate_locked(const Receipt&, bool require_delivery) noexcept;
     void refuse() noexcept;
 };
 

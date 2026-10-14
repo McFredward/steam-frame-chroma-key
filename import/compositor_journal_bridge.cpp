@@ -59,19 +59,33 @@ std::size_t Owner::drain(SnapshotNotify snapshot, void* context, std::size_t max
     const auto drained = journal_.drain(Collector{*this, snapshot, context, target}, max_records);
     // A partial replay batch is not the current resource state. Keep the
     // bounded immutable copies until the owning journal catches up.
-    if (!journal_.empty()) return drained;
+    if (!journal_.empty()) {
+        if (pending_count_) pending_waits_.fetch_add(1, std::memory_order_relaxed);
+        return drained;
+    }
+    std::size_t retained = 0;
     for (std::size_t i = 0; i < pending_count_; ++i) {
-        auto& receipt = pending_[i];
-        receipt.current_after_drain = journal_.validateImportResourceReceipt(receipt.resource);
+        auto receipt = pending_[i];
+        pending_[i] = {};
+        ++receipt.delivery_validation_attempts;
+        receipt.delivery_validation = validate_locked(receipt, false);
+        if (receipt.delivery_validation.transient &&
+            receipt.delivery_validation_attempts < DeliveryValidationAttemptLimit) {
+            pending_[retained++] = receipt;
+            deferred_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (receipt.delivery_validation.transient)
+            exhausted_.fetch_add(1, std::memory_order_relaxed);
+        receipt.current_after_drain = receipt.delivery_validation.valid;
         if (!receipt.current_after_drain) invalid_.fetch_add(1, std::memory_order_relaxed);
         if (registration_.load(std::memory_order_acquire) == 2 &&
             !stopped_.load(std::memory_order_acquire)) {
             callbacks_.notify(receipt, callbacks_.context);
             delivered_.fetch_add(1, std::memory_order_relaxed);
         } else refuse();
-        receipt = {};
     }
-    pending_count_ = 0;
+    pending_count_ = retained;
     return drained;
 }
 bool Owner::validate(const Receipt& receipt) noexcept {
@@ -83,6 +97,13 @@ Validation Owner::validate_detailed(const Receipt& receipt) noexcept {
         result.bridge_reason = BridgeValidationReason::ChildRetired; return result;
     }
     std::lock_guard<std::mutex> owner(owner_mutex_);
+    return validate_locked(receipt, true);
+}
+Validation Owner::validate_locked(const Receipt& receipt, bool require_delivery) noexcept {
+    Validation result;
+    if (child_retired_.load(std::memory_order_acquire)) {
+        result.bridge_reason = BridgeValidationReason::ChildRetired; return result;
+    }
     if (initialization_.load(std::memory_order_acquire) != 2) return result;
     if (stopped_.load(std::memory_order_acquire)) {
         result.bridge_reason = BridgeValidationReason::Stopped; return result;
@@ -90,7 +111,7 @@ Validation Owner::validate_detailed(const Receipt& receipt) noexcept {
     if (lost_.load(std::memory_order_acquire)) {
         result.bridge_reason = BridgeValidationReason::Loss; return result;
     }
-    if (!receipt.current_after_drain) {
+    if (require_delivery && !receipt.current_after_drain) {
         result.bridge_reason = BridgeValidationReason::ReceiptNotCurrent; return result;
     }
     result.journal = journal_.validateImportResourceReceiptDetailed(receipt.resource);
@@ -113,6 +134,8 @@ void Owner::retire_child_atomically() noexcept {
 }
 Counters Owner::counters() const noexcept {
     return {requested_.load(std::memory_order_relaxed), delivered_.load(std::memory_order_relaxed),
-            invalid_.load(std::memory_order_relaxed), refused_.load(std::memory_order_relaxed)};
+            invalid_.load(std::memory_order_relaxed), refused_.load(std::memory_order_relaxed),
+            deferred_.load(std::memory_order_relaxed), exhausted_.load(std::memory_order_relaxed),
+            pending_waits_.load(std::memory_order_relaxed)};
 }
 } // namespace frame_compositor_journal
