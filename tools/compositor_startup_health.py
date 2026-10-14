@@ -10,6 +10,7 @@ No recovery/restart command is issued by this module.
 """
 from __future__ import annotations
 import datetime
+import itertools
 import json
 import math
 import os
@@ -32,6 +33,9 @@ JOURNAL_FIELDS = ("MESSAGE", "_PID", "_SYSTEMD_INVOCATION_ID", "_SYSTEMD_USER_IN
     "COREDUMP_PID", "COREDUMP_EXE", "COREDUMP_SIGNAL", "COREDUMP_USER_UNIT", "COREDUMP_CGROUP")
 COREDUMP_MESSAGE_ID = "fc2e22bc6ee647b6b90729ab34a250b1"
 MAX_PROCESSES = 512
+UI_COMPOSITOR_TASK_NAMES = frozenset(("Chrome_ChildIOT", "GpuMemoryThread", "Compositor"))
+UI_TASK_LIMITS = {"samples": 128, "tasks": 8192, "metadata_bytes": 4 * 1024 * 1024, "elapsed_ns": 8 * 10**9}
+UI_TASKS_PER_PROCESS = 256
 ISOLATION_SCHEMA = "frame-compositor-startup-isolation-v1"
 ISOLATION_BYTE_LIMIT = 64 * 1024 * 1024
 ISOLATION_SAMPLE_LIMIT = 64
@@ -218,13 +222,38 @@ def identity(process):
 
 def require_process(process, *, main=False):
     keys = {"pid", "start_ticks", "state"} if main else {"pid", "start_ticks", "state", "exe", "kind", "libcef"}
-    if (not isinstance(process, dict) or set(process) != keys or
+    if (not isinstance(process, dict) or set(process) not in (keys, keys | ({"ui_compositor_tasks"} if not main else set())) or
             any(type(process.get(key)) is not int or not 0 < process[key] < 2**64 for key in ("pid", "start_ticks")) or
             not isinstance(process.get("state"), str) or process["state"] not in tuple("RSDTtXxZIKPW")):
         raise RuntimeError("Invalid startup process metadata")
     if not main and (process["exe"] not in (COMPOSITOR, WEBHELPER) or
                      not isinstance(process["kind"], str) or len(process["kind"]) > 64 or type(process["libcef"]) is not bool):
         raise RuntimeError("Invalid startup executable/mapping metadata")
+    tasks = process.get("ui_compositor_tasks")
+    if tasks is not None:
+        if (not isinstance(tasks, list) or len(tasks) > 3 or
+                any(not isinstance(task, dict) or set(task) != {"tid", "start_ticks", "state", "comm"} or
+                    type(task["tid"]) is not int or not 0 < task["tid"] < 2**31 or task["tid"] == process["pid"] or
+                    type(task["start_ticks"]) is not int or not process["start_ticks"] <= task["start_ticks"] < 2**64 or
+                    not isinstance(task["state"], str) or task["state"] not in tuple("RSDTtXxZIKPW") or
+                    task["comm"] not in UI_COMPOSITOR_TASK_NAMES for task in tasks) or
+                len({task["tid"] for task in tasks}) != len(tasks) or
+                len({task["comm"] for task in tasks}) != len(tasks)):
+            raise RuntimeError("Invalid native UI compositor task metadata")
+
+
+def forked_ui_compositor_live(process):
+    """Frame's native CEF fork may retain --type=zygote in its proc argv."""
+    tasks = process.get("ui_compositor_tasks") or []
+    return (process["exe"] == WEBHELPER and process["kind"] == "zygote" and process["libcef"] and
+            {task["comm"] for task in tasks} == UI_COMPOSITOR_TASK_NAMES and
+            all(task["state"] not in INELIGIBLE_STATES for task in tasks))
+
+
+def require_ui_task_usage(usage):
+    if (not isinstance(usage, dict) or set(usage) != set(UI_TASK_LIMITS) or
+            any(type(usage[key]) is not int or not 0 <= usage[key] <= limit for key, limit in UI_TASK_LIMITS.items())):
+        raise RuntimeError("Invalid cumulative native UI task budget")
 
 
 def require_errors(errors):
@@ -264,6 +293,8 @@ class NativeEvidenceSource:
         self.isolation_descriptor = require_isolation_descriptor(isolation)
         self.cgroup_root = Path(cgroup_root)
         self.isolation_usage = {"samples": 0, "processes": 0, "metadata_bytes": 0}
+        self.ui_task_usage = {key: 0 for key in UI_TASK_LIMITS}
+        self.ui_task_deadline = None
         self.native_paths = {name: os.path.realpath(name) for name in (COMPOSITOR, WEBHELPER, LIBCEF)}
         self.logs = {name: self.home / ".local/share/Steam/logs" / (name + ".txt")
                      for name in ("vrcompositor", "vrserver")}
@@ -327,6 +358,10 @@ class NativeEvidenceSource:
         # An inactive unit with no group cannot own any of these candidates.
         # Do not accidentally treat every absolute cgroup as its descendant.
         if not unit["ControlGroup"]: return [], []
+        if self.ui_task_usage["samples"] >= UI_TASK_LIMITS["samples"]:
+            raise RuntimeError("Native UI task sample budget exhausted")
+        self.ui_task_usage["samples"] += 1
+        self.ui_task_deadline = time.monotonic() + 1.0
         entries = list(self.proc.iterdir())
         if len(entries) > 8192: raise RuntimeError("Startup process directory bound exceeded")
         result, errors = [], []
@@ -355,15 +390,25 @@ class NativeEvidenceSource:
                 for arg in cmd:
                     if arg.startswith("--type="): kind = arg[len("--type="):]
                 libcef = False
+                ui_tasks = None
                 if exe == WEBHELPER:
                     maps = self.proc_read(path / "maps", 1048576).decode("utf-8").splitlines()
                     if len(maps) > 8192: raise RuntimeError("Startup map row bound exceeded")
                     libcef = any(len(cols := row.split(None, 5)) == 6 and cols[5] in (LIBCEF, self.native_paths[LIBCEF]) and
                                  len(cols[1]) == 4 and cols[1][2] == "x" for row in maps)
-                if self.process_identity(path)[0] != start:
+                    if kind == "zygote" and libcef:
+                        ui_tasks = self.ui_compositor_tasks(path, unit["ControlGroup"], start)
+                # Bracket the native role and its task reads with the same exact
+                # managed executable/owner/group/start identity, not a filename.
+                end_start, end_state = self.process_identity(path)
+                if (end_start != start or path.lstat().st_uid != self.uid or
+                        os.readlink(path / "exe") != mapped_exe or
+                        self.proc_read(path / "cgroup", 8192).decode("ascii").splitlines() != groups or
+                        self.proc_read(path / "cmdline", 32768).decode("utf-8").split("\0") != cmd):
                     raise RuntimeError("Startup process changed during sampling")
-                result.append({"pid": int(path.name), "start_ticks": start, "state": state,
-                    "exe": exe, "kind": kind, "libcef": libcef})
+                result.append({"pid": int(path.name), "start_ticks": start,
+                    "state": state if state in INELIGIBLE_STATES else end_state,
+                    "exe": exe, "kind": kind, "libcef": libcef, "ui_compositor_tasks": ui_tasks})
                 if len(result) > MAX_PROCESSES: raise RuntimeError("Startup managed process bound exceeded")
             except FileNotFoundError:
                 # A required identity already seen by the gate disappearing is
@@ -377,6 +422,72 @@ class NativeEvidenceSource:
                 if len(errors) >= 16: raise RuntimeError("Startup unreadable process bound exceeded")
                 errors.append({"pid": int(path.name), "reason": type(error).__name__})
         return result, errors
+
+    def ui_task_read(self, path, limit):
+        if time.monotonic() >= self.ui_task_deadline:
+            raise RuntimeError("Native UI task sample time bound exceeded")
+        remaining = UI_TASK_LIMITS["metadata_bytes"] - self.ui_task_usage["metadata_bytes"]
+        if remaining <= 0: raise RuntimeError("Native UI task byte budget exhausted")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            raw = stream.read(min(limit + 1, remaining))
+        self.ui_task_usage["metadata_bytes"] += len(raw)
+        if len(raw) > limit: raise RuntimeError("Native UI task metadata extent exceeded")
+        if remaining <= limit and len(raw) == remaining:
+            raise RuntimeError("Native UI task byte budget exhausted")
+        return raw
+
+    def ui_compositor_tasks(self, process, group, process_start):
+        if self.ui_task_usage["elapsed_ns"] >= UI_TASK_LIMITS["elapsed_ns"]:
+            raise RuntimeError("Native UI task cumulative time budget exhausted")
+        began = time.monotonic_ns()
+        try:
+            taskdir = process / "task"
+            entries = list(itertools.islice(taskdir.iterdir(), UI_TASKS_PER_PROCESS + 1))
+            if len(entries) > UI_TASKS_PER_PROCESS or any(not path.name.isdigit() or not 0 < int(path.name) < 2**31 for path in entries):
+                raise RuntimeError("Native UI task inventory bound exceeded")
+            result = []
+            for path in entries:
+                if self.ui_task_usage["tasks"] >= UI_TASK_LIMITS["tasks"]:
+                    raise RuntimeError("Native UI task count budget exhausted")
+                self.ui_task_usage["tasks"] += 1
+                name = self.ui_task_read(path / "comm", 32).decode("ascii").rstrip("\n")
+                if name not in UI_COMPOSITOR_TASK_NAMES: continue
+                node = path.lstat()
+                if not stat.S_ISDIR(node.st_mode) or node.st_uid != self.uid:
+                    raise RuntimeError("Native UI compositor task owner/type changed")
+                first = self.ui_task_read(path / "stat", 8192).decode("ascii")
+                fields = first[first.rfind(")") + 2:].split()
+                if (first.split(" ", 1)[0] != path.name or first.rfind(")") < 0 or len(fields) < 20 or
+                        not fields[19].isdigit() or not process_start <= int(fields[19]) < 2**64 or
+                        fields[0] not in tuple("RSDTtXxZIKPW")):
+                    raise RuntimeError("Invalid native UI compositor task identity")
+                groups = self.ui_task_read(path / "cgroup", 8192).decode("ascii").splitlines()
+                if not any(len(row.split(":", 2)) == 3 and
+                        (row.split(":", 2)[2] == group or row.split(":", 2)[2].startswith(group + "/")) for row in groups):
+                    raise RuntimeError("Native UI compositor task left its control group")
+                second = self.ui_task_read(path / "stat", 8192).decode("ascii")
+                fields2 = second[second.rfind(")") + 2:].split()
+                if (second.split(" ", 1)[0] != path.name or second.rfind(")") < 0 or len(fields2) < 20 or
+                        fields2[19] != fields[19] or fields2[0] not in tuple("RSDTtXxZIKPW") or
+                        (end_node := path.lstat()).st_uid != self.uid or
+                        (end_node.st_dev, end_node.st_ino, end_node.st_mode) != (node.st_dev, node.st_ino, node.st_mode) or
+                        self.ui_task_read(path / "comm", 32).decode("ascii").rstrip("\n") != name or
+                        self.ui_task_read(path / "cgroup", 8192).decode("ascii").splitlines() != groups):
+                    raise RuntimeError("Native UI compositor task changed during sampling")
+                result.append({"tid": int(path.name), "start_ticks": int(fields[19]),
+                    "state": fields[0] if fields[0] in INELIGIBLE_STATES else fields2[0], "comm": name})
+                if len(result) > 3 or len({task["comm"] for task in result}) != len(result):
+                    raise RuntimeError("Ambiguous native UI compositor task roles")
+            if {path.name for path in itertools.islice(taskdir.iterdir(), UI_TASKS_PER_PROCESS + 1)} != {path.name for path in entries}:
+                raise RuntimeError("Native UI compositor task inventory changed during sampling")
+            if time.monotonic() >= self.ui_task_deadline:
+                raise RuntimeError("Native UI task sample time bound exceeded")
+            return sorted(result, key=lambda task: task["comm"])
+        finally:
+            self.ui_task_usage["elapsed_ns"] += max(0, time.monotonic_ns() - began)
+            if self.ui_task_usage["elapsed_ns"] > UI_TASK_LIMITS["elapsed_ns"]:
+                raise RuntimeError("Native UI task cumulative time budget exhausted")
 
     def isolation_read(self, path, limit):
         # This cumulative accounting includes metadata reads which later fail
@@ -612,6 +723,7 @@ class NativeEvidenceSource:
     def baseline(self):
         self.total = 0
         self.isolation_usage = {"samples": 0, "processes": 0, "metadata_bytes": 0}
+        self.ui_task_usage = {key: 0 for key in UI_TASK_LIMITS}
         self.pending_lines = {name: "" for name in self.logs}
         unit = self.unit(); self.journal(initial=True)
         for name in self.logs: self.log_read(name, initial=True)
@@ -639,18 +751,21 @@ class NativeEvidenceSource:
 
     def checkpoint(self):
         return {"cursor": self.cursor, "log_offsets": self.offsets, "pending_lines": self.pending_lines, "total": self.total,
-                "isolation_descriptor": self.isolation_descriptor, "isolation_usage": self.isolation_usage}
+                "isolation_descriptor": self.isolation_descriptor, "isolation_usage": self.isolation_usage,
+                "ui_task_usage": self.ui_task_usage}
 
     def resume(self, checkpoint):
-        if not isinstance(checkpoint, dict) or set(checkpoint) != {"cursor", "log_offsets", "pending_lines", "total", "isolation_descriptor", "isolation_usage"}:
+        if not isinstance(checkpoint, dict) or set(checkpoint) != {"cursor", "log_offsets", "pending_lines", "total", "isolation_descriptor", "isolation_usage", "ui_task_usage"}:
             raise RuntimeError("Invalid startup source checkpoint shape")
         if type(checkpoint["total"]) is not int or not 0 <= checkpoint["total"] <= LIMIT:
             raise RuntimeError("Invalid cumulative startup evidence budget")
         require_isolation_usage(checkpoint["isolation_usage"])
+        require_ui_task_usage(checkpoint["ui_task_usage"])
         descriptor = require_isolation_descriptor(checkpoint["isolation_descriptor"])
         if descriptor != self.isolation_descriptor:
             raise RuntimeError("Startup isolation descriptor changed across resume")
         self.isolation_usage = dict(checkpoint["isolation_usage"])
+        self.ui_task_usage = dict(checkpoint["ui_task_usage"])
         self.total = checkpoint["total"]
         self.cursor = checkpoint["cursor"]
         self.offsets, self.pending_lines = checkpoint["log_offsets"], checkpoint["pending_lines"]
@@ -680,6 +795,7 @@ class StartupGate:
         self.isolation_result = None
         self.invocation, self.unit_identity = None, None
         self.markers, self.pinned = {}, {}
+        self.webhelper_connections = {}
         self.ready_since, self.ready = None, False
         self.last_progress, self.progress = baseline["monotonic"], 0
         self.failed = "Baseline managed process metadata unreadable" if baseline.get("errors") else None
@@ -831,8 +947,11 @@ class StartupGate:
             connected = re.search(r"New Connect message from " + re.escape(WEBHELPER) + r" \(VRApplication_WebHelper\).*\) ([0-9]+) *$", row)
             if connected:
                 p = current.get(int(connected[1]))
-                if p and p["exe"] == WEBHELPER and p["kind"] == "browser" and p["libcef"]:
-                    self.markers["ui_browser_connected"] = p["pid"]
+                if p and p["exe"] == WEBHELPER and p["libcef"]:
+                    self.webhelper_connections[str(p["pid"])] = p["start_ticks"]
+                    if len(self.webhelper_connections) > MAX_PROCESSES:
+                        raise RuntimeError("Native UI connection inventory bound exceeded")
+                    if p["kind"] == "browser": self.markers["ui_browser_connected"] = p["pid"]
             system = re.search(r"SetApplicationPid appkey=system\.systemui pid=([0-9]+),", row)
             if system:
                 p = current.get(int(system[1]))
@@ -843,6 +962,10 @@ class StartupGate:
             if p and p["libcef"]:
                 self.pinned.setdefault(role, {"pid": p["pid"], "start_ticks": p["start_ticks"]})
         renderers = [p for p in current.values() if p["exe"] == WEBHELPER and p["kind"] == "renderer" and p["libcef"]]
+        system_ui = current.get(self.markers.get("system_ui_connected"))
+        forked_renderer = (system_ui if system_ui and forked_ui_compositor_live(system_ui) and
+            self.webhelper_connections.get(str(system_ui["pid"])) == system_ui["start_ticks"] else None)
+        if not renderers and forked_renderer is not None: renderers = [forked_renderer]
         if renderers:
             self.markers["libcef_renderer_live"] = True
             if "ui_renderer" not in self.pinned:
@@ -853,7 +976,9 @@ class StartupGate:
         complete = required <= self.markers.keys() and set(self.pinned) == {"service_main", "compositor", "ui_browser", "system_ui", "ui_renderer"}
         if complete:
             complete = all(current[pin["pid"]]["libcef"] for role, pin in self.pinned.items() if role not in ("compositor", "service_main"))
-            complete = complete and current[self.pinned["ui_renderer"]["pid"]]["kind"] == "renderer"
+            renderer = current[self.pinned["ui_renderer"]["pid"]]
+            complete = complete and (renderer["kind"] == "renderer" or forked_renderer is not None and
+                identity(renderer) == identity(forked_renderer))
         if unit["ActiveState"] != "active" or unit["SubState"] != "running" or int(unit["MainPID"]) <= 0 or sample["errors"]:
             complete = False
         if self.isolation_descriptor is not None and (self.isolation_result is None or self.isolation_result["status"] != "isolated"):
@@ -875,14 +1000,20 @@ class StartupGate:
         return {"baseline": self.baseline, "invocation": self.invocation, "unit_identity": self.unit_identity,
                 "markers": self.markers, "pinned": self.pinned, "ready_since": self.ready_since,
                 "ready": self.ready, "last_progress": self.last_progress, "progress": self.progress,
-                "failed": self.failed, "isolation": self.isolation_result}
+                "failed": self.failed, "isolation": self.isolation_result, "webhelper_connections": self.webhelper_connections}
 
     @classmethod
     def resume(cls, checkpoint):
-        expected = {"baseline", "invocation", "unit_identity", "markers", "pinned", "ready_since", "ready", "last_progress", "progress", "failed", "isolation"}
+        expected = {"baseline", "invocation", "unit_identity", "markers", "pinned", "ready_since", "ready", "last_progress", "progress", "failed", "isolation", "webhelper_connections"}
         if not isinstance(checkpoint, dict) or set(checkpoint) != expected:
             raise RuntimeError("Invalid startup gate checkpoint shape")
         gate = cls(checkpoint["baseline"])
+        connections = checkpoint["webhelper_connections"]
+        if (not isinstance(connections, dict) or len(connections) > MAX_PROCESSES or
+                any(not isinstance(pid, str) or not re.fullmatch(r"[1-9][0-9]{0,9}", pid) or int(pid) >= 2**31 or
+                    type(start) is not int or not 0 < start < 2**64 for pid, start in connections.items())):
+            raise RuntimeError("Invalid native UI connection checkpoint")
+        gate.webhelper_connections = dict(connections)
         require_clock(checkpoint["last_progress"])
         if checkpoint["ready_since"] is not None: require_clock(checkpoint["ready_since"])
         if (type(checkpoint["ready"]) is not bool or type(checkpoint["progress"]) is not int or not 0 <= checkpoint["progress"] <= 7 or

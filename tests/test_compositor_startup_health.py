@@ -56,6 +56,19 @@ def coredump(pid="101"):
         "COREDUMP_CGROUP": unit()["ControlGroup"]}
 
 
+def forked_sample(now=2.0):
+    s = sample(now)
+    s["processes"] = [p for p in s["processes"] if p["kind"] != "renderer"]
+    p = s["processes"][2]
+    # Captured normal native systemui has these distinct tasks while proc argv
+    # still says --type=zygote. Fixture start ticks remain injected test values.
+    p["ui_compositor_tasks"] = [{"tid": 2702896 + index, "start_ticks": p["start_ticks"] + index,
+        "state": "S", "comm": name} for index, name in enumerate(("Chrome_ChildIOT", "GpuMemoryThread", "Compositor"))]
+    s["logs"]["vrserver"] += "\n" + line("New Connect message from " + M.WEBHELPER +
+        " (VRApplication_WebHelper) (Args: --type=zygote --no-sandbox) 103 ")
+    return s
+
+
 def descriptor():
     result = {"schema": M.ISOLATION_SCHEMA, "target_exe": M.COMPOSITOR,
         "selector_path": "/reviewed/selector.so", "payload_path": "/reviewed/observer.so", "audit_path": "/reviewed/audit.so"}
@@ -650,6 +663,180 @@ class NativeSourceTests(unittest.TestCase):
         self.source.baseline(); checkpoint = self.source.checkpoint()
         checkpoint["log_offsets"]["vrserver"]["offset"] = -1
         with self.assertRaises(RuntimeError): self.source.resume(checkpoint)
+
+
+class ForkedRendererGateTests(unittest.TestCase):
+    def test_actual_native_fork_shape_retains_all_required_positive_ui_proofs(self):
+        gate = M.StartupGate(baseline())
+        result = gate.consume(forked_sample(), stable_seconds=0)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["process_identities"]["ui_renderer"], result["process_identities"]["system_ui"])
+        self.assertIn("libcef_renderer_live", result["evidence"])
+        self.assertFalse(result["screen_pixels_verified"])
+
+    def test_native_connection_and_registration_can_arrive_in_different_polls(self):
+        gate = M.StartupGate(baseline()); first = forked_sample()
+        first["logs"]["vrserver"] = "\n".join(row for row in first["logs"]["vrserver"].splitlines() if "system.systemui" not in row)
+        self.assertFalse(gate.consume(first, stable_seconds=0)["ready"])
+        second = forked_sample(3); second["logs"]["vrserver"] = line("SetApplicationPid appkey=system.systemui pid=103, external transition")
+        self.assertTrue(gate.consume(second, stable_seconds=0)["ready"])
+
+    def test_unused_zygote_utility_and_missing_fresh_connection_do_not_pass(self):
+        for variant in ("utility", "browser", "unused_zygote", "missing_connection", "old_connection", "old_systemui"):
+            s = forked_sample(); b = baseline()
+            if variant in ("utility", "browser"): s["processes"][2]["kind"] = variant
+            if variant == "unused_zygote":
+                p = process(105, "zygote"); s["processes"].append(p)
+                s["logs"]["vrserver"] = s["logs"]["vrserver"].replace("system.systemui pid=103", "system.systemui pid=105")
+            if variant == "missing_connection":
+                s["logs"]["vrserver"] = "\n".join(row for row in s["logs"]["vrserver"].splitlines() if "Args: --type=zygote" not in row)
+            if variant == "old_connection":
+                s["logs"]["vrserver"] = "\n".join(line(row.split("[Info] - ", 1)[1], wall=99) if "Args: --type=zygote" in row else row
+                    for row in s["logs"]["vrserver"].splitlines())
+            if variant == "old_systemui": b["processes"].append(copy.deepcopy(s["processes"][2]))
+            with self.subTest(variant=variant): self.assertFalse(M.StartupGate(b).consume(s, stable_seconds=0)["ready"])
+
+    def test_missing_partial_stopped_or_dead_tasks_are_non_proof(self):
+        for variant in (None, [], "partial", "T", "Z", "X"):
+            s = forked_sample(); tasks = s["processes"][2]["ui_compositor_tasks"]
+            if variant is None or variant == []: s["processes"][2]["ui_compositor_tasks"] = variant
+            elif variant == "partial": tasks.pop()
+            else: tasks[0]["state"] = variant
+            with self.subTest(variant=variant): self.assertFalse(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
+
+    def test_invalid_task_metadata_and_foreign_steam_renderer_are_refused(self):
+        for variant in ("duplicate_tid", "duplicate_role", "bool_tid", "old_start", "foreign_exe", "foreign_role"):
+            s = forked_sample(); p = s["processes"][2]; tasks = p["ui_compositor_tasks"]
+            if variant == "duplicate_tid": tasks[0]["tid"] = tasks[1]["tid"]
+            if variant == "duplicate_role": tasks[0]["comm"] = tasks[1]["comm"]
+            if variant == "bool_tid": tasks[0]["tid"] = True
+            if variant == "old_start": tasks[0]["start_ticks"] = p["start_ticks"] - 1
+            if variant == "foreign_exe": p["exe"] = "/home/steamos/.local/share/Steam/steamrtarm64/steamwebhelper"
+            if variant == "foreign_role": tasks[0]["comm"] = "Chrome_IOThread"
+            with self.subTest(variant=variant): self.assertEqual(M.StartupGate(baseline()).consume(s)["status"], "fault")
+
+    def test_ready_resume_monitor_requires_same_native_renderer_task_roles(self):
+        gate = M.StartupGate(baseline()); self.assertTrue(gate.consume(forked_sample(), stable_seconds=0)["ready"])
+        saved = json.loads(json.dumps(gate.checkpoint())); resumed = M.StartupGate.resume(saved)
+        self.assertTrue(resumed.consume(forked_sample(3), stable_seconds=0)["ready"])
+        missing = forked_sample(4); missing["processes"][2]["ui_compositor_tasks"].pop()
+        self.assertEqual(resumed.consume(missing)["status"], "fault")
+        for bad in ({"103": True}, {"foreign": 10300}, {"103": 0}, []):
+            saved["webhelper_connections"] = bad
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError): M.StartupGate.resume(saved)
+
+
+class ForkedRendererSourceTests(unittest.TestCase):
+    setUp = NativeSourceTests.setUp
+    tearDown = NativeSourceTests.tearDown
+    command = NativeSourceTests.command
+    procfile = NativeSourceTests.procfile
+
+    def native_ui(self):
+        process = self.procfile(103, "zygote")
+        taskdir = process / "task"; taskdir.mkdir()
+        for index, name in enumerate(("Chrome_ChildIOT", "GpuMemoryThread", "Compositor")):
+            p = taskdir / str(2702896 + index); p.mkdir()
+            (p / "comm").write_text(name + "\n")
+            cols = ["S"] + ["0"] * 18 + [str(10300 + index)]
+            (p / "stat").write_text(p.name + " (" + name + ") " + " ".join(cols))
+            (p / "cgroup").write_text("0::" + unit()["ControlGroup"] + "\n")
+        return process
+
+    def test_collects_only_exact_managed_libcef_native_fork_tasks(self):
+        self.native_ui()
+        processes, errors = self.source.processes(unit()); self.assertFalse(errors)
+        p = processes[0]
+        self.assertEqual(p["kind"], "zygote")
+        self.assertEqual({task["comm"] for task in p["ui_compositor_tasks"]}, M.UI_COMPOSITOR_TASK_NAMES)
+        self.assertTrue(M.forked_ui_compositor_live(p))
+        self.assertEqual(self.source.ui_task_usage["tasks"], 3)
+        self.assertGreater(self.source.ui_task_usage["metadata_bytes"], 0)
+        self.assertGreater(self.source.ui_task_usage["elapsed_ns"], 0)
+
+    def test_real_proc_fixture_collection_drives_native_fork_gate(self):
+        self.native_ui(); self.procfile(101, "compositor"); self.procfile(102); self.procfile(100)
+        self.source.cursor = "s=old"
+        for name, text in forked_sample()["logs"].items():
+            (self.logdir / (name + ".txt")).write_text(text + "\n")
+        collected = self.source.sample()
+        result = M.StartupGate(baseline()).consume(collected, stable_seconds=0)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["process_identities"]["ui_renderer"]["pid"], 103)
+        self.assertFalse(result["screen_pixels_verified"])
+
+    def test_unreadable_missing_wrong_group_and_symlink_task_are_non_proof(self):
+        for variant in ("missing", "foreign_group", "symlink"):
+            with self.subTest(variant=variant):
+                self.tearDown(); self.setUp(); p = self.native_ui() / "task/2702896"
+                if variant == "missing": (p / "stat").unlink()
+                if variant == "foreign_group": (p / "cgroup").write_text("0::/unrelated\n")
+                if variant == "symlink":
+                    (p / "comm").unlink(); (p / "comm").symlink_to(p / "stat")
+                processes, errors = self.source.processes(unit())
+                self.assertFalse(processes)
+                if variant != "missing": self.assertTrue(errors)
+
+    def test_changed_task_identity_and_process_role_cannot_pass(self):
+        for variant in ("task_start", "task_name", "process_role"):
+            with self.subTest(variant=variant):
+                self.tearDown(); self.setUp(); p = self.native_ui()
+                original = self.source.ui_task_read; changed = False
+                def mutate(path, limit):
+                    nonlocal changed
+                    data = original(path, limit)
+                    if not changed and path.name == "stat":
+                        changed = True
+                        if variant == "task_start":
+                            prefix, ticks = path.read_text().rsplit(" ", 1)
+                            path.write_text(prefix + " " + str(int(ticks) + 1))
+                        if variant == "task_name": path.with_name("comm").write_text("Chrome_IOThread\n")
+                        if variant == "process_role": (p / "cmdline").write_bytes((M.WEBHELPER + "\0--type=utility\0").encode())
+                    return data
+                with mock.patch.object(self.source, "ui_task_read", side_effect=mutate):
+                    processes, errors = self.source.processes(unit())
+                self.assertFalse(processes); self.assertTrue(errors)
+
+    def test_changed_task_inventory_cannot_pass(self):
+        p = self.native_ui() / "task"; original = self.source.ui_task_read
+        def mutate(path, limit):
+            data = original(path, limit)
+            if path.name == "stat" and not (p / "extra").exists(): (p / "extra").mkdir()
+            return data
+        with mock.patch.object(self.source, "ui_task_read", side_effect=mutate):
+            processes, errors = self.source.processes(unit())
+        self.assertFalse(processes); self.assertTrue(errors)
+
+    def test_task_sample_read_count_time_and_resume_budgets_do_not_reset(self):
+        self.native_ui(); self.source.processes(unit())
+        self.source.cursor = "s=current"
+        saved = json.loads(json.dumps(self.source.checkpoint()))
+        resumed = M.NativeEvidenceSource(self.home, proc_root=self.proc, run=self.command)
+        # Supply baseline log offsets before testing the independent UI budget.
+        saved["log_offsets"] = {name: None for name in self.source.logs}
+        resumed.resume(saved)
+        self.assertEqual(resumed.ui_task_usage, self.source.ui_task_usage)
+        for key, limit in M.UI_TASK_LIMITS.items():
+            resumed.ui_task_usage = dict(self.source.ui_task_usage); resumed.ui_task_usage[key] = limit
+            if key == "samples":
+                with self.assertRaisesRegex(RuntimeError, "sample budget exhausted"): resumed.processes(unit())
+            else:
+                processes, errors = resumed.processes(unit()); self.assertFalse(processes); self.assertTrue(errors)
+            bad = copy.deepcopy(saved); bad["ui_task_usage"][key] = True
+            with self.subTest(key=key), self.assertRaises(RuntimeError): resumed.resume(bad)
+
+    def test_per_process_inventory_and_sample_time_are_hard_bounds(self):
+        p = self.native_ui() / "task"
+        for index in range(M.UI_TASKS_PER_PROCESS + 1): (p / str(3000000 + index)).mkdir()
+        processes, errors = self.source.processes(unit()); self.assertFalse(processes); self.assertTrue(errors)
+        self.tearDown(); self.setUp(); self.native_ui()
+        original = self.source.ui_task_read
+        def expire(path, limit):
+            self.source.ui_task_deadline = 0
+            return original(path, limit)
+        with mock.patch.object(self.source, "ui_task_read", side_effect=expire):
+            processes, errors = self.source.processes(unit())
+        self.assertFalse(processes); self.assertTrue(errors)
 
 class IsolationGateTests(unittest.TestCase):
     def setUp(self):
