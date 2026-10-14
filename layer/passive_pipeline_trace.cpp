@@ -53,13 +53,15 @@
     static_cast<unsigned char>(((value) >> 16) & 255), \
     static_cast<unsigned char>(((value) >> 24) & 255)
 extern "C" {
-__attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_trace_sampling_scope[32] = {
-    'F','C','M','S','M','P','0','1',
+__attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_trace_sampling_scope[40] = {
+    'F','C','M','S','M','P','0','2',
     SAMPLING_LE(frame_compositor_sampling::Budget::Version),
+    SAMPLING_LE(40),
     SAMPLING_LE(frame_compositor_sampling::Budget::DrawLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::ExecuteLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::SubmitLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::SnapshotLimit),
+    SAMPLING_LE(frame_compositor_sampling::Budget::ProbeLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::Flags)
 };
 }
@@ -88,6 +90,45 @@ struct Capture {
     std::atomic<bool> importJournalOpen{false}, importRequestPublished{false};
     frame_compositor_sampling::Budget rawSampling;
     std::atomic<std::uint64_t> snapshotsDeferredBeforeImport{0};
+    std::atomic<std::uint64_t> selectedImportTag{0}, selectedImportCookie{0};
+    // Immutable event metadata is retained only until its ordered lightweight
+    // probe replays. Nonmatches never enter the large output EventRing.
+    static constexpr std::size_t ProbeSlotCount = 256;
+    struct ProbeSlot { std::atomic<bool> owned{false}; Event event{}; };
+    std::array<ProbeSlot, ProbeSlotCount> probeSlots{};
+    std::atomic<std::uint64_t> probeSlotOmitted{0}, probeMetadataUnavailable{0}, probePublicationRefused{0};
+    std::uint64_t probesFiltered = 0, probesUnknown = 0, probesMatched = 0, probesQuotaOmitted = 0, probesOutputOmitted = 0;
+    std::atomic<std::uint64_t> probeNext{0};
+    bool reserveProbeSlot(const Event& event, std::uint32_t& slot) noexcept {
+        slot = static_cast<std::uint32_t>(probeNext.fetch_add(1, std::memory_order_relaxed) % ProbeSlotCount);
+        bool expected = false;
+        if (!probeSlots[slot].owned.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+            probeSlotOmitted.fetch_add(1, std::memory_order_relaxed); return false;
+        }
+        probeSlots[slot].event = event;
+        return true;
+    }
+    void consumeProbe(std::uint32_t slot, const frame_bindings::TargetSnapshotProbeResult& result) noexcept {
+        if (result.outcome == frame_bindings::TargetProbeOutcome::Filtered) ++probesFiltered;
+        else if (result.outcome == frame_bindings::TargetProbeOutcome::QuotaOmitted) ++probesQuotaOmitted;
+        else if (result.outcome == frame_bindings::TargetProbeOutcome::ExactMatch) ++probesMatched;
+        else ++probesUnknown;
+        if (slot >= ProbeSlotCount) return;
+        auto& retained = probeSlots[slot];
+        if (result.outcome == frame_bindings::TargetProbeOutcome::ExactMatch && result.snapshot) {
+            const auto cookie = bindingSnapshots.fetch_add(1, std::memory_order_relaxed);
+            if (cookie < BindingSnapshotLimit) {
+                bindingResults[cookie] = *result.snapshot; bindingReady[cookie] = true;
+                auto event = retained.event;
+                event.kind = Kind::Bindings; event.bindingCookie = cookie;
+                event.probeReplayOrder = result.replayOrder; event.probeInvocationTag = result.invocationTag;
+                if (!events.push(event)) ++probesOutputOmitted;
+            }
+        }
+        retained.owned.store(false, std::memory_order_release);
+    }
+    static_assert(sizeof(probeSlots) < 512 * 1024, "Probe retention must remain small and fixed");
+
 #endif
     std::atomic<bool> stop{false};
     std::thread writer;
@@ -118,7 +159,10 @@ struct Capture {
                 capture.bindingResults[cookie] = result;
                 capture.bindingReady[cookie] = true;
             }
-        }, this);
+        }, this, 256, [](std::uint32_t slot, const frame_bindings::TargetSnapshotProbeResult& result,
+                        void* context) noexcept {
+            static_cast<Capture*>(context)->consumeProbe(slot, result);
+        });
 #else
         return bindings.drain([this](std::uint32_t cookie, const frame_bindings::Snapshot& result) {
             if (cookie < BindingSnapshotLimit) {
@@ -298,6 +342,12 @@ struct Capture {
                 stage.bytes, entry, stage.complete ? "true" : "false");
         }
         valid = valid && append(out, sizeof(out), used, "]");
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        if (e.kind == Kind::Bindings && e.probeInvocationTag)
+            valid = valid && append(out, sizeof(out), used,
+                ",\"target_probe_replay_order\":%llu,\"target_probe_invocation_tag\":%llu",
+                static_cast<unsigned long long>(e.probeReplayOrder), static_cast<unsigned long long>(e.probeInvocationTag));
+#endif
         if (e.kind == Kind::Bindings)
             valid = valid && binding && serializeBindings(*binding, out, sizeof(out), used);
         valid = valid && append(out, sizeof(out), used, "}\n");
@@ -397,9 +447,9 @@ struct Capture {
             ",\"raw_trace_sampling\":{\"intentional\":true,\"draw_call_limit\":%u,"
             "\"execute_child_limit\":%u,\"submit_command_limit\":%u,"
             "\"binding_snapshots_require_import_request\":true,"
-            "\"lifecycle_survives_trace_cap\":true}",
+            "\"lifecycle_survives_trace_cap\":true,\"binding_probe_limit\":%u,\"binding_probe_slots\":256,\"binding_snapshots_require_target_match\":true}",
             frame_compositor_sampling::Budget::DrawLimit, frame_compositor_sampling::Budget::ExecuteLimit,
-            frame_compositor_sampling::Budget::SubmitLimit);
+            frame_compositor_sampling::Budget::SubmitLimit, frame_compositor_sampling::Budget::ProbeLimit);
 #endif
         headerValid = headerValid && append(header, sizeof(header), total, "}\n");
         bool ioGood = headerValid && writeAll(fd, header, total), capped = false;
@@ -546,6 +596,13 @@ struct Capture {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+        // Corrupted/lost ordered records cannot identify a safe cookie. After
+        // producers are quiescent and replay is finished, retire every owned
+        // slot without inspecting or emitting guessed metadata.
+        std::uint64_t probeSlotsCanceled = 0;
+        for (auto& slot : probeSlots) if (slot.owned.exchange(false, std::memory_order_acq_rel)) ++probeSlotsCanceled;
+#endif
         char footer[FooterReserve];
         const auto journal = bindings.transportCounters();
         std::uint64_t cpuEnd = 0;
@@ -589,7 +646,11 @@ struct Capture {
             "\"execute_children_sampled\":%llu,\"execute_children_omitted\":%llu,"
             "\"submit_commands_sampled\":%llu,\"submit_commands_omitted\":%llu,"
             "\"snapshots_deferred_before_import\":%llu,\"import_request_published\":%s,"
-            "\"output_records_omitted\":%llu,\"exhaustive_draw_trace\":false}",
+            "\"output_records_omitted\":%llu,\"exhaustive_draw_trace\":false,"
+            "\"target_probes_sampled\":%llu,\"target_probes_omitted\":%llu,"
+            "\"target_probes_filtered\":%llu,\"target_probes_unknown\":%llu,\"target_probes_matched\":%llu,"
+            "\"target_probes_match_quota_omitted\":%llu,\"target_probes_slot_omitted\":%llu,"
+            "\"target_probes_metadata_unavailable\":%llu,\"target_probes_publication_refused\":%llu,\"target_probe_slots_canceled\":%llu,\"target_probe_output_omitted\":%llu}",
             static_cast<unsigned long long>(rawSampling.draws.sampled()),
             static_cast<unsigned long long>(rawSampling.draws.omitted()),
             static_cast<unsigned long long>(rawSampling.executes.sampled()),
@@ -598,7 +659,15 @@ struct Capture {
             static_cast<unsigned long long>(rawSampling.submits.omitted()),
             static_cast<unsigned long long>(snapshotsDeferredBeforeImport.load(std::memory_order_relaxed)),
             importRequestPublished.load(std::memory_order_acquire) ? "true" : "false",
-            static_cast<unsigned long long>(traceOutputOmitted));
+            static_cast<unsigned long long>(traceOutputOmitted),
+            static_cast<unsigned long long>(rawSampling.probes.sampled()),
+            static_cast<unsigned long long>(rawSampling.probes.omitted()),
+            static_cast<unsigned long long>(probesFiltered), static_cast<unsigned long long>(probesUnknown),
+            static_cast<unsigned long long>(probesMatched), static_cast<unsigned long long>(probesQuotaOmitted),
+            static_cast<unsigned long long>(probeSlotOmitted.load()),
+            static_cast<unsigned long long>(probeMetadataUnavailable.load()),
+            static_cast<unsigned long long>(probePublicationRefused.load()),
+            static_cast<unsigned long long>(probeSlotsCanceled), static_cast<unsigned long long>(probesOutputOmitted));
 #endif
         bool footerValid = samplingValid && append(footer, sizeof(footer), footerBytes,
             ",\"binding_writer\":{\"iterations\":%llu,\"replayed\":%llu,\"replay_ns\":%llu,"
@@ -661,6 +730,25 @@ void recordedDraw(std::uint64_t device, VkCommandBuffer command, std::uint32_t k
 #else
     c.core.draw(device, number(command), kind);
 #endif
+#ifdef FRAME_MASK_COMPOSITOR_RAW
+    if (!c.bindingsEnabled || !c.bindingsArmed.load(std::memory_order_acquire) || !c.lifecycleReady() ||
+        !c.rawSampling.probes.take()) return;
+    Event event;
+    if (!c.core.describeDraw(device, number(command), event)) {
+        c.probeMetadataUnavailable.fetch_add(1, std::memory_order_relaxed); return;
+    }
+    const auto tag = c.selectedImportTag.load(std::memory_order_acquire);
+    const auto ownedCookie = c.selectedImportCookie.load(std::memory_order_relaxed);
+    std::uint32_t slot = 0;
+    event.drawKind = kind;
+    if (!c.reserveProbeSlot(event, slot)) return;
+    if (!c.bindings.requestTargetSnapshotProbe(device, command, (VkPipelineLayout)(std::uintptr_t)event.layout,
+                                               tag, ownedCookie, slot)) {
+        c.probePublicationRefused.fetch_add(1, std::memory_order_relaxed);
+        c.probeSlots[slot].owned.store(false, std::memory_order_release);
+    }
+    return;
+#else
     if (!c.bindingsEnabled || !c.bindingsArmed.load(std::memory_order_acquire) ||
         c.bindingSnapshots.load(std::memory_order_relaxed) >= Capture::BindingSnapshotLimit) return;
     Event event;
@@ -676,6 +764,7 @@ void recordedDraw(std::uint64_t device, VkCommandBuffer command, std::uint32_t k
         event.complete = false;
     }
     c.events.push(event);
+#endif
 }
 
 struct Instance {
@@ -779,10 +868,15 @@ bool request(std::uint64_t device, VkImage image, VkImageView view,
     // The existing reviewed adapter invokes this after its successful tagged
     // view publication. This reserves snapshots until an actual request exists;
     // it does not assert that a later draw consumes that image or a video frame.
-    if (published) c.importRequestPublished.store(true, std::memory_order_release);
+    if (published) {
+        c.selectedImportCookie.store(cookie, std::memory_order_relaxed);
+        c.selectedImportTag.store(tag, std::memory_order_release);
+        c.importRequestPublished.store(true, std::memory_order_release);
+    }
     return published;
 }
 bool validate(const Receipt& receipt) noexcept { return capture().importReceipts.validate(receipt); }
+Validation validate_detailed(const Receipt& receipt) noexcept { return capture().importReceipts.validate_detailed(receipt); }
 void stop() noexcept { capture().importReceipts.stop(); }
 void retire_child_atomically() noexcept {
     // Only a successfully prepared constructor publishes this pointer; do not

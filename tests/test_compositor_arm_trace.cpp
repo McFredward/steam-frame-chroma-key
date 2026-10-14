@@ -49,7 +49,7 @@ void wait_replayed(Capture& c) {
 }
 }
 int main(int argc,char** argv) {
-    const unsigned char scope[32]={'F','C','M','S','M','P','0','1',1,0,0,0,32,0,0,0,16,0,0,0,16,0,0,0,32,0,0,0,3,0,0,0};
+    const unsigned char scope[40]={'F','C','M','S','M','P','0','2',2,0,0,0,40,0,0,0,32,0,0,0,16,0,0,0,16,0,0,0,32,0,0,0,0,16,0,0,7,0,0,0};
     require(sizeof(frame_compositor_trace_sampling_scope)==sizeof(scope) && !std::memcmp(scope,frame_compositor_trace_sampling_scope,sizeof(scope)));
     const std::string mode=argc==1?"armed":argv[1];
     const bool armed_run=mode!="unarmed",deadline_run=mode=="deadline";
@@ -173,12 +173,40 @@ int main(int argc,char** argv) {
         require(!results.receipt.resource.sourceFrameAssociated && !results.receipt.resource.gpuConsumedCoherent);
         require(c.importReceipts.counters().delivered==1 && !c.importReceipts.notification_loss());
         if(!byte_cap && !event_cap) {
+            const auto setLayout=handle<VkDescriptorSetLayout>(40);const auto set=handle<VkDescriptorSet>(41);
+            const auto pool=handle<VkDescriptorPool>(42);
+            VkDescriptorSetLayoutBinding binding{9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+            VkDescriptorSetLayoutCreateInfo sli{};sli.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            sli.bindingCount=1;sli.pBindings=&binding;
             VkPipelineLayoutCreateInfo layout{};layout.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-            observeBindings([&](auto& b){b.createPipelineLayout(1,handle<VkPipelineLayout>(11),layout);b.allocateCommands(1,handle<VkCommandPool>(13),1,&command);b.beginCommand(1,command);});
+            layout.setLayoutCount=1;layout.pSetLayouts=&setLayout;
+            VkDescriptorPoolCreateInfo pci{};pci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;pci.maxSets=1;
+            VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            sai.descriptorPool=pool;sai.descriptorSetCount=1;sai.pSetLayouts=&setLayout;
+            VkDescriptorImageInfo di{VK_NULL_HANDLE,handle<VkImageView>(22),VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;
+            write.dstBinding=9;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;write.pImageInfo=&di;
+            observeBindings([&](auto& b){
+                b.createSetLayout(1,setLayout,sli);b.createPipelineLayout(1,handle<VkPipelineLayout>(11),layout);
+                b.createPool(1,pool,pci);b.allocateSets(1,sai,&set);b.updateSets(1,1,&write,0,nullptr);
+                b.beginCommand(1,command);
+                b.bindSets(1,command,VK_PIPELINE_BIND_POINT_GRAPHICS,handle<VkPipelineLayout>(11),0,1,&set,0,nullptr);
+            });
+            const auto uiImage=handle<VkImage>(50);const auto uiView=handle<VkImageView>(51);const auto uiMemory=handle<VkDeviceMemory>(52);
+            auto uiImageInfo=image;uiImageInfo.pNext=nullptr;auto uiMemoryInfo=memory;uiMemoryInfo.pNext=nullptr;
+            auto uiViewInfo=view;uiViewInfo.image=uiImage;
+            observeBindings([&](auto& b){b.createImage(1,uiImage,uiImageInfo);b.allocateMemory(1,uiMemory,uiMemoryInfo);
+                b.bindImageMemory(1,uiImage,uiMemory,0);b.createView(1,uiView,uiViewInfo);});
+            di.imageView=uiView;observeBindings([&](auto& b){b.updateSets(1,1,&write,0,nullptr);});
             c.core.commandBegin(1,number(command));c.core.bind(1,number(command),12);
             for(unsigned i=0;i<80;++i)recordedDraw(1,command,1);
-            require(c.bindingSnapshots==32 && c.rawSampling.draws.sampled()==32);
             wait_replayed(c);
+            require(c.bindingSnapshots==0 && c.probesFiltered==80 && !c.probesUnknown);
+            di.imageView=handle<VkImageView>(22);observeBindings([&](auto& b){b.updateSets(1,1,&write,0,nullptr);});
+            for(unsigned i=0;i<80;++i)recordedDraw(1,command,1);
+            wait_replayed(c);
+            require(c.bindingSnapshots==32 && c.rawSampling.draws.sampled()==32 && c.rawSampling.probes.sampled()==160);
+            require(c.probesMatched==32 && c.probesQuotaOmitted==48 && c.probesFiltered==80 && c.probesUnknown==0);
             require(c.lifecycleReady() && !c.events.finished() && !c.events.dropped());
             // A forked child cannot reopen/reset budgets or touch the copied
             // owning writer. Parent admission and counters stay unchanged.

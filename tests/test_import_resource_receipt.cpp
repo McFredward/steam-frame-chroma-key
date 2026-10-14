@@ -304,7 +304,7 @@ void duplicateCapacityAndMissingConsumer() {
         // receipt cannot reserve storage. The existing journal loss is explicit.
         for (std::size_t i = 4; i < Journal::LaneCapacity; ++i) f.journal->deviceDestroyed(999);
         require(!f.journal->requestImportResourceReceipt(f.device, f.image, f.view, f.tag, f.cookie), "full lane accepted receipt");
-        require(f.journal->operationCounters().back().publicationLoss == 1 && f.journal->lostState(), "receipt queue loss unreported");
+        require(f.journal->operationCounters()[37].publicationLoss == 1 && f.journal->lostState(), "receipt queue loss unreported");
         f.journal->close(); while (!f.journal->finished()) f.journal->drain(Collector{});
     }
     {
@@ -356,6 +356,92 @@ void orderedInterleavedScopes() {
         journal->close(); require(journal->finished(), "interleaved receipt journal remained pending");
     }
 }
+struct ProbeCollector {
+    std::uint64_t filtered=0, unknown=0, matched=0, omitted=0, lastOrder=0;
+    std::vector<Snapshot> selected;
+    void operator()(std::uint32_t, const Snapshot&) noexcept {}
+    void operator()(std::uint64_t, const ImportResourceReceipt&) noexcept {}
+    void operator()(std::uint32_t, const TargetSnapshotProbeResult& value) noexcept {
+        require(value.replayOrder>lastOrder,"probe replay order regressed");lastOrder=value.replayOrder;
+        if(value.outcome==TargetProbeOutcome::ExactMatch) {
+            require(value.snapshot,"exact match omitted owned replay snapshot");++matched;selected.push_back(*value.snapshot);
+        } else {
+            require(!value.snapshot,"nonmatch constructed a full snapshot");
+            if(value.outcome==TargetProbeOutcome::Filtered)++filtered;
+            else if(value.outcome==TargetProbeOutcome::QuotaOmitted)++omitted;
+            else ++unknown;
+        }
+    }
+};
+void targetSnapshotSelection() {
+    Fixture f;f.create();const auto target=f.receipt();
+    const auto layout=h<VkDescriptorSetLayout>(101);const auto pipeline=h<VkPipelineLayout>(102);const auto pool=h<VkDescriptorPool>(103);
+    const auto set=h<VkDescriptorSet>(104);const auto command=h<VkCommandBuffer>(105);const auto commandPool=h<VkCommandPool>(106);
+    const auto unrelatedImage=h<VkImage>(107);const auto unrelatedView=h<VkImageView>(108);const auto unrelatedMemory=h<VkDeviceMemory>(109);
+    auto unrelatedCreate=f.imageInfo;unrelatedCreate.pNext=nullptr;
+    f.journal->createImage(f.device,unrelatedImage,unrelatedCreate);
+    auto allocation=f.memoryInfo;allocation.pNext=nullptr;
+    f.journal->allocateMemory(f.device,unrelatedMemory,allocation);
+    f.journal->bindImageMemory(f.device,unrelatedImage,unrelatedMemory,0);
+    auto unrelatedViewInfo=f.viewInfo;unrelatedViewInfo.image=unrelatedImage;
+    f.journal->createView(f.device,unrelatedView,unrelatedViewInfo);
+    VkDescriptorSetLayoutBinding binding{9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+    auto sli=info<VkDescriptorSetLayoutCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+    sli.bindingCount=1;sli.pBindings=&binding;f.journal->createSetLayout(f.device,layout,sli);
+    auto pli=info<VkPipelineLayoutCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+    pli.setLayoutCount=1;pli.pSetLayouts=&layout;f.journal->createPipelineLayout(f.device,pipeline,pli);
+    auto pci=info<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);pci.maxSets=1;
+    f.journal->createPool(f.device,pool,pci);
+    auto sai=info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+    sai.descriptorPool=pool;sai.descriptorSetCount=1;sai.pSetLayouts=&layout;f.journal->allocateSets(f.device,sai,&set);
+    f.journal->allocateCommands(f.device,commandPool,1,&command);f.journal->beginCommand(f.device,command);
+    f.journal->bindSets(f.device,command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline,0,1,&set,0,nullptr);
+    const auto writeView=[&](VkImageView value) {
+        VkDescriptorImageInfo di{VK_NULL_HANDLE,value,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        auto write=info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+        write.dstSet=set;write.dstBinding=9;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        write.pImageInfo=&di;f.journal->updateSets(f.device,1,&write,0,nullptr);
+    };
+    const auto probe=[&](std::uint64_t tag,std::uint64_t cookie) {
+        monitorHookAllocations=true;
+        const auto published=f.journal->requestTargetSnapshotProbe(f.device,command,pipeline,tag,cookie,7);
+        monitorHookAllocations=false;require(published,"target probe publication failed");
+    };
+    ProbeCollector collector;writeView(unrelatedView);
+    for(unsigned batch=0;batch<64;++batch) {
+        for(unsigned i=0;i<64;++i)probe(f.tag,f.cookie);
+        while(f.journal->drain(collector)){}
+    }
+    require(collector.filtered==4096 && !collector.matched && !collector.unknown && !collector.omitted,
+            "unrelated UI exhausted target snapshot slots or masqueraded as unknown/loss");
+    // Both matches resolve from their own exact ordered state, even though the
+    // later descriptor update is already published before replay begins.
+    writeView(f.view);probe(f.tag,f.cookie);writeView(unrelatedView);probe(f.tag,f.cookie);
+    writeView(f.view);probe(f.tag,f.cookie);probe(f.tag+1,f.cookie);probe(f.tag,f.cookie+1);
+    while(f.journal->drain(collector)){}
+    require(collector.matched==2 && collector.filtered==4097 && collector.unknown==2,"ordered target selection lost identity gates");
+    require(collector.selected[0].setRevision<collector.selected[1].setRevision,
+            "later descriptor revision replaced earlier draw state");
+    for(const auto& selected:collector.selected) {
+        require(selected.sourceComplete && !selected.gpuConsumedCoherent,"target selection promoted GPU proof");
+        const auto& selectedBinding=selected.bindings[5];
+        require(same(selectedBinding.image.identity,target.image.identity) && same(selectedBinding.view.identity,target.view.identity) &&
+                same(selectedBinding.image.allocation.identity,target.memory.identity),"selected snapshot lost exact imported generations");
+    }
+    for(unsigned i=0;i<40;++i)probe(f.tag,f.cookie);
+    while(f.journal->drain(collector)){}
+    require(collector.matched==32 && collector.omitted==10,"target snapshot output quota exceeded 32");
+    f.journal->destroyView(f.device,f.view);f.journal->destroyImage(f.device,f.image);
+    require(f.journal->createImageTagged(f.device,f.image,f.imageInfo,f.tag+5),"recreated image failed");
+    f.journal->bindImageMemory(f.device,f.image,f.memory,0);
+    require(f.journal->createViewTagged(f.device,f.view,f.viewInfo,f.tag+5),"recreated view failed");
+    writeView(f.view);probe(f.tag,f.cookie);while(f.journal->drain(collector)){}
+    require(collector.unknown==3,"recycled handles revived selected import generations");
+    f.journal->reportUnsupported(f.device);probe(f.tag,f.cookie);while(f.journal->drain(collector)){}
+    require(collector.unknown==4 && f.journal->lostState()>0,"unsupported lifecycle loss was hidden as ordinary filter/quota");
+    require(!hookAllocations.load(),"target probe callback allocated on hook thread");
+    f.journal->close();require(f.journal->finished(),"filtered probes left a blocking queue head");
+}
 void backgroundOwnerValidation() {
     Fixture f; f.create();
     const auto receipt = f.receipt();
@@ -366,21 +452,30 @@ void backgroundOwnerValidation() {
     std::thread producer([&] { JournalTestAccess::delayedSnapshot(*f.journal, entered, release); });
     while (!entered.load(std::memory_order_acquire)) std::this_thread::yield();
     require(!f.journal->validateImportResourceReceipt(receipt), "active unpublished predecessor ignored");
+    const auto active=f.journal->validateImportResourceReceiptDetailed(receipt);
+    require(!active.valid && active.transient && active.before_observed && !active.after_observed && !active.core_checked && active.reason==ImportReceiptValidationReason::ActivePublication,
+            "active publication was classified permanent");
     release.store(true, std::memory_order_release); producer.join();
     require(!f.journal->validateImportResourceReceipt(receipt), "unreplayed lifecycle ticket ignored");
+    const auto pending=f.journal->validateImportResourceReceiptDetailed(receipt);
+    require(!pending.valid && pending.transient && pending.before_observed && !pending.after_observed && !pending.core_checked && pending.reason==ImportReceiptValidationReason::PendingReplay,
+            "pending replay was classified permanent");
     Collector collector; while (f.journal->drain(collector)) {}
     require(f.journal->validateImportResourceReceipt(receipt), "unchanged resources refused after replay");
     f.journal->destroyImage(f.device, f.image);
     require(!f.journal->validateImportResourceReceipt(receipt), "queued image retirement ignored");
     while (f.journal->drain(collector)) {}
     require(!f.journal->validateImportResourceReceipt(receipt), "retired resource accepted by owner API");
+    const auto stale=f.journal->validateImportResourceReceiptDetailed(receipt);
+    require(!stale.valid && !stale.transient && stale.before_observed && stale.after_observed && stale.core_checked && stale.reason==ImportReceiptValidationReason::CoreGenerationMismatch,
+            "retired generation was classified retryable");
     Fixture closed; closed.create(); const auto closed_receipt = closed.receipt(); closed.journal->close();
     require(!closed.journal->validateImportResourceReceipt(closed_receipt), "closed observation range accepted");
 }
 }
 int main() {
     orderedOwnedSuccess(); unmatchedAndMissing(); retireReuseAndDeviceIsolation();
-    unsupportedAndLoss(); duplicateCapacityAndMissingConsumer(); orderedInterleavedScopes(); backgroundOwnerValidation();
+    unsupportedAndLoss(); duplicateCapacityAndMissingConsumer(); orderedInterleavedScopes(); backgroundOwnerValidation(); targetSnapshotSelection();
     std::cout << checks << " import resource receipt checks passed; " << sizeof(Journal)
               << " bytes fixed state; no hook allocations; offline lifecycle proof only\n";
 }

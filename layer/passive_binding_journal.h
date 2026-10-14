@@ -255,6 +255,7 @@ public:
     // This remains CPU lifecycle evidence, never GPU completion or a lifetime pin.
     ImportReceiptValidation validateImportResourceReceiptDetailed(const ImportResourceReceipt& receipt) noexcept {
         ImportReceiptValidation out;
+        out.before_observed = true;
         out.tickets_before = tickets_.load(std::memory_order_acquire);
         out.closed_before = closed_.load(std::memory_order_acquire);
         out.halted_before = halted_.load(std::memory_order_acquire);
@@ -269,7 +270,9 @@ public:
         if (out.active_before) return deny(ImportReceiptValidationReason::ActivePublication, true);
         if (!out.empty_before || out.expected_before != out.tickets_before)
             return deny(ImportReceiptValidationReason::PendingReplay, true);
+        out.core_checked = true;
         const auto valid = core_.validate(receipt);
+        out.after_observed = true;
         out.active_after = active_.load(std::memory_order_acquire);
         out.empty_after = empty(); out.expected_after = expected_;
         out.tickets_after = tickets_.load(std::memory_order_acquire);

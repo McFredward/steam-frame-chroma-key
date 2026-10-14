@@ -217,7 +217,7 @@ enum class ImportReceiptValidationReason : std::uint8_t {
     PublicationChanged, CoreGenerationMismatch
 };
 struct ImportReceiptValidation {
-    bool valid = false, transient = false;
+    bool valid = false, transient = false, before_observed = false, after_observed = false, core_checked = false;
     ImportReceiptValidationReason reason = ImportReceiptValidationReason::CoreGenerationMismatch;
     std::uint64_t active_before = 0, active_after = 0;
     std::uint64_t expected_before = 0, expected_after = 0, tickets_before = 0, tickets_after = 0;
