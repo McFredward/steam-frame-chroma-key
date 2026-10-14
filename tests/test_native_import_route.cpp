@@ -111,6 +111,44 @@ int main() {
         auto truncated=f.stack(); truncated.size=1233; require(!decode(stage,e,truncated,kBias,expected()).valid());
         e.x[29]+=16; require(!decode(stage,e,f.stack(),kBias,expected()).valid());
     }
+    // The source-pinned Facet implementation has a separate allocator frame;
+    // its layout and scalar location cannot be inferred from the old route.
+    for (auto stage : {Boundary::Image, Boundary::Bind, Boundary::View}) {
+        std::array<std::uint8_t,1856> bytes{};
+        const auto put = [&](std::size_t at, auto value) { std::memcpy(bytes.data()+at,&value,sizeof(value)); };
+        const auto link = [&](std::size_t at, std::size_t parent, std::uintptr_t lr) {
+            put(at,std::uint64_t{kBase+parent}); put(at+8,std::uint64_t{kBias+lr});
+        };
+        link(0,688,0x2ab100); link(688,1056,0x70bc8);
+        link(1056,1216,0x13bbdc); link(1216,1312,0x13beb0); link(1312,1536,0x154194);
+        put(744,std::uint64_t{0x12345678fedcba98}); put(1328,std::uint64_t{kPipe}); put(1644,kSequence);
+        // The allocator's own saved x24 is not the client's identifier.
+        put(56,std::uint64_t{37});
+        const Expected ex{kBase+1536,kPipe,kSequence};
+        Entry e{}; e.sp=e.x[29]=kBase;
+        constexpr std::uintptr_t pcs[]{0x3076a0,0x307874,0x30735c};
+        e.x[30]=kBias+pcs[static_cast<unsigned>(stage)-2];
+        const StackBytes stack{bytes.data(),kBase,bytes.size()};
+        const auto run=[&] {return decode(stage,e,stack,kBias,ex);};
+        auto r=run();require(r.valid() && r.creation_route==CreationRoute::Facet && r.client_available && r.client==0xfedcba98);
+        require(r.invocation.dispatch_frame==ex.dispatch_frame && r.invocation.pipe==ex.pipe && r.invocation.sequence==ex.sequence);
+        require(creation_route(stage,e,kBias)==CreationRoute::Facet && creation_dispatch_offset(CreationRoute::Facet)==1536);
+        for (std::size_t at : {0U,688U,1056U,1216U,1312U}) {
+            for (std::size_t field : {0U,8U}) {
+                std::uint64_t saved=0;std::memcpy(&saved,bytes.data()+at+field,8);
+                put(at+field,saved+16);require(!run().valid());put(at+field,saved);
+            }
+        }
+        put(1064,std::uint64_t{kBias+0x13bc8c});require(run().valid());
+        auto wrong=ex;wrong.sequence=0;require(!decode(stage,e,stack,kBias,wrong).valid());
+        wrong=ex;wrong.pipe+=16;require(!decode(stage,e,stack,kBias,wrong).valid());
+        wrong=ex;wrong.dispatch_frame+=16;require(!decode(stage,e,stack,kBias,wrong).valid());
+        auto truncated=stack;truncated.size=1647;require(!decode(stage,e,truncated,kBias,ex).valid());
+        auto oversized=stack;oversized.size=1857;require(!decode(stage,e,oversized,kBias,ex).valid());
+        e.x[29]+=96;require(creation_route(stage,e,kBias)==CreationRoute::None && !run().valid());
+        e.x[29]=e.sp;e.x[30]+=4;require(!run().valid());
+        e.x[30]=entry(stage).x[30];e.x[29]=e.sp+96;require(!run().valid());
+    }
     for (auto stage : {Boundary::SendLock, Boundary::Write, Boundary::Finish}) {
         Fixture f; auto e=sender(f,stage);
         auto out=decode(stage,e,f.stack(),kBias,expected());

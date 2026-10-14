@@ -8,7 +8,7 @@
 // for actual reads (including copies whose ownership postcheck fails).
 namespace frame_compositor_sparse {
 using Read = bool (*)(std::uintptr_t, void*, std::size_t, void*) noexcept;
-constexpr std::size_t kScratchBytes = 1344;
+constexpr std::size_t kScratchBytes = 1648;
 enum class Refusal { None, Boundary, Entry, Reader, Decode };
 struct Result {
     frame_import_native::Scalars scalars{};
@@ -19,7 +19,8 @@ struct Result {
     Refusal refusal = Refusal::Entry;
     bool valid() const noexcept { return refusal == Refusal::None; }
 };
-std::size_t scalar_budget(frame_import_native::Boundary) noexcept;
+std::size_t scalar_budget(frame_import_native::Boundary,
+                         frame_import_native::CreationRoute = frame_import_native::CreationRoute::Vulkan) noexcept;
 Result decode(frame_import_native::Boundary, const frame_import_native::Entry&,
               std::uintptr_t compositor_bias, const frame_import_native::Expected&,
               Read, void*) noexcept;

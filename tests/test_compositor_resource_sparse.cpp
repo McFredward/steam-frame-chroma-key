@@ -18,7 +18,11 @@ void check(bool ok) {
 constexpr std::uintptr_t base=0x100000,bias=0x500000,pipe=0x700000,dispatch=base+1232;
 constexpr std::uint32_t sequence=0xffffffff;
 struct Fixture {
-    std::array<std::uint8_t,1552> bytes{};
+    std::array<std::uint8_t,1856> bytes{};
+    CreationRoute selected=CreationRoute::Vulkan;
+    std::uintptr_t dispatch=::dispatch;
+    explicit Fixture(CreationRoute route=CreationRoute::Vulkan):selected(route),
+        dispatch(base+creation_dispatch_offset(route)){}
     unsigned reads=0,fail_at=0;
     std::size_t requested=0,confirmed=0;
     template<class T> void put(std::uintptr_t at,T value) {
@@ -38,10 +42,20 @@ struct Fixture {
             e.sp=e.x[29]=dispatch;e.x[0]=e.x[19]=pipe;e.x[25]=1;
             put(dispatch+128,std::uint64_t{pipe});
         } else if(boundary==Boundary::Image || boundary==Boundary::Bind || boundary==Boundary::View) {
-            e.sp=base;e.x[29]=base+96;
-            link(base+96,base+752,0x70bc8);link(base+752,base+912,0x13bbdc);
-            link(base+912,base+1008,0x13beb0);link(base+1008,dispatch,0x154194);
-            put(base+152,std::uint32_t{0});put(base+1024,std::uint64_t{pipe});
+            e.sp=base;
+            if(selected==CreationRoute::Facet) {
+                constexpr std::uintptr_t pcs[]{0x3076a0,0x307874,0x30735c};
+                e.x[30]=bias+pcs[static_cast<unsigned>(boundary)-2];e.x[29]=base;
+                link(base,base+688,0x2ab100);link(base+688,base+1056,0x70bc8);
+                link(base+1056,base+1216,0x13bbdc);link(base+1216,base+1312,0x13beb0);
+                link(base+1312,dispatch,0x154194);
+                put(base+744,std::uint32_t{0});put(base+1328,std::uint64_t{pipe});
+            } else {
+                e.x[29]=base+96;
+                link(base+96,base+752,0x70bc8);link(base+752,base+912,0x13bbdc);
+                link(base+912,base+1008,0x13beb0);link(base+1008,dispatch,0x154194);
+                put(base+152,std::uint32_t{0});put(base+1024,std::uint64_t{pipe});
+            }
         } else {
             const auto send=dispatch-80;e.sp=e.x[29]=send;
             link(send,dispatch,0x1542b0);put(send+64,std::uint64_t{pipe});
@@ -67,14 +81,14 @@ struct Fixture {
         return frame_compositor_sparse::decode(b,e,bias,ex,reader,this);
     }
     Scalars full(Boundary b,const Entry& e,const Expected& ex) {
-        return frame_import_native::decode(b,e,{bytes.data(),base,bytes.size()},bias,ex);
+        return frame_import_native::decode(b,e,{bytes.data(),base,selected==CreationRoute::Facet?bytes.size():1552},bias,ex);
     }
 };
 void equivalent(const Scalars& a,const Scalars& b) {
     check(a.refusal==b.refusal);
     check(a.invocation.dispatch_frame==b.invocation.dispatch_frame &&
           a.invocation.pipe==b.invocation.pipe && a.invocation.sequence==b.invocation.sequence);
-    check(a.client==b.client && a.client_available==b.client_available &&
+    check(a.creation_route==b.creation_route && a.client==b.client && a.client_available==b.client_available &&
           a.native_payload_read==b.native_payload_read && a.native_send_success==b.native_send_success);
     check(a.packet_base==b.packet_base && a.packet_offset==b.packet_offset &&
           a.remaining==b.remaining && a.fd==b.fd);
@@ -82,6 +96,29 @@ void equivalent(const Scalars& a,const Scalars& b) {
 }
 
 int main() {
+    for (auto b : {Boundary::Image,Boundary::Bind,Boundary::View}) {
+        Fixture f(CreationRoute::Facet);const auto e=f.entry(b);const auto ex=f.expected();
+        const auto good=f.sparse(b,e,ex);check(good.valid());equivalent(good.scalars,f.full(b,e,ex));
+        check(good.bytes_requested==96 && good.bytes_confirmed==96 && f.reads==8);
+        check(frame_compositor_sparse::scalar_budget(b,CreationRoute::Facet)==96);
+        const auto calls=f.reads;
+        for (unsigned fail=1;fail<=calls;++fail) {
+            f.reset();f.fail_at=fail;const auto bad=f.sparse(b,e,ex);
+            check(!bad.valid() && bad.refusal==frame_compositor_sparse::Refusal::Reader);
+            check(f.reads==fail && bad.bytes_requested==f.requested && bad.bytes_confirmed==f.confirmed);
+            check(bad.bytes_requested<=96 && bad.bytes_confirmed<bad.bytes_requested);
+        }
+        // All copied dependencies and all unreferenced holes are checked.
+        for (std::size_t at=0;at<f.bytes.size();++at) {
+            f.bytes[at]^=0xff;f.reset();const auto s=f.sparse(b,e,ex);
+            equivalent(s.scalars,f.full(b,e,ex));check(s.bytes_requested==96);
+            f.bytes[at]^=0xff;
+        }
+        for (auto reg : {29U,30U}) {auto bad=e;bad.x[reg]+=4;f.reset();check(!f.sparse(b,bad,ex).valid() && !f.reads);}
+        auto old=e;old.x[29]+=96;old.x[30]=bias+(b==Boundary::Image?0x2c75ac:b==Boundary::Bind?0x2c7684:0x2c7804);
+        f.reset();check(!f.sparse(b,old,ex).valid());
+        check(frame_compositor_sparse::scalar_budget(b,CreationRoute::None)==0);
+    }
     for(unsigned index=0;index<8;++index) {
         const auto b=static_cast<Boundary>(index);Fixture f;auto e=f.entry(b);const auto ex=f.expected();
         const auto good=f.sparse(b,e,ex);check(good.valid());equivalent(good.scalars,f.full(b,e,ex));

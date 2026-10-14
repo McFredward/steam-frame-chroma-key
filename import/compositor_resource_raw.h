@@ -22,7 +22,10 @@ using BindResult = frame_compositor_attempt::BindResult;
 using ViewResult = frame_compositor_attempt::ViewResult;
 constexpr std::size_t kReplyBytes = 21;
 constexpr unsigned kMaxWrites = 8;
-constexpr std::size_t kMaxScalarBytes = 12 + 12 + 3 * 80 + 28 + kMaxWrites * 44 + 28;
+// Facet has one additional authenticated caller frame at each creation call.
+// This is an offline budget expansion, not authorization to deploy a package
+// previously reviewed under the older 709-byte total private-read ceiling.
+constexpr std::size_t kMaxScalarBytes = 12 + 12 + 3 * 96 + 28 + kMaxWrites * 44 + 28;
 constexpr std::size_t kMaxWireBytes = kReplyBytes;
 
 enum Reason : std::uint64_t {
@@ -70,6 +73,7 @@ struct Event {
 };
 struct RawRecord {
     frame_import_native::Expected invocation{};
+    frame_import_native::CreationRoute creation_route = frame_import_native::CreationRoute::None;
     std::uint32_t client = 0;
     bool client_available = false;
     std::uintptr_t packet_base = 0;

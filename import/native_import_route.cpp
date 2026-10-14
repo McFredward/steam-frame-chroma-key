@@ -58,15 +58,40 @@ bool matches(Scalars& result, const Expected& expected) noexcept {
 }
 }
 
+CreationRoute creation_route(Boundary boundary, const Entry& entry,
+                             std::uintptr_t bias) noexcept {
+    const auto index = static_cast<unsigned>(boundary);
+    if (index < 2 || index > 4 || !address(entry.sp) || !address(entry.x[29]))
+        return CreationRoute::None;
+    std::uintptr_t fp = 0;
+    if (pc(entry.x[30], bias, kSites[index]) && add(entry.sp, 96, fp) && entry.x[29] == fp)
+        return CreationRoute::Vulkan;
+    constexpr std::uint64_t facet[] = {0x3076a0, 0x307874, 0x30735c};
+    if (pc(entry.x[30], bias, facet[index - 2]) && entry.x[29] == entry.sp)
+        return CreationRoute::Facet;
+    return CreationRoute::None;
+}
+std::size_t creation_dispatch_offset(CreationRoute route) noexcept {
+    switch (route) {
+    case CreationRoute::Vulkan: return 1232;
+    case CreationRoute::Facet: return 1536;
+    default: return 0;
+    }
+}
+
 Scalars decode(Boundary boundary, const Entry& entry, const StackBytes& stack,
                std::uintptr_t bias, const Expected& expected) noexcept {
     Scalars out{};
     const auto index = static_cast<unsigned>(boundary);
-    if (index >= sizeof(kSites)/sizeof(kSites[0]) || !pc(entry.x[30], bias, kSites[index])) {
+    const bool creation = boundary == Boundary::Image || boundary == Boundary::Bind || boundary == Boundary::View;
+    const auto selected = creation_route(boundary, entry, bias);
+    if (index >= sizeof(kSites)/sizeof(kSites[0]) ||
+        (creation ? selected == CreationRoute::None : !pc(entry.x[30], bias, kSites[index]))) {
         out.refusal = Refusal::UnknownSite; return out;
     }
     const auto fp = static_cast<std::uintptr_t>(entry.x[29]);
-    if (!address(fp) || !address(entry.sp) || stack.size > 1552 || !address(stack.base)) return out;
+    const std::size_t stack_limit = selected == CreationRoute::Facet ? 1856 : 1552;
+    if (!address(fp) || !address(entry.sp) || stack.size > stack_limit || !address(stack.base)) return out;
     if (boundary == Boundary::AcceptedInit) {
         std::uintptr_t parent = 0, attribute = 0;
         if (fp != entry.sp || !add(fp, 32, parent) ||
@@ -98,24 +123,39 @@ Scalars decode(Boundary boundary, const Entry& entry, const StackBytes& stack,
         if (boundary == Boundary::EarlyUnlock)
             out.native_payload_read = (entry.x[25] & 255) != 0;
         if (boundary == Boundary::EarlyUnlock && !matches(out, expected)) return out;
-    } else if (boundary == Boundary::Image || boundary == Boundary::Bind || boundary == Boundary::View) {
+    } else if (creation) {
         std::uintptr_t entry_fp = 0, wrapper = 0, helper = 0, method = 0, dispatch = 0;
-        if (!add(entry.sp, 96, entry_fp) || entry_fp != fp ||
-            !add(fp, 656, wrapper) || !add(fp, 816, helper) ||
-            !add(fp, 912, method) || !add(fp, 1136, dispatch)) return out;
-        if (!link(stack, fp, wrapper, bias, 0x70bc8, out.refusal) ||
-            !link(stack, wrapper, helper, bias, 0x13bbdc, out.refusal, 0x13bc8c) ||
+        std::uintptr_t client_at = 0, pipe_at = 0;
+        if (selected == CreationRoute::Vulkan) {
+            if (!add(entry.sp, 96, entry_fp) || entry_fp != fp ||
+                !add(fp, 656, wrapper) || !add(fp, 816, helper) ||
+                !add(fp, 912, method) || !add(fp, 1136, dispatch) ||
+                !add(fp, 56, client_at)) return out;
+            if (!link(stack, fp, wrapper, bias, 0x70bc8, out.refusal)) return out;
+        } else {
+            // Facet's allocator adds a fifth native frame. Its saved caller
+            // x24 may be renderer scratch state, so the client comes from the
+            // renderer's saved caller x24. Authenticate both frames first.
+            std::uintptr_t renderer = 0;
+            if (entry.sp != fp || !add(fp, 688, renderer) ||
+                !add(fp, 1056, wrapper) || !add(fp, 1216, helper) ||
+                !add(fp, 1312, method) || !add(fp, 1536, dispatch) ||
+                !add(renderer, 56, client_at)) return out;
+            if (!link(stack, fp, renderer, bias, 0x2ab100, out.refusal) ||
+                !link(stack, renderer, wrapper, bias, 0x70bc8, out.refusal)) return out;
+        }
+        if (!link(stack, wrapper, helper, bias, 0x13bbdc, out.refusal, 0x13bc8c) ||
             !link(stack, helper, method, bias, 0x13beb0, out.refusal) ||
             !link(stack, method, dispatch, bias, 0x154194, out.refusal)) return out;
         out.invocation.dispatch_frame = dispatch;
-        std::uintptr_t client_at = 0, pipe_at = 0;
         // Method saves the dispatch caller's x19, which is still the pipe.
-        if (!add(fp, 56, client_at) || !slot(stack, client_at, out.client) ||
+        if (!slot(stack, client_at, out.client) ||
             !add(method, 16, pipe_at) || !slot(stack, pipe_at, out.invocation.pipe)) {
             out.refusal = Refusal::OutsideWindow; return out;
         }
         out.client_available = true;
         if (!sequence(stack, out) || !matches(out, expected)) return out;
+        out.creation_route = selected;
     } else {
         std::uintptr_t send = fp, dispatch = 0;
         if (boundary == Boundary::Write) {

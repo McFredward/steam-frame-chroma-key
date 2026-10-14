@@ -21,6 +21,12 @@ static_assert(offsetof(Entry, sp) == 248, "AArch64 SP slot changed");
 enum class Boundary {
     Begin, EarlyUnlock, Image, Bind, View, SendLock, Write, Finish, AcceptedInit
 };
+enum class CreationRoute : unsigned { None, Vulkan, Facet };
+// Zero-read classification of the exact public entry shape only. A non-None
+// result still requires every source-specific caller link and scalar below;
+// neither the return PC nor this label proves a complete import invocation.
+CreationRoute creation_route(Boundary, const Entry&, std::uintptr_t load_bias) noexcept;
+std::size_t creation_dispatch_offset(CreationRoute) noexcept;
 enum class Refusal {
     None, UnknownSite, InvalidEntry, OutsideWindow, FrameLink,
     ParentReturn, ChangedInvocation, Arguments, ResponseShape
@@ -41,6 +47,7 @@ struct Expected {
 };
 struct Scalars {
     Expected invocation{};
+    CreationRoute creation_route = CreationRoute::None;
     std::uint32_t client = 0;
     bool client_available = false;
     bool native_payload_read = false;

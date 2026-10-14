@@ -125,10 +125,12 @@ void attach(bool bindings=true) {
         check(rt::bridge({audit::Stage::Bind,provider(f),false,{}}).ready);
 }
 struct Fixture {
-    alignas(16)std::array<std::uint8_t,1552> bytes{};
+    alignas(16)std::array<std::uint8_t,1856> bytes{};
     std::uintptr_t base=reinterpret_cast<std::uintptr_t>(bytes.data()),dispatch=base+1232,pipe=0x700000;
+    frame_import_native::CreationRoute selected=frame_import_native::CreationRoute::Vulkan;
     std::array<std::uint8_t,21> packet{};
-    Fixture() {
+    explicit Fixture(frame_import_native::CreationRoute route=frame_import_native::CreationRoute::Vulkan):
+        dispatch(base+frame_import_native::creation_dispatch_offset(route)),selected(route) {
         put(dispatch+108,sequence);link(dispatch,dispatch+320,0x24fee0);
         for(unsigned b=0;b<4;++b){packet[b]=0x235U>>(b*8);packet[b+4]=sequence>>(b*8);packet[b+8]=9U>>(b*8);}
         packet[12]=9;for(unsigned b=0;b<8;++b)packet[b+13]=token>>(b*8);
@@ -143,10 +145,21 @@ struct Fixture {
         if(b==Boundary::Begin || b==Boundary::EarlyUnlock) {
             e.sp=e.x[29]=dispatch;e.x[0]=e.x[19]=pipe;e.x[25]=1;put(dispatch+128,std::uint64_t{pipe});
         }else if(b==Boundary::Image || b==Boundary::Bind || b==Boundary::View) {
-            e.sp=base;e.x[29]=base+96;e.x[0]=native_device;
-            link(base+96,base+752,0x70bc8);link(base+752,base+912,0x13bbdc);
-            link(base+912,base+1008,0x13beb0);link(base+1008,dispatch,0x154194);
-            put(base+152,std::uint32_t{0});put(base+1024,std::uint64_t{pipe});
+            e.sp=base;e.x[0]=native_device;
+            if(selected==frame_import_native::CreationRoute::Facet) {
+                constexpr std::uintptr_t pcs[]{0x3076a0,0x307874,0x30735c};
+                e.x[30]=bias+pcs[static_cast<unsigned>(b)-2];e.x[29]=base;
+                link(base,base+688,0x2ab100);link(base+688,base+1056,0x70bc8);
+                link(base+1056,base+1216,0x13bbdc);link(base+1216,base+1312,0x13beb0);
+                link(base+1312,dispatch,0x154194);
+                put(base+744,std::uint32_t{0});put(base+1328,std::uint64_t{pipe});
+                put(base+56,std::uint32_t{37});
+            } else {
+                e.x[29]=base+96;
+                link(base+96,base+752,0x70bc8);link(base+752,base+912,0x13bbdc);
+                link(base+912,base+1008,0x13beb0);link(base+1008,dispatch,0x154194);
+                put(base+152,std::uint32_t{0});put(base+1024,std::uint64_t{pipe});
+            }
             if(b==Boundary::Bind){e.x[1]=10;e.x[2]=20;e.x[3]=16;}
         }else {
             const auto send=dispatch-80;e.sp=e.x[29]=send;
@@ -199,15 +212,17 @@ unsigned drain(rt::Kind desired,rt::Record* result=nullptr) {
     while(rt::pop(r)){check(r.ordinal==ordinal++);if(r.kind==desired){++found;if(result)*result=r;}}
     check(!rt::pop(r));return found;
 }
-void success(unsigned chunk) {
-    attach();Fixture f;f.through(Boundary::SendLock);
+void success(unsigned chunk,frame_import_native::CreationRoute route=frame_import_native::CreationRoute::Vulkan) {
+    attach();Fixture f(route);f.through(Boundary::SendLock);
     unsigned writes=0;for(unsigned at=0;at<21;){const auto n=std::min(chunk,21-at);f.libc_pair(Boundary::Write,at,n);at+=n;++writes;}
     f.libc_pair(Boundary::Finish);const auto s=rt::status();
-    check(s.attached && !s.retired && s.started && s.terminal && s.parent_bytes==16 && s.scalar_bytes==320+44*writes && s.wire_bytes==21);
-    check(s.parent_bytes+s.scalar_bytes+s.wire_bytes<=709 && fixture_stubs::attributes_calls==1);
+    const auto fixed=route==frame_import_native::CreationRoute::Facet?368U:320U;
+    check(s.attached && !s.retired && s.started && s.terminal && s.parent_bytes==16 && s.scalar_bytes==fixed+44*writes && s.wire_bytes==21);
+    check(s.parent_bytes+s.scalar_bytes+s.wire_bytes<=(route==frame_import_native::CreationRoute::Facet?757U:709U) && fixture_stubs::attributes_calls==1);
     check(fixture_stubs::journal_requests==1 && fixture_stubs::requested_tag==rt::kTag && fixture_stubs::requested_cookie==rt::kCookie);
     check(fixture_stubs::requested_device==device && fixture_stubs::requested_image==(VkImage)(std::uintptr_t)10 && fixture_stubs::requested_view==(VkImageView)(std::uintptr_t)30);
     rt::Record r;check(drain(rt::Kind::RawMatched,&r)==1);no_proof(r.raw);
+    check(r.raw.creation_route==route);
     const auto finish=f.entry(Boundary::Finish);
     check(r.entry.sp==finish.sp && r.entry.x==finish.x);
     check(r.raw.last_boundary==Boundary::Finish && r.raw.last_phase==raw::Phase::After &&
@@ -215,6 +230,15 @@ void success(unsigned chunk) {
     check(r.raw.reply_token==token && r.raw.reply==f.packet && r.raw.writes==writes && r.raw.image.device==device && r.raw.image.native_device==native_device);
     const auto before=rt::status();f.libc_pair(Boundary::Begin);check(rt::status().queued==before.queued);
     rt::finalize();check(rt::status().retired && rt::quiescent() && !frame_compositor_raw_ready.load());
+}
+void mixed_renderer() {
+    attach();Fixture f(frame_import_native::CreationRoute::Facet);f.through(Boundary::Image);
+    auto n=f.vnote(Boundary::Bind,frame_import_vulkan::Phase::Before);
+    n.entry.sp=f.dispatch-1232;n.entry.x[29]=n.entry.sp+96;n.entry.x[30]=bias+0x2c7684;
+    const auto before=rt::status();check(rt::vulkan_notification(n,&rt::runtime)==0);
+    const auto after=rt::status();check(after.retired && after.scalar_bytes==before.scalar_bytes &&
+        before.scalar_bytes==120 && !fixture_stubs::journal_requests);
+    rt::Record r;check(drain(rt::Kind::RawRefused,&r)==1 && r.raw.reason==raw::InvalidEntry);
 }
 void inert_production() {
     frame_compositor_main::Profiles p{};errno=ERANGE;const auto prepared=frame_compositor_main::prepare(p);
@@ -364,7 +388,7 @@ int main(int argc,char** argv) {
     check(reinterpret_cast<std::uintptr_t>(&::pthread_attr_destroy)==mapped_libc+0x81420);
     std::printf("Actual retained ARM libc pthread helpers: %s\n",provider.dli_fname);
 #endif
-    constexpr std::array<void(*)(),27> cases{
+    constexpr std::array<void(*)(),30> cases{
         inert_production,forwarding_only,+[]{success(21);},+[]{success(3);},
         native_failure,incomplete_finalization,parent_mismatch,+[]{ownership_postcheck(0);},
         +[]{ownership_postcheck(1);},queue_budget,foreign_begin,
@@ -372,7 +396,9 @@ int main(int argc,char** argv) {
         +[]{mutated_binding(0);},+[]{mutated_binding(1);},+[]{mutated_binding(2);},
         missing_binding,request_failure,+[]{invalid_vulkan(0);},+[]{invalid_vulkan(1);},
         +[]{invalid_vulkan(2);},attaching_not_published,foreign_after_during_parent_copy,main_thread_rejected,
-        +[]{refusal_entry_evidence(false);},+[]{refusal_entry_evidence(true);}};
+        +[]{refusal_entry_evidence(false);},+[]{refusal_entry_evidence(true);},
+        +[]{success(21,frame_import_native::CreationRoute::Facet);},
+        +[]{success(3,frame_import_native::CreationRoute::Facet);},mixed_renderer};
     unsigned passed=0;
     if(argc==2) {char* end=nullptr;const auto n=std::strtoul(argv[1],&end,10);check(end && !*end && n<cases.size());run(cases[n],passed);}
     else {check(argc==1);for(unsigned n=0;n<cases.size();++n){std::printf("runtime case %u\n",n);std::fflush(stdout);run(cases[n],passed);}}

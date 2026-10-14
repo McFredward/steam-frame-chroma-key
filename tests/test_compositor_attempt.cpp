@@ -281,6 +281,20 @@ int main(int argc, char** argv) {
       check(!f.capture.early_unlock(in,0)); f.capture.abandon(); OwnedAttempt a; check(f.capture.take(a)&&!a.complete()); }
     { Fixture f; f.begin(); f.early(); auto in=f.input(Boundary::Image); in.entry.x[30]+=4;
       check(!f.capture.prepare_vulkan(Boundary::Image,in)); check(f.capture.refusal()==Refusal::NativeRoute); }
+    { Fixture f; f.begin(); f.early(); auto in=f.input(Boundary::Image);
+      std::array<std::uint8_t,1856> facet{};const auto start=base-304;
+      const auto put=[&](std::size_t at,auto value){std::memcpy(facet.data()+at,&value,sizeof(value));};
+      const auto link=[&](std::size_t at,std::size_t parent,std::uintptr_t lr){
+          put(at,std::uint64_t{start+parent});put(at+8,std::uint64_t{bias+lr});};
+      link(0,688,0x2ab100);link(688,1056,0x70bc8);link(1056,1216,0x13bbdc);
+      link(1216,1312,0x13beb0);link(1312,1536,0x154194);
+      put(744,std::uint32_t{0});put(1328,std::uint64_t{pipe});put(1644,sequence);
+      in.stack={facet.data(),start,facet.size()};in.entry.sp=in.entry.x[29]=start;in.entry.x[30]=bias+0x3076a0;
+      const auto decoded=frame_import_native::decode(Boundary::Image,in.entry,in.stack,bias,{dispatch,pipe,sequence});
+      check(decoded.valid() && decoded.creation_route==frame_import_native::CreationRoute::Facet);
+      check(!f.capture.prepare_vulkan(Boundary::Image,in));check(f.capture.refusal()==Refusal::NativeRoute);
+      f.capture.abandon();OwnedAttempt refused;check(f.capture.take(refused) && !refused.complete() &&
+          refused.refusal()==Refusal::NativeRoute); }
     { Fixture f; f.begin(); f.early(); f.registry.close_fd(7);
       check(!f.capture.prepare_vulkan(Boundary::Image,f.input(Boundary::Image)));
       check(f.capture.refusal()==Refusal::Lease); }

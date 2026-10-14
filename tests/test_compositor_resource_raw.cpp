@@ -44,7 +44,9 @@ constexpr Boundary stages[]{Boundary::Begin,Boundary::EarlyUnlock,Boundary::Imag
 struct Fixture {
     Observer observer{};
     Scope scope{};
-    std::array<std::uint8_t,1552> stack{};
+    std::array<std::uint8_t,1856> stack{};
+    frame_import_native::CreationRoute selected=frame_import_native::CreationRoute::Vulkan;
+    std::uintptr_t dispatch=::dispatch;
     std::array<std::uint8_t,21> packet{};
     template<class T> void put(std::uintptr_t at, T value) {
         check(at >= base && at - base <= stack.size() - sizeof(T));
@@ -53,7 +55,8 @@ struct Fixture {
     void link(std::uintptr_t fp, std::uintptr_t parent, std::uint64_t rva) {
         put(fp,std::uint64_t{parent}); put(fp+8,std::uint64_t{bias+rva});
     }
-    Fixture() {
+    explicit Fixture(frame_import_native::CreationRoute route=frame_import_native::CreationRoute::Vulkan):
+        selected(route),dispatch(base+frame_import_native::creation_dispatch_offset(route)) {
         put(dispatch+108,sequence);
         for (unsigned b=0;b<4;++b) {
             packet[b]=0x235U>>(8*b); packet[b+4]=sequence>>(8*b); packet[b+8]=9U>>(8*b);
@@ -69,10 +72,21 @@ struct Fixture {
             e.sp=e.x[29]=dispatch; e.x[0]=e.x[19]=pipe; e.x[25]=1;
             put(dispatch+128,std::uint64_t{pipe});
         } else if (b==Boundary::Image || b==Boundary::Bind || b==Boundary::View) {
-            e.sp=base; e.x[29]=base+96; e.x[0]=native_device;
-            link(base+96,base+752,0x70bc8); link(base+752,base+912,0x13bbdc);
-            link(base+912,base+1008,0x13beb0); link(base+1008,dispatch,0x154194);
-            put(base+152,std::uint64_t{0xdeadbeef00000000}); put(base+1024,std::uint64_t{pipe});
+            e.sp=base;e.x[0]=native_device;
+            if(selected==frame_import_native::CreationRoute::Facet) {
+                constexpr std::uintptr_t pcs[]{0x3076a0,0x307874,0x30735c};
+                e.x[30]=bias+pcs[static_cast<unsigned>(b)-2];e.x[29]=base;
+                link(base,base+688,0x2ab100);link(base+688,base+1056,0x70bc8);
+                link(base+1056,base+1216,0x13bbdc);link(base+1216,base+1312,0x13beb0);
+                link(base+1312,dispatch,0x154194);
+                put(base+744,std::uint64_t{0xdeadbeef00000000});put(base+1328,std::uint64_t{pipe});
+                put(base+56,std::uint64_t{37});
+            } else {
+                e.x[29]=base+96;
+                link(base+96,base+752,0x70bc8); link(base+752,base+912,0x13bbdc);
+                link(base+912,base+1008,0x13beb0); link(base+1008,dispatch,0x154194);
+                put(base+152,std::uint64_t{0xdeadbeef00000000}); put(base+1024,std::uint64_t{pipe});
+            }
             if (b==Boundary::Bind) { e.x[1]=10; e.x[2]=20; e.x[3]=16; }
         } else {
             const auto send=dispatch-80;
@@ -93,13 +107,19 @@ struct Fixture {
         return e;
     }
     Event decoded(Event e, std::size_t count) {
-        e.scalars=frame_import_native::decode(e.boundary,e.entry,{stack.data(),base,stack.size()},bias,scope.expected());
+        const bool creating=e.boundary==Boundary::Image || e.boundary==Boundary::Bind || e.boundary==Boundary::View;
+        const auto at=creating?base:e.entry.sp;
+        const std::size_t extent=creating?(selected==frame_import_native::CreationRoute::Facet?1856:1552):
+            e.boundary==Boundary::Begin || e.boundary==Boundary::EarlyUnlock?136:
+            e.boundary==Boundary::Write?304:e.boundary==Boundary::Finish?224:192;
+        e.scalars=frame_import_native::decode(e.boundary,e.entry,{stack.data()+(at-base),at,extent},bias,scope.expected());
         e.decoded_available=true; e.scalar_bytes_copied=count; return e;
     }
-    static std::size_t budget(Boundary b) {
+    std::size_t budget(Boundary b) const {
         switch(b) {
         case Boundary::Begin:case Boundary::EarlyUnlock:return 12;
-        case Boundary::Image:case Boundary::Bind:case Boundary::View:return 80;
+        case Boundary::Image:case Boundary::Bind:case Boundary::View:
+            return selected==frame_import_native::CreationRoute::Facet?96:80;
         case Boundary::SendLock:case Boundary::Finish:return 28;
         case Boundary::Write:return 44;
         default:return 0;
@@ -162,12 +182,14 @@ void matched(Fixture& f, const Outcome& result) {
     check(result.kind==Kind::Matched && result.record.matched && result.record.terminal && result.record.reason==0);
     check(f.scope.finished() && !f.scope.active());no_proof(result.record);
     const auto& r=result.record;
-    check(r.invocation.dispatch_frame==dispatch && r.invocation.pipe==pipe && r.invocation.sequence==sequence);
+    check(r.invocation.dispatch_frame==f.dispatch && r.invocation.pipe==pipe && r.invocation.sequence==sequence);
+    check(r.creation_route==f.selected);
     check(r.client_available && r.client==0 && r.fd==7 && r.reply_token==token && r.reply==f.packet);
     check(r.begin_lock_succeeded && r.early_unlock_succeeded && r.native_payload_read);
     check(r.image_succeeded && r.bind_succeeded && r.view_succeeded && r.send_lock_succeeded);
     check(r.finish_unlock_succeeded && r.native_send_success && r.reply_complete && r.reply_bytes==21);
-    check(r.scalar_bytes_copied==320+44*r.writes && r.scalar_bytes_copied<=672 && r.wire_bytes_copied==21);
+    const auto fixed=f.selected==frame_import_native::CreationRoute::Facet?368U:320U;
+    check(r.scalar_bytes_copied==fixed+44*r.writes && r.scalar_bytes_copied<=720 && r.wire_bytes_copied==21);
     check(r.image.device==journal_device && r.image.native_device==native_device && journal_device!=native_device);
     check(f.observer.abandon(f.scope).kind==Kind::None && f.observer.observer_loss(f.scope).kind==Kind::None);
     check(f.observer.observe(f.bare(Boundary::Begin),f.scope).kind==Kind::None);
@@ -346,8 +368,9 @@ struct SparseReader {
     }
 };
 void sparse_adapter_controls() {
+    for(auto selected : {frame_import_native::CreationRoute::Vulkan,frame_import_native::CreationRoute::Facet})
     for(unsigned chunk:{21U,3U}) {
-        Fixture f;SparseReader reader{f};
+        Fixture f(selected);SparseReader reader{f};
         auto run=[&](Boundary b,unsigned offset=0,std::int64_t result=0) {
             auto before=f.bare(b,offset);
             if(Fixture::before_copy(b))before=reader.copy(before);
@@ -369,7 +392,8 @@ void sparse_adapter_controls() {
         for(auto b:stages){if(b==Boundary::Write)break;check(run(b).kind==Kind::None);}
         for(unsigned at=0;at<21;){auto n=std::min(chunk,21-at);check(run(Boundary::Write,at,n).kind==Kind::None);at+=n;}
         auto out=run(Boundary::Finish);matched(f,out);
-        check(reader.actual_bytes==out.record.scalar_bytes_copied && reader.actual_bytes==320+44*out.record.writes);
+        const auto fixed=selected==frame_import_native::CreationRoute::Facet?368U:320U;
+        check(reader.actual_bytes==out.record.scalar_bytes_copied && reader.actual_bytes==fixed+44*out.record.writes);
     }
     // A reader that actually copies before its ownership postcheck fails must
     // report that real count; bytes_confirmed alone would silently undercount.
@@ -386,11 +410,43 @@ void sparse_adapter_controls() {
       check(reader.calls==0 && reader.actual_bytes==0);}
 }
 
+void facet_route_controls() {
+    using Route=frame_import_native::CreationRoute;
+    // Eight partial writes exercise the exact expanded maximum (720 scalar,
+    // 21 wire plus the runtime's independent 16-byte parent admission).
+    {Fixture f(Route::Facet);f.through(Boundary::SendLock);
+      for(unsigned n=0;n<7;++n)check(f.pair(Boundary::Write,n,1).kind==Kind::None);
+      check(f.pair(Boundary::Write,7,14).kind==Kind::None);matched(f,f.end());
+      check(f.scope.record().scalar_bytes_copied==720);}
+    for(auto initial : {Route::Vulkan,Route::Facet}) {
+        for(auto b : {Boundary::Bind,Boundary::View}) {
+            Fixture f(initial);f.through(b==Boundary::Bind?Boundary::Image:Boundary::Bind);
+            auto e=f.bare(b);const auto before=f.scope.record().scalar_bytes_copied;
+            // Preserve the same computed dispatch address while replacing the
+            // public creation site/shape with the other renderer's shape.
+            const auto other=initial==Route::Vulkan?Route::Facet:Route::Vulkan;
+            e.entry.sp=f.dispatch-frame_import_native::creation_dispatch_offset(other);
+            e.entry.x[29]=e.entry.sp+(other==Route::Vulkan?96:0);
+            e.entry.x[30]=bias+(other==Route::Vulkan?(b==Boundary::Bind?0x2c7684:0x2c7804):
+                (b==Boundary::Bind?0x307874:0x30735c));
+            check(!f.observer.can_acquire(e,f.scope));
+            refused(f,f.observer.observe(e,f.scope),InvalidEntry);
+            check(f.scope.record().scalar_bytes_copied==before);
+        }
+    }
+    for (auto b : {Boundary::Image,Boundary::Bind,Boundary::View}) {
+        Fixture f(Route::Facet);f.through(b==Boundary::Image?Boundary::EarlyUnlock:
+            b==Boundary::Bind?Boundary::Image:Boundary::Bind);
+        auto e=f.before(b);e.scalars.creation_route=Route::Vulkan;
+        refused(f,f.observer.observe(e,f.scope),InvalidDecode);
+    }
+}
+
 }
 int main() {
     forbid_allocations=true;
     {Fixture f;f.through(Boundary::SendLock);f.writes();matched(f,f.end());}
-    admission_controls();lifecycle_controls();paired_controls();metadata_controls();write_controls();sparse_adapter_controls();
+    admission_controls();lifecycle_controls();paired_controls();metadata_controls();write_controls();sparse_adapter_controls();facet_route_controls();
     unsigned partition_count=0;std::array<unsigned,8> parts{};complete_partitions(21,0,0,parts,partition_count);
     check(partition_count==137980);check(allocations.load()==0);
     forbid_allocations=false;

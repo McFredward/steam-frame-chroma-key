@@ -15,7 +15,7 @@ bool same_invocation(const frame_import_native::Expected& a,
     return a.dispatch_frame == b.dispatch_frame && a.pipe == b.pipe && a.sequence == b.sequence;
 }
 bool same_scalars(const Scalars& a, const Scalars& b) noexcept {
-    return same_invocation(a.invocation, b.invocation) && a.client == b.client &&
+    return same_invocation(a.invocation, b.invocation) && a.creation_route == b.creation_route && a.client == b.client &&
         a.client_available == b.client_available && a.native_payload_read == b.native_payload_read &&
         a.native_send_success == b.native_send_success && a.packet_base == b.packet_base &&
         a.packet_offset == b.packet_offset && a.remaining == b.remaining &&
@@ -25,10 +25,13 @@ bool no_prefix(const Event& e) noexcept { return e.prefix.count == 0 && !e.prefi
 bool no_private(const Event& e) noexcept { return e.scalar_bytes_copied == 0 && no_prefix(e); }
 bool undecoded(const Event& e) noexcept { return no_private(e) && !e.decoded_available; }
 bool vulkan(Boundary b) noexcept { return b == Boundary::Image || b == Boundary::Bind || b == Boundary::View; }
-std::size_t scalar_budget(Boundary b) noexcept {
+std::size_t scalar_budget(const Event& e) noexcept {
+    const auto b = e.boundary;
     switch (b) {
     case Boundary::Begin: case Boundary::EarlyUnlock: return 12;
-    case Boundary::Image: case Boundary::Bind: case Boundary::View: return 80;
+    case Boundary::Image: case Boundary::Bind: case Boundary::View:
+        return frame_import_native::creation_route(b, e.entry, e.load_bias) ==
+            frame_import_native::CreationRoute::Facet ? 96 : 80;
     case Boundary::SendLock: case Boundary::Finish: return 28;
     case Boundary::Write: return 44;
     default: return 0;
@@ -37,10 +40,13 @@ std::size_t scalar_budget(Boundary b) noexcept {
 bool source_entry(const Event& e) noexcept {
     constexpr std::uint64_t sites[]{0x153fc0,0x1540b0,0x2c75ac,0x2c7684,0x2c7804,0x172ea0,0x172c00,0x172fbc};
     const auto index = static_cast<unsigned>(e.boundary);
-    if (index >= 8 || !address(e.load_bias, 4096) || sites[index] > kMaxAddress - e.load_bias ||
-        e.entry.x[30] != e.load_bias + sites[index] || !address(e.entry.sp) || !address(e.entry.x[29])) return false;
-    if (vulkan(e.boundary))
-        return e.entry.sp <= kMaxAddress - 1232 && e.entry.x[29] == e.entry.sp + 96 && e.entry.x[0] != 0;
+    if (index >= 8 || !address(e.load_bias, 4096) || !address(e.entry.sp) || !address(e.entry.x[29])) return false;
+    if (vulkan(e.boundary)) {
+        const auto selected = frame_import_native::creation_route(e.boundary, e.entry, e.load_bias);
+        const auto offset = frame_import_native::creation_dispatch_offset(selected);
+        return offset && e.entry.sp <= kMaxAddress - offset && e.entry.x[0] != 0;
+    }
+    if (sites[index] > kMaxAddress - e.load_bias || e.entry.x[30] != e.load_bias + sites[index]) return false;
     if (e.boundary == Boundary::Finish)
         return e.entry.sp <= kMaxAddress - 32 && e.entry.x[29] == e.entry.sp + 32;
     return e.entry.sp == e.entry.x[29];
@@ -49,13 +55,15 @@ bool entry_route(const Event& e, const RawRecord& r) noexcept {
     const auto& x = e.entry.x;
     const auto dispatch = r.invocation.dispatch_frame, pipe = r.invocation.pipe;
     if (!source_entry(e)) return false;
+    const auto selected = frame_import_native::creation_route(e.boundary, e.entry, e.load_bias);
+    const auto creation_dispatch = e.entry.sp + frame_import_native::creation_dispatch_offset(selected);
     switch (e.boundary) {
     case Boundary::Begin: return address(x[0]) && x[19] == x[0];
     case Boundary::EarlyUnlock: return e.entry.sp == dispatch && x[0] == pipe;
-    case Boundary::Image: return e.entry.sp + 1232 == dispatch;
-    case Boundary::Bind: return e.entry.sp + 1232 == dispatch && x[0] == r.image.native_device &&
+    case Boundary::Image: return creation_dispatch == dispatch;
+    case Boundary::Bind: return creation_dispatch == dispatch && selected == r.creation_route && x[0] == r.image.native_device &&
         x[1] == r.image.image && x[2] != 0;
-    case Boundary::View: return e.entry.sp + 1232 == dispatch && x[0] == r.image.native_device;
+    case Boundary::View: return creation_dispatch == dispatch && selected == r.creation_route && x[0] == r.image.native_device;
     case Boundary::SendLock:
         return dispatch >= 80 && e.entry.sp == dispatch - 80 && x[0] == pipe && x[19] == pipe &&
             x[20] == 9 && x[21] == 0x235 && x[22] == r.invocation.sequence;
@@ -77,8 +85,9 @@ bool route(const Event& e, const RawRecord& r, bool beginning = false) noexcept 
             !e.scalars.client_available;
     if (!same_invocation(e.scalars.invocation, r.invocation)) return false;
     if (vulkan(e.boundary))
-        return e.scalars.client_available;
-    return !e.scalars.client_available;
+        return e.scalars.client_available && e.scalars.creation_route ==
+            frame_import_native::creation_route(e.boundary, e.entry, e.load_bias);
+    return !e.scalars.client_available && e.scalars.creation_route == frame_import_native::CreationRoute::None;
 }
 void add_truthful(std::size_t value, std::size_t& total) noexcept {
     total = value > std::numeric_limits<std::size_t>::max() - total ?
@@ -123,7 +132,7 @@ bool Observer::can_acquire(const Event& e, const Scope& s) const noexcept {
         !e.native_provider_current || !e.source_current || e.thread_reason || !e.thread_identity ||
         e.thread_identity != s.thread_identity_ || e.load_bias != s.load_bias_ ||
         !undecoded(e) || e.public_result_available || !entry_route(e, s.record_)) return false;
-    const auto count = scalar_budget(e.boundary);
+    const auto count = scalar_budget(e);
     if (!count || s.record_.scalar_bytes_copied > kMaxScalarBytes ||
         count > kMaxScalarBytes - s.record_.scalar_bytes_copied) return false;
     if (e.phase == Phase::Before) {
@@ -225,9 +234,10 @@ Outcome Observer::observe(const Event& e, Scope& s) const noexcept {
         if (e.boundary == Boundary::SendLock) {
             if (!undecoded(e)) return refuse(AcquisitionBudget, s);
         } else {
-            if (!decode_checked(scalar_budget(e.boundary)) || !no_prefix(e)) return refuse(InvalidDecode | AcquisitionBudget, s);
+            if (!decode_checked(scalar_budget(e)) || !no_prefix(e)) return refuse(InvalidDecode | AcquisitionBudget, s);
             if (vulkan(e.boundary)) {
                 if (r.client_available && e.scalars.client != r.client) return refuse(ChangedClient, s);
+                if (e.boundary == Boundary::Image) r.creation_route = e.scalars.creation_route;
                 r.client = e.scalars.client; r.client_available = true;
             }
             s.paired_snapshot_ = e.scalars;

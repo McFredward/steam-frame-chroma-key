@@ -70,6 +70,11 @@ bool Capture::live(const NativeInput& in, Boundary boundary, frame_import_native
     if (stage_ == Stage::Idle || stage_ == Stage::Done || record_.refusal_ != Refusal::None) return false;
     scalar = frame_import_native::decode(boundary, in.entry, in.stack, in.load_bias, expected_);
     if (!scalar.valid()) return fail(Refusal::NativeRoute);
+    // This older lease/replay path emits CVulkan-specific symbolic sites.
+    // Facet belongs to the separate raw diagnostic; never relabel its events
+    // as that legacy route or accept a mixed renderer resource sequence.
+    if (scalar.client_available && scalar.creation_route != frame_import_native::CreationRoute::Vulkan)
+        return fail(Refusal::NativeRoute);
     if (!local_lease(registry_, in.lease) || !same_connection(record_.lease_, in.lease) ||
         in.lease.object.pipe != scalar.invocation.pipe) return fail(Refusal::Lease);
     if (record_.lease_.fresh_native_peer_pid &&
