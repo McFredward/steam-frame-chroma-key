@@ -33,7 +33,7 @@ public:
     static constexpr std::size_t LaneCapacity = 2048;
     static constexpr std::size_t ByteCapacity = 256 * 1024;
     static constexpr std::uint32_t CallCapacity = 32;
-    static constexpr std::size_t OperationCount = 38;
+    static constexpr std::size_t OperationCount = 39;
     struct TransportCounters {
         std::uint64_t registry = 0, queue = 0, orderGap = 0, batch = 0;
         std::uint64_t orderWrap = 0, closedCalls = 0;
@@ -56,7 +56,7 @@ public:
             "create_view", "destroy_view", "create_sampler", "destroy_sampler", "create_conversion", "destroy_conversion",
             "bind_buffer_memory", "bind_image_memory", "bind_buffer_memory_batch", "bind_image_memory_batch",
             "allocate_commands", "free_commands", "begin_command", "end_command", "reset_command",
-            "reset_command_pool", "destroy_command_pool", "execute_commands", "bind_sets", "device_destroyed", "snapshot", "import_resource_receipt"};
+            "reset_command_pool", "destroy_command_pool", "execute_commands", "bind_sets", "device_destroyed", "snapshot", "import_resource_receipt", "target_snapshot_probe"};
         return index < names.size() ? names[index] : "unknown";
     }
 
@@ -188,6 +188,11 @@ public:
                         if (result.reason == Reason::Capacity) result.errors |= ImportCapacity;
                     }
                 }
+                if (result.resourceComplete && result.cookie && result.invocationTag) {
+                    // Retain the exact ordered generation set only once. A new
+                    // receipt never silently replaces the selected target.
+                    if (!targetReceipt_.invocationTag) targetReceipt_ = result;
+                }
                 // Opt-in capture consumers must provide the typed overload.
                 // Old Snapshot-only consumers remain valid but cannot silently
                 // claim receipts: their omissions are counted explicitly.
@@ -196,6 +201,25 @@ public:
                     receiptDelivered_.store(receiptDelivered_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
                 } else {
                     receiptUnconsumed_.store(receiptUnconsumed_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                }
+            } else if (record->op == Op::TargetSnapshotProbe) {
+                TargetSnapshotProbeResult result;
+                result.replayOrder = record->ticket;
+                const auto& p = observation.payload.targetProbe;
+                result.invocationTag = restored ? p.invocationTag : 0;
+                if (!aborted_ && restored && !lostState() && targetReceipt_.invocationTag == p.invocationTag &&
+                    targetReceipt_.cookie == p.ownedCookie && targetReceipt_.device == record->device) {
+                    result.outcome = core_.targetSnapshotMatch(record->device, p.command, p.layout, targetReceipt_);
+                }
+                if (result.outcome == TargetProbeOutcome::ExactMatch && targetSnapshots_ >= TargetSnapshotLimit)
+                    result.outcome = TargetProbeOutcome::QuotaOmitted;
+                if constexpr (std::is_invocable_v<Callback&, std::uint32_t, const TargetSnapshotProbeResult&>) {
+                    if (result.outcome == TargetProbeOutcome::ExactMatch) {
+                        const auto snapshot = core_.snapshot(record->device, p.command, p.layout);
+                        ++targetSnapshots_;
+                        result.snapshot = &snapshot;
+                        callback(p.slot, result);
+                    } else callback(restored ? p.slot : std::numeric_limits<std::uint32_t>::max(), result);
                 }
             } else if (!aborted_ && restored) replay(observation);
             const auto replayLoss = core_.lostState() - lossBefore;
@@ -216,6 +240,13 @@ public:
 
     bool requestSnapshot(std::uint64_t device, VkCommandBuffer command, VkPipelineLayout layout, std::uint32_t cookie) noexcept {
         return publish(Op::Snapshot, device, [&](Record& r) { r.payload.snapshot = {command, layout, cookie}; });
+    }
+    static constexpr std::uint32_t TargetSnapshotLimit = 32;
+    bool requestTargetSnapshotProbe(std::uint64_t device, VkCommandBuffer command, VkPipelineLayout layout,
+                                   std::uint64_t invocationTag, std::uint64_t ownedCookie, std::uint32_t slot) noexcept {
+        return publish(Op::TargetSnapshotProbe, device, [&](Record& r) {
+            auto& p = construct(r.payload.targetProbe); p = {command, layout, invocationTag, ownedCookie, slot};
+        });
     }
     // Background-owner only, after drain() has returned. Never call from an API
     // hook or the drain receipt callback: pending lifecycle records must first
@@ -483,9 +514,9 @@ private:
         AllocateMemory, FreeMemory, CreateBuffer, DestroyBuffer, CreateImage, DestroyImage,
         CreateView, DestroyView, CreateSampler, DestroySampler, CreateConversion, DestroyConversion,
         BindBufferMemory, BindImageMemory, BindBufferMemoryBatch, BindImageMemoryBatch, AllocateCommands, FreeCommands, BeginCommand, EndCommand,
-        ResetCommand, ResetCommandPool, DestroyCommandPool, ExecuteCommands, BindSets, DeviceDestroyed, Snapshot, ImportResourceReceipt
+        ResetCommand, ResetCommandPool, DestroyCommandPool, ExecuteCommands, BindSets, DeviceDestroyed, Snapshot, ImportResourceReceipt, TargetSnapshotProbe
     };
-    static_assert(static_cast<std::size_t>(Op::ImportResourceReceipt) + 1 == OperationCount, "Operation names and counters must cover every record");
+    static_assert(static_cast<std::size_t>(Op::TargetSnapshotProbe) + 1 == OperationCount, "Operation names and counters must cover every record");
     struct SetLayoutRecord {
         VkDescriptorSetLayout value; VkDescriptorSetLayoutCreateInfo info; bool unsupported;
         std::array<VkDescriptorSetLayoutBinding, BindingCapacity> bindings;
@@ -529,13 +560,14 @@ private:
         std::array<std::uint32_t, SetIndexCapacity * BindingCapacity> offsets;
     };
     struct SnapshotRecord { VkCommandBuffer command; VkPipelineLayout layout; std::uint32_t cookie; };
+    struct TargetProbeRecord { VkCommandBuffer command; VkPipelineLayout layout; std::uint64_t invocationTag, ownedCookie; std::uint32_t slot; };
     struct ImportReceiptRecord { VkImage image; VkImageView view; std::uint64_t invocationTag, cookie; };
     union Payload {
         std::uint64_t scalar;
         SetLayoutRecord setLayout; PipelineLayoutRecord pipelineLayout; PoolRecord pool; SetsRecord sets;
         FreeSetsRecord freeSets; UpdateRecord updates; MemoryRecord memory; BufferRecord buffer; ImageRecord image;
         ViewRecord view; SamplerRecord sampler; ConversionRecord conversion; MemoryBindingRecord binding;
-        MemoryBindingBatchRecord memoryBatch; CommandRecord commands; BindSetsRecord bindSets; SnapshotRecord snapshot; ImportReceiptRecord importReceipt;
+        MemoryBindingBatchRecord memoryBatch; CommandRecord commands; BindSetsRecord bindSets; SnapshotRecord snapshot; ImportReceiptRecord importReceipt; TargetProbeRecord targetProbe;
         Payload() noexcept {}
     };
     struct Record { std::uint64_t ticket = 0, device = 0; Op op = Op::Snapshot; Payload payload; };
@@ -557,7 +589,7 @@ private:
     static_assert(OwnedRepresentation<SetLayoutRecord, PipelineLayoutRecord, PoolRecord, SetsRecord,
         FreeSetsRecord, WriteRecord, CopyRecord, UpdateEntry, UpdateRecord, MemoryRecord, BufferRecord,
         ImageRecord, ViewRecord, SamplerRecord, ConversionRecord, MemoryBindingRecord,
-        MemoryBindingBatchRecord, CommandRecord, BindSetsRecord, SnapshotRecord, ImportReceiptRecord>::value,
+        MemoryBindingBatchRecord, CommandRecord, BindSetsRecord, SnapshotRecord, ImportReceiptRecord, TargetProbeRecord>::value,
         "Owned compact metadata must have standard layout and a trivially copyable representation");
     static_assert(sizeof(RecordHeader) == 32, "Compact headers exceeded their bounded lane budget");
     static_assert(sizeof(Lane) <= 128 * sizeof(Record), "Compact lanes must not increase the old memory budget");
@@ -594,6 +626,7 @@ private:
         case Op::BindSets: return sizeof(BindSetsRecord);
         case Op::Snapshot: return sizeof(SnapshotRecord);
         case Op::ImportResourceReceipt: return sizeof(ImportReceiptRecord);
+        case Op::TargetSnapshotProbe: return sizeof(TargetProbeRecord);
         default: return sizeof(std::uint64_t);
         }
     }
@@ -674,6 +707,7 @@ private:
         case Op::BindSets: return &construct(r.payload.bindSets);
         case Op::Snapshot: return &construct(r.payload.snapshot);
         case Op::ImportResourceReceipt: return &construct(r.payload.importReceipt);
+        case Op::TargetSnapshotProbe: return &construct(r.payload.targetProbe);
         default: return &construct(r.payload.scalar);
         }
     }
@@ -923,7 +957,7 @@ private:
         case Op::DestroyCommandPool: core_.destroyCommandPool(d, fromHandle<VkCommandPool>(r.payload.scalar)); break;
         case Op::ExecuteCommands: core_.executeCommands(d, fromHandle<VkCommandBuffer>(r.payload.scalar)); break;
         case Op::DeviceDestroyed: core_.deviceDestroyed(d); break;
-        case Op::Snapshot: case Op::ImportResourceReceipt: break;
+        case Op::Snapshot: case Op::ImportResourceReceipt: case Op::TargetSnapshotProbe: break;
         }
     }
 
@@ -938,6 +972,8 @@ private:
     std::array<std::atomic<std::uint64_t>, 6> transport_{};
     std::array<std::atomic<std::uint64_t>, OperationCount> publicationLoss_{}, replayLoss_{};
     std::atomic<std::uint64_t> headerQueue_{0}, byteQueue_{0};
+    ImportResourceReceipt targetReceipt_{}; // Background owner only.
+    std::uint32_t targetSnapshots_ = 0;
     std::atomic<std::uint64_t> receiptRequests_{0}, receiptDelivered_{0}, receiptUnconsumed_{0}, receiptCapRefused_{0};
     Lane* preferred_ = nullptr; // Background owner only; never read by hooks.
     std::uint64_t expected_ = 1;

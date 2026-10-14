@@ -202,6 +202,15 @@ static_assert(std::is_trivially_copyable_v<ImportResourceReceipt>,
               "Import receipts must contain bounded owned metadata");
 static_assert(sizeof(ImportResourceReceipt) < 4096, "Import receipt exceeds its bounded budget");
 
+enum class TargetProbeOutcome : std::uint8_t { ExactMatch, Filtered, Unknown, QuotaOmitted };
+// The optional pointer is owned by the replay callback's stack. Consumers must
+// copy a selected result before returning; nonmatches carry no large snapshot.
+struct TargetSnapshotProbeResult {
+    TargetProbeOutcome outcome = TargetProbeOutcome::Unknown;
+    std::uint64_t replayOrder = 0, invocationTag = 0;
+    const Snapshot* snapshot = nullptr;
+};
+
 // Instantaneous owner-side samples, not an atomic lease on native resources.
 enum class ImportReceiptValidationReason : std::uint8_t {
     Valid, Closed, Halted, JournalLoss, ActivePublication, PendingReplay,
@@ -659,6 +668,45 @@ public:
         return current.resourceComplete && same(previous.image.identity, current.image.identity) &&
             same(previous.view.identity, current.view.identity) && same(previous.memory.identity, current.memory.identity) &&
             same(previous.image.memory, current.image.memory) && previous.image.memoryOffset == current.image.memoryOffset;
+    }
+    // Single owning-Journal replay only. Selection precedes full snapshot
+    // construction and compares generations, not recycled native handles.
+    TargetProbeOutcome targetSnapshotMatch(std::uint64_t device, VkCommandBuffer commandValue,
+                                         VkPipelineLayout layoutValue, const ImportResourceReceipt& target) noexcept {
+        auto lock = acquire();
+        if (!lock.owns_lock() || lostState() || !target.resourceComplete || target.device != device ||
+            target.journalInstance != journalInstance_) return TargetProbeOutcome::Unknown;
+        const auto current = importResourceReceiptLocked(device, target.requestedImage, target.requestedView, target.invocationTag);
+        if (!current.resourceComplete || !same(target.image.identity, current.image.identity) ||
+            !same(target.view.identity, current.view.identity) || !same(target.memory.identity, current.memory.identity) ||
+            !same(target.image.memory, current.image.memory) || target.image.memoryOffset != current.image.memoryOffset)
+            return TargetProbeOutcome::Unknown;
+        const auto* command = find(commands_, device, handle(commandValue));
+        const auto* layout = find(pipelineLayouts_, device, handle(layoutValue));
+        if (!command || !layout || !command->complete || !layout->complete || !layout->count ||
+            !same(command->layout, layout->id)) return TargetProbeOutcome::Unknown;
+        const auto& bound = command->sets[0];
+        const auto* set = lookup(sets_, device, bound.set);
+        const auto* setLayout = lookup(layouts_, device, layout->sets[0]);
+        if (!bound.complete || !set || !set->complete || !setLayout || !setLayout->complete ||
+            !same(set->layout, setLayout->id) || !lookup(pools_, device, set->pool)) return TargetProbeOutcome::Unknown;
+        bool unknown = false;
+        for (const auto bindingNumber : TargetBindings) {
+            const auto pos = index(*setLayout, bindingNumber);
+            if (pos == BindingCapacity || !imageType(setLayout->bindings[pos].type)) continue;
+            const auto& value = set->values[pos];
+            if (!value.written || !value.complete) { unknown = true; continue; }
+            const auto* view = lookup(views_, device, value.view);
+            const auto* image = view ? lookup(images_, device, view->metadata.image) : nullptr;
+            if (!view || !image || !view->complete || !image->complete) { unknown = true; continue; }
+            if (!same(value.view, target.view.identity) || !same(view->metadata.image, target.image.identity) ||
+                !same(image->id, target.image.identity) || !same(image->metadata.memory, target.memory.identity)) continue;
+            const auto selected = binding(device, *set, *setLayout, bound, bindingNumber);
+            if (selected.complete && selected.image.complete && selected.view.complete && selected.image.allocation.complete &&
+                same(selected.image.allocation.identity, target.memory.identity)) return TargetProbeOutcome::ExactMatch;
+            unknown = true;
+        }
+        return unknown ? TargetProbeOutcome::Unknown : TargetProbeOutcome::Filtered;
     }
     void deviceDestroyed(std::uint64_t device) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;

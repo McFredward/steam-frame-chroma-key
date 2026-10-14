@@ -24,11 +24,12 @@ private:
     std::atomic<std::uint64_t> attempts_{0};
 };
 struct Budget {
-    static constexpr std::uint32_t Version = 1;
-    static constexpr std::uint32_t DrawLimit = 32, ExecuteLimit = 16, SubmitLimit = 16, SnapshotLimit = 32;
+    static constexpr std::uint32_t Version = 2;
+    static constexpr std::uint32_t DrawLimit = 32, ExecuteLimit = 16, SubmitLimit = 16, SnapshotLimit = 32, ProbeLimit = 4096;
     // Bit 0 reserves snapshots until import publication; bit 1 preserves the
     // lifecycle owner when optional trace output reaches its existing cap.
-    static constexpr std::uint32_t Flags = 3;
+    static constexpr std::uint32_t Flags = 7;
+    Quota<ProbeLimit> probes;
     Quota<DrawLimit> draws;
     Quota<ExecuteLimit> executes;
     Quota<SubmitLimit> submits;
