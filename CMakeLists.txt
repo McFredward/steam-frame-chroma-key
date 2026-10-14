@@ -286,7 +286,12 @@ if(BUILD_TESTING)
         target_compile_options(test_compositor_arm_trace PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME compositor_raw_reserved_trace COMMAND test_compositor_arm_trace)
         add_test(NAME compositor_raw_unarmed_trace COMMAND test_compositor_arm_trace unarmed)
-        set_tests_properties(compositor_raw_reserved_trace compositor_raw_unarmed_trace PROPERTIES TIMEOUT 10)
+        add_test(NAME compositor_raw_byte_cap_lifecycle COMMAND test_compositor_arm_trace byte-cap)
+        add_test(NAME compositor_raw_event_cap_lifecycle COMMAND test_compositor_arm_trace event-cap)
+        add_test(NAME compositor_raw_failed_writer COMMAND test_compositor_arm_trace failed-writer)
+        set_tests_properties(compositor_raw_reserved_trace compositor_raw_unarmed_trace
+            compositor_raw_byte_cap_lifecycle compositor_raw_event_cap_lifecycle
+            compositor_raw_failed_writer PROPERTIES TIMEOUT 10)
         add_executable(test_import_observer tests/test_import_observer.cpp
             import/import_observer_core.cpp)
         target_include_directories(test_import_observer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

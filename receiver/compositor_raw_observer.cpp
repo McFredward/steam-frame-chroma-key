@@ -283,6 +283,9 @@ void* write_background(void* argument) noexcept {
         end,records,total,u(s.queued),u(s.drained),s.started?"true":"false",s.terminal?"true":"false",s.started&&!s.terminal?"true":"false",unsigned(s.refusal),
         s.parent_bytes,s.scalar_bytes,s.wire_bytes,quiet?"true":"false",joined?"true":"false",
         s.candidate_arm_required?"true":"false",s.candidate_armed?"true":"false",s.candidate_claimed?"true":"false");
+    footer.add(",\"public_begin_counts\":{\"before_candidate_arm\":%llu,\"after_candidate_arm\":%llu,\"skipped_prearm_afters\":%llu,"
+        "\"overflow\":%s,\"scope\":\"validated_supplied_notifications_not_packet_or_frame_proof\"}",
+        u(s.begins_before_arm),u(s.begins_after_arm),u(s.skipped_prearm_afters),s.begin_counts_overflow?"true":"false");
     proofs(footer);footer.add("}\n");write_line(footer,total,0);close(output_fd);output_fd=-1;return nullptr;
 }
 void finish_owned() noexcept {

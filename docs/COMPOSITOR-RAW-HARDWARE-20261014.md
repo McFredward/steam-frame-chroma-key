@@ -122,6 +122,54 @@ session pass, followed by affected checks for the later limited repairs: all
 runtime, ARM artifact and session evidence is inherited for unchanged areas;
 this is not a new complete native/GPU or headset validation.
 
+## Successful arming still missed stream allocation
+
+The following catch-up attempt passed native startup, isolation and the fresh
+arm health sample. Its accepted cumulative startup evidence was 395,857 bytes.
+The operator had confirmed a visible PC-VR stream; the raw writer observed
+the marker about 69.60 seconds into its original 120-second window. The footer
+reports armed but unclaimed, zero private bytes and no local resource join.
+
+The passive journal recorded 32 binding snapshots: 16 UI samples and 16 complete
+imported YUV descriptor samples, with eight distinct imported image generations
+seen twice. The latter use VS_DISTORT/PS_DISTORT, DMA-BUF import and YCbCr
+conversion. These are real recording-time API resource facts, not proof of a
+selected PC frame, physical eye, native UV ownership or coherent GPU use.
+
+The journal reached its 1-MiB cap about 3.32 seconds after arming, after 882 draw
+and 294 submit records. All 699,909 admitted lifecycle publications replayed
+without recorded loss before closure. The remaining raw window could not rely
+on continued journal currentness. Cap closure alone does not explain the
+unclaimed raw candidate: it does not itself claim a Begin or retire the raw
+observer's native notifications.
+
+Independent retained-source checks establish a pool of 16 imported resources
+rebuilt on decoder source change, then reused during ordinary presentation.
+This explains why a post-visible-stream signal can miss the import burst.
+The next selection window is therefore explicit readiness immediately before
+a fresh connection, as described in [the pre-stream contract](COMPOSITOR-PRESTREAM-ARM.md).
+It is not a claim that the first following import must be video.
+
+The new raw-only collector deliberately samples at most 32 draw, 16 execute and
+16 submit observations. It reserves the existing 32 binding attempts until an
+actual tagged import request is published; those samples are not guaranteed
+to consume the imported image. Optional output exhaustion no longer retires
+the owning lifecycle mirror: it drains until the unchanged original deadline.
+Actual losses and deliberate output omissions remain separate. The final
+artifact carries a hidden read-only FCMSMP01 quota/lifecycle marker, with no
+new launch getter or private acquisition. Bounded aggregate public Begin
+notifications distinguish observations before/after candidate arming and
+skipped pre-arm After callbacks; they are not packet/frame association proof.
+
+Recovery restarted original SteamVR, passed its native UI gate, observed the old
+target's exit and no own mappings in 15 observed current service processes,
+then archived evidence and removed 45 verified session/input files. Original
+files remained unchanged. Private captures and independent instruction/API
+classification evidence are retained in
+`build/private-compositor-catchup-integration-20261014/` and
+`build/private-compositor-stream-import-review-20261014/`. No passthrough shader
+or mask was activated.
+
 An operator acknowledgment selects the recording period; it is not source-frame
 association proof. Missing, invalid, stale or lost evidence keeps rendering
 opaque. Capture expiry stops recording only. Installation removal and a native

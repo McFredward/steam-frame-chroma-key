@@ -42,6 +42,12 @@ LAYER = 'VK_LAYER_FRAME_MASK_trace'
 ENVELOPE_BYTES = 8272
 MARKER = b'FCMRAW03' + struct.pack('<II', 3, ENVELOPE_BYTES)
 ARM_CONTENTS = b'FRAME_COMPOSITOR_RAW/1\n'
+SAMPLING_SCOPE = 'frame_compositor_trace_sampling_scope'
+SAMPLING_MARKER = b'FCMSMP01' + struct.pack('<6I', 1, 32, 16, 16, 32, 3)
+RAW_TRACE_SAMPLING = {'intentional': True, 'draw_call_limit': 32,
+                      'execute_child_limit': 16, 'submit_command_limit': 16,
+                      'binding_snapshots_require_import_request': True,
+                      'lifecycle_survives_trace_cap': True}
 LIMIT_WORDS = (720, 21, 16, 8, 32, 65536, 120, 4)
 CAPTURE_LIMITS = {'records': 32, 'bytes': 65536, 'seconds': 120}
 RAW_LIMITS = {'transactions': 1, 'writes': 8, 'scalar_bytes': 720, 'wire_bytes': 21,
@@ -99,9 +105,22 @@ def hidden_object(elf, name, size):
     return rva
 
 
+def sampling_marker(elf):
+    rva = hidden_object(elf, SAMPLING_SCOPE, len(SAMPLING_MARKER))
+    spans = [p for p in elf.phdrs if p[0] == 1 and p[1] == 4 and
+             p[3] <= rva and rva + len(SAMPLING_MARKER) <= p[3] + p[5]]
+    if len(spans) != 1:
+        raise ValueError('Raw trace sampling marker requires exact read-only storage')
+    span = spans[0]; offset = span[2] + rva - span[3]
+    if elf.data[offset:offset + len(SAMPLING_MARKER)] != SAMPLING_MARKER:
+        raise ValueError('Raw trace sampling artifact differs from reviewed quotas/lifecycle contract')
+    return {'symbol': SAMPLING_SCOPE, 'rva': rva, 'bytes': len(SAMPLING_MARKER),
+            'sha256': digest(SAMPLING_MARKER).hex()}
+
+
 def scope_marker(elf):
     if any(s['defined'] and s['name'].endswith('_scope') and s['name'].startswith(('frame_client_', 'frame_compositor_'))
-           and s['name'] != SCOPE for s in elf.symbols):
+           and s['name'] not in (SCOPE, SAMPLING_SCOPE) for s in elf.symbols):
         raise ValueError('Artifact includes a conflicting retained diagnostic scope')
     rva = hidden_object(elf, SCOPE, 16)
     spans = [p for p in elf.phdrs if p[0] == 1 and p[1] == 4 and p[3] <= rva and rva + 16 <= p[3] + p[5]]
@@ -175,7 +194,7 @@ def validate_observer(data, reviewed_sha, provider_exports):
     tls = [p[6] for p in elf.phdrs if p[0] == 7]
     if len(tls) > 1 or any(size > 128 for size in tls):
         raise ValueError('Combined observer static TLS exceeds the small reviewed marker scope')
-    marker, ready = scope_marker(elf), ready_object(elf)
+    marker, ready, sampling = scope_marker(elf), ready_object(elf), sampling_marker(elf)
     rx = elf.rx()
     if ready['data_rva_begin'] < rx[1] and rx[0] < ready['data_rva_end']:
         raise ValueError('Readiness storage overlaps executable bytes')
@@ -183,6 +202,7 @@ def validate_observer(data, reviewed_sha, provider_exports):
                  'ready_rva': ready['rva'], 'rx_rva_begin': rx[0], 'rx_rva_end': rx[1],
                  'data_rva_begin': ready['data_rva_begin'], 'data_rva_end': ready['data_rva_end'],
                  'hidden_entries': entries, 'scope_marker': marker, 'ready_object': ready,
+                 'raw_trace_sampling': dict(RAW_TRACE_SAMPLING), 'trace_sampling_marker': sampling,
                  'public_exports': sorted(exports), 'vulkan_functions': dict(VULKAN_FUNCTIONS),
                  'standard_vulkan_exports': [], 'required_aliases': list(ALIAS_IMPORTS),
                  'bootstrap_imports': list(BOOTSTRAP_IMPORTS), 'versioned_glibc_imports': sorted(versioned),

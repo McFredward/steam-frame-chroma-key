@@ -278,7 +278,9 @@ void prearm_pair_crosses_signal() {
     check(rt::arm_candidate_once());
     f.libc(Boundary::Begin,raw::Phase::After);f.libc(Boundary::Begin,raw::Phase::After);
     check(!rt::skipped_begins && !rt::status().candidate_claimed && !rt::status().retired && !rt::status().parent_bytes);
+    check(rt::status().begins_before_arm==2 && !rt::status().begins_after_arm && rt::status().skipped_prearm_afters==2);
     f.through(Boundary::SendLock);f.libc_pair(Boundary::Write,0,21);f.libc_pair(Boundary::Finish);
+    check(rt::status().begins_after_arm==1 && rt::status().begins_before_arm==2 && !rt::status().begin_counts_overflow);
     check(rt::status().terminal && !rt::status().retired && fixture_stubs::attributes_calls==1);
     check(drain(rt::Kind::RawMatched)==1);
 }
@@ -351,6 +353,7 @@ void unqualified_begin_keeps_claim() {
     rt::libc_notification(note,&rt::runtime);note.phase=raw::Phase::After;rt::libc_notification(note,&rt::runtime);
     check(!rt::status().candidate_claimed && !rt::status().started && !fixture_stubs::attributes_calls);
     check(!rt::status().parent_bytes && !rt::status().scalar_bytes && !rt::status().wire_bytes);
+    check(!rt::status().begins_before_arm && !rt::status().begins_after_arm && !rt::status().skipped_prearm_afters);
     // Audit forwarding remains available while the capture is operator-armed.
     for(const auto fn:{audit::Function::MutexLock,audit::Function::MutexUnlock,audit::Function::Write}) {
         const auto response=rt::bridge({audit::Stage::ForwardOnly,provider(fn),false,{}});
@@ -517,7 +520,7 @@ int main(int argc,char** argv) {
     check(reinterpret_cast<std::uintptr_t>(&::pthread_attr_destroy)==mapped_libc+0x81420);
     std::printf("Actual retained ARM libc pthread helpers: %s\n",provider.dli_fname);
 #endif
-    constexpr std::array<void(*)(),48> cases{
+    constexpr std::array<void(*)(),49> cases{
         inert_production,forwarding_only,+[]{success(21);},+[]{success(3);},
         native_failure,incomplete_finalization,parent_mismatch,+[]{ownership_postcheck(0);},
         +[]{ownership_postcheck(1);},queue_budget,foreign_begin,
@@ -535,7 +538,13 @@ int main(int argc,char** argv) {
         +[]{arm_refusals(3);},+[]{arm_refusals(4);},+[]{arm_refusals(5);},
         +[]{arm_refusals(6);},+[]{arm_refusals(7);},+[]{arm_refusals(8);},
         +[]{armed_nested_refusal(false);},+[]{armed_nested_refusal(true);},
-        concurrent_operator_arm,unqualified_begin_keeps_claim};
+        concurrent_operator_arm,unqualified_begin_keeps_claim,+[]{
+            attach(true,true);Fixture f;
+            rt::runtime.begins_before_arm.store(std::numeric_limits<std::uint64_t>::max());
+            f.libc_pair(Boundary::Begin);
+            check(rt::status().begin_counts_overflow && !rt::status().candidate_claimed && !rt::status().started);
+            check(!rt::status().parent_bytes && !rt::status().scalar_bytes && !rt::status().wire_bytes && !fixture_stubs::attributes_calls);
+        }};
     unsigned passed=0;
     if(argc==2) {char* end=nullptr;const auto n=std::strtoul(argv[1],&end,10);check(end && !*end && n<cases.size());run(cases[n],passed);}
     else {check(argc==1);for(unsigned n=0;n<cases.size();++n){std::printf("runtime case %u\n",n);std::fflush(stdout);run(cases[n],passed);}}

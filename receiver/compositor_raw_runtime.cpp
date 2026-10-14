@@ -26,6 +26,8 @@ struct Runtime {
     std::atomic<Refusal> refusal{Refusal::Unprepared};
     std::atomic<unsigned> callbacks{0},bound{0};
     std::atomic<std::uint64_t> queued{0},drained{0};
+    std::atomic<std::uint64_t> begins_before_arm{0},begins_after_arm{0},skipped_prearm_afters{0};
+    std::atomic<bool> begin_counts_overflow{false};
     std::atomic<bool> prepared{false},started{false},terminal{false};
     std::atomic<bool> arm_required{false};
     std::atomic<Candidate> candidate{Candidate::Waiting};
@@ -46,6 +48,14 @@ struct Runtime {
 } runtime;
 static_assert(std::atomic<std::size_t>::is_always_lock_free);
 static_assert(std::atomic<Candidate>::is_always_lock_free);
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+
+void count_begin(std::atomic<std::uint64_t>& counter) noexcept {
+    // Only already supplied public notifications; no private acquisition or
+    // additional event publication. Overflow is explicitly not complete data.
+    if(counter.fetch_add(1,std::memory_order_relaxed)==std::numeric_limits<std::uint64_t>::max())
+        runtime.begin_counts_overflow.store(true,std::memory_order_relaxed);
+}
 unsigned char* current_marker(void*) noexcept {return &marker;}
 bool alive() noexcept {
     return runtime.state.load(std::memory_order_acquire)==3 &&
@@ -156,6 +166,9 @@ void libc_notification(frame_import_forwarding::Notification note,void* owner) n
     else if(note.operation==Op::Write && pc==bias+0x172c00)b=Boundary::Write;
     else if(note.operation==Op::Unlock && pc==bias+0x172fbc)b=Boundary::Finish;
     else return;
+    if(b==Boundary::Begin && note.phase==Phase::Before)
+        count_begin(runtime.candidate.load(std::memory_order_acquire)==Candidate::Waiting?
+            runtime.begins_before_arm:runtime.begins_after_arm);
     if(b==Boundary::Begin && runtime.arm_required.load(std::memory_order_acquire)) {
         const auto candidate=runtime.candidate.load(std::memory_order_acquire);
         if(note.phase==Phase::Before && (candidate==Candidate::Waiting || skipped_begins)) {
@@ -165,7 +178,7 @@ void libc_notification(frame_import_forwarding::Notification note,void* owner) n
             else ++skipped_begins;
             return;
         }
-        if(note.phase==Phase::After && skipped_begins){--skipped_begins;return;}
+        if(note.phase==Phase::After && skipped_begins){count_begin(runtime.skipped_prearm_afters);--skipped_begins;return;}
         if(candidate==Candidate::Waiting)return;
         if(note.phase==Phase::Before) {
             auto armed=Candidate::Armed;
@@ -317,7 +330,8 @@ Status status() noexcept {
     const auto s=runtime.state.load(std::memory_order_acquire),candidate=static_cast<unsigned>(runtime.candidate.load(std::memory_order_acquire));
     return {runtime.prepared.load(),s==3,s==4,runtime.started.load(),runtime.terminal.load(),runtime.refusal.load(),
         runtime.queued.load(),runtime.drained.load(),runtime.parent_bytes.load(),runtime.scalar_bytes.load(),runtime.wire_bytes.load(),
-        runtime.arm_required.load(std::memory_order_acquire),candidate>=static_cast<unsigned>(Candidate::Armed),candidate==static_cast<unsigned>(Candidate::Claimed)};
+        runtime.arm_required.load(std::memory_order_acquire),candidate>=static_cast<unsigned>(Candidate::Armed),candidate==static_cast<unsigned>(Candidate::Claimed),
+        runtime.begins_before_arm.load(),runtime.begins_after_arm.load(),runtime.skipped_prearm_afters.load(),runtime.begin_counts_overflow.load()};
 }
 void finalize() noexcept {retire(Refusal::Finalized);}
 bool quiescent() noexcept {return !runtime.callbacks.load(std::memory_order_acquire);}

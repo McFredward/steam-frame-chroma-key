@@ -25,7 +25,8 @@ def fixture(*, missing_entry=None, missing_import=None, extra_export=None, extra
             marker=tool.MARKER, marker_flags=4, marker_visibility=2, ready_rva=0x7400,
             ready_flags=6, ready_size=4, ready_value=0, entry_size=156, entry_visibility=2,
             dynamic_tls=False, tls_bytes=0, extra_scope=None, dependency='libc.so.6', standard_exports=False,
-            missing_export=None):
+            missing_export=None, sampling=tool.SAMPLING_MARKER, sampling_rva=0x6040,
+            sampling_visibility=2, sampling_size=32):
     """Only ELF metadata and zero-filled own synthetic instruction slots."""
     raw = bytearray(0x8000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
@@ -40,6 +41,8 @@ def fixture(*, missing_entry=None, missing_import=None, extra_export=None, extra
     struct.pack_into('<III', raw, 0x180, 4, 20, 3)
     raw[0x18c:0x190] = b'GNU\0'; raw[0x190:0x1a4] = bytes(range(20))
     raw[0x6000:0x6010] = marker
+    if sampling is not None:
+        raw[sampling_rva:sampling_rva + len(sampling)] = sampling
     if 0x7000 <= ready_rva < 0x7300:
         struct.pack_into('<I', raw, ready_rva, ready_value)
     public = {tool.BRIDGE, *tool.VULKAN_FUNCTIONS} if standard_exports else tool.PUBLIC
@@ -84,6 +87,8 @@ def fixture(*, missing_entry=None, missing_import=None, extra_export=None, extra
         hidden(extra_entry, 0x1800, 156)
     hidden(tool.SCOPE, 0x6000, 16, kind=1, visibility=marker_visibility)
     hidden(tool.READY, ready_rva, ready_size, kind=1)
+    if sampling is not None:
+        hidden(tool.SAMPLING_SCOPE, sampling_rva, sampling_size, kind=1, visibility=sampling_visibility)
     if extra_scope:
         hidden(extra_scope, 0x6020, 16, kind=1)
     verneed = struct.pack('<HHIII', 1, 2, offsets[dependency], 16, 0)
@@ -155,6 +160,17 @@ class PackageControls(unittest.TestCase):
         self.assertIs(descriptor['restart_required'], False)
         self.assertIs(descriptor['source_frame_associated'], False)
         self.assertEqual(len(tool.launch_environment(tool.launch_config(frame))), 7)
+
+    def test_sampling_requires_actual_exact_readonly_hidden_artifact_marker(self):
+        _, report = self.validate(fixture())
+        self.assertEqual(report['raw_trace_sampling'], tool.RAW_TRACE_SAMPLING)
+        self.assertEqual(report['trace_sampling_marker']['sha256'], tool.digest(tool.SAMPLING_MARKER).hex())
+        for kwargs in ({'sampling': None}, {'sampling': b'FCMSMP00' + tool.SAMPLING_MARKER[8:]},
+                       {'sampling': b'FCMSMP01' + struct.pack('<6I', 1, 32, 16, 16, 32, 1)},
+                       {'sampling': b'FCMSMP01' + struct.pack('<6I', 1, 33, 16, 16, 32, 3)},
+                       {'sampling_visibility': 0}, {'sampling_size': 31},
+                       {'sampling_rva': 0x2400}, {'sampling_rva': 0x7080}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError): self.validate(fixture(**kwargs))
 
     def test_launch_configuration_is_exact_and_child_service_only_preloads_selector(self):
         config = tool.launch_config(Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw'))

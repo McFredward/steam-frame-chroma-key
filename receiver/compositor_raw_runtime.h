@@ -46,6 +46,8 @@ struct Status {
     std::uint64_t queued=0,drained=0;
     std::size_t parent_bytes=0,scalar_bytes=0,wire_bytes=0;
     bool candidate_arm_required=false,candidate_armed=false,candidate_claimed=false;
+    std::uint64_t begins_before_arm=0,begins_after_arm=0,skipped_prearm_afters=0;
+    bool begin_counts_overflow=false;
 };
 bool initialize(const frame_compositor_main::Prepared&,Setup) noexcept;
 // Metadata publication only, after cold initialization and audit attachment.
