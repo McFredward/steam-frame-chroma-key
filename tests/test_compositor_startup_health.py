@@ -750,7 +750,7 @@ class ForkedRendererSourceTests(unittest.TestCase):
         self.assertEqual(p["kind"], "zygote")
         self.assertEqual({task["comm"] for task in p["ui_compositor_tasks"]}, M.UI_COMPOSITOR_TASK_NAMES)
         self.assertTrue(M.forked_ui_compositor_live(p))
-        self.assertEqual(self.source.ui_task_usage["tasks"], 3)
+        self.assertEqual(self.source.ui_task_usage["tasks"], 6)
         self.assertGreater(self.source.ui_task_usage["metadata_bytes"], 0)
         self.assertGreater(self.source.ui_task_usage["elapsed_ns"], 0)
 
@@ -774,8 +774,8 @@ class ForkedRendererSourceTests(unittest.TestCase):
                 if variant == "symlink":
                     (p / "comm").unlink(); (p / "comm").symlink_to(p / "stat")
                 processes, errors = self.source.processes(unit())
-                self.assertFalse(processes)
-                if variant != "missing": self.assertTrue(errors)
+                self.assertEqual(len(processes), 1); self.assertFalse(errors)
+                self.assertIsNone(processes[0]["ui_compositor_tasks"])
 
     def test_changed_task_identity_and_process_role_cannot_pass(self):
         for variant in ("task_start", "task_name", "process_role"):
@@ -795,17 +795,22 @@ class ForkedRendererSourceTests(unittest.TestCase):
                     return data
                 with mock.patch.object(self.source, "ui_task_read", side_effect=mutate):
                     processes, errors = self.source.processes(unit())
-                self.assertFalse(processes); self.assertTrue(errors)
+                if variant == "process_role": self.assertFalse(processes); self.assertTrue(errors)
+                else:
+                    self.assertEqual(len(processes), 1); self.assertFalse(errors)
+                    self.assertIsNone(processes[0]["ui_compositor_tasks"])
 
-    def test_changed_task_inventory_cannot_pass(self):
+    def test_changed_required_task_role_inventory_cannot_pass(self):
         p = self.native_ui() / "task"; original = self.source.ui_task_read
         def mutate(path, limit):
             data = original(path, limit)
-            if path.name == "stat" and not (p / "extra").exists(): (p / "extra").mkdir()
+            if path.name == "stat" and not (p / "3000001").exists():
+                extra = p / "3000001"; extra.mkdir(); (extra / "comm").write_text("Compositor\n")
             return data
         with mock.patch.object(self.source, "ui_task_read", side_effect=mutate):
             processes, errors = self.source.processes(unit())
-        self.assertFalse(processes); self.assertTrue(errors)
+        self.assertEqual(len(processes), 1); self.assertFalse(errors)
+        self.assertIsNone(processes[0]["ui_compositor_tasks"])
 
     def test_task_sample_read_count_time_and_resume_budgets_do_not_reset(self):
         self.native_ui(); self.source.processes(unit())
@@ -821,14 +826,17 @@ class ForkedRendererSourceTests(unittest.TestCase):
             if key == "samples":
                 with self.assertRaisesRegex(RuntimeError, "sample budget exhausted"): resumed.processes(unit())
             else:
-                processes, errors = resumed.processes(unit()); self.assertFalse(processes); self.assertTrue(errors)
+                processes, errors = resumed.processes(unit())
+                self.assertEqual(len(processes), 1); self.assertFalse(errors)
+                self.assertIsNone(processes[0]["ui_compositor_tasks"])
             bad = copy.deepcopy(saved); bad["ui_task_usage"][key] = True
             with self.subTest(key=key), self.assertRaises(RuntimeError): resumed.resume(bad)
 
     def test_per_process_inventory_and_sample_time_are_hard_bounds(self):
         p = self.native_ui() / "task"
         for index in range(M.UI_TASKS_PER_PROCESS + 1): (p / str(3000000 + index)).mkdir()
-        processes, errors = self.source.processes(unit()); self.assertFalse(processes); self.assertTrue(errors)
+        processes, errors = self.source.processes(unit())
+        self.assertEqual(len(processes), 1); self.assertFalse(errors); self.assertIsNone(processes[0]["ui_compositor_tasks"])
         self.tearDown(); self.setUp(); self.native_ui()
         original = self.source.ui_task_read
         def expire(path, limit):
@@ -836,7 +844,60 @@ class ForkedRendererSourceTests(unittest.TestCase):
             return original(path, limit)
         with mock.patch.object(self.source, "ui_task_read", side_effect=expire):
             processes, errors = self.source.processes(unit())
-        self.assertFalse(processes); self.assertTrue(errors)
+        self.assertEqual(len(processes), 1); self.assertFalse(errors); self.assertIsNone(processes[0]["ui_compositor_tasks"])
+
+    def test_unrelated_task_birth_death_and_non_ascii_names_preserve_required_roles(self):
+        p = self.native_ui() / "task"; original = self.source.ui_task_read
+        ordinary = p / "3000000"; ordinary.mkdir(); (ordinary / "comm").write_text("WorkerThread\n")
+        changed = False
+        def mutate(path, limit):
+            nonlocal changed
+            data = original(path, limit)
+            if not changed and path.name == "stat":
+                changed = True
+                # Birth/death of unneeded tasks must not become a renderer loss.
+                (ordinary / "comm").unlink(); ordinary.rmdir()
+                extra = p / "3000001"; extra.mkdir(); (extra / "comm").write_bytes(b"Worker_\xff\n")
+            return data
+        with mock.patch.object(self.source, "ui_task_read", side_effect=mutate):
+            processes, errors = self.source.processes(unit())
+        self.assertEqual(len(processes), 1); self.assertFalse(errors)
+        self.assertTrue(M.forked_ui_compositor_live(processes[0]))
+
+    def test_optional_task_gap_preserves_one_shot_native_connection_until_role_ready(self):
+        self.native_ui(); self.procfile(101, "compositor"); self.procfile(102); self.procfile(100)
+        self.source.cursor = "s=old"
+        for name, text in forked_sample()["logs"].items(): (self.logdir / (name + ".txt")).write_text(text + "\n")
+        gate = M.StartupGate(baseline())
+        with mock.patch.object(self.source, "ui_compositor_tasks", side_effect=RuntimeError("temporarily changing task roles")):
+            first = self.source.sample()
+        self.assertFalse(first["errors"])
+        self.assertFalse(gate.consume(first, stable_seconds=0)["ready"])
+        self.source.now = 3
+        # Cursor/log offsets advanced; no invented/replayed native events.
+        second = self.source.sample()
+        self.assertTrue(all(not text for text in second["logs"].values()))
+        self.assertTrue(gate.consume(second, stable_seconds=0)["ready"])
+
+    def test_unrelated_optional_task_gap_does_not_revoke_an_explicit_renderer(self):
+        self.native_ui(); self.procfile(101, "compositor"); self.procfile(102); self.procfile(104, "renderer"); self.procfile(100)
+        self.source.cursor = "s=old"
+        for name, text in sample()["logs"].items(): (self.logdir / (name + ".txt")).write_text(text + "\n")
+        gate = M.StartupGate(baseline()); self.assertTrue(gate.consume(self.source.sample(), stable_seconds=0)["ready"])
+        self.source.now = 3
+        with mock.patch.object(self.source, "ui_compositor_tasks", side_effect=RuntimeError("ordinary CEF worker churn")):
+            second = self.source.sample()
+        self.assertTrue(gate.consume(second, stable_seconds=0)["ready"])
+
+    def test_required_fork_task_proof_loss_still_revokes_readiness(self):
+        self.native_ui(); self.procfile(101, "compositor"); self.procfile(102); self.procfile(100)
+        self.source.cursor = "s=old"
+        for name, text in forked_sample()["logs"].items(): (self.logdir / (name + ".txt")).write_text(text + "\n")
+        gate = M.StartupGate(baseline()); self.assertTrue(gate.consume(self.source.sample(), stable_seconds=0)["ready"])
+        self.source.now = 3
+        with mock.patch.object(self.source, "ui_compositor_tasks", side_effect=RuntimeError("required task unavailable")):
+            second = self.source.sample()
+        self.assertEqual(gate.consume(second, stable_seconds=0)["status"], "fault")
 
 class IsolationGateTests(unittest.TestCase):
     def setUp(self):

@@ -34,6 +34,7 @@ JOURNAL_FIELDS = ("MESSAGE", "_PID", "_SYSTEMD_INVOCATION_ID", "_SYSTEMD_USER_IN
 COREDUMP_MESSAGE_ID = "fc2e22bc6ee647b6b90729ab34a250b1"
 MAX_PROCESSES = 512
 UI_COMPOSITOR_TASK_NAMES = frozenset(("Chrome_ChildIOT", "GpuMemoryThread", "Compositor"))
+UI_COMPOSITOR_TASK_BYTES = frozenset(name.encode("ascii") for name in UI_COMPOSITOR_TASK_NAMES)
 UI_TASK_LIMITS = {"samples": 128, "tasks": 8192, "metadata_bytes": 4 * 1024 * 1024, "elapsed_ns": 8 * 10**9}
 UI_TASKS_PER_PROCESS = 256
 ISOLATION_SCHEMA = "frame-compositor-startup-isolation-v1"
@@ -397,7 +398,14 @@ class NativeEvidenceSource:
                     libcef = any(len(cols := row.split(None, 5)) == 6 and cols[5] in (LIBCEF, self.native_paths[LIBCEF]) and
                                  len(cols[1]) == 4 and cols[1][2] == "x" for row in maps)
                     if kind == "zygote" and libcef:
-                        ui_tasks = self.ui_compositor_tasks(path, unit["ControlGroup"], start)
+                        try: ui_tasks = self.ui_compositor_tasks(path, unit["ControlGroup"], start)
+                        except (OSError, RuntimeError, UnicodeError, ValueError):
+                            # Optional fork-role proof may be unavailable while
+                            # tasks start. Retain the independently authenticated
+                            # process, so its one-shot native connection remains
+                            # bindable. The gate still needs live required UI tasks;
+                            # unrelated children cannot revoke a proven renderer.
+                            ui_tasks = None
                 # Bracket the native role and its task reads with the same exact
                 # managed executable/owner/group/start identity, not a filename.
                 end_start, end_state = self.process_identity(path)
@@ -447,12 +455,15 @@ class NativeEvidenceSource:
             if len(entries) > UI_TASKS_PER_PROCESS or any(not path.name.isdigit() or not 0 < int(path.name) < 2**31 for path in entries):
                 raise RuntimeError("Native UI task inventory bound exceeded")
             result = []
+            role_nodes = {}
             for path in entries:
                 if self.ui_task_usage["tasks"] >= UI_TASK_LIMITS["tasks"]:
                     raise RuntimeError("Native UI task count budget exhausted")
                 self.ui_task_usage["tasks"] += 1
-                name = self.ui_task_read(path / "comm", 32).decode("ascii").rstrip("\n")
-                if name not in UI_COMPOSITOR_TASK_NAMES: continue
+                try: raw_name = self.ui_task_read(path / "comm", 32).rstrip(b"\n")
+                except FileNotFoundError: continue
+                if raw_name not in UI_COMPOSITOR_TASK_BYTES: continue
+                name = raw_name.decode("ascii")
                 node = path.lstat()
                 if not stat.S_ISDIR(node.st_mode) or node.st_uid != self.uid:
                     raise RuntimeError("Native UI compositor task owner/type changed")
@@ -477,16 +488,55 @@ class NativeEvidenceSource:
                     raise RuntimeError("Native UI compositor task changed during sampling")
                 result.append({"tid": int(path.name), "start_ticks": int(fields[19]),
                     "state": fields[0] if fields[0] in INELIGIBLE_STATES else fields2[0], "comm": name})
+                role_nodes[(int(path.name), name)] = (node.st_dev, node.st_ino, node.st_mode, node.st_uid)
                 if len(result) > 3 or len({task["comm"] for task in result}) != len(result):
                     raise RuntimeError("Ambiguous native UI compositor task roles")
-            if {path.name for path in itertools.islice(taskdir.iterdir(), UI_TASKS_PER_PROCESS + 1)} != {path.name for path in entries}:
-                raise RuntimeError("Native UI compositor task inventory changed during sampling")
+            # Unrelated CEF workers may come and go during a healthy startup or
+            # stream. Recheck the required role identities, not the entire task
+            # inventory. New duplicate roles or a replaced/disappeared required
+            # task still leave no positive renderer proof.
+            ending = list(itertools.islice(taskdir.iterdir(), UI_TASKS_PER_PROCESS + 1))
+            if len(ending) > UI_TASKS_PER_PROCESS:
+                raise RuntimeError("Native UI task inventory bound exceeded")
+            expected = {(task["tid"], task["comm"]): task for task in result}
+            observed = set()
+            for path in ending:
+                if not path.name.isdigit() or not 0 < int(path.name) < 2**31:
+                    raise RuntimeError("Invalid native UI task inventory identity")
+                if self.ui_task_usage["tasks"] >= UI_TASK_LIMITS["tasks"]:
+                    raise RuntimeError("Native UI task count budget exhausted")
+                self.ui_task_usage["tasks"] += 1
+                try: raw_name = self.ui_task_read(path / "comm", 32).rstrip(b"\n")
+                except FileNotFoundError: continue
+                if raw_name not in UI_COMPOSITOR_TASK_BYTES: continue
+                key = (int(path.name), raw_name.decode("ascii"))
+                if key not in expected:
+                    raise RuntimeError("Native UI compositor task role inventory changed during sampling")
+                raw = self.ui_task_read(path / "stat", 8192).decode("ascii")
+                fields = raw[raw.rfind(")") + 2:].split()
+                if (raw.rfind(")") < 0 or raw.split(" ", 1)[0] != path.name or len(fields) < 20 or
+                        fields[19] != str(expected[key]["start_ticks"]) or
+                        fields[0] not in tuple("RSDTtXxZIKPW") or fields[0] in INELIGIBLE_STATES):
+                    raise RuntimeError("Native UI compositor task role identity changed during sampling")
+                node = path.lstat()
+                groups = self.ui_task_read(path / "cgroup", 8192).decode("ascii").splitlines()
+                if ((node.st_dev, node.st_ino, node.st_mode, node.st_uid) != role_nodes[key] or
+                        not any(len(row.split(":", 2)) == 3 and
+                            (row.split(":", 2)[2] == group or row.split(":", 2)[2].startswith(group + "/")) for row in groups)):
+                    raise RuntimeError("Native UI compositor task role scope changed during sampling")
+                observed.add(key)
+            if observed != set(expected):
+                raise RuntimeError("Native UI compositor task role inventory changed during sampling")
             if time.monotonic() >= self.ui_task_deadline:
                 raise RuntimeError("Native UI task sample time bound exceeded")
             return sorted(result, key=lambda task: task["comm"])
         finally:
-            self.ui_task_usage["elapsed_ns"] += max(0, time.monotonic_ns() - began)
-            if self.ui_task_usage["elapsed_ns"] > UI_TASK_LIMITS["elapsed_ns"]:
+            spent = self.ui_task_usage["elapsed_ns"] + max(0, time.monotonic_ns() - began)
+            # This is a spent-budget counter, not an exact timing measurement.
+            # Saturation retains retirement across resume without invalidating
+            # otherwise valid explicit-renderer process evidence/checkpoints.
+            self.ui_task_usage["elapsed_ns"] = min(spent, UI_TASK_LIMITS["elapsed_ns"])
+            if spent > UI_TASK_LIMITS["elapsed_ns"]:
                 raise RuntimeError("Native UI task cumulative time budget exhausted")
 
     def isolation_read(self, path, limit):
