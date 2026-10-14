@@ -202,6 +202,20 @@ static_assert(std::is_trivially_copyable_v<ImportResourceReceipt>,
               "Import receipts must contain bounded owned metadata");
 static_assert(sizeof(ImportResourceReceipt) < 4096, "Import receipt exceeds its bounded budget");
 
+// Instantaneous owner-side samples, not an atomic lease on native resources.
+enum class ImportReceiptValidationReason : std::uint8_t {
+    Valid, Closed, Halted, JournalLoss, ActivePublication, PendingReplay,
+    PublicationChanged, CoreGenerationMismatch
+};
+struct ImportReceiptValidation {
+    bool valid = false, transient = false;
+    ImportReceiptValidationReason reason = ImportReceiptValidationReason::CoreGenerationMismatch;
+    std::uint64_t active_before = 0, active_after = 0;
+    std::uint64_t expected_before = 0, expected_after = 0, tickets_before = 0, tickets_after = 0;
+    std::uint64_t loss_before = 0, loss_after = 0;
+    bool empty_before = false, empty_after = false, closed_before = false, closed_after = false;
+    bool halted_before = false, halted_after = false;
+};
 class Core {
     friend struct TestAccess;
     struct Base { std::uint64_t device = 0; Identity id{}; bool complete = false; };

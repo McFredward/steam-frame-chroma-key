@@ -222,14 +222,39 @@ public:
     // be replayed. Refuse a concurrent publication window or an unread ticket;
     // current handle equality alone cannot validate a queued destroy/recreate.
     // This remains CPU lifecycle evidence, never GPU completion or a lifetime pin.
-    bool validateImportResourceReceipt(const ImportResourceReceipt& receipt) noexcept {
-        const auto ticket = tickets_.load(std::memory_order_acquire);
-        if (closed_.load(std::memory_order_acquire) || halted_.load(std::memory_order_acquire) ||
-            active_.load(std::memory_order_acquire) || !empty() || expected_ != ticket || lostState()) return false;
+    ImportReceiptValidation validateImportResourceReceiptDetailed(const ImportResourceReceipt& receipt) noexcept {
+        ImportReceiptValidation out;
+        out.tickets_before = tickets_.load(std::memory_order_acquire);
+        out.closed_before = closed_.load(std::memory_order_acquire);
+        out.halted_before = halted_.load(std::memory_order_acquire);
+        out.active_before = active_.load(std::memory_order_acquire);
+        out.empty_before = empty(); out.expected_before = expected_; out.loss_before = lostState();
+        const auto deny = [&](ImportReceiptValidationReason reason, bool transient = false) {
+            out.reason = reason; out.transient = transient; return out;
+        };
+        if (out.closed_before) return deny(ImportReceiptValidationReason::Closed);
+        if (out.halted_before) return deny(ImportReceiptValidationReason::Halted);
+        if (out.loss_before) return deny(ImportReceiptValidationReason::JournalLoss);
+        if (out.active_before) return deny(ImportReceiptValidationReason::ActivePublication, true);
+        if (!out.empty_before || out.expected_before != out.tickets_before)
+            return deny(ImportReceiptValidationReason::PendingReplay, true);
         const auto valid = core_.validate(receipt);
-        return valid && !active_.load(std::memory_order_acquire) && empty() &&
-            expected_ == ticket && tickets_.load(std::memory_order_acquire) == ticket &&
-            !closed_.load(std::memory_order_acquire) && !halted_.load(std::memory_order_acquire) && !lostState();
+        out.active_after = active_.load(std::memory_order_acquire);
+        out.empty_after = empty(); out.expected_after = expected_;
+        out.tickets_after = tickets_.load(std::memory_order_acquire);
+        out.closed_after = closed_.load(std::memory_order_acquire);
+        out.halted_after = halted_.load(std::memory_order_acquire); out.loss_after = lostState();
+        if (out.closed_after) return deny(ImportReceiptValidationReason::Closed);
+        if (out.halted_after) return deny(ImportReceiptValidationReason::Halted);
+        if (out.loss_after) return deny(ImportReceiptValidationReason::JournalLoss);
+        if (!valid) return deny(ImportReceiptValidationReason::CoreGenerationMismatch);
+        if (out.active_after || !out.empty_after || out.expected_after != out.tickets_before ||
+            out.tickets_after != out.tickets_before)
+            return deny(ImportReceiptValidationReason::PublicationChanged, true);
+        out.valid = true; out.reason = ImportReceiptValidationReason::Valid; return out;
+    }
+    bool validateImportResourceReceipt(const ImportResourceReceipt& receipt) noexcept {
+        return validateImportResourceReceiptDetailed(receipt).valid;
     }
     // The verified native adapter calls this immediately after publishing the
     // matching successful tagged view creation. Hooks copy only owned scalars;
