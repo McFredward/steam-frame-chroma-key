@@ -1,5 +1,11 @@
 # Next compositor resource observation
 
+Historical 2026-10-13 plan: its 709-byte scope covered the Vulkan renderer only.
+The source-proven Facet path, distinct 757-byte review and current v3 package are
+documented in [the artifact contract](COMPOSITOR-RAW-ARTIFACT-20261013.md) and
+[the second-cutoff analysis](COMPOSITOR-RAW-FIRST-CANDIDATE-20261013.md).
+The original runtime approval does not authorize that changed acquisition scope.
+
 The client capture on 2026-10-13 observed a real, complete import request/reply
 and the receiver's following reference of the same nonzero token. That is a
 useful local transaction result. It does not identify a compositor image, an

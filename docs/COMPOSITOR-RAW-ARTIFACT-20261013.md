@@ -23,6 +23,13 @@ manifest selects `frame_compositor_raw_` aliases instead. Eleven native
 forwarding entries and the readiness marker remain hidden. The raw build cannot
 opt back into the unsafe ordinary names.
 
+The current offline/owned package schema is v3 with envelope/source marker v2.
+It includes the source-proven Vulkan and Facet creation routes described in the
+[2026-10-14 analysis](COMPOSITOR-RAW-FIRST-CANDIDATE-20261013.md).
+Its 757-byte maximum is a newly reviewed acquisition scope, not an extension of
+the older package's runtime authorization. Keep the original package helper for
+any original-package rollback; do not replace a live session's owned helper.
+
 The offline preparer validates the final ELF, complete separately reviewed file
 hash, scope marker, static TLS, hidden entries, real compatibility imports,
 native profiles and provider addresses. It produces an immutable audit library,
@@ -60,9 +67,9 @@ address, reply sequence or stack range becomes a source-frame proof.
 | --- | ---: |
 | Native import transactions | 1 |
 | Parent-pair bytes | 16 |
-| Sparse stack-scalar bytes | 672 |
+| Sparse stack-scalar bytes | 720 |
 | Successful reply-prefix bytes | 21 |
-| Total mutable native bytes copied | 709 |
+| Total mutable native bytes copied | 757 |
 | Positive partial reply writes | 8 |
 | Raw output | 32 records, 64 KiB, 120 seconds |
 | Existing passive Journal output | 1 MiB, bounded queues and records |

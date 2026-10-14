@@ -40,11 +40,11 @@ READY = 'frame_compositor_raw_ready'
 BRIDGE = 'frame_compositor_raw_bridge'
 LAYER = 'VK_LAYER_FRAME_MASK_trace'
 ENVELOPE_BYTES = 8272
-MARKER = b'FCMRAW01' + struct.pack('<II', 1, ENVELOPE_BYTES)
-LIMIT_WORDS = (672, 21, 16, 8, 32, 65536, 120, 4)
+MARKER = b'FCMRAW02' + struct.pack('<II', 2, ENVELOPE_BYTES)
+LIMIT_WORDS = (720, 21, 16, 8, 32, 65536, 120, 4)
 CAPTURE_LIMITS = {'records': 32, 'bytes': 65536, 'seconds': 120}
-RAW_LIMITS = {'transactions': 1, 'writes': 8, 'scalar_bytes': 672, 'wire_bytes': 21,
-              'parent_bytes': 16, 'private_bytes': 709, 'bootstrap_poll_bytes': 0}
+RAW_LIMITS = {'transactions': 1, 'writes': 8, 'scalar_bytes': 720, 'wire_bytes': 21,
+              'parent_bytes': 16, 'private_bytes': 757, 'bootstrap_poll_bytes': 0}
 JOURNAL_LIMITS = {'bytes': 1048576, 'call_records': 512, 'binding_records': 32}
 ROLES = (7, 3, 4, 5)
 NATIVE_PROFILES = tuple(bytes.fromhex(value) for value in (
@@ -211,7 +211,7 @@ def decode_envelope(data, expected_profile=None):
         raise ValueError('Compositor envelope acquisition/capture limits changed')
     blobs = tuple(data[112 + 2032 * i:112 + 2032 * (i + 1)] for i in range(4))
     validate_profiles(blobs, reviewed)
-    return {'schema': 1, 'bytes': ENVELOPE_BYTES, 'reviewed_observer_profile_identity': reviewed.hex(),
+    return {'schema': 2, 'bytes': ENVELOPE_BYTES, 'reviewed_observer_profile_identity': reviewed.hex(),
             'module_roles': list(ROLES), 'module_count': 4, 'raw_limits': dict(RAW_LIMITS),
             'capture_limits': dict(CAPTURE_LIMITS), 'profiles': blobs, 'sha256': digest(data).hex(),
             'independent_observer_checked': expected_profile is not None}
@@ -402,7 +402,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
     inventory = [{'name': name, 'bytes': len(value), 'sha256': digest(value).hex(),
                   'frame_path': None if name in ('audit-preparation.cpp', SELECTOR_SOURCE) else str(frame / name),
                   'owned_source': True, 'native_bytes': False, 'mode': '0600'} for name, value in artifacts.items()]
-    plan = {'schema': 'frame-compositor-raw-offline-bundle-v2', 'prepared': True, 'installed': False, 'activated': False,
+    plan = {'schema': 'frame-compositor-raw-offline-bundle-v3', 'prepared': True, 'installed': False, 'activated': False,
             'runtime_authorized': False, 'frame_access': False, 'network_access': False, 'automatic_restart': False,
             'native_binary_or_script_changes': False, 'shader_or_mask_activation': False, 'source_frame_associated': False,
             'gpu_coherent': False, 'continuous_connection_owned': False, 'native_namespace_associated': False,
@@ -411,7 +411,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
             'launch_isolation': {'schema': 'frame-compositor-startup-isolation-v1', 'target_exe': configuration['target'],
                 'selector_path': configuration['selector'], 'payload_path': configuration['payload'],
                 'audit_path': configuration['audit'], 'target_exec_environment': launch_environment(configuration)},
-            'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 1,
+            'envelope': {'bytes': len(envelope), 'sha256': digest(envelope).hex(), 'schema': 2,
                          'reviewed_observer_profile_identity': reviewed.hex(), 'module_count': 4, 'module_roles': list(ROLES)},
             'manifest': {'name': MANIFEST, 'bytes': len(manifest), 'sha256': digest(manifest).hex(), 'layer_name': LAYER,
                          'functions': dict(VULKAN_FUNCTIONS),
@@ -424,7 +424,8 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
             'environment': {'LD_PRELOAD': configuration['selector']},
             'inventory': inventory, 'audit_source_sha256': digest(source.encode()).hex(), 'audit_compile_command': command, 'logs': logs,
             'local_receipt': {'name': PLAN, 'mode': '0600', 'frame_path': None},
-            'scope': ['one current-thread native compositor import, at most 709 precisely listed scalar/reply metadata bytes',
+            'scope': ['one current-thread native compositor import, at most 757 precisely listed scalar/reply metadata bytes',
+                      'two exact pinned renderer routes; 80 Vulkan or 96 Facet bytes per creation boundary, never mixed',
                       'original public libc forwarding and public Vulkan image/bind/view results; no GPU pixel readback',
                       'same combined DSO for preload, three hidden Vulkan entries and the implicit Vulkan layer',
                       'tiny C launch selector in service descendants; full observer/audit only in the exact compositor target',

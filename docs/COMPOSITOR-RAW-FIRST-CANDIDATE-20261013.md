@@ -169,3 +169,53 @@ checking while keeping its simulated native frame on the actual thread stack.
 All 27 cases then passed. No production ownership check was weakened. These
 internal adapter/transport fixtures establish neither native cold admission nor
 a real headset result. No complete gate was repeated for this bounded change.
+
+## Second source-specific cutoff (2026-10-14)
+
+The cold-freeze v2 attempt produced the same successful Begin/early-unlock and
+40-byte cutoff. Unlike the earlier capture, its terminal record now identifies
+`Image/Before`, `InvalidEntry`, and the actual entry registers. The image entry's
+frame pointer equals SP and the dispatch frame is 1,536 bytes above SP. The
+previously supported Vulkan route requires a 96-byte FP offset and a 1,232-byte
+dispatch offset. No image scalar read or wire copy followed that mismatch.
+
+Offline review of the exact already-pinned native executable identifies two
+renderer implementations. The observed image call belongs to the Facet
+allocator, reached through the Facet renderer, not the supported Vulkan renderer.
+Its additional allocator/renderer frame explains the observed layout exactly.
+Thus this is a source-specific alternate route, not merely a relocated address
+or evidence that native image creation failed. The capture did not acquire its
+caller chain, so static source agreement still does not prove a complete runtime
+transaction or video-resource association.
+
+The source repair admits both exact renderer paths and remembers which path its
+Image boundary selected. Bind/View must use that same route; mixed chains remain
+refused. Facet uses the same genuine public image/bind/view APIs, but five caller
+links require 96 scalar bytes per creation boundary instead of Vulkan's 80. The
+new maximum is 720 scalar bytes, plus the unchanged 16-byte parent and 21-byte
+reply limits: **757 private bytes**. Omitting a caller check to retain the old
+709-byte authorization would be incorrect.
+
+The source marker/envelope and offline/owned package schemas are versioned again.
+Older 709-byte artifacts cannot silently become 757-byte packages, and the new
+artifact needs separate runtime scope approval before deployment. One candidate,
+eight writes, 32 raw records, 64 KiB and 120 seconds remain unchanged. No new
+heap, socket, payload, image, shader or sender acquisition is proposed. Operator
+arming and passive-output reservation remain independent pending work; a
+successful startup import still cannot identify the requested PC-VR frame.
+
+Local validation passed four affected source/sparse/raw/runtime CTest groups
+normally and under ASan/UBSan, including 30 callback subprocess cases and exact
+maximum-write/scalar-budget cases. The older lease/replay adapter explicitly
+retains its Vulkan-only contract; its additional refusal control passed normally
+and sanitized without rerunning the already passing raw groups.
+
+Integration validation used the final ARM64 ELF for all 11 offline artifact
+controls without skips, plus three inert ARM/native-libc forwarding/forced-unwind
+cases (52 checks each). The changed writer's focused sanitizer target passed.
+The 77 session controls passed after schema/envelope changes; three later scope
+guards passed separately, checking actual read-only ELF marker bytes, relabelled
+old artifacts and stored-plan activation admission without blocking recovery.
+The stage helper rechecks the marker through bounded actual load-segment metadata;
+it does not rely solely on the preparer's JSON report. These are software/source
+results, not a completed Frame capture or live resource association.

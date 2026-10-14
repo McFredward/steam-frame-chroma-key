@@ -54,9 +54,8 @@ were regenerated. Content, permissions, identity or environment mismatches still
 prevent a restoration success claim. Native files are never rewritten. Fresh
 restoration/UI receipts join the existing bounded capture archive.
 
-The current Frame has already been restored and both owned input/session
-directories removed. These new changes were tested locally; they have not been
-deployed for a further headset run.
+At that checkpoint the Frame had been restored and both owned input/session
+directories removed. The later 2026-10-14 attempt is recorded below.
 
 Validation reused already passing evidence for unchanged areas. The integration
 ran three focused CTest groups: 70 session controls, 44 selector core checks and
@@ -149,3 +148,45 @@ The separate raw `InvalidEntry` retirement and missing source frame/eye/UV/GPU
 associations are still described in
 [the first-candidate analysis](COMPOSITOR-RAW-FIRST-CANDIDATE-20261013.md).
 Startup health does not resolve them or activate passthrough.
+
+## Cold-freeze hardware attempt and journal repair (2026-10-14)
+
+The maintainer explicitly authorized the reviewed v2 package and immediate
+original-state recovery on a detected startup fault. The operator uploaded and
+staged only its five artifacts, deployment plan and three helpers, then consumed
+restart readiness immediately. No native file or shader was modified.
+
+The gate stopped on `Unsupported current journal evidence`. Its saved current
+invocation includes normal colour-coded XRService/ONNX messages whose `MESSAGE`
+is a byte array. This is a documented
+[systemd Journal JSON encoding](https://systemd.io/JOURNAL_EXPORT_FORMATS/), not
+by itself a SteamVR or loader failure. The same parser defect rejected the first
+original-service recovery receipt. The operator removed the exact activation and
+performed an additional original-service restart rather than leaving uncertain
+diagnostic state. The maintainer subsequently confirmed a normal interface.
+
+The new parser accepts only strings or bounded arrays of genuine integer bytes
+0–255, preserving every byte. Unknown, missing, duplicate-value and oversized
+representations remain non-proof. ANSI CSI control sequences are removed only
+from the fatal-search view: a colour prefix must not hide the word boundary of
+`VK_ERROR_DEVICE_LOST`. Original evidence and invocation/PID/time filtering are
+retained. Local tests cover genuine source-shaped JSON, fatal arrays, malformed
+values, byte limits and old/current invocation filtering.
+
+The raw header records a successful exact-owner cold freeze with ABI 1/provider
+mask 63. The initial cgroup sample maps the full observer/audit only in its one
+declared compositor; its sampled helpers have neither those libraries nor trace
+inputs. However, two short-lived processes disappeared during that census, and
+the journal fault occurred before a stable UI/isolation verdict. This is useful
+positive launch evidence, **not a passing startup gate or complete live-isolation
+proof**. A separately declined native image route is described in the
+[first-candidate analysis](COMPOSITOR-RAW-FIRST-CANDIDATE-20261013.md).
+
+Following confirmed restoration, a stable census of 15 current managed processes
+showed no owned diagnostic mappings; the service environment/drop-ins and both
+activation paths were empty. The operator saved all bounded captures, verified
+the exact owned file hashes and removed only the 28 recorded input/session files.
+That cleanup did not restart SteamVR. Private operation, recovery and cleanup
+receipts remain in `build/private-compositor-freeze-integration-20261014/`.
+The failed automatic health receipts are preserved as failures; user confirmation
+and later original-state census do not retroactively turn them into ready receipts.

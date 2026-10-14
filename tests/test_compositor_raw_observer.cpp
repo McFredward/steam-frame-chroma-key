@@ -142,21 +142,23 @@ void join_controls() {
 }
 void formatter_controls() {
     runtime::Record r{};r.kind=runtime::Kind::RawMatched;r.raw=raw_fixture();r.ordinal=2;
+    r.raw.creation_route=frame_import_native::CreationRoute::Vulkan;
     r.entry.sp=0xabcdef00;r.entry.x[29]=0xabcdef20;r.entry.x[30]=0x98765400;
     Line l;record(l,r);check(l.valid && l.used<l.bytes.size() && l.bytes[l.used-1]=='\n');
     const std::string text(l.bytes.data(),l.used);
     for(const auto* name:{"\"mask_enabled\":false","\"source_frame_associated\":false","\"accepted_submit\":false","\"gpu_consumed\":false"})check(text.find(name)!=std::string::npos);
     check(text.find("\"reply_token\":\"8877665544332211\"")!=std::string::npos);
     for(const auto* field:{"\"entry_sp\":\"abcdef00\"", "\"entry_fp\":\"abcdef20\"", "\"entry_lr\":\"98765400\"",
-        "\"last_boundary\":7", "\"last_phase\":1", "\"last_native_result\":0", "\"last_native_result_available\":true"})
+        "\"last_boundary\":7", "\"last_phase\":1", "\"creation_route\":1", "\"last_native_result\":0", "\"last_native_result_available\":true"})
         check(text.find(field)!=std::string::npos);
     auto refused=r;refused.kind=runtime::Kind::RawRefused;refused.raw.matched=false;
     refused.raw.reason=frame_compositor_raw::InvalidEntry;refused.raw.last_boundary=frame_compositor_raw::Boundary::Image;
+    refused.raw.creation_route=frame_import_native::CreationRoute::Facet;
     refused.raw.last_phase=frame_compositor_raw::Phase::Before;refused.raw.last_native_result=-1;
     refused.raw.last_native_result_available=false;Line refusal;record(refusal,refused);
     check(refusal.valid && refusal.used<refusal.bytes.size());
     const std::string denial(refusal.bytes.data(),refusal.used);
-    for(const auto* field:{"\"reason\":128", "\"last_boundary\":2", "\"last_phase\":0",
+    for(const auto* field:{"\"reason\":128", "\"last_boundary\":2", "\"last_phase\":0", "\"creation_route\":2",
         "\"last_native_result\":-1", "\"last_native_result_available\":false", "\"entry_lr\":\"98765400\""})
         check(denial.find(field)!=std::string::npos);
     r.kind=runtime::Kind::Receipt;r.receipt=receipt_fixture();Line second;record(second,r);check(second.valid && second.used<second.bytes.size());

@@ -85,8 +85,8 @@ class SessionTests(unittest.TestCase):
         for key, value in (("NATIVE", pins), ("PROFILE_PINS", tuple(p[-32:].hex() for p in profiles))):
             patch = mock.patch.object(M, key, value); patch.start(); self.patches.append(patch)
         main, audit, selector = self.elf(7), self.elf(8), self.elf(9); profiles.append(self.profile(5, main))
-        envelope = bytearray(8272); envelope[:8] = b"FCMRAW01"
-        struct.pack_into("<II", envelope, 8, 1, 8272); envelope[16:48] = profiles[-1][-32:]
+        envelope = bytearray(8272); envelope[:8] = b"FCMRAW02"
+        struct.pack_into("<II", envelope, 8, 2, 8272); envelope[16:48] = profiles[-1][-32:]
         struct.pack_into("<8Q", envelope, 48, *M.ENVELOPE_LIMITS)
         envelope[112:-32] = b"".join(profiles); envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
         layer = self.layer_bytes()
@@ -96,9 +96,10 @@ class SessionTests(unittest.TestCase):
             "frame_user_home": str(self.home), "directory_mode": "0700", "environment": self.session.activation_values(), "native_profiles": reports,
             "observer_profile": {"role": 5, "file_sha256": M.digest(main), "profile_sha256": profiles[-1][-32:].hex()},
             "observer": {"sha256": M.digest(main), "bytes": len(main), "public_exports": sorted(M.PUBLIC_EXPORTS),
+                "scope_marker": {"symbol": "frame_compositor_raw_scope", "rva": 0x1080, "bytes": 16, "sha256": M.digest(M.SCOPE_MARKER)},
                 "vulkan_functions": dict(M.VULKAN_FUNCTIONS), "standard_vulkan_exports": [], "cold_environment_freeze_abi": 1, "launch_provider_mask": 63},
             "audit": {"sha256": M.digest(audit), "bytes": len(audit), "native_rvas": dict(M.NATIVE_RVAS), "early_forward_only": True},
-            "envelope": {"sha256": M.digest(envelope), "bytes": len(envelope), "schema": 1, "module_count": 4,
+            "envelope": {"sha256": M.digest(envelope), "bytes": len(envelope), "schema": 2, "module_count": 4,
                 "module_roles": [7, 3, 4, 5], "reviewed_observer_profile_identity": profiles[-1][-32:].hex()},
             "manifest": {"sha256": M.digest(layer), "bytes": len(layer), "library_path": str(self.session.library),
                 "functions": dict(M.VULKAN_FUNCTIONS),
@@ -129,7 +130,15 @@ class SessionTests(unittest.TestCase):
         patch.start(); self.patches.append(patch)
 
     @staticmethod
-    def elf(value): return b"\x7fELF\x02\x01\x01" + b"\0" * 9 + b"\x03\0\xb7\0" + bytes([value]) * 44
+    def elf(value):
+        raw = bytearray(192)
+        raw[:20] = b"\x7fELF\x02\x01\x01" + b"\0" * 9 + b"\x03\0\xb7\0"
+        struct.pack_into("<Q", raw, 32, 64)
+        struct.pack_into("<3H", raw, 52, 64, 56, 1)
+        struct.pack_into("<II6Q", raw, 64, 1, 4, 0, 0x1000, 0, len(raw), len(raw), 4096)
+        raw[128:144] = M.SCOPE_MARKER
+        raw[144:] = bytes([value]) * 48
+        return bytes(raw)
     @staticmethod
     def profile(role, data):
         raw = bytearray(2032); struct.pack_into("<5Q", raw, 0, 1, role, 183, 3, len(data))
@@ -260,9 +269,52 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(self.session.readcheck()["active"])
         self.assertTrue(self.session.manifest()["scope_acknowledged"])
 
+    def test_actual_observer_scope_is_read_only_and_matches_the_reviewed_contract(self):
+        report = copy.deepcopy(self.plan["observer"]["scope_marker"])
+        valid = self.artifacts[M.MAIN].read_bytes()
+        self.session.validate_scope_marker(valid, report)
+        variants = []
+        raw = bytearray(valid); raw[128:144] = b"FCMRAW01" + struct.pack("<II", 1, 8272); variants.append(raw)
+        for flags in (5, 6, 7):
+            raw = bytearray(valid); struct.pack_into("<I", raw, 68, flags); variants.append(raw)
+        raw = bytearray(valid); struct.pack_into("<Q", raw, 96, 128); variants.append(raw)
+        raw = bytearray(valid); struct.pack_into("<H", raw, 56, 129); variants.append(raw)
+        variants.append(valid[:100])
+        for raw in variants:
+            with self.subTest(raw=bytes(raw[:16])), self.assertRaises(RuntimeError):
+                self.session.validate_scope_marker(bytes(raw), report)
+        for key, value in (("rva", True), ("rva", 2**64), ("bytes", 15), ("sha256", "f" * 64)):
+            bad = dict(report); bad[key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                self.session.validate_scope_marker(valid, bad)
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_staging_rejects_relabelled_old_observer_even_with_a_reviewed_new_plan(self):
+        raw = bytearray(self.artifacts[M.MAIN].read_bytes())
+        raw[128:144] = b"FCMRAW01" + struct.pack("<II", 1, 8272)
+        self.alter_artifact(M.MAIN, bytes(raw))
+        with self.assertRaisesRegex(RuntimeError, "acquisition marker"): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_activation_readmits_stored_scope_without_blocking_original_recovery(self):
+        self.stage()
+        plan = copy.deepcopy(self.plan); plan["schema"] = "frame-compositor-raw-offline-bundle-v2"
+        path = self.session.folder / "deployment-plan.json"; path.unlink(); M.exclusive(path, M.json_bytes(plan))
+        manifest_path = self.session.folder / "owned.json"
+        manifest = json.loads(manifest_path.read_bytes()); manifest["plan_sha256"] = M.digest(path.read_bytes())
+        manifest["owned_files"]["deployment-plan.json"] = manifest["plan_sha256"]
+        manifest_path.unlink(); M.exclusive(manifest_path, M.json_bytes(manifest))
+        with self.assertRaisesRegex(RuntimeError, "Stored acquisition scope"): self.activate()
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertEqual(self.restart_count(), 0)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 1)
+
     def test_legacy_environment_or_unreviewed_freeze_cannot_stage(self):
         original = copy.deepcopy(self.plan)
         variants = (("schema", "frame-compositor-raw-offline-bundle-v1"),
+            ("schema", "frame-compositor-raw-offline-bundle-v2"),
+            ("raw_limits", dict(self.plan["raw_limits"], scalar_bytes=672, private_bytes=709)),
             ("environment", self.session.target_environment()),
             ("selector", dict(self.plan["selector"], launch_provider_mask=15)),
             ("launch_isolation", dict(self.plan["launch_isolation"], target_exe="/foreign/vrcompositor")))

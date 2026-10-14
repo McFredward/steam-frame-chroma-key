@@ -31,8 +31,8 @@ _health_spec.loader.exec_module(health)
 safe_path, read_regular, exclusive = base.safe_path, base.read_regular, base.exclusive
 digest, json_bytes, private_parents = base.digest, base.json_bytes, base.private_parents
 UNIT = "steamvr.service"
-SCHEMA = "frame-compositor-raw-offline-bundle-v2"
-SESSION_SCHEMA = "frame-compositor-raw-owned-session-v2"
+SCHEMA = "frame-compositor-raw-offline-bundle-v3"
+SESSION_SCHEMA = "frame-compositor-raw-owned-session-v3"
 MAIN, AUDIT, ENVELOPE = "libVkLayer_frame_mask_trace.so", "libframe_compositor_raw_audit.so", "compositor-raw-envelope.bin"
 SELECTOR = "libframe_compositor_launch_selector.so"
 SELECTOR_EXPORTS = {"execve", "execv", "execvp", "execvpe", "posix_spawn", "posix_spawnp", "getenv", "secure_getenv",
@@ -59,10 +59,11 @@ BLOCKED = {"LD_PRELOAD", "LD_AUDIT", "LD_BIND_NOW", "LD_BIND_NOT", "LD_DEBUG", "
 MAX_INPUT = 8 * 1024 * 1024
 CAPTURE_LIMITS = {"records": 32, "bytes": 65536, "seconds": 120}
 JOURNAL_LIMITS = {"bytes": 1048576, "call_records": 512, "binding_records": 32}
-RAW_LIMITS = {"transactions": 1, "writes": 8, "scalar_bytes": 672, "wire_bytes": 21,
-    "parent_bytes": 16, "private_bytes": 709, "bootstrap_poll_bytes": 0}
+RAW_LIMITS = {"transactions": 1, "writes": 8, "scalar_bytes": 720, "wire_bytes": 21,
+    "parent_bytes": 16, "private_bytes": 757, "bootstrap_poll_bytes": 0}
 NATIVE_RVAS = {"lock": "0x87370", "unlock": "0x88f74", "write": "0xdfee0"}
-ENVELOPE_LIMITS = (672, 21, 16, 8, 32, 65536, 120, 4)
+ENVELOPE_LIMITS = (720, 21, 16, 8, 32, 65536, 120, 4)
+SCOPE_MARKER = b"FCMRAW02" + struct.pack("<II", 2, 8272)
 STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-startup-health.json",
     "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"})
 
@@ -231,8 +232,36 @@ class Session(base.Session):
         return len(data) >= 64 and data[:7] == b"\x7fELF\x02\x01\x01" and data[16:20] == b"\x03\x00\xb7\x00"
 
     @staticmethod
+    def validate_scope_marker(data, report):
+        # Recheck the actual bounded ELF bytes; a relabelled plan must not
+        # convert an old acquisition artifact into the new reviewed scope.
+        rva = report.get("rva") if isinstance(report, dict) else None
+        if (not isinstance(report, dict) or report.get("symbol") != "frame_compositor_raw_scope" or
+                type(rva) is not int or not 0 < rva < 2**64 - 16 or report.get("bytes") != 16 or
+                report.get("sha256") != digest(SCOPE_MARKER) or not Session.elf(data)):
+            raise RuntimeError("Exact actual observer acquisition marker required")
+        phoff = struct.unpack_from("<Q", data, 32)[0]
+        ehsize, entsize, count = struct.unpack_from("<3H", data, 52)
+        if (ehsize != 64 or entsize != 56 or not 0 < count <= 128 or phoff < 64 or
+                phoff > len(data) or count * entsize > len(data) - phoff):
+            raise RuntimeError("Bounded observer program headers required")
+        matches = []
+        for index in range(count):
+            kind, flags, offset, vaddr, _, file_bytes, memory_bytes, _ = struct.unpack_from("<II6Q", data, phoff + index * entsize)
+            if kind != 1: continue
+            if (file_bytes > memory_bytes or offset > len(data) or file_bytes > len(data) - offset or
+                    vaddr > 2**64 - memory_bytes):
+                raise RuntimeError("Invalid observer load segment")
+            if vaddr <= rva and rva - vaddr < memory_bytes and 16 <= memory_bytes - (rva - vaddr):
+                if flags != 4 or rva - vaddr > file_bytes or 16 > file_bytes - (rva - vaddr):
+                    raise RuntimeError("Observer scope marker must be file-backed read-only data")
+                matches.append(offset + rva - vaddr)
+        if len(matches) != 1 or data[matches[0]:matches[0] + 16] != SCOPE_MARKER:
+            raise RuntimeError("Actual observer acquisition marker changed")
+
+    @staticmethod
     def validate_envelope(data, plan, files, observer):
-        if (len(data) != 8272 or data[:8] != b"FCMRAW01" or struct.unpack_from("<II", data, 8) != (1, 8272) or
+        if (len(data) != 8272 or data[:8] != b"FCMRAW02" or struct.unpack_from("<II", data, 8) != (2, 8272) or
             struct.unpack_from("<8Q", data, 48) != ENVELOPE_LIMITS or digest(data[:-32]) != data[-32:].hex()):
             raise RuntimeError("Exact raw envelope schema/limits/checksum required")
         reviewed = data[16:48].hex()
@@ -296,6 +325,7 @@ class Session(base.Session):
             report = plan.get(report_name, {})
             if report.get("sha256") != digest(payloads[name]) or report.get("bytes") != len(payloads[name]):
                 raise RuntimeError("Artifact report changed")
+        self.validate_scope_marker(payloads[MAIN], plan["observer"].get("scope_marker"))
         if plan["audit"].get("native_rvas") != NATIVE_RVAS or plan["audit"].get("early_forward_only") is not True:
             raise RuntimeError("Canonical audited providers required")
         if (plan["observer"].get("public_exports") != sorted(PUBLIC_EXPORTS) or
@@ -315,7 +345,7 @@ class Session(base.Session):
             "audit": str(self.audit), "envelope": str(self.envelope), "output": str(self.capture), "journal": str(self.journal)}
         if isolation != expected_isolation or plan["selector"].get("configuration") != expected_config:
             raise RuntimeError("Reviewed exact launch/isolation paths differ from staged natives/artifacts")
-        if (plan["envelope"].get("schema") != 1 or plan["envelope"].get("module_count") != 4 or
+        if (plan["envelope"].get("schema") != 2 or plan["envelope"].get("module_count") != 4 or
             plan["envelope"].get("module_roles") != [7, 3, 4, 5]):
             raise RuntimeError("Exact envelope module report required")
         self.validate_envelope(payloads[ENVELOPE], plan, files, payloads[MAIN])
@@ -425,6 +455,7 @@ class Session(base.Session):
         if not self.folder.exists(): require_reviewed_launch_isolation()
         with self.lock():
             m = self.manifest(); self.verify_owned(m)
+            self.verify_acquisition_scope(m)
             require_reviewed_launch_isolation(m)
             self.reject_old_activation({name: item["sha256"] for name, item in m["original_native_layers"].items()})
             self.revalidate_native_layers(m)
@@ -460,6 +491,20 @@ class Session(base.Session):
             except BaseException:
                 self.remove_activation(m); self.recovery_event("activation_interrupted", native_restart_still_required=True)
                 raise
+
+    def verify_acquisition_scope(self, manifest):
+        # Activation must re-admit the stored acquisition contract. Recovery
+        # does not use this extra guard: removing exact owned activation and
+        # restarting the original service takes priority over proof failures.
+        plan = json.loads(read_regular(self.folder / "deployment-plan.json", private=True))
+        if (plan.get("schema") != SCHEMA or plan.get("raw_limits") != RAW_LIMITS or
+                plan.get("capture_limits") != CAPTURE_LIMITS or plan.get("journal_limits") != JOURNAL_LIMITS or
+                plan.get("envelope", {}).get("schema") != 2):
+            raise RuntimeError("Stored acquisition scope cannot authorize this artifact")
+        observer = read_regular(self.library, MAX_INPUT, private=True)
+        self.validate_scope_marker(observer, plan.get("observer", {}).get("scope_marker"))
+        envelope = read_regular(self.envelope, MAX_INPUT, private=True)
+        self.validate_envelope(envelope, plan, manifest["native_files"], observer)
 
     def active_environment(self, m, *, post_restart=False):
         current = self.state();actual = self.env_values(current["Environment"])

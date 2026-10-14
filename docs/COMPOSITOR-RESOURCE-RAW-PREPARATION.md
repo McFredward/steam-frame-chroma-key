@@ -1,5 +1,10 @@
 # Bounded raw compositor preparation
 
+Historical single-renderer preparation. The current source also admits the
+exact pinned Facet path, with 96 instead of 80 scalar bytes per creation boundary
+and a separately reviewed 720-scalar/757-total-byte maximum. See
+[the current artifact contract](COMPOSITOR-RAW-ARTIFACT-20261013.md).
+
 The [actual client capture](CLIENT-RESOURCE-RAW-CAPTURE-20261013.md) closes the
 local request/reply/reference question. This checkpoint implements the next
 offline components for the compositor. It is **not a deployable diagnostic**:

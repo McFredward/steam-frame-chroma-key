@@ -136,6 +136,10 @@ class PackageControls(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'cold-freeze'):
                 self.validate(fixture(missing_import=name))
 
+    def test_old_creation_route_scope_cannot_use_the_new_acquisition_contract(self):
+        old = b'FCMRAW01' + struct.pack('<II', 1, tool.ENVELOPE_BYTES)
+        with self.assertRaises(ValueError): self.validate(fixture(marker=old))
+
     def test_launch_configuration_is_exact_and_child_service_only_preloads_selector(self):
         config = tool.launch_config(Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw'))
         env = tool.launch_environment(config)
@@ -238,7 +242,7 @@ class PackageControls(unittest.TestCase):
             self.assertEqual(envelope[112:8240], b''.join(blobs))
             parsed = tool.decode_envelope(envelope, reviewed)
             self.assertTrue(parsed['independent_observer_checked'])
-            self.assertEqual(parsed['raw_limits']['private_bytes'], 709)
+            self.assertEqual(parsed['raw_limits']['private_bytes'], 757)
             self.assertEqual(parsed['raw_limits']['bootstrap_poll_bytes'], 0)
             for i in range(8272):
                 bad = bytearray(envelope); bad[i] ^= 1
@@ -258,7 +262,7 @@ class PackageControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='frame-compositor-preparer-controls-') as temporary:
             output = Path(temporary) / 'bundle'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, REMOTE)
-            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v2')
+            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v3')
             self.assertEqual(plan['raw_limits'], tool.RAW_LIMITS)
             self.assertEqual(plan['capture_limits'], tool.CAPTURE_LIMITS)
             for field in ('installed', 'activated', 'runtime_authorized', 'frame_access', 'network_access', 'automatic_restart',

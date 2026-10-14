@@ -19,7 +19,7 @@ __attribute__((weak)) int frame_compositor_launch_freeze_environment_v1(unsigned
 __attribute__((weak)) unsigned frame_compositor_launch_provider_mask(void);
 __attribute__((weak)) unsigned frame_compositor_launch_frozen_status_v1(void);
 __attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_raw_scope[16]={
-    'F','C','M','R','A','W','0','1',1,0,0,0,0x50,0x20,0,0};
+    'F','C','M','R','A','W','0','2',2,0,0,0,0x50,0x20,0,0};
 __attribute__((visibility("hidden"))) std::atomic<unsigned> frame_compositor_raw_ready{0};
 __attribute__((visibility("hidden"))) void frame_import_lock_entry();
 __attribute__((visibility("hidden"))) void frame_import_unlock_entry();
@@ -90,7 +90,7 @@ bool envelope(const char* name,frame_compositor_main::Profiles& profiles) noexce
     if(!ok || std::memcmp(bytes.data(),frame_compositor_raw_scope,16))return false;
     frame_receiver::Sha256 hash;hash.update(bytes.data(),bytes.size()-32);
     if(std::memcmp(hash.finish().data(),bytes.data()+bytes.size()-32,32))return false;
-    constexpr std::array<std::uint64_t,8> limits{{672,21,16,8,32,65536,120,4}};
+    constexpr std::array<std::uint64_t,8> limits{{frame_compositor_raw::kMaxScalarBytes,21,16,8,32,65536,120,4}};
     for(std::size_t i=0;i<limits.size();++i)if(little(bytes.data()+48+8*i,8)!=limits[i])return false;
     std::memcpy(profiles.reviewed_observer_identity.data(),bytes.data()+16,32);
     constexpr unsigned roles[]{7,3,4,5};
@@ -189,9 +189,9 @@ void record(Line& l,const runtime::Record& r) noexcept {
     if(r.kind==runtime::Kind::RawMatched || r.kind==runtime::Kind::RawRefused) {
         const auto& c=r.raw;
         l.add(",\"raw\":{\"matched\":%s,\"reason\":%llu,\"decoder_refusal\":%u,"
-            "\"last_boundary\":%u,\"last_phase\":%u,\"last_native_result\":%lld,\"last_native_result_available\":%s,\"client\":%u,\"fd\":%d,\"writes\":%u,"
+            "\"last_boundary\":%u,\"last_phase\":%u,\"creation_route\":%u,\"last_native_result\":%lld,\"last_native_result_available\":%s,\"client\":%u,\"fd\":%d,\"writes\":%u,"
             "\"reply_token\":\"%llx\",\"reply_bytes\":%u,\"scalar_copies\":%zu,\"wire_copies\":%zu,\"reply\":\"",
-            c.matched?"true":"false",u(c.reason),unsigned(c.decoder_refusal),unsigned(c.last_boundary),unsigned(c.last_phase),
+            c.matched?"true":"false",u(c.reason),unsigned(c.decoder_refusal),unsigned(c.last_boundary),unsigned(c.last_phase),unsigned(c.creation_route),
             static_cast<long long>(c.last_native_result),c.last_native_result_available?"true":"false",c.client,c.fd,c.writes,u(c.reply_token),c.reply_bytes,c.scalar_bytes_copied,c.wire_bytes_copied);
         l.hex(c.reply);
         l.add("\",\"sequence\":%u,\"pipe\":\"%llx\",\"dispatch_frame\":\"%llx\",\"device\":%llu,\"native_device\":\"%llx\",\"image\":\"%llx\",\"memory\":\"%llx\",\"memory_offset\":%llu,"
@@ -292,8 +292,9 @@ __attribute__((constructor)) void start() noexcept {
         header.add("\",\"profile_sha256\":\"");header.hex(image.profile_identity);header.add("\"}");
     }
     header.add("]");
-    header.add(",\"transactions\":1,\"parent_byte_limit\":16,\"scalar_byte_limit\":672,\"wire_byte_limit\":21,\"private_byte_limit\":709,"
-        "\"write_limit\":8,\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120");proofs(header);header.add("}\n");
+    header.add(",\"transactions\":1,\"parent_byte_limit\":16,\"scalar_byte_limit\":%llu,\"wire_byte_limit\":21,\"private_byte_limit\":%llu,"
+        "\"creation_routes\":[\"Vulkan\",\"Facet\"],\"write_limit\":8,\"record_limit\":32,\"byte_limit\":65536,\"seconds_limit\":120",
+        u(frame_compositor_raw::kMaxScalarBytes),u(16+frame_compositor_raw::kMaxScalarBytes+21));proofs(header);header.add("}\n");
     std::size_t total=0;
     // Register after the owning layer's function-static Capture construction.
     // Stop our consumer before that Journal and its writer are destroyed.
