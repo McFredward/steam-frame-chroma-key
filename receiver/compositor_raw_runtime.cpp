@@ -16,6 +16,10 @@ namespace raw=frame_compositor_raw;
 namespace thread=frame_compositor_import_thread;
 using Boundary=raw::Boundary;using Phase=raw::Phase;
 thread_local unsigned char marker __attribute__((tls_model("initial-exec")))=0;
+// Pair native Begin calls skipped before the operator signal. Their matching
+// After must remain inert even if the writer arms while the native call runs.
+thread_local unsigned skipped_begins __attribute__((tls_model("initial-exec")))=0;
+enum class Candidate : unsigned { Waiting,Armed,Claimed };
 struct Slot {std::atomic<unsigned> state{0};Record record{};};
 struct Runtime {
     std::atomic<unsigned> state{0}; // unprepared, preparing, prepared, attached, retired
@@ -23,6 +27,8 @@ struct Runtime {
     std::atomic<unsigned> callbacks{0},bound{0};
     std::atomic<std::uint64_t> queued{0},drained{0};
     std::atomic<bool> prepared{false},started{false},terminal{false};
+    std::atomic<bool> arm_required{false};
+    std::atomic<Candidate> candidate{Candidate::Waiting};
     std::atomic<std::size_t> parent_bytes{0},scalar_bytes{0},wire_bytes{0};
     std::array<Slot,kRecordLimit> slots{};
     std::array<frame_compositor_main::Image,4> images{};
@@ -39,6 +45,7 @@ struct Runtime {
     std::size_t event_copies=0;
 } runtime;
 static_assert(std::atomic<std::size_t>::is_always_lock_free);
+static_assert(std::atomic<Candidate>::is_always_lock_free);
 unsigned char* current_marker(void*) noexcept {return &marker;}
 bool alive() noexcept {
     return runtime.state.load(std::memory_order_acquire)==3 &&
@@ -149,6 +156,27 @@ void libc_notification(frame_import_forwarding::Notification note,void* owner) n
     else if(note.operation==Op::Write && pc==bias+0x172c00)b=Boundary::Write;
     else if(note.operation==Op::Unlock && pc==bias+0x172fbc)b=Boundary::Finish;
     else return;
+    if(b==Boundary::Begin && runtime.arm_required.load(std::memory_order_acquire)) {
+        const auto candidate=runtime.candidate.load(std::memory_order_acquire);
+        if(note.phase==Phase::Before && (candidate==Candidate::Waiting || skipped_begins)) {
+            // This is existing TLS metadata only: no stack preparation, native
+            // memory read, candidate claim, allocation or provider discovery.
+            if(skipped_begins==std::numeric_limits<unsigned>::max())retire(Refusal::Thread);
+            else ++skipped_begins;
+            return;
+        }
+        if(note.phase==Phase::After && skipped_begins){--skipped_begins;return;}
+        if(candidate==Candidate::Waiting)return;
+        if(note.phase==Phase::Before) {
+            auto armed=Candidate::Armed;
+            runtime.candidate.compare_exchange_strong(armed,Candidate::Claimed,std::memory_order_acq_rel);
+            // A previously claimed Begin still reaches the original Gate,
+            // which rejects nested/repeated/foreign candidates fail-closed.
+        } else if(candidate==Candidate::Armed)return;
+    } else if(b==Boundary::Begin && note.phase==Phase::Before) {
+        auto armed=Candidate::Armed;
+        runtime.candidate.compare_exchange_strong(armed,Candidate::Claimed,std::memory_order_acq_rel);
+    }
     const unsigned required=note.operation==Op::Lock?1:note.operation==Op::Unlock?2:4;
     if(!(runtime.bound.load(std::memory_order_acquire)&required)){retire(Refusal::Audit);return;}
     std::int64_t result=0;
@@ -213,6 +241,7 @@ void receipt_notification(const frame_compositor_journal::Receipt& receipt,void*
 }
 bool initialize(const frame_compositor_main::Prepared& prepared,Setup setup) noexcept {
     unsigned empty=0;if(!runtime.state.compare_exchange_strong(empty,1))return false;
+    runtime.arm_required.store(setup.require_operator_arm,std::memory_order_relaxed);
     runtime.refusal.store(Refusal::None,std::memory_order_release);
     if(!prepared.ready()){retire(Refusal::Preparation);return false;}
     runtime.images=prepared.images();runtime.setup=setup;
@@ -229,7 +258,19 @@ bool initialize(const frame_compositor_main::Prepared& prepared,Setup setup) noe
        !frame_compositor_journal::register_receipts_before_threads({receipt_notification,&runtime})) {
         retire(Refusal::Registration);return false;
     }
+    if(!setup.require_operator_arm)runtime.candidate.store(Candidate::Armed,std::memory_order_relaxed);
     runtime.refusal.store(Refusal::None);runtime.prepared.store(true);runtime.state.store(2,std::memory_order_release);enqueue(message(Kind::Prepared));return true;
+}
+bool arm_candidate_once() noexcept {
+    if(!runtime.arm_required.load(std::memory_order_acquire) || !alive() ||
+       !runtime.prepared.load(std::memory_order_acquire) || runtime.started.load(std::memory_order_acquire) ||
+       runtime.terminal.load(std::memory_order_acquire) || runtime.parent_bytes.load() ||
+       runtime.scalar_bytes.load() || runtime.wire_bytes.load())return false;
+    auto waiting=Candidate::Waiting;
+    if(!runtime.candidate.compare_exchange_strong(waiting,Candidate::Armed,std::memory_order_acq_rel))return false;
+    // Concurrent retirement cannot reopen a capture. Publication has no side
+    // effects on the native Gate or ownership/budget state.
+    return alive();
 }
 frame_compositor_audit::BridgeResponse bridge(frame_compositor_audit::BridgeRequest request) noexcept {
     const Activity activity;
@@ -273,8 +314,10 @@ bool pop(Record& result) noexcept {
     result=slot.record;slot.state.store(3);runtime.drained.store(ticket+1);return true;
 }
 Status status() noexcept {
-    const auto s=runtime.state.load(std::memory_order_acquire);return {runtime.prepared.load(),s==3,s==4,runtime.started.load(),runtime.terminal.load(),runtime.refusal.load(),
-        runtime.queued.load(),runtime.drained.load(),runtime.parent_bytes.load(),runtime.scalar_bytes.load(),runtime.wire_bytes.load()};
+    const auto s=runtime.state.load(std::memory_order_acquire),candidate=static_cast<unsigned>(runtime.candidate.load(std::memory_order_acquire));
+    return {runtime.prepared.load(),s==3,s==4,runtime.started.load(),runtime.terminal.load(),runtime.refusal.load(),
+        runtime.queued.load(),runtime.drained.load(),runtime.parent_bytes.load(),runtime.scalar_bytes.load(),runtime.wire_bytes.load(),
+        runtime.arm_required.load(std::memory_order_acquire),candidate>=static_cast<unsigned>(Candidate::Armed),candidate==static_cast<unsigned>(Candidate::Claimed)};
 }
 void finalize() noexcept {retire(Refusal::Finalized);}
 bool quiescent() noexcept {return !runtime.callbacks.load(std::memory_order_acquire);}

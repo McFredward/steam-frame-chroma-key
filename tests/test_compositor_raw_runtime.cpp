@@ -98,7 +98,7 @@ frame_import_startup::PreparedImage image() {
     return p;
 }
 audit::ModuleView module(std::uintptr_t b,std::uint64_t generation) {return {b,b+0x10000,b+0x300000,generation,0,0};}
-void model_cold_adapter_only() {
+void model_cold_adapter_only(bool operator_arm=false) {
     auto& r=rt::runtime;
     // Direct internal fixture state models already authenticated immutable
     // geometry. It cannot construct/seal Ready production Prepared and is not
@@ -109,9 +109,11 @@ void model_cold_adapter_only() {
     r.setup.lock_entry=self_bias+0x10100;r.setup.unlock_entry=self_bias+0x10200;r.setup.write_entry=self_bias+0x10300;
     r.setup.self=::pthread_self;r.setup.main_thread=fixture_cold_main;r.setup.attributes=actual_attributes;r.setup.get_stack=::pthread_attr_getstack;
     r.setup.destroy_attributes=::pthread_attr_destroy;r.setup.self_data_begin=self_bias+0x400000;r.setup.self_data_end=self_bias+0x500000;
+    r.setup.require_operator_arm=operator_arm;r.arm_required.store(operator_arm);
+    if(!operator_arm)r.candidate.store(rt::Candidate::Armed);
     r.originals={libc_bias+0x87370,libc_bias+0x88f74,libc_bias+0xdfee0};
     r.gate=new(r.thread_storage.data())gate::Gate(image(),marker_current,&r);
-    r.refusal.store(rt::Refusal::None);r.state.store(2);
+    r.refusal.store(rt::Refusal::None);r.prepared.store(true);r.state.store(2);
 }
 audit::BoundProvider provider(audit::Function f=audit::Function::None) {
     audit::BoundProvider b{module(bias,1),module(self_bias,2),module(libc_bias,3),f,0};
@@ -119,8 +121,8 @@ audit::BoundProvider provider(audit::Function f=audit::Function::None) {
     b.original=f==audit::Function::MutexLock?rt::runtime.originals[0]:f==audit::Function::MutexUnlock?rt::runtime.originals[1]:
         f==audit::Function::Write?rt::runtime.originals[2]:0;return b;
 }
-void attach(bool bindings=true) {
-    model_cold_adapter_only();check(rt::bridge({audit::Stage::Prepare,provider(),false,{}}).ready);
+void attach(bool bindings=true,bool operator_arm=false) {
+    model_cold_adapter_only(operator_arm);check(rt::bridge({audit::Stage::Prepare,provider(),false,{}}).ready);
     if(bindings)for(const auto f:{audit::Function::MutexLock,audit::Function::MutexUnlock,audit::Function::Write})
         check(rt::bridge({audit::Stage::Bind,provider(f),false,{}}).ready);
 }
@@ -212,12 +214,15 @@ unsigned drain(rt::Kind desired,rt::Record* result=nullptr) {
     while(rt::pop(r)){check(r.ordinal==ordinal++);if(r.kind==desired){++found;if(result)*result=r;}}
     check(!rt::pop(r));return found;
 }
-void success(unsigned chunk,frame_import_native::CreationRoute route=frame_import_native::CreationRoute::Vulkan) {
-    attach();Fixture f(route);f.through(Boundary::SendLock);
+void success(unsigned chunk,frame_import_native::CreationRoute route=frame_import_native::CreationRoute::Vulkan,bool operator_arm=false) {
+    attach(true,operator_arm);
+    if(operator_arm){check(rt::arm_candidate_once());check(!rt::arm_candidate_once());}
+    Fixture f(route);f.through(Boundary::SendLock);
     unsigned writes=0;for(unsigned at=0;at<21;){const auto n=std::min(chunk,21-at);f.libc_pair(Boundary::Write,at,n);at+=n;++writes;}
     f.libc_pair(Boundary::Finish);const auto s=rt::status();
     const auto fixed=route==frame_import_native::CreationRoute::Facet?368U:320U;
     check(s.attached && !s.retired && s.started && s.terminal && s.parent_bytes==16 && s.scalar_bytes==fixed+44*writes && s.wire_bytes==21);
+    check(s.candidate_arm_required==operator_arm && s.candidate_armed && s.candidate_claimed && !rt::arm_candidate_once());
     check(s.parent_bytes+s.scalar_bytes+s.wire_bytes<=(route==frame_import_native::CreationRoute::Facet?757U:709U) && fixture_stubs::attributes_calls==1);
     check(fixture_stubs::journal_requests==1 && fixture_stubs::requested_tag==rt::kTag && fixture_stubs::requested_cookie==rt::kCookie);
     check(fixture_stubs::requested_device==device && fixture_stubs::requested_image==(VkImage)(std::uintptr_t)10 && fixture_stubs::requested_view==(VkImageView)(std::uintptr_t)30);
@@ -230,6 +235,130 @@ void success(unsigned chunk,frame_import_native::CreationRoute route=frame_impor
     check(r.raw.reply_token==token && r.raw.reply==f.packet && r.raw.writes==writes && r.raw.image.device==device && r.raw.image.native_device==native_device);
     const auto before=rt::status();f.libc_pair(Boundary::Begin);check(rt::status().queued==before.queued);
     rt::finalize();check(rt::status().retired && rt::quiescent() && !frame_compositor_raw_ready.load());
+    check(!rt::arm_candidate_once() && rt::status().candidate_claimed);
+}
+void prearm_no_private_work() {
+    attach(true,true);Fixture f;
+    const auto before=f.note(Boundary::Begin,raw::Phase::Before),after=f.note(Boundary::Begin,raw::Phase::After);
+    const auto queued=rt::status().queued;
+    std::array<std::thread,8> workers;
+    for(auto& worker:workers)worker=std::thread([&]{
+        for(unsigned n=0;n<128;++n) {
+            rt::libc_notification(before,&rt::runtime);
+            rt::libc_notification(after,&rt::runtime);
+        }
+    });
+    for(auto& worker:workers)worker.join();
+    for(auto b:{Boundary::EarlyUnlock,Boundary::SendLock,Boundary::Write,Boundary::Finish})f.libc_pair(b);
+    for(auto b:{Boundary::Image,Boundary::Bind,Boundary::View}) {
+        auto note=f.vnote(b,frame_import_vulkan::Phase::Before);
+        check(rt::vulkan_notification(note,&rt::runtime)==0);
+        note.phase=frame_import_vulkan::Phase::After;check(rt::vulkan_notification(note,&rt::runtime)==0);
+    }
+    const auto s=rt::status();
+    check(s.prepared && s.attached && !s.retired && s.candidate_arm_required && !s.candidate_armed && !s.candidate_claimed);
+    check(!s.started && !s.terminal && !s.parent_bytes && !s.scalar_bytes && !s.wire_bytes && s.queued==queued);
+    check(!fixture_stubs::attributes_calls && !fixture_stubs::journal_requests && rt::quiescent());
+    check(!(rt::marker&gate::kMarkerBit) && !rt::runtime.candidate_stack.current());
+    errno=ERANGE;check(rt::arm_candidate_once() && errno==ERANGE);
+    check(!rt::arm_candidate_once() && rt::status().candidate_armed && !rt::status().candidate_claimed);
+    // An unmatched post-arm After cannot claim or prepare a candidate.
+    rt::libc_notification(after,&rt::runtime);
+    check(!rt::status().retired && !rt::status().candidate_claimed && !fixture_stubs::attributes_calls);
+    f.through(Boundary::SendLock);f.libc_pair(Boundary::Write,0,21);f.libc_pair(Boundary::Finish);
+    check(rt::status().terminal && !rt::status().retired && rt::status().candidate_claimed);
+    check(fixture_stubs::attributes_calls==1 && rt::status().parent_bytes==16 && rt::status().scalar_bytes==364 && rt::status().wire_bytes==21);
+    check(drain(rt::Kind::RawMatched)==1 && !rt::arm_candidate_once());
+}
+void prearm_pair_crosses_signal() {
+    attach(true,true);Fixture f;
+    f.libc(Boundary::Begin,raw::Phase::Before);
+    f.libc(Boundary::Begin,raw::Phase::Before);
+    check(rt::skipped_begins==2 && !rt::status().started && !fixture_stubs::attributes_calls);
+    check(rt::arm_candidate_once());
+    f.libc(Boundary::Begin,raw::Phase::After);f.libc(Boundary::Begin,raw::Phase::After);
+    check(!rt::skipped_begins && !rt::status().candidate_claimed && !rt::status().retired && !rt::status().parent_bytes);
+    f.through(Boundary::SendLock);f.libc_pair(Boundary::Write,0,21);f.libc_pair(Boundary::Finish);
+    check(rt::status().terminal && !rt::status().retired && fixture_stubs::attributes_calls==1);
+    check(drain(rt::Kind::RawMatched)==1);
+}
+void foreign_prearm_after_claim() {
+    attach(true,true);Fixture f;
+    const auto before=f.note(Boundary::Begin,raw::Phase::Before),after=f.note(Boundary::Begin,raw::Phase::After);
+    std::atomic<bool> pending{false},release{false};
+    std::thread old([&]{
+        rt::libc_notification(before,&rt::runtime);pending.store(true,std::memory_order_release);
+        while(!release.load(std::memory_order_acquire))std::this_thread::yield();
+        rt::libc_notification(after,&rt::runtime);
+    });
+    while(!pending.load(std::memory_order_acquire))std::this_thread::yield();
+    check(rt::arm_candidate_once());f.libc(Boundary::Begin,raw::Phase::Before);
+    check(rt::status().candidate_claimed && rt::status().started && !rt::status().parent_bytes);
+    release.store(true,std::memory_order_release);old.join();
+    check(!rt::status().retired && !rt::status().parent_bytes && fixture_stubs::attributes_calls==1);
+    f.libc(Boundary::Begin,raw::Phase::After);
+    check(!rt::status().retired && rt::status().parent_bytes==16 && rt::status().scalar_bytes==12);
+    rt::finalize();check(!rt::arm_candidate_once());
+}
+void arm_refusals(unsigned which) {
+    if(which==0){check(!rt::arm_candidate_once() && !rt::status().candidate_armed);return;}
+    model_cold_adapter_only(true);
+    check(!rt::arm_candidate_once() && !rt::status().candidate_armed);
+    if(which==1) {
+        const auto b=provider(audit::Function::MutexLock);
+        const auto response=rt::bridge({audit::Stage::ForwardOnly,b,false,{}});
+        check(response.ready && response.hidden_entry==rt::runtime.setup.lock_entry);
+        check(!rt::arm_candidate_once() && !rt::status().candidate_armed);return;
+    }
+    check(rt::bridge({audit::Stage::Prepare,provider(),false,{}}).ready);
+    if(which==2)rt::finalize();
+    else if(which==3)rt::runtime.parent_bytes.store(1);
+    else if(which==4)rt::runtime.scalar_bytes.store(1);
+    else if(which==5)rt::runtime.wire_bytes.store(1);
+    else if(which==6)rt::runtime.started.store(true);
+    else if(which==7)rt::runtime.terminal.store(true);
+    else fixture_stubs::libc_loss.store(true);
+    const auto before=rt::status();
+    check(!rt::arm_candidate_once());const auto after=rt::status();
+    check(!after.candidate_armed && !after.candidate_claimed && before.parent_bytes==after.parent_bytes &&
+        before.scalar_bytes==after.scalar_bytes && before.wire_bytes==after.wire_bytes && before.retired==after.retired);
+}
+void armed_nested_refusal(bool repeated) {
+    attach(true,true);Fixture f;check(rt::arm_candidate_once());
+    f.libc(Boundary::Begin,raw::Phase::Before);
+    if(repeated)f.libc(Boundary::Begin,raw::Phase::After);
+    const auto before=rt::status();check(before.candidate_claimed && !rt::arm_candidate_once());
+    f.libc(Boundary::Begin,raw::Phase::Before);const auto after=rt::status();
+    check(after.retired && after.refusal==rt::Refusal::Thread && after.candidate_armed && after.candidate_claimed && !rt::arm_candidate_once());
+    check(before.parent_bytes==after.parent_bytes && before.scalar_bytes==after.scalar_bytes && before.wire_bytes==after.wire_bytes && fixture_stubs::attributes_calls==1);
+    check(drain(rt::Kind::Refused)==1);
+}
+void concurrent_operator_arm() {
+    attach(true,true);std::array<std::thread,8> workers;
+    std::atomic<bool> ready{false};std::atomic<unsigned> arms{0};
+    for(auto& worker:workers)worker=std::thread([&]{
+        while(!ready.load(std::memory_order_acquire))std::this_thread::yield();
+        if(rt::arm_candidate_once())arms.fetch_add(1,std::memory_order_relaxed);
+    });
+    ready.store(true,std::memory_order_release);for(auto& worker:workers)worker.join();
+    check(arms.load()==1 && rt::status().candidate_armed && !rt::status().candidate_claimed && !rt::status().started);
+    check(!rt::status().parent_bytes && !rt::status().scalar_bytes && !rt::status().wire_bytes && !fixture_stubs::attributes_calls);
+    check(!rt::arm_candidate_once());rt::finalize();check(!rt::arm_candidate_once());
+}
+void unqualified_begin_keeps_claim() {
+    attach(true,true);Fixture f;check(rt::arm_candidate_once());
+    auto note=f.note(Boundary::Begin,raw::Phase::Before);note.entry.x[30]+=4;
+    rt::libc_notification(note,&rt::runtime);note.phase=raw::Phase::After;rt::libc_notification(note,&rt::runtime);
+    check(!rt::status().candidate_claimed && !rt::status().started && !fixture_stubs::attributes_calls);
+    check(!rt::status().parent_bytes && !rt::status().scalar_bytes && !rt::status().wire_bytes);
+    // Audit forwarding remains available while the capture is operator-armed.
+    for(const auto fn:{audit::Function::MutexLock,audit::Function::MutexUnlock,audit::Function::Write}) {
+        const auto response=rt::bridge({audit::Stage::ForwardOnly,provider(fn),false,{}});
+        check(response.ready && response.hidden_entry==(fn==audit::Function::MutexLock?rt::runtime.setup.lock_entry:
+            fn==audit::Function::MutexUnlock?rt::runtime.setup.unlock_entry:rt::runtime.setup.write_entry));
+    }
+    f.libc_pair(Boundary::Begin);check(rt::status().candidate_claimed && !rt::status().retired && fixture_stubs::attributes_calls==1);
+    check(rt::status().parent_bytes==16 && rt::status().scalar_bytes==12);rt::finalize();
 }
 void mixed_renderer() {
     attach();Fixture f(frame_import_native::CreationRoute::Facet);f.through(Boundary::Image);
@@ -388,7 +517,7 @@ int main(int argc,char** argv) {
     check(reinterpret_cast<std::uintptr_t>(&::pthread_attr_destroy)==mapped_libc+0x81420);
     std::printf("Actual retained ARM libc pthread helpers: %s\n",provider.dli_fname);
 #endif
-    constexpr std::array<void(*)(),30> cases{
+    constexpr std::array<void(*)(),48> cases{
         inert_production,forwarding_only,+[]{success(21);},+[]{success(3);},
         native_failure,incomplete_finalization,parent_mismatch,+[]{ownership_postcheck(0);},
         +[]{ownership_postcheck(1);},queue_budget,foreign_begin,
@@ -398,7 +527,15 @@ int main(int argc,char** argv) {
         +[]{invalid_vulkan(2);},attaching_not_published,foreign_after_during_parent_copy,main_thread_rejected,
         +[]{refusal_entry_evidence(false);},+[]{refusal_entry_evidence(true);},
         +[]{success(21,frame_import_native::CreationRoute::Facet);},
-        +[]{success(3,frame_import_native::CreationRoute::Facet);},mixed_renderer};
+        +[]{success(3,frame_import_native::CreationRoute::Facet);},mixed_renderer,
+        +[]{success(21,frame_import_native::CreationRoute::Vulkan,true);},
+        +[]{success(21,frame_import_native::CreationRoute::Facet,true);},
+        prearm_no_private_work,prearm_pair_crosses_signal,foreign_prearm_after_claim,
+        +[]{arm_refusals(0);},+[]{arm_refusals(1);},+[]{arm_refusals(2);},
+        +[]{arm_refusals(3);},+[]{arm_refusals(4);},+[]{arm_refusals(5);},
+        +[]{arm_refusals(6);},+[]{arm_refusals(7);},+[]{arm_refusals(8);},
+        +[]{armed_nested_refusal(false);},+[]{armed_nested_refusal(true);},
+        concurrent_operator_arm,unqualified_begin_keeps_claim};
     unsigned passed=0;
     if(argc==2) {char* end=nullptr;const auto n=std::strtoul(argv[1],&end,10);check(end && !*end && n<cases.size());run(cases[n],passed);}
     else {check(argc==1);for(unsigned n=0;n<cases.size();++n){std::printf("runtime case %u\n",n);std::fflush(stdout);run(cases[n],passed);}}

@@ -21,6 +21,9 @@ struct Setup {
     pthread_t main_thread{}; // Cached through the authenticated provider at constructor startup.
     GetStack get_stack=nullptr;DestroyAttributes destroy_attributes=nullptr;
     std::uintptr_t self_data_begin=0,self_data_end=0;
+    // Production operator-controlled captures reserve their only candidate
+    // until an authenticated writer publishes the arm signal.
+    bool require_operator_arm=false;
 };
 enum class Kind : unsigned { Prepared,Attached,Bound,BeginStaged,ThreadAdmitted,RawMatched,
     RawRefused,Receipt,Refused,Retired };
@@ -42,8 +45,13 @@ struct Status {
     Refusal refusal=Refusal::Unprepared;
     std::uint64_t queued=0,drained=0;
     std::size_t parent_bytes=0,scalar_bytes=0,wire_bytes=0;
+    bool candidate_arm_required=false,candidate_armed=false,candidate_claimed=false;
 };
 bool initialize(const frame_compositor_main::Prepared&,Setup) noexcept;
+// Metadata publication only, after cold initialization and audit attachment.
+// Single-use: duplicates, completed/retired captures and legacy automatic
+// captures refuse without resetting any claim, stack ownership or read budget.
+__attribute__((visibility("hidden"))) bool arm_candidate_once() noexcept;
 frame_compositor_audit::BridgeResponse bridge(frame_compositor_audit::BridgeRequest) noexcept;
 bool pop(Record&) noexcept;
 Status status() noexcept;
