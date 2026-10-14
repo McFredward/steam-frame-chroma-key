@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import stat
 import subprocess
 import time
@@ -23,6 +24,13 @@ UNIT = "steamvr.service"
 SCHEMA = "frame-compositor-startup-health-v1"
 LIMIT = 512 * 1024
 JOURNAL_MESSAGE_LIMIT = 32768
+# Request complete messages without collecting private coredump environment,
+# memory maps or file-descriptor inventories. journalctl otherwise emits null
+# for fields exceeding 4096 bytes, hiding the actual reason for a startup fault.
+JOURNAL_FIELDS = ("MESSAGE", "_PID", "_SYSTEMD_INVOCATION_ID", "_SYSTEMD_USER_INVOCATION_ID",
+    "__MONOTONIC_TIMESTAMP", "__CURSOR", "SYSLOG_IDENTIFIER", "MESSAGE_ID",
+    "COREDUMP_PID", "COREDUMP_EXE", "COREDUMP_SIGNAL", "COREDUMP_USER_UNIT", "COREDUMP_CGROUP")
+COREDUMP_MESSAGE_ID = "fc2e22bc6ee647b6b90729ab34a250b1"
 MAX_PROCESSES = 512
 ISOLATION_SCHEMA = "frame-compositor-startup-isolation-v1"
 ISOLATION_BYTE_LIMIT = 64 * 1024 * 1024
@@ -62,6 +70,39 @@ def journal_message(value):
             all(type(byte) is int and 0 <= byte <= 255 for byte in value)):
         return bytes(value).decode("latin-1")
     raise RuntimeError("Unsupported current journal evidence")
+
+
+def bounded_command(args, *, check, capture_output, text, timeout):
+    """Read pipes incrementally; an oversized journal never buffers unboundedly."""
+    if check is not True or capture_output is not True or text is not True or not 0 < timeout <= 5:
+        raise RuntimeError("Unsupported bounded startup command options")
+    deadline = time.monotonic() + timeout
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    used = 0
+    with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        try:
+            with selectors.DefaultSelector() as selector:
+                for name in buffers: selector.register(getattr(child, name), selectors.EVENT_READ, name)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0: raise subprocess.TimeoutExpired(args, timeout)
+                    for key, _ in selector.select(remaining):
+                        raw = os.read(key.fd, min(16384, LIMIT - used + 1))
+                        used += len(raw)
+                        if used > LIMIT: raise RuntimeError("Startup command output bound exceeded")
+                        if raw: buffers[key.data].extend(raw)
+                        else: selector.unregister(key.fileobj)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: raise subprocess.TimeoutExpired(args, timeout)
+            returncode = child.wait(timeout=remaining)
+            result = subprocess.CompletedProcess(args, returncode,
+                buffers["stdout"].decode("utf-8"), buffers["stderr"].decode("utf-8"))
+            result.check_returncode()
+            return result
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
 
 
 def reviewed_absolute_path(value):
@@ -213,10 +254,10 @@ def require_unit(unit, *, allow_inactive=False):
 
 class NativeEvidenceSource:
     """Kernel process metadata, bounded fresh native log ranges and journal only."""
-    def __init__(self, home, *, proc_root=Path("/proc"), run=subprocess.run,
+    def __init__(self, home, *, proc_root=Path("/proc"), run=None,
                  clock=time.monotonic, wall_clock=time.time, uid=None, isolation=None,
                  cgroup_root=Path("/sys/fs/cgroup")):
-        self.home, self.proc, self.run = Path(home), Path(proc_root), run
+        self.home, self.proc, self.run = Path(home), Path(proc_root), bounded_command if run is None else run
         self.clock, self.wall_clock = clock, wall_clock
         self.sleep = time.sleep
         self.uid = os.getuid() if uid is None else uid
@@ -244,7 +285,8 @@ class NativeEvidenceSource:
         return result
 
     def journal(self, *, initial=False):
-        args = ["journalctl", "--user-unit=" + UNIT, "--no-pager", "--output=json", "--show-cursor"]
+        args = ["journalctl", "--user-unit=" + UNIT, "--no-pager", "--output=json", "--all",
+                "--output-fields=" + ",".join(JOURNAL_FIELDS), "--show-cursor"]
         args += ["-n", "1"] if initial else ["--after-cursor=" + self.cursor, "-n", "512"]
         raw = self.command(args)
         records, cursor = [], None
@@ -702,17 +744,48 @@ class StartupGate:
         old_ids = {identity(p) for p in self.baseline["processes"]}
         old_pids = {p["pid"] for p in self.baseline["processes"]}
         if self.baseline.get("main_process"): old_pids.add(self.baseline["main_process"]["pid"])
+        current_pids = {p["pid"] for p in sample["processes"] if identity(p) not in old_ids}
+        current_pids.update(pin["pid"] for pin in self.pinned.values())
+        if sample.get("main_process") and (self.baseline.get("main_process") is None or
+                identity(sample["main_process"]) != identity(self.baseline["main_process"])):
+            current_pids.add(sample["main_process"]["pid"])
         for entry in sample["journal"]:
             if not isinstance(entry, dict):
                 raise RuntimeError("Unsupported current journal evidence")
-            message = journal_message(entry.get("MESSAGE"))
             invocation = entry.get("_SYSTEMD_INVOCATION_ID", entry.get("_SYSTEMD_USER_INVOCATION_ID"))
             pid = entry.get("_PID", "0")
             stamp = entry.get("__MONOTONIC_TIMESTAMP")
-            if (not isinstance(pid, str) or not re.fullmatch(r"[0-9]{1,20}", pid) or not isinstance(stamp, str) or not re.fullmatch(r"[0-9]{1,20}", stamp)):
+            if (not isinstance(pid, str) or not re.fullmatch(r"[0-9]{1,20}", pid) or
+                    not isinstance(stamp, str) or not re.fullmatch(r"[0-9]{1,20}", stamp) or
+                    invocation is not None and (not isinstance(invocation, str) or not re.fullmatch(r"[0-9a-f]{32}", invocation))):
                 raise RuntimeError("Unsupported current journal evidence")
-            if invocation and invocation != self.invocation: continue
             if int(stamp) / 1000000 < self.baseline["monotonic"]: continue
+            if (entry.get("SYSLOG_IDENTIFIER") == "systemd-coredump" or
+                    entry.get("MESSAGE_ID") == COREDUMP_MESSAGE_ID):
+                # The logger runs in a separate system service, whose invocation
+                # and PID are not those of the process which actually crashed.
+                # Its message may be huge or null; exact structured fields still
+                # provide a fatal verdict without hiding a current UI failure.
+                crashed, signal = entry.get("COREDUMP_PID"), entry.get("COREDUMP_SIGNAL")
+                exe, group = entry.get("COREDUMP_EXE"), entry.get("COREDUMP_CGROUP")
+                user_unit = entry.get("COREDUMP_USER_UNIT")
+                if (entry.get("SYSLOG_IDENTIFIER") != "systemd-coredump" or
+                        entry.get("MESSAGE_ID") != COREDUMP_MESSAGE_ID or
+                        not isinstance(crashed, str) or not re.fullmatch(r"[0-9]{1,10}", crashed) or
+                        not 0 < int(crashed) < 2**31 or
+                        not isinstance(signal, str) or not re.fullmatch(r"[0-9]{1,2}", signal) or not 0 < int(signal) <= 64 or
+                        not reviewed_absolute_path(exe) or not reviewed_absolute_path(group) or
+                        not isinstance(user_unit, str) or not re.fullmatch(r"[A-Za-z0-9_.@:-]{1,256}", user_unit)):
+                    raise RuntimeError("Unsupported structured startup coredump evidence")
+                current_group = unit["ControlGroup"]
+                group_matches = bool(current_group) and (group == current_group or group.startswith(current_group + "/"))
+                if not group_matches and user_unit != UNIT: continue
+                if not group_matches or user_unit != UNIT:
+                    raise RuntimeError("Startup coredump unit/control-group scope disagrees")
+                if int(crashed) in old_pids and int(crashed) not in current_pids: continue
+                raise RuntimeError("Fresh startup coredump: pid=" + crashed + " signal=" + signal + " exe=" + exe[:192])
+            if invocation and invocation != self.invocation: continue
+            message = journal_message(entry.get("MESSAGE"))
             # A PID number may be reused after restart. An explicit current
             # invocation overrides the old-number filter, never its converse.
             if invocation != self.invocation:

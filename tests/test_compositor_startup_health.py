@@ -46,6 +46,16 @@ def sample(now=2.0):
                 line("SetApplicationPid appkey=system.systemui pid=103, external transition")])}}
 
 
+def coredump(pid="101"):
+    # Actual Frame journal shape: the coredump logger has its own invocation,
+    # and MESSAGE exceeded journalctl's default 4096-byte JSON field threshold.
+    return {"MESSAGE": None, "_PID": "2700709", "__MONOTONIC_TIMESTAMP": "2000000",
+        "_SYSTEMD_INVOCATION_ID": "c" * 32, "SYSLOG_IDENTIFIER": "systemd-coredump",
+        "MESSAGE_ID": M.COREDUMP_MESSAGE_ID, "COREDUMP_PID": pid,
+        "COREDUMP_EXE": M.COMPOSITOR, "COREDUMP_SIGNAL": "11", "COREDUMP_USER_UNIT": M.UNIT,
+        "COREDUMP_CGROUP": unit()["ControlGroup"]}
+
+
 def descriptor():
     result = {"schema": M.ISOLATION_SCHEMA, "target_exe": M.COMPOSITOR,
         "selector_path": "/reviewed/selector.so", "payload_path": "/reviewed/observer.so", "audit_path": "/reviewed/audit.so"}
@@ -112,6 +122,50 @@ class JournalMessageTests(unittest.TestCase):
                       [65, 1.0], [65, None], [65, {}]):
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 M.journal_message(value)
+
+
+class BoundedCommandTests(unittest.TestCase):
+    def run_python(self, source, *, timeout=5):
+        return M.bounded_command([sys.executable, "-c", source], check=True,
+            capture_output=True, text=True, timeout=timeout)
+
+    def test_complete_output_at_exact_joint_byte_limit_is_preserved(self):
+        result = self.run_python("import os; os.write(1, b'x' * " + str(M.LIMIT - 4) + "); os.write(2, b'last')")
+        self.assertEqual(len(result.stdout.encode()), M.LIMIT - 4)
+        self.assertEqual(result.stderr, "last")
+
+    def test_joint_overflow_stops_and_reaps_actual_child(self):
+        children = []
+        popen = subprocess.Popen
+        def tracked(*args, **kwargs):
+            child = popen(*args, **kwargs); children.append(child); return child
+        with mock.patch.object(M.subprocess, "Popen", side_effect=tracked):
+            with self.assertRaisesRegex(RuntimeError, "output bound exceeded"):
+                self.run_python("import os,time; os.write(1, b'x' * " + str(M.LIMIT) + "); os.write(2, b'y'); time.sleep(30)")
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].poll())
+
+    def test_timeout_stops_and_reaps_actual_child(self):
+        children = []
+        popen = subprocess.Popen
+        def tracked(*args, **kwargs):
+            child = popen(*args, **kwargs); children.append(child); return child
+        with mock.patch.object(M.subprocess, "Popen", side_effect=tracked):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.run_python("import time; time.sleep(30)", timeout=0.1)
+        self.assertIsNotNone(children[0].poll())
+
+    def test_nonzero_utf8_and_multibyte_limits_are_not_silent_success(self):
+        with self.assertRaises(subprocess.CalledProcessError): self.run_python("raise SystemExit(7)")
+        with self.assertRaises(UnicodeDecodeError): self.run_python("import os; os.write(1, b'\\xff')")
+        with self.assertRaisesRegex(RuntimeError, "output bound exceeded"):
+            self.run_python("import os; os.write(1, '\\u00e4'.encode() * " + str(M.LIMIT // 2 + 1) + ")")
+
+    def test_default_native_source_uses_incremental_bound(self):
+        source = M.NativeEvidenceSource("/unused")
+        self.assertIs(source.run, M.bounded_command)
+        with self.assertRaisesRegex(RuntimeError, "output bound exceeded"):
+            source.command([sys.executable, "-c", "import os; os.write(1, b'x' * " + str(M.LIMIT + 1) + ")"])
 
 
 class GateTests(unittest.TestCase):
@@ -258,6 +312,59 @@ class GateTests(unittest.TestCase):
         result = M.StartupGate(baseline()).consume(s, stable_seconds=0)
         self.assertEqual(result["status"], "fault")
         self.assertIn("static TLS", result["reason"])
+
+    def test_current_structured_coredump_is_fatal_with_null_or_oversize_message(self):
+        for message in (None, "x" * (M.JOURNAL_MESSAGE_LIMIT + 1), "no fatal words", list(b"renderer crash")):
+            s = sample(); row = coredump(); row["MESSAGE"] = message; s["journal"] = [row]
+            with self.subTest(message_type=type(message).__name__):
+                gate = M.StartupGate(baseline()); result = gate.consume(s, stable_seconds=0)
+                self.assertEqual(result["status"], "fault")
+                self.assertEqual(result["reason"], "Fresh startup coredump: pid=101 signal=11 exe=" + M.COMPOSITOR)
+                self.assertEqual(gate.consume(sample(4))["status"], "fault")
+
+    def test_delayed_baseline_coredump_null_message_does_not_poison_restoration(self):
+        s = sample(); s["journal"] = [coredump("10")]
+        self.assertTrue(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
+
+    def test_current_crashed_pid_reuse_and_old_logger_pid_are_not_hidden(self):
+        b = baseline(); b["processes"] = [process(101, "compositor")]; b["processes"][0]["start_ticks"] = 1
+        s = sample(); row = coredump(); row["_PID"] = "101"; s["journal"] = [row]
+        self.assertEqual(M.StartupGate(b).consume(s)["status"], "fault")
+        b = baseline(); b["processes"] += [process(100, "browser")]
+        s = sample(); s["journal"] = [coredump("100")]
+        self.assertEqual(M.StartupGate(b).consume(s)["status"], "fault")
+
+    def test_structured_core_scope_and_identity_are_required_before_old_pid_skip(self):
+        for updates in ({"COREDUMP_PID": True}, {"COREDUMP_PID": "0"}, {"COREDUMP_PID": "2147483648"},
+                        {"COREDUMP_SIGNAL": "0"}, {"COREDUMP_SIGNAL": "65"}, {"COREDUMP_SIGNAL": [11]},
+                        {"COREDUMP_USER_UNIT": None}, {"COREDUMP_CGROUP": None},
+                        {"COREDUMP_EXE": "../vrcompositor"}, {"MESSAGE_ID": "unknown"},
+                        {"SYSLOG_IDENTIFIER": "foreign"}):
+            s = sample(); row = coredump("10"); row.update(updates); s["journal"] = [row]
+            with self.subTest(updates=updates):
+                result = M.StartupGate(baseline()).consume(s)
+                self.assertEqual(result["status"], "fault")
+                self.assertIn("structured startup coredump", result["reason"])
+        for updates in ({"COREDUMP_USER_UNIT": "other.service"}, {"COREDUMP_CGROUP": "/other.service"}):
+            s = sample(); row = coredump("10"); row.update(updates); s["journal"] = [row]
+            with self.subTest(updates=updates):
+                result = M.StartupGate(baseline()).consume(s)
+                self.assertEqual(result["status"], "fault")
+                self.assertIn("scope disagrees", result["reason"])
+
+    def test_prior_or_proven_unrelated_core_is_not_current_ui_crash(self):
+        for updates in ({"__MONOTONIC_TIMESTAMP": "999999"},
+                        {"COREDUMP_USER_UNIT": "other.service", "COREDUMP_CGROUP": "/other.service"}):
+            s = sample(); row = coredump(); row.update(updates); s["journal"] = [row]
+            with self.subTest(updates=updates):
+                self.assertTrue(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
+
+    def test_ordinary_current_null_message_is_not_replaced_with_empty(self):
+        s = sample(); s["journal"] = [{"MESSAGE": None, "_PID": "102", "__MONOTONIC_TIMESTAMP": "2000000"}]
+        self.assertEqual(M.StartupGate(baseline()).consume(s)["reason"], "Unsupported current journal evidence")
+        for updates in ({"_SYSTEMD_INVOCATION_ID": "a" * 32}, {"__MONOTONIC_TIMESTAMP": "999999"}):
+            s["journal"][0].update(updates)
+            self.assertTrue(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
 
     def test_stale_rotated_native_readiness_and_error_lines_are_not_admitted(self):
         s = sample()
@@ -484,6 +591,21 @@ class NativeSourceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): self.source.baseline()
         self.source.baseline(); self.journal_rows = [{"MESSAGE": "x", "__CURSOR": "s=x"}] * 512
         with self.assertRaises(RuntimeError): self.source.sample()
+
+    def test_journal_requests_complete_fields_without_private_core_payloads(self):
+        self.source.baseline()
+        self.journal_rows = [{"MESSAGE": "x" * 9000, "_PID": "102", "__MONOTONIC_TIMESTAMP": "2000000"}]
+        self.assertEqual(self.source.journal(), self.journal_rows)
+        calls = [args for args in self.commands if args[0] == "journalctl"]
+        for args in calls:
+            self.assertIn("--all", args)
+            fields = next(arg for arg in args if arg.startswith("--output-fields=")).split("=", 1)[1].split(",")
+            self.assertEqual(set(fields), set(M.JOURNAL_FIELDS))
+            self.assertNotIn("COREDUMP_ENVIRON", fields)
+            self.assertNotIn("COREDUMP_PROC_MAPS", fields)
+            self.assertNotIn("COREDUMP_OPEN_FDS", fields)
+        s = sample(); s["journal"] = self.source.journal()
+        self.assertTrue(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
 
     def test_json_byte_arrays_keep_current_invocation_and_budget_checks(self):
         self.source.baseline()
