@@ -406,6 +406,7 @@ class Session(base.Session):
 
     def stage(self, path, expected, native, artifacts, *, runtime_scope=False, reviewed_helpers=None, reviewed_environment_files=None, reviewed_native_layers=None):
         if runtime_scope is not True: raise RuntimeError("Separate compositor-private-scope acknowledgment required")
+        self.require_fresh_capture_paths()
         native_layers = self.reject_old_activation(reviewed_native_layers)
         for target in (self.folder, self.dropin, self.layer, self.dropin.with_suffix(".pending"), self.layer.with_suffix(".pending")):
             safe_path(target)
@@ -767,8 +768,11 @@ class Session(base.Session):
         if len(journal) >= 2048:
             raise RuntimeError("Passive journal record budget exhausted before operator arming")
         for row in journal[1:]:
-            if (row.get("event") in ("header", "footer", "bindings_armed", "draw", "binding_snapshot", "bindings_recorded", "submit_accepted", "incomplete") or
-                    row.get("complete") is False or row.get("io_ok") is False or
+            # These are the exact lifecycle names emitted by Capture::serialize.
+            # In particular the renderer emits draw_recorded, not "draw";
+            # unknown events cannot silently spend the reserved stream budget.
+            if (row.get("event") not in ("shader", "pipeline") or row.get("complete") is not True or
+                    type(row.get("reason")) is not int or row["reason"] != 0 or row.get("io_ok") is False or
                     any(type(row.get(key)) is not int or row[key] != 0 for key in
                         ("lost_state", "lost_binding_state", "dropped_events") if key in row)):
                 raise RuntimeError("Passive journal armed, lost state or finished before the operator signal")
@@ -875,7 +879,7 @@ class Session(base.Session):
                 "accepted_submit": False, "gpu_consumed": False, "mask_enabled": False}
             exclusive(self.arm_receipt, json_bytes(receipt)); directory_sync(self.folder)
             self.event("operator_arm_requested", stream_ready_acknowledged=True, source_frame_associated=False,
-                accepted_submit=False, automatic_restart=False, receiver_process=process)
+                accepted_submit=False, automatic_restart=False, compositor_process=process)
             return receipt
 
     def validate_arm_archive(self, payloads):

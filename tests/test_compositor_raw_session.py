@@ -769,6 +769,42 @@ class OperatorArmTests(unittest.TestCase):
             path.unlink()
         self.assertEqual(self.restart_count(), 0)
 
+    def test_stage_refuses_existing_arm_marker_before_any_installation_mutation(self):
+        M.private_parents(self.session.folder)
+        M.exclusive(self.session.marker, M.ARM_CONTENTS)
+        original = {path.name: path.read_bytes() for path in self.session.folder.iterdir()}
+        with self.assertRaisesRegex(RuntimeError, "cannot reset"):
+            self.stage()
+        self.assertEqual({path.name: path.read_bytes() for path in self.session.folder.iterdir()}, original)
+        self.assertFalse(self.session.dropin.exists()); self.assertFalse(self.session.layer.exists())
+        self.assertFalse((self.session.folder / "operation.lock").exists())
+        self.assertEqual(self.restart_count(), 0)
+
+    def test_prearm_journal_accepts_only_actual_complete_shader_and_pipeline_lifecycle_events(self):
+        self.live_fixture()
+        source = (Path(__file__).resolve().parents[1] / "layer/passive_pipeline_trace.cpp").read_text()
+        serialized_names = ('"shader", "pipeline", "draw_recorded", "execute_recorded",',
+            '"submit_accepted", "incomplete", "bindings_recorded", "bindings_armed"')
+        for text in serialized_names: self.assertIn(text, source)
+        for event in ("shader", "pipeline"):
+            rows = [self.journal_header, {"event": event, "complete": True, "reason": 0}]
+            evidence = self.session.validate_prearm_outputs([self.header], rows, self.session.manifest(), self.current)
+            self.assertTrue(evidence["journal_no_recorded_loss"])
+        forbidden = ("draw_recorded", "execute_recorded", "submit_accepted", "incomplete", "bindings_recorded",
+            "bindings_armed", "header", "footer", "draw", "binding_snapshot", "unknown", None)
+        for event in forbidden:
+            self.save_live_records([self.header], [self.journal_header, {"event": event, "complete": True, "reason": 0}])
+            with self.subTest(event=event), self.assertRaisesRegex(RuntimeError, "journal armed"):
+                self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists()); self.assertEqual(self.restart_count(), 1)
+        for change in ({"complete": False}, {"complete": 1}, {"reason": 1}, {"reason": False},
+                {"lost_binding_state": 1}, {"io_ok": False}):
+            row = {"event": "shader", "complete": True, "reason": 0, **change}
+            self.save_live_records([self.header], [self.journal_header, row])
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "journal armed"):
+                self.session.arm(stream_ready=True)
+            self.assertFalse(self.session.marker.exists())
+
     def test_raw_deadline_owner_limits_pins_and_retired_states_refuse_without_marker(self):
         self.live_fixture()
         variants = (("operator_arm_required", False), ("operator_armed", True), ("pre_arm_private_bytes", 1),
