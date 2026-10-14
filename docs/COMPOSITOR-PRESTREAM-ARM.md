@@ -82,8 +82,12 @@ to contain the same exact typed `raw_trace_sampling` metadata:
 Missing fields, foreign caps, coerced number/boolean types and disabled lifecycle
 preservation are refused before publishing the arm marker. Stage and acquisition
 readmission check the observer report; arming additionally checks the live
-journal header. The artifact preparer authenticates this collector's owned
-sampling marker in the actual ELF. These bounded trace samples do not prove
+journal header. Both the artifact preparer and session helper authenticate this
+collector's owned sampling marker in the actual ELF before staging or acquisition
+readmission. The exact 32-byte `FCMSMP01` object must occupy one read-only,
+non-executing, file-backed load range and have the reviewed LOCAL or HIDDEN
+OBJECT symbol, absent from the dynamic symbol table. A JSON report cannot relabel
+an older artifact as this collector. These bounded trace samples do not prove
 complete GPU coverage, video-frame association or absence of unsampled calls.
 Legacy v1 visible-only plans keep their original behavior. Sampling checks never
 prevent the authorized original-service recovery before dynamic evidence is

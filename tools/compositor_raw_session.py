@@ -74,6 +74,8 @@ STREAM_SELECTION_PHASES = ("visible", "start-intent")
 RAW_TRACE_SAMPLING = {"intentional": True, "draw_call_limit": 32,
     "execute_child_limit": 16, "submit_command_limit": 16,
     "binding_snapshots_require_import_request": True, "lifecycle_survives_trace_cap": True}
+TRACE_SAMPLING_SYMBOL = "frame_compositor_trace_sampling_scope"
+TRACE_SAMPLING_MARKER = b"FCMSMP01" + struct.pack("<6I", 1, 32, 16, 16, 32, 3)
 STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-startup-health.json",
     "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"})
 
@@ -272,6 +274,77 @@ class Session(base.Session):
             raise RuntimeError("Actual observer acquisition marker changed")
 
     @staticmethod
+    def validate_trace_sampling_marker(data, plan):
+        if plan["operator_arm"]["schema"] == LEGACY_ARM_RECEIPT_SCHEMA:
+            return
+        observer = plan.get("observer")
+        report = observer.get("trace_sampling_marker") if isinstance(observer, dict) else None
+        rva = report.get("rva") if isinstance(report, dict) else None
+        if (not isinstance(report, dict) or set(report) != {"symbol", "rva", "bytes", "sha256"} or
+                report.get("symbol") != TRACE_SAMPLING_SYMBOL or type(rva) is not int or
+                not 0 < rva < 2**64 - 32 or type(report.get("bytes")) is not int or report["bytes"] != 32 or
+                report.get("sha256") != digest(TRACE_SAMPLING_MARKER) or not Session.elf(data) or
+                not 64 <= len(data) <= MAX_INPUT or struct.unpack_from("<I", data, 20)[0] != 1):
+            raise RuntimeError("Exact actual observer trace sampling marker required")
+        phoff, shoff = struct.unpack_from("<2Q", data, 32)
+        ehsize, phsize, phcount, shsize, shcount = struct.unpack_from("<5H", data, 52)
+        if (ehsize != 64 or phsize != 56 or shsize != 64 or not 0 < phcount <= 128 or
+                not 0 < shcount <= 4096 or phoff < 64 or shoff < 64 or
+                phoff > len(data) or phcount * phsize > len(data) - phoff or
+                shoff > len(data) or shcount * shsize > len(data) - shoff):
+            raise RuntimeError("Bounded trace sampling ELF tables required")
+        spans = []
+        for index in range(phcount):
+            kind, flags, offset, vaddr, _, file_bytes, memory_bytes, _ = struct.unpack_from("<II6Q", data, phoff + index * phsize)
+            if kind != 1: continue
+            if (file_bytes > memory_bytes or offset > len(data) or file_bytes > len(data) - offset or
+                    vaddr > 2**64 - memory_bytes):
+                raise RuntimeError("Invalid trace sampling load segment")
+            if vaddr <= rva and rva - vaddr < memory_bytes and 32 <= memory_bytes - (rva - vaddr):
+                if flags != 4 or rva - vaddr > file_bytes or 32 > file_bytes - (rva - vaddr):
+                    raise RuntimeError("Trace sampling marker must be file-backed read-only non-executing data")
+                spans.append(offset + rva - vaddr)
+        if len(spans) != 1 or data[spans[0]:spans[0] + 32] != TRACE_SAMPLING_MARKER:
+            raise RuntimeError("Actual trace sampling marker changed or is ambiguous")
+        sections = []
+        for index in range(shcount):
+            section = struct.unpack_from("<II4QII2Q", data, shoff + index * shsize)
+            offset, length = section[4:6]
+            if section[1] != 8 and (offset > len(data) or length > len(data) - offset):
+                raise RuntimeError("Trace sampling ELF section exceeds file bounds")
+            sections.append(section)
+        found, symbol_count = False, 0
+        for table in sections:
+            if table[1] not in (2, 11): continue
+            symbol_count += table[5] // 24
+            if table[9] != 24 or table[5] % 24 or symbol_count > 65536 or table[6] >= shcount:
+                raise RuntimeError("Bounded trace sampling symbol table required")
+            strings = sections[table[6]]
+            if strings[1] != 3:
+                raise RuntimeError("Trace sampling symbols require a bounded string table")
+            for offset in range(table[4], table[4] + table[5], 24):
+                name, info, other, index, value, size = struct.unpack_from("<IBBHQQ", data, offset)
+                if name >= strings[5]:
+                    raise RuntimeError("Trace sampling symbol name exceeds string table")
+                start = strings[4] + name
+                end = data.find(b"\0", start, min(strings[4] + strings[5], start + 512))
+                if end < 0:
+                    raise RuntimeError("Unterminated trace sampling symbol name")
+                if data[start:end] != TRACE_SAMPLING_SYMBOL.encode("ascii"): continue
+                if (table[1] == 11 or info & 15 != 1 or (info >> 4 != 0 and other & 3 != 2) or
+                        not 0 < index < shcount or value != rva or size != 32):
+                    raise RuntimeError("Trace sampling symbol must be the exact hidden/local non-dynamic object")
+                section = sections[index]
+                if (section[1] != 1 or not section[2] & 2 or section[2] & 5 or
+                        section[3] > 2**64 - section[5] or not section[3] <= rva or
+                        rva - section[3] > section[5] or 32 > section[5] - (rva - section[3]) or
+                        section[4] + rva - section[3] != spans[0]):
+                    raise RuntimeError("Trace sampling object section must match its read-only file range")
+                found = True
+        if not found:
+            raise RuntimeError("Actual trace sampling object symbol missing")
+
+    @staticmethod
     def validate_envelope(data, plan, files, observer):
         if (len(data) != 8272 or data[:8] != b"FCMRAW03" or struct.unpack_from("<II", data, 8) != (3, 8272) or
             struct.unpack_from("<8Q", data, 48) != ENVELOPE_LIMITS or digest(data[:-32]) != data[-32:].hex()):
@@ -340,6 +413,7 @@ class Session(base.Session):
             if report.get("sha256") != digest(payloads[name]) or report.get("bytes") != len(payloads[name]):
                 raise RuntimeError("Artifact report changed")
         self.validate_scope_marker(payloads[MAIN], plan["observer"].get("scope_marker"))
+        self.validate_trace_sampling_marker(payloads[MAIN], plan)
         if plan["audit"].get("native_rvas") != NATIVE_RVAS or plan["audit"].get("early_forward_only") is not True:
             raise RuntimeError("Canonical audited providers required")
         if (plan["observer"].get("public_exports") != sorted(PUBLIC_EXPORTS) or
@@ -563,6 +637,7 @@ class Session(base.Session):
         self.validate_raw_trace_sampling(plan)
         observer = read_regular(self.library, MAX_INPUT, private=True)
         self.validate_scope_marker(observer, plan.get("observer", {}).get("scope_marker"))
+        self.validate_trace_sampling_marker(observer, plan)
         envelope = read_regular(self.envelope, MAX_INPUT, private=True)
         self.validate_envelope(envelope, plan, manifest["native_files"], observer)
 

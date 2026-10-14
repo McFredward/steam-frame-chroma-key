@@ -98,6 +98,8 @@ class SessionTests(unittest.TestCase):
             "observer_profile": {"role": 5, "file_sha256": M.digest(main), "profile_sha256": profiles[-1][-32:].hex()},
             "observer": {"sha256": M.digest(main), "bytes": len(main), "public_exports": sorted(M.PUBLIC_EXPORTS),
                 "scope_marker": {"symbol": "frame_compositor_raw_scope", "rva": 0x1080, "bytes": 16, "sha256": M.digest(M.SCOPE_MARKER)},
+                "trace_sampling_marker": {"symbol": M.TRACE_SAMPLING_SYMBOL, "rva": 0x10a0, "bytes": 32,
+                    "sha256": M.digest(M.TRACE_SAMPLING_MARKER)},
                 "vulkan_functions": dict(M.VULKAN_FUNCTIONS), "standard_vulkan_exports": [], "cold_environment_freeze_abi": 1, "launch_provider_mask": 63,
                 "raw_trace_sampling": dict(M.RAW_TRACE_SAMPLING)},
             "audit": {"sha256": M.digest(audit), "bytes": len(audit), "native_rvas": dict(M.NATIVE_RVAS), "early_forward_only": True},
@@ -134,13 +136,28 @@ class SessionTests(unittest.TestCase):
 
     @staticmethod
     def elf(value):
-        raw = bytearray(192)
+        raw = bytearray(576 if value == 7 else 192)
         raw[:20] = b"\x7fELF\x02\x01\x01" + b"\0" * 9 + b"\x03\0\xb7\0"
         struct.pack_into("<Q", raw, 32, 64)
         struct.pack_into("<3H", raw, 52, 64, 56, 1)
         struct.pack_into("<II6Q", raw, 64, 1, 4, 0, 0x1000, 0, len(raw), len(raw), 4096)
         raw[128:144] = M.SCOPE_MARKER
-        raw[144:] = bytes([value]) * 48
+        raw[144:] = bytes([value]) * (len(raw) - 144)
+        if value == 7:
+            # Small real ELF tables authenticate the new own object; other
+            # native/audit fixture profiles keep their original shape.
+            struct.pack_into("<I", raw, 20, 1)
+            struct.pack_into("<Q", raw, 40, 320)
+            struct.pack_into("<3H", raw, 58, 64, 4, 0)
+            raw[160:192] = M.TRACE_SAMPLING_MARKER
+            strings = b"\0" + M.TRACE_SAMPLING_SYMBOL.encode("ascii") + b"\0"
+            raw[192:192 + len(strings)] = strings
+            raw[256:304] = bytes(48)
+            struct.pack_into("<IBBHQQ", raw, 280, 1, 1, 0, 1, 0x10a0, 32)
+            raw[320:] = bytes(256)
+            struct.pack_into("<II4QII2Q", raw, 384, 0, 1, 2, 0x1080, 128, 64, 0, 0, 8, 0)
+            struct.pack_into("<II4QII2Q", raw, 448, 0, 3, 0, 0, 192, len(strings), 0, 0, 1, 0)
+            struct.pack_into("<II4QII2Q", raw, 512, 0, 2, 0, 0, 256, 48, 2, 2, 8, 24)
         return bytes(raw)
     @staticmethod
     def profile(role, data):
@@ -828,6 +845,67 @@ class OperatorArmTests(unittest.TestCase):
             self.assertFalse(self.session.folder.exists())
             self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
             self.assertEqual(self.restart_count(), 0)
+
+    def test_actual_v2_sampling_marker_checks_bounded_hidden_object_and_file_bytes(self):
+        original = self.artifacts[M.MAIN].read_bytes()
+        self.session.validate_trace_sampling_marker(original, self.plan)
+        variants = []
+        for offset, content in ((160, b"FCMSMP00"), (280, struct.pack("<I", 0)),
+                (284, b"\x02"), (284, b"\x11"), (288, struct.pack("<Q", 0x10a8)),
+                (296, struct.pack("<Q", 31)), (516, struct.pack("<I", 11)),
+                (392, struct.pack("<Q", 3))):
+            raw = bytearray(original); raw[offset:offset + len(content)] = content; variants.append(bytes(raw))
+        for flags in (5, 6, 7):
+            raw = bytearray(original); struct.pack_into("<I", raw, 68, flags); variants.append(bytes(raw))
+        raw = bytearray(original); struct.pack_into("<Q", raw, 96, 176); variants.append(bytes(raw))
+        raw = bytearray(original); struct.pack_into("<Q", raw, 40, len(raw) - 1); variants.append(bytes(raw))
+        raw = bytearray(original); struct.pack_into("<H", raw, 60, 4097); variants.append(bytes(raw))
+        raw = bytearray(original); raw.extend(original[64:120] * 2)
+        struct.pack_into("<Q", raw, 32, len(original)); struct.pack_into("<H", raw, 56, 2); variants.append(bytes(raw))
+        for index, raw in enumerate(variants):
+            with self.subTest(index=index), self.assertRaisesRegex(RuntimeError, "[Tt]race sampling"):
+                self.session.validate_trace_sampling_marker(raw, self.plan)
+        for key, value in (("rva", True), ("rva", 0x1080), ("bytes", 32.0), ("bytes", 31),
+                ("sha256", "f" * 64), ("symbol", "frame_compositor_raw_scope")):
+            plan = copy.deepcopy(self.plan); plan["observer"]["trace_sampling_marker"][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, "[Tt]race sampling"):
+                self.session.validate_trace_sampling_marker(original, plan)
+        hidden = bytearray(original); hidden[284:286] = bytes((0x11, 2))
+        self.session.validate_trace_sampling_marker(bytes(hidden), self.plan)
+
+    def test_old_acquisition_artifact_cannot_be_relabelled_as_v2_sampling_before_stage(self):
+        old = bytearray(self.artifacts[M.MAIN].read_bytes()); old[160:192] = bytes(32)
+        SessionTests.alter_artifact(self, M.MAIN, bytes(old))
+        with self.assertRaisesRegex(RuntimeError, "Actual trace sampling marker changed"):
+            self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+
+    def test_missing_v2_sampling_object_report_is_refused_before_stage(self):
+        self.plan["observer"].pop("trace_sampling_marker"); self.save_plan()
+        with self.assertRaisesRegex(RuntimeError, "actual observer trace sampling marker"):
+            self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_old_actual_sampling_artifact_refuses_activation_without_blocking_recovery(self):
+        self.stage()
+        old = bytearray(self.session.library.read_bytes()); old[160:192] = bytes(32)
+        self.session.library.unlink(); M.exclusive(self.session.library, bytes(old))
+        manifest_path = self.session.folder / "owned.json"
+        manifest = json.loads(manifest_path.read_bytes()); manifest["owned_files"][M.MAIN] = M.digest(old)
+        manifest_path.unlink(); M.exclusive(manifest_path, M.json_bytes(manifest))
+        with self.assertRaisesRegex(RuntimeError, "Actual trace sampling marker changed"):
+            self.activate()
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertEqual(self.restart_count(), 0)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 1)
+
+    def test_legacy_sampling_guard_does_not_require_the_new_artifact_marker(self):
+        plan = copy.deepcopy(self.plan)
+        plan["operator_arm"] = self.session.operator_arm_descriptor(schema=M.LEGACY_ARM_RECEIPT_SCHEMA)
+        plan["observer"].pop("trace_sampling_marker")
+        self.session.validate_trace_sampling_marker(self.elf(6), plan)
 
     def test_live_v2_journal_sampling_must_match_reviewed_report_before_arming(self):
         self.live_fixture(); prior = self.restart_count()
