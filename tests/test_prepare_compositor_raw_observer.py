@@ -144,7 +144,8 @@ class PackageControls(unittest.TestCase):
     def test_operator_arm_descriptor_reserves_the_existing_budget_without_new_environment(self):
         frame = Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw')
         descriptor = tool.operator_arm_descriptor(frame)
-        self.assertEqual(descriptor['schema'], 'frame-compositor-operator-arm-v1')
+        self.assertEqual(descriptor['schema'], 'frame-compositor-operator-arm-v2')
+        self.assertEqual(descriptor['allowed_stream_selection_phases'], ['visible', 'start-intent'])
         self.assertIs(descriptor['required'], True)
         self.assertEqual(descriptor['marker_path'], str(frame / 'capture-arm.marker'))
         self.assertEqual(descriptor['marker_bytes'], len(b'FRAME_COMPOSITOR_RAW/1\n'))

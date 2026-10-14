@@ -80,12 +80,13 @@ def remote_observer(value, home='/home/steamos'):
 
 
 def operator_arm_descriptor(frame):
-    return {'schema': 'frame-compositor-operator-arm-v1', 'required': True,
+    return {'schema': 'frame-compositor-operator-arm-v2', 'required': True,
             'marker_path': str(frame / 'capture-arm.marker'), 'marker_bytes': len(ARM_CONTENTS),
             'marker_sha256': digest(ARM_CONTENTS).hex(), 'marker_mode': '0600',
             'pc_vr_stream_acknowledgment_required': True, 'restart_required': False,
             'deadline_from_capture_start_seconds': 120, 'deadline_reset_allowed': False,
-            'source_frame_associated': False}
+            'source_frame_associated': False,
+            'allowed_stream_selection_phases': ['visible', 'start-intent']}
 
 def hidden_object(elf, name, size):
     symbols = [s for s in elf.symbols if s['name'] == name and s['defined']]
@@ -441,7 +442,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
                       'tiny C launch selector in service descendants; full observer/audit only in the exact compositor target',
                       'cold single-threaded diagnostic environment freeze; internal system/popen children inherit clean actual environ',
                       'own cold-ready forwarding before actual la_preinit; private candidate and draw budgets wait for protected operator arming',
-                      'operator arming only after healthy UI and visible PC-VR stream; one absolute 120-second boot deadline without reset',
+                      'operator arming after healthy UI with an explicit ready-to-connect or visible PC-VR stream acknowledgment; one absolute 120-second boot deadline without reset',
                       'local raw facts, not an immutable socket lease, native cross-endpoint namespace, video frame, eye, UV or GPU proof'],
             'before_activation': ['Independent final source/artifact/plan review', 'Fresh exact native Frame hashes and public loader names',
                                   'Exact user-owned staging files and no foreign service/preload/audit/layer state',
