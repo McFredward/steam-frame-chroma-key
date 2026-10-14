@@ -175,8 +175,8 @@ def main():
             assert footer["binding_journal"]["queue"] == (footer["binding_journal"]["header_queue"] +
                                                          footer["binding_journal"]["byte_queue"]), footer
             operations = footer["binding_operation_losses"]
-            assert len(operations) == 38 and "unknown" not in operations, operations
-            assert "import_resource_receipt" in operations, operations
+            assert len(operations) == 39 and "unknown" not in operations, operations
+            assert "import_resource_receipt" in operations and "target_snapshot_probe" in operations, operations
             assert all(loss == 0 for counter in operations.values() for loss in counter.values()), operations
             if mode == "bindings-concurrent":
                 assert footer["binding_journal"]["replayed"] >= 256, "Concurrent native resource calls did not traverse the journal"
