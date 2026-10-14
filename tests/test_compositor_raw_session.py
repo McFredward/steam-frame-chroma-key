@@ -714,6 +714,10 @@ class OperatorArmTests(unittest.TestCase):
     def test_protected_signal_arms_once_without_restart_or_extra_environment(self):
         self.live_fixture(); prior = self.restart_count()
         result = self.session.arm(stream_ready=True)
+        self.assertEqual(result["schema"], M.ARM_RECEIPT_SCHEMA)
+        self.assertEqual(result["stream_selection_phase"], "visible")
+        self.assertTrue(result["stream_ready_acknowledged"])
+        self.assertFalse(result["stream_start_intent_acknowledged"])
         self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
         self.assertEqual(self.session.marker.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.restart_count(), prior)
@@ -738,11 +742,140 @@ class OperatorArmTests(unittest.TestCase):
              mock.patch.dict(M.os.environ, {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}), \
              mock.patch.object(M, "Session", return_value=fake), mock.patch("builtins.print"):
             M.main(["arm", "--ack-pc-vr-stream-visible"])
-            fake.arm.assert_called_once_with(stream_ready=True)
+            fake.arm.assert_called_once_with(stream_ready=True, stream_start_intent=False)
             fake.activate.assert_not_called(); fake.command.assert_not_called()
             fake.arm.reset_mock()
             M.main(["arm"])
-            fake.arm.assert_called_once_with(stream_ready=False)
+            fake.arm.assert_called_once_with(stream_ready=False, stream_start_intent=False)
+
+    def test_pre_stream_intent_arms_after_fresh_health_without_claiming_visible_stream(self):
+        self.live_fixture(); prior = self.restart_count()
+        def fresh_health():
+            self.assertFalse(self.session.marker.exists())
+            self.assertFalse(self.session.arm_receipt.exists())
+            return self.current
+        self.session.current_arm_health.side_effect = fresh_health
+        result = self.session.arm(stream_start_intent=True)
+        self.session.current_arm_health.assert_called_once_with()
+        self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
+        self.assertEqual(result["schema"], M.ARM_RECEIPT_SCHEMA)
+        self.assertEqual(result["stream_selection_phase"], "start-intent")
+        self.assertFalse(result["stream_ready_acknowledged"])
+        self.assertTrue(result["stream_start_intent_acknowledged"])
+        self.assertFalse(result["source_frame_associated"])
+        self.assertFalse(result["accepted_submit"])
+        self.assertFalse(result["gpu_consumed"])
+        self.assertEqual(result["operator_arm_ns"], 3000000000)
+        self.assertEqual(result["capture_started_ns"], 1000000000)
+        self.assertEqual(result["capture_deadline_ns"], 121000000000)
+        self.assertEqual(self.restart_count(), prior)
+        with self.assertRaisesRegex(RuntimeError, "single-use"):
+            self.session.arm(stream_ready=True)
+
+    def test_pre_stream_acknowledgment_rejects_conflicts_and_non_booleans_before_io(self):
+        for ready, intent in ((True, True), (False, False), (False, 1), (1, False),
+                (True, None), (False, "yes"), (0, True)):
+            with self.subTest(ready=ready, intent=intent), self.assertRaisesRegex(RuntimeError, "Exactly one"):
+                self.session.arm(stream_ready=ready, stream_start_intent=intent)
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.calls, [])
+
+    def test_pre_stream_cli_is_a_distinct_mutually_exclusive_acknowledgment(self):
+        fake = mock.Mock(); fake.arm.return_value = {"operator_arm_requested": True}
+        with mock.patch.object(M.platform, "machine", return_value="aarch64"), \
+             mock.patch.dict(M.os.environ, {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}), \
+             mock.patch.object(M, "Session", return_value=fake) as constructor, mock.patch("builtins.print"):
+            M.main(["arm", "--ack-pc-vr-stream-start-intent"])
+            fake.arm.assert_called_once_with(stream_ready=False, stream_start_intent=True)
+            fake.activate.assert_not_called(); fake.command.assert_not_called()
+            constructor.reset_mock(); fake.arm.reset_mock()
+            with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                M.main(["arm", "--ack-pc-vr-stream-visible", "--ack-pc-vr-stream-start-intent"])
+            self.assertEqual(error.exception.code, 2)
+            constructor.assert_not_called(); fake.arm.assert_not_called()
+
+    def test_legacy_visible_descriptor_and_receipt_still_restore(self):
+        self.plan["operator_arm"] = self.session.operator_arm_descriptor(schema=M.LEGACY_ARM_RECEIPT_SCHEMA)
+        self.save_plan(); self.live_fixture()
+        result = self.session.arm(stream_ready=True)
+        self.assertEqual(result["schema"], M.LEGACY_ARM_RECEIPT_SCHEMA)
+        self.assertTrue(result["stream_ready_acknowledged"])
+        self.assertNotIn("stream_selection_phase", result)
+        self.assertNotIn("stream_start_intent_acknowledged", result)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertEqual(json.loads((self.session.folder / "archive" / self.session.arm_receipt.name).read_bytes()), result)
+
+    def test_legacy_descriptor_cannot_silently_admit_pre_stream_intent(self):
+        self.plan["operator_arm"] = self.session.operator_arm_descriptor(schema=M.LEGACY_ARM_RECEIPT_SCHEMA)
+        self.save_plan(); self.live_fixture(); before = list(self.calls)
+        with self.assertRaisesRegex(RuntimeError, "separately reviewed v2"):
+            self.session.arm(stream_start_intent=True)
+        self.session.current_arm_health.assert_not_called()
+        self.assertEqual(self.calls, before)
+        self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+
+    def test_pre_stream_receipt_is_preserved_after_native_recovery(self):
+        self.live_fixture(); result = self.session.arm(stream_start_intent=True)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertEqual(json.loads((self.session.folder / "archive" / self.session.arm_receipt.name).read_bytes()), result)
+
+    def test_inconsistent_pre_stream_receipt_is_refused_after_native_recovery(self):
+        self.live_fixture(); result = self.session.arm(stream_start_intent=True)
+        result["stream_ready_acknowledged"] = True
+        self.session.arm_receipt.write_bytes(M.json_bytes(result))
+        with self.assertRaisesRegex(RuntimeError, "receipt preserved after native recovery"):
+            self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertEqual(json.loads(self.session.arm_receipt.read_bytes()), result)
+
+    def test_new_receipt_phase_version_and_booleans_cannot_be_relabelled(self):
+        self.live_fixture(); result = self.session.arm(stream_start_intent=True)
+        payloads = {"owned.json": (self.session.folder / "owned.json").read_bytes(),
+            "deployment-plan.json": (self.session.folder / "deployment-plan.json").read_bytes(),
+            self.session.marker.name: M.ARM_CONTENTS, self.session.arm_receipt.name: M.json_bytes(result)}
+        self.session.validate_arm_archive(payloads)
+        for field, value in (("schema", M.LEGACY_ARM_RECEIPT_SCHEMA), ("stream_selection_phase", "visible"),
+                ("stream_selection_phase", "connected"), ("stream_ready_acknowledged", 0),
+                ("stream_start_intent_acknowledged", 1), ("source_frame_associated", True)):
+            changed = dict(result); changed[field] = value
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(RuntimeError, "preserved after native recovery"):
+                self.session.validate_arm_archive(dict(payloads, **{self.session.arm_receipt.name: M.json_bytes(changed)}))
+        self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
+        self.assertEqual(json.loads(self.session.arm_receipt.read_bytes()), result)
+
+    def test_pre_stream_intent_still_requires_healthy_passed_invocation(self):
+        self.live_fixture(); prior = self.restart_count()
+        self.session.current_arm_health.side_effect = RuntimeError("Current compositor/UI health or invocation changed")
+        with self.assertRaisesRegex(RuntimeError, "health or invocation changed"):
+            self.session.arm(stream_start_intent=True)
+        self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+        self.assertEqual(self.restart_count(), prior)
+
+    def test_pre_stream_intent_does_not_extend_expired_absolute_deadline(self):
+        self.live_fixture(); self.health_source.clock = lambda: 121.0
+        with self.assertRaisesRegex(RuntimeError, "deadline|expired"):
+            self.session.arm(stream_start_intent=True)
+        self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+        self.assertEqual(self.header["capture_deadline_ns"], 121000000000)
+        self.assertEqual(self.restart_count(), 1)
+
+    def test_pre_stream_receipt_write_fault_cannot_retry_or_rearm_as_visible(self):
+        self.live_fixture(); original = M.exclusive
+        def failing(path, value):
+            if path == self.session.arm_receipt: raise OSError("receipt storage unavailable")
+            return original(path, value)
+        with mock.patch.object(M, "exclusive", side_effect=failing), self.assertRaises(OSError):
+            self.session.arm(stream_start_intent=True)
+        self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
+        for kwargs in ({"stream_start_intent": True}, {"stream_ready": True}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(RuntimeError, "single-use"):
+                self.session.arm(**kwargs)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 2)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
 
     def test_missing_arm_descriptor_or_legacy_unarmed_artifact_cannot_stage(self):
         original = copy.deepcopy(self.plan)
@@ -750,7 +883,10 @@ class OperatorArmTests(unittest.TestCase):
             dict(original["operator_arm"], required=1), dict(original["operator_arm"], marker_path="/foreign"),
             dict(original["operator_arm"], deadline_reset_allowed=True),
             dict(original["operator_arm"], marker_sha256="f" * 64),
-            dict(original["operator_arm"], pc_vr_stream_acknowledgment_required=False))
+            dict(original["operator_arm"], pc_vr_stream_acknowledgment_required=False),
+            dict(original["operator_arm"], allowed_stream_selection_phases=["visible"]),
+            dict(original["operator_arm"], allowed_stream_selection_phases=["visible", "start-intent", "automatic"]),
+            dict(original["operator_arm"], schema="frame-compositor-operator-arm-v3"))
         for descriptor in variants:
             self.plan = copy.deepcopy(original)
             if descriptor is None: self.plan.pop("operator_arm")

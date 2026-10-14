@@ -68,7 +68,9 @@ NATIVE_RVAS = {"lock": "0x87370", "unlock": "0x88f74", "write": "0xdfee0"}
 ENVELOPE_LIMITS = (720, 21, 16, 8, 32, 65536, 120, 4)
 SCOPE_MARKER = b"FCMRAW03" + struct.pack("<II", 3, 8272)
 ARM_CONTENTS = b"FRAME_COMPOSITOR_RAW/1\n"
-ARM_RECEIPT_SCHEMA = "frame-compositor-operator-arm-v1"
+LEGACY_ARM_RECEIPT_SCHEMA = "frame-compositor-operator-arm-v1"
+ARM_RECEIPT_SCHEMA = "frame-compositor-operator-arm-v2"
+STREAM_SELECTION_PHASES = ("visible", "start-intent")
 STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-startup-health.json",
     "restoration-startup-baseline.json", "restoration-startup-health.json", "startup-monitor.json"})
 
@@ -384,16 +386,22 @@ class Session(base.Session):
     def activation_files(self, layer_data):
         return {self.dropin: self.activation(), self.layer: layer_data}
 
-    def operator_arm_descriptor(self):
-        return {"schema": ARM_RECEIPT_SCHEMA, "required": True,
+    def operator_arm_descriptor(self, *, schema=ARM_RECEIPT_SCHEMA):
+        if schema not in (LEGACY_ARM_RECEIPT_SCHEMA, ARM_RECEIPT_SCHEMA):
+            raise RuntimeError("Unsupported operator-arm descriptor version")
+        descriptor = {"schema": schema, "required": True,
             "marker_path": str(self.marker), "marker_bytes": len(ARM_CONTENTS),
             "marker_sha256": digest(ARM_CONTENTS), "marker_mode": "0600",
             "pc_vr_stream_acknowledgment_required": True, "restart_required": False,
             "deadline_from_capture_start_seconds": 120, "deadline_reset_allowed": False,
             "source_frame_associated": False}
+        if schema == ARM_RECEIPT_SCHEMA:
+            descriptor["allowed_stream_selection_phases"] = list(STREAM_SELECTION_PHASES)
+        return descriptor
 
     def validate_operator_arm(self, descriptor):
-        expected = self.operator_arm_descriptor()
+        schema = descriptor.get("schema") if isinstance(descriptor, dict) else None
+        expected = self.operator_arm_descriptor(schema=schema)
         if (not isinstance(descriptor, dict) or descriptor != expected or
                 any(type(descriptor[key]) is not type(value) for key, value in expected.items())):
             raise RuntimeError("Exact protected operator-arm descriptor required")
@@ -847,11 +855,16 @@ class Session(base.Session):
             "mapped_observer_sha256": manifest["owned_files"][MAIN],
             "verification_scope": "bounded current public proc metadata and pinned files; not GPU lifetime or video-frame proof"}
 
-    def arm(self, *, stream_ready=False):
-        if stream_ready is not True:
-            raise RuntimeError("Visible PC-VR stream acknowledgment required before operator arming")
+    def arm(self, *, stream_ready=False, stream_start_intent=False):
+        if (type(stream_ready) is not bool or type(stream_start_intent) is not bool or
+                stream_ready == stream_start_intent):
+            raise RuntimeError("Exactly one visible PC-VR stream or ready-to-start acknowledgment required before operator arming")
+        selection_phase = "visible" if stream_ready else "start-intent"
         with self.lock():
             m = self.manifest(); self.verify_owned(m); self.verify_acquisition_scope(m)
+            descriptor = json.loads(read_regular(self.folder / "deployment-plan.json", private=True))["operator_arm"]
+            if stream_start_intent and descriptor["schema"] != ARM_RECEIPT_SCHEMA:
+                raise RuntimeError("Ready-to-start acknowledgment requires a separately reviewed v2 operator-arm plan")
             for path in (self.marker, self.arm_receipt, self.folder / "rollback-complete.json"):
                 safe_path(path)
                 if path.exists() or path.is_symlink(): raise RuntimeError("Operator arm is single-use; existing or restored session refused")
@@ -878,15 +891,20 @@ class Session(base.Session):
                     raise RuntimeError("Capture expired before the operator marker could be published")
                 exclusive(self.marker, ARM_CONTENTS)
                 directory_sync(self.folder)
-            receipt = {"schema": ARM_RECEIPT_SCHEMA, "plan_sha256": m["plan_sha256"],
-                "stream_ready_acknowledged": True, "operator_arm_requested": True,
+            receipt = {"schema": descriptor["schema"], "plan_sha256": m["plan_sha256"],
+                "stream_ready_acknowledged": stream_ready, "operator_arm_requested": True,
                 "operator_arm_ns": requested_ns,
                 "marker_sha256": digest(ARM_CONTENTS), "marker_bytes": len(ARM_CONTENTS),
                 "marker_path": str(self.marker), "process": process, **evidence,
                 "automatic_restart": False, "source_frame_associated": False,
                 "accepted_submit": False, "gpu_consumed": False, "mask_enabled": False}
+            if descriptor["schema"] == ARM_RECEIPT_SCHEMA:
+                receipt.update(stream_selection_phase=selection_phase,
+                    stream_start_intent_acknowledged=stream_start_intent)
             exclusive(self.arm_receipt, json_bytes(receipt)); directory_sync(self.folder)
-            self.event("operator_arm_requested", stream_ready_acknowledged=True, source_frame_associated=False,
+            self.event("operator_arm_requested", stream_ready_acknowledged=stream_ready,
+                stream_selection_phase=selection_phase, stream_start_intent_acknowledged=stream_start_intent,
+                source_frame_associated=False,
                 accepted_submit=False, automatic_restart=False, compositor_process=process)
             return receipt
 
@@ -898,18 +916,29 @@ class Session(base.Session):
         if receipt is None: return  # A failed receipt write must not prevent recovery.
         value = json.loads(receipt)
         manifest = json.loads(payloads["owned.json"])
+        descriptor = json.loads(payloads["deployment-plan.json"])["operator_arm"]
+        self.validate_operator_arm(descriptor)
+        if not isinstance(value, dict):
+            raise RuntimeError("Changed operator-arm receipt preserved after native recovery")
         keys = {"schema", "plan_sha256", "stream_ready_acknowledged", "operator_arm_requested",
             "operator_arm_ns", "marker_sha256", "marker_bytes", "marker_path", "process",
             "capture_started_ns", "capture_deadline_ns", "pre_arm_private_bytes", "journal_no_recorded_loss",
             "continuous_transport_loss_proven", "automatic_restart", "source_frame_associated",
             "accepted_submit", "gpu_consumed", "mask_enabled"}
-        fixed = {"schema": ARM_RECEIPT_SCHEMA, "plan_sha256": manifest["plan_sha256"],
+        fixed = {"schema": descriptor["schema"], "plan_sha256": manifest["plan_sha256"],
             "stream_ready_acknowledged": True, "operator_arm_requested": True,
             "marker_sha256": digest(ARM_CONTENTS), "marker_bytes": len(ARM_CONTENTS), "marker_path": str(self.marker),
             "pre_arm_private_bytes": 0, "journal_no_recorded_loss": True,
             "continuous_transport_loss_proven": False, "automatic_restart": False,
             "source_frame_associated": False, "accepted_submit": False, "gpu_consumed": False, "mask_enabled": False}
-        if (not isinstance(value, dict) or set(value) != keys or marker != ARM_CONTENTS or
+        if descriptor["schema"] == ARM_RECEIPT_SCHEMA:
+            keys.update(("stream_selection_phase", "stream_start_intent_acknowledged"))
+            phase = value.get("stream_selection_phase")
+            if phase not in STREAM_SELECTION_PHASES:
+                raise RuntimeError("Changed operator-arm selection phase preserved after native recovery")
+            fixed.update(stream_selection_phase=phase, stream_ready_acknowledged=phase == "visible",
+                stream_start_intent_acknowledged=phase == "start-intent")
+        if (set(value) != keys or marker != ARM_CONTENTS or
                 any(value[key] != item or type(value[key]) is not type(item) for key, item in fixed.items())):
             raise RuntimeError("Changed operator-arm receipt preserved after native recovery")
         start, end, requested = (value[key] for key in ("capture_started_ns", "capture_deadline_ns", "operator_arm_ns"))
@@ -1135,7 +1164,11 @@ def main(argv=None):
     p.add_argument("--reviewed-native-layer", action="append", default=[], metavar="PATH=SHA256")
     p.add_argument("--ack-compositor-raw-diagnostic-scope", action="store_true")
     p.add_argument("--ack-steamvr-restart-readiness", action="store_true")
-    p.add_argument("--ack-pc-vr-stream-visible", action="store_true")
+    selection = p.add_mutually_exclusive_group()
+    selection.add_argument("--ack-pc-vr-stream-visible", action="store_true",
+        help="acknowledge that the PC-VR stream is already visible; not source-frame proof")
+    selection.add_argument("--ack-pc-vr-stream-start-intent", action="store_true",
+        help="acknowledge readiness to connect the PC-VR stream immediately after arming; not stream visibility")
     a = p.parse_args(argv)
     try:
         if platform.system() != "Linux" or platform.machine().lower() not in ("aarch64", "arm64"):
@@ -1160,7 +1193,8 @@ def main(argv=None):
         elif a.mode == "activate": session.activate(runtime_scope=a.ack_compositor_raw_diagnostic_scope,
             restart_ready=a.ack_steamvr_restart_readiness)
         elif a.mode == "rollback": session.rollback(restart_ready=a.ack_steamvr_restart_readiness)
-        elif a.mode == "arm": print(json.dumps(session.arm(stream_ready=a.ack_pc_vr_stream_visible), sort_keys=True))
+        elif a.mode == "arm": print(json.dumps(session.arm(stream_ready=a.ack_pc_vr_stream_visible,
+            stream_start_intent=a.ack_pc_vr_stream_start_intent), sort_keys=True))
         elif a.mode == "monitor-startup": print(json.dumps(session.monitor_startup(seconds=a.monitor_seconds), sort_keys=True))
         elif a.mode == "verify-unloaded": print(json.dumps(session.verify_unloaded(), sort_keys=True))
         else: print(json.dumps(session.readcheck(), sort_keys=True))
