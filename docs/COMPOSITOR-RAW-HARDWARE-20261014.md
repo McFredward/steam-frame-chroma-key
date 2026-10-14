@@ -215,3 +215,47 @@ hash-verified before removing all 45 exact owned session/input files. Native
 files were preserved; no additional automatic restart, image/shader change or
 PC Steam sender modification occurred. Private evidence is retained under
 `build/private-compositor-prestream-integration-20261014/`.
+
+## Selected P010 import belongs to the current Steam Link process
+
+The authorized v5 attempt on `cbd9894` excluded 55 public image creations before
+claiming one P010 (format 1000156013), 1152 by 4608, one-layer Facet import. The
+native image/bind/view/send/reply path completed with a successful exact reply.
+Private acquisition was 16 parent, 388 scalar and 21 wire bytes (425 total),
+with no earlier private Begin/Early replay. Only two worker slots were reserved.
+
+The captured client value was 3091578. A subsequent read-only public `/proc`
+snapshot found that current PID executing
+`/opt/steamvr/tools/vrlink/bin/linuxarm64/vrlink`, with comm `vrlinkrunthread`.
+This identifies the current process class, not a birth/endpoint epoch, accepted
+socket, source PC session, particular frame, physical eye or native UV mapping.
+
+The same owning journal delivered a complete receipt with zero errors/loss and
+`current_after_drain=true`, matching the raw image/view/memory handles and their
+actual generations. Nevertheless the raw consumer's single later `join()`
+returned false. Its old serialization omits some comparison fields and the
+individual validation outcome, so the exact failed conjunct is **not proved**
+by this capture. Source inspection establishes that the final check can also
+refuse an unchanged resource when unrelated publications arrive between receipt
+delivery and consumer revalidation. Global cursor advancement alone is not a
+generation mismatch. The next repair must report the exact decision and retry
+only bounded transient nonquiescence, using the same immutable receipt and
+unchanged strict generation/loss checks within the original deadline.
+
+None of the 32 retained descriptor snapshots references the selected image
+generation 2993329, memory generation 2993330 or view generation 2993331. They
+all sampled other RGB/UI textures. The import gate reserves time but does not
+select a requested resource. Exact-generation filtering at ordered replay is
+required before spending a full snapshot slot; a late mutable descriptor lookup
+or dimensions-only match is insufficient.
+
+The final journal replayed all 811,507 public publications without recorded loss
+or reaching its byte cap. The native UI stayed functional, as confirmed by the
+operator. Coordinated recovery passed the original startup gate, confirmed old
+compositor exit and absence of own mappings in 15 observed managed processes,
+then hash-verified the archive and removed all 45 owned files. Native/system
+files and the PC sender remained unchanged. Private evidence is retained under
+`build/private-compositor-stream-image-integration-20261014/` and the independent
+analysis under `build/private-compositor-stream-image-join-review-20261014/`.
+Passthrough remains disabled; neither the recorded import nor the refused final
+join establishes frame, eye, UV or coherent GPU association.
