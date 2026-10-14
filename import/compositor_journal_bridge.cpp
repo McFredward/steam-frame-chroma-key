@@ -37,13 +37,17 @@ bool Owner::request(std::uint64_t device, VkImage image, VkImageView view,
     requested_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
-std::size_t Owner::drain(SnapshotNotify snapshot, void* context, std::size_t max_records) noexcept {
+std::size_t Owner::drain(SnapshotNotify snapshot, void* context, std::size_t max_records,
+                         TargetProbeNotify target) noexcept {
     if (child_retired_.load(std::memory_order_acquire)) return 0;
     std::lock_guard<std::mutex> owner(owner_mutex_);
     struct Collector {
-        Owner& bridge; SnapshotNotify snapshot; void* context;
+        Owner& bridge; SnapshotNotify snapshot; void* context; TargetProbeNotify target;
         void operator()(std::uint32_t cookie, const frame_bindings::Snapshot& value) noexcept {
             if (snapshot) snapshot(cookie, value, context);
+        }
+        void operator()(std::uint32_t cookie, const frame_bindings::TargetSnapshotProbeResult& value) noexcept {
+            if (target) target(cookie, value, context);
         }
         void operator()(std::uint64_t cookie, const frame_bindings::ImportResourceReceipt& value) noexcept {
             if (cookie != value.cookie || bridge.pending_count_ >= bridge.pending_.size()) {
@@ -52,7 +56,7 @@ std::size_t Owner::drain(SnapshotNotify snapshot, void* context, std::size_t max
             bridge.pending_[bridge.pending_count_++].resource = value;
         }
     };
-    const auto drained = journal_.drain(Collector{*this, snapshot, context}, max_records);
+    const auto drained = journal_.drain(Collector{*this, snapshot, context, target}, max_records);
     // A partial replay batch is not the current resource state. Keep the
     // bounded immutable copies until the owning journal catches up.
     if (!journal_.empty()) return drained;
@@ -71,11 +75,29 @@ std::size_t Owner::drain(SnapshotNotify snapshot, void* context, std::size_t max
     return drained;
 }
 bool Owner::validate(const Receipt& receipt) noexcept {
-    if (child_retired_.load(std::memory_order_acquire)) return false;
+    return validate_detailed(receipt).valid;
+}
+Validation Owner::validate_detailed(const Receipt& receipt) noexcept {
+    Validation result;
+    if (child_retired_.load(std::memory_order_acquire)) {
+        result.bridge_reason = BridgeValidationReason::ChildRetired; return result;
+    }
     std::lock_guard<std::mutex> owner(owner_mutex_);
-    return initialization_.load(std::memory_order_acquire) == 2 &&
-        !stopped_.load(std::memory_order_acquire) && !lost_.load(std::memory_order_acquire) &&
-        receipt.current_after_drain && journal_.validateImportResourceReceipt(receipt.resource);
+    if (initialization_.load(std::memory_order_acquire) != 2) return result;
+    if (stopped_.load(std::memory_order_acquire)) {
+        result.bridge_reason = BridgeValidationReason::Stopped; return result;
+    }
+    if (lost_.load(std::memory_order_acquire)) {
+        result.bridge_reason = BridgeValidationReason::Loss; return result;
+    }
+    if (!receipt.current_after_drain) {
+        result.bridge_reason = BridgeValidationReason::ReceiptNotCurrent; return result;
+    }
+    result.journal = journal_.validateImportResourceReceiptDetailed(receipt.resource);
+    result.valid = result.journal.valid;
+    result.transient = !result.valid && result.journal.transient;
+    result.bridge_reason = result.valid ? BridgeValidationReason::None : BridgeValidationReason::Journal;
+    return result;
 }
 void Owner::stop() noexcept {
     if (child_retired_.load(std::memory_order_acquire)) return;

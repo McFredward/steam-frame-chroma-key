@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <mutex>
 
+namespace frame_bindings { struct TargetSnapshotProbeResult; }
+
 // CPU-only import receipts from the passive layer's existing owning Journal.
 // Invocation labels, cookies and replay order are not native generations,
 // accepted submissions, video-frame identities or GPU-completion evidence.
@@ -16,9 +18,18 @@ struct Receipt {
     frame_bindings::ImportResourceReceipt resource{};
     bool current_after_drain = false;
 };
+enum class BridgeValidationReason : unsigned {
+    None, ChildRetired, Uninitialized, Stopped, Loss, ReceiptNotCurrent, Journal
+};
+struct Validation {
+    bool valid = false, transient = false;
+    BridgeValidationReason bridge_reason = BridgeValidationReason::Uninitialized;
+    frame_bindings::ImportReceiptValidation journal{};
+};
 using Notify = void (*)(const Receipt&, void*) noexcept;
 struct Callbacks { Notify notify = nullptr; void* context = nullptr; };
 using SnapshotNotify = void (*)(std::uint32_t, const frame_bindings::Snapshot&, void*) noexcept;
+using TargetProbeNotify = void (*)(std::uint32_t, const frame_bindings::TargetSnapshotProbeResult&, void*) noexcept;
 struct Counters {
     std::uint64_t requested = 0, delivered = 0, invalid_after_drain = 0, refused = 0;
 };
@@ -37,11 +48,13 @@ public:
     // receipts. Currentness is checked after drain() returns, before delivery.
     // The notification may enqueue a fixed owned value, but must not reenter
     // validate(), drain() or stop() while this background-owner lock is held.
-    std::size_t drain(SnapshotNotify, void* context, std::size_t max_records = 256) noexcept;
+    std::size_t drain(SnapshotNotify, void* context, std::size_t max_records = 256,
+                      TargetProbeNotify target = nullptr) noexcept;
     // Other background consumer only, immediately before publishing a joined
     // diagnostic. Serializes against the journal owner; pending/unreplayed
     // lifecycles, concurrency, closure and retirement all fail closed.
     bool validate(const Receipt&) noexcept;
+    Validation validate_detailed(const Receipt&) noexcept;
     // Background teardown only. On return no callback can retain/use context.
     void stop() noexcept;
     // pthread_atfork child only. No inherited owner mutex, allocation, I/O,
@@ -69,6 +82,7 @@ bool register_receipts_before_threads(Callbacks) noexcept;
 bool request(std::uint64_t device, VkImage image, VkImageView view,
              std::uint64_t tag, std::uint64_t cookie) noexcept;
 bool validate(const Receipt&) noexcept;
+Validation validate_detailed(const Receipt&) noexcept;
 void stop() noexcept;
 void retire_child_atomically() noexcept;
 bool notification_loss() noexcept;
