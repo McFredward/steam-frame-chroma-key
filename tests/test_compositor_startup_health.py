@@ -523,6 +523,145 @@ class NativeSourceTests(unittest.TestCase):
         (self.logdir / "vrserver.txt").write_text("new invocation\n")
         self.assertEqual(self.source.sample()["logs"]["vrserver"], "new invocation")
         self.assertNotIn("previous", str(self.commands))
+
+    def test_delayed_stream_log_snapshot_uses_bounded_reads_and_keeps_budget(self):
+        self.source.baseline()
+        # The failed hardware arm resumed at 265191 cumulative bytes, with a
+        # later vrserver delta larger than one 128-KiB read but within 512 KiB.
+        checkpoint = copy.deepcopy(self.source.checkpoint())
+        checkpoint["total"] = 265191
+        self.source.resume(checkpoint)
+        raw = b"stream connected\n" * 9500
+        self.assertGreater(len(raw), M.LOG_READ_CHUNK)
+        with (self.logdir / "vrserver.txt").open("ab") as stream: stream.write(raw)
+        requests = []; original = M.os.fdopen
+        class BoundedReader:
+            def __init__(self, stream): self.stream = stream
+            def __enter__(self): return self
+            def __exit__(self, *args): return self.stream.__exit__(*args)
+            def __getattr__(self, name): return getattr(self.stream, name)
+            def read(self, size):
+                requests.append(size)
+                return self.stream.read(size)
+        with mock.patch.object(M.os, "fdopen", side_effect=lambda *args, **kwargs: BoundedReader(original(*args, **kwargs))):
+            text = self.source.log_read("vrserver")
+        self.assertEqual(text, raw.decode().removesuffix("\n"))
+        self.assertGreater(len(requests), 1)
+        self.assertLessEqual(max(requests), M.LOG_READ_CHUNK)
+        self.assertEqual(self.source.total, checkpoint["total"] + len(raw))
+        observed = sample(); observed["logs"]["vrserver"] += "\n" + text
+        self.assertTrue(M.StartupGate(baseline()).consume(observed, stable_seconds=0)["ready"])
+        resumed = M.NativeEvidenceSource(self.home, proc_root=self.proc, run=self.command,
+            clock=lambda: self.now, wall_clock=lambda: 100.0)
+        resumed.resume(copy.deepcopy(self.source.checkpoint()))
+        self.assertEqual(resumed.log_read("vrserver"), "")
+        self.assertEqual(resumed.total, self.source.total)
+
+    def test_chunk_boundary_does_not_split_utf8_or_reemit_pending_lines(self):
+        self.source.baseline()
+        path = self.logdir / "vrserver.txt"
+        with path.open("ab") as stream: stream.write(b"pending ")
+        self.assertEqual(self.source.log_read("vrserver"), "")
+        saved = copy.deepcopy(self.source.checkpoint()); self.source.resume(saved)
+        raw = b"x\n" * ((M.LOG_READ_CHUNK - 2) // 2) + b"x" + "ä\n".encode()
+        self.assertEqual(raw[M.LOG_READ_CHUNK - 1:M.LOG_READ_CHUNK + 1], "ä".encode())
+        with path.open("ab") as stream: stream.write(raw)
+        text = self.source.log_read("vrserver")
+        self.assertTrue(text.startswith("pending x\n"))
+        self.assertTrue(text.endswith("xä"))
+        self.assertEqual(self.source.total, len(b"pending ") + len(raw))
+        self.assertEqual(self.source.log_read("vrserver"), "")
+
+    def test_failure_after_first_chunk_still_revokes_ready_gate(self):
+        self.source.baseline()
+        gate = M.StartupGate(baseline())
+        self.assertTrue(gate.consume(sample(), stable_seconds=0)["ready"])
+        raw = (line("stream progress") + "\n") * 3000 + line("FATAL graphics initialization failed") + "\n"
+        self.assertGreater(raw.index("FATAL"), M.LOG_READ_CHUNK)
+        with (self.logdir / "vrserver.txt").open("a") as stream: stream.write(raw)
+        observed = sample(3.0)
+        observed["logs"] = {"vrserver": self.source.log_read("vrserver"), "vrcompositor": ""}
+        result = gate.consume(observed, stable_seconds=0)
+        self.assertEqual(result["status"], "fault")
+        self.assertIn("Fresh native startup failure", result["reason"])
+
+    def test_all_log_files_share_cumulative_budget_and_refuse_before_reading(self):
+        self.source.baseline()
+        checkpoint = copy.deepcopy(self.source.checkpoint())
+        checkpoint["total"] = M.LIMIT - 200000; self.source.resume(checkpoint)
+        for name in self.source.logs:
+            with (self.logdir / (name + ".txt")).open("ab") as stream: stream.write(b"x\n" * 80000)
+        self.source.log_read("vrcompositor")
+        before = copy.deepcopy(self.source.checkpoint())
+        # The second file cannot silently spend a fresh budget or skip its gap.
+        with mock.patch.object(M.os, "fdopen", wraps=M.os.fdopen) as opened, \
+                self.assertRaisesRegex(RuntimeError, "evidence byte bound"):
+            self.source.log_read("vrserver")
+        self.assertEqual(self.source.checkpoint(), before)
+        self.assertEqual(opened.call_count, 1)
+        oversized = sample()
+        oversized["logs"] = {"vrserver": "x" * (M.LIMIT // 2 + 1), "vrcompositor": "x" * (M.LIMIT // 2)}
+        self.assertEqual(M.StartupGate(baseline()).consume(oversized)["status"], "fault")
+
+    def test_replaced_snapshot_keeps_consumed_bytes_without_advancing_offset(self):
+        self.source.baseline()
+        path = self.logdir / "vrserver.txt"
+        raw = b"x\n" * 80000
+        with path.open("ab") as stream: stream.write(raw)
+        before = copy.deepcopy(self.source.checkpoint()); original = M.os.fdopen
+        class ReplacedReader:
+            def __init__(self, stream): self.stream = stream; self.replaced = False
+            def __enter__(self): return self
+            def __exit__(self, *args): return self.stream.__exit__(*args)
+            def __getattr__(self, name): return getattr(self.stream, name)
+            def read(self, size):
+                data = self.stream.read(size)
+                if not self.replaced:
+                    self.replaced = True
+                    path.rename(path.with_suffix(".old")); path.write_bytes(b"new log\n")
+                return data
+        with mock.patch.object(M.os, "fdopen", side_effect=lambda *args, **kwargs: ReplacedReader(original(*args, **kwargs))), \
+                self.assertRaisesRegex(RuntimeError, "rotated during sampling"):
+            self.source.log_read("vrserver")
+        self.assertEqual(self.source.total, before["total"] + len(raw))
+        self.assertEqual(self.source.offsets["vrserver"], before["log_offsets"]["vrserver"])
+
+    def test_truncated_snapshot_charges_short_read_and_keeps_old_offset(self):
+        self.source.baseline()
+        path = self.logdir / "vrserver.txt"
+        with path.open("ab") as stream: stream.write(b"x\n" * 80000)
+        before = copy.deepcopy(self.source.checkpoint()); original = M.os.fdopen
+        class TruncatedReader:
+            def __init__(self, stream): self.stream = stream; self.truncated = False
+            def __enter__(self): return self
+            def __exit__(self, *args): return self.stream.__exit__(*args)
+            def __getattr__(self, name): return getattr(self.stream, name)
+            def read(self, size):
+                data = self.stream.read(min(size, 19))
+                if not self.truncated:
+                    self.truncated = True
+                    path.write_bytes(b"")
+                return data
+        with mock.patch.object(M.os, "fdopen", side_effect=lambda *args, **kwargs: TruncatedReader(original(*args, **kwargs))), \
+                self.assertRaisesRegex(RuntimeError, "truncated during sampling"):
+            self.source.log_read("vrserver")
+        self.assertEqual(self.source.total, before["total"] + 19)
+        self.assertEqual(self.source.offsets["vrserver"], before["log_offsets"]["vrserver"])
+
+    def test_journal_and_delayed_log_snapshot_share_one_evidence_budget(self):
+        self.source.baseline()
+        checkpoint = copy.deepcopy(self.source.checkpoint())
+        checkpoint["total"] = M.LIMIT - 200000; self.source.resume(checkpoint)
+        self.journal_rows = [{"MESSAGE": "x" * 25000, "__CURSOR": "s=one"},
+                             {"MESSAGE": "x" * 25000, "__CURSOR": "s=two"}]
+        self.source.journal()
+        self.assertGreater(self.source.total, checkpoint["total"] + 40000)
+        with (self.logdir / "vrserver.txt").open("ab") as stream: stream.write(b"x\n" * 80000)
+        before = copy.deepcopy(self.source.checkpoint())
+        with self.assertRaisesRegex(RuntimeError, "evidence byte bound"):
+            self.source.log_read("vrserver")
+        self.assertEqual(self.source.checkpoint(), before)
+
     def test_partial_lines_are_only_emitted_once_complete(self):
         self.source.baseline()
         path = self.logdir / "vrserver.txt"

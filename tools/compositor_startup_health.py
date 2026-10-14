@@ -24,6 +24,7 @@ import time
 UNIT = "steamvr.service"
 SCHEMA = "frame-compositor-startup-health-v1"
 LIMIT = 512 * 1024
+LOG_READ_CHUNK = 128 * 1024
 JOURNAL_MESSAGE_LIMIT = 32768
 # Request complete messages without collecting private coredump environment,
 # memory maps or file-descriptor inventories. journalctl otherwise emits null
@@ -732,7 +733,7 @@ class NativeEvidenceSource:
         except FileNotFoundError:
             if initial: self.offsets[name] = None; return ""
             return ""
-        with os.fdopen(fd, "rb") as stream:
+        with os.fdopen(fd, "rb", buffering=0) as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid or info.st_nlink != 1:
                 raise RuntimeError("Unsafe native startup log type/owner")
@@ -744,17 +745,28 @@ class NativeEvidenceSource:
             offset = previous["offset"] if previous and node == (previous["dev"], previous["ino"]) and info.st_size >= previous["offset"] else 0
             if offset == 0: self.pending_lines[name] = ""
             available = info.st_size - offset
-            if available > 128 * 1024: raise RuntimeError("Startup log delta bound exceeded")
-            stream.seek(offset); data = stream.read(available)
+            # The operator can start a stream well after the startup sample.
+            # Drain that snapshot in bounded reads without discarding any
+            # failure lines or resetting the cumulative evidence budget.
+            if available > LIMIT - self.total:
+                raise RuntimeError("Startup evidence byte bound exceeded")
+            stream.seek(offset); chunks = []; unread = available
+            while unread:
+                chunk = stream.read(min(unread, LOG_READ_CHUNK))
+                if not chunk: raise RuntimeError("Startup log truncated during sampling")
+                self.total += len(chunk)
+                chunks.append(chunk); unread -= len(chunk)
+            data = b"".join(chunks)
             after = os.fstat(stream.fileno()); current = path.lstat()
             if (after.st_dev, after.st_ino) != node or (current.st_dev, current.st_ino) != node or after.st_size < offset + len(data):
                 raise RuntimeError("Startup log rotated during sampling")
             self.offsets[name] = {"dev": node[0], "ino": node[1], "offset": offset + len(data)}
-        self.total += len(data)
-        if self.total > LIMIT: raise RuntimeError("Startup evidence byte bound exceeded")
         text = self.pending_lines[name] + data.decode("utf-8")
-        rows = text.split("\n"); self.pending_lines[name] = rows.pop()
-        if len(self.pending_lines[name]) > 8192: raise RuntimeError("Startup log line bound exceeded")
+        rows = text.split("\n"); pending = rows.pop()
+        # Keep even a denied checkpoint bounded enough to persist. A huge
+        # unterminated line must not replace the previously bounded fragment.
+        if len(pending) > 8192: raise RuntimeError("Startup log line bound exceeded")
+        self.pending_lines[name] = pending
         return "\n".join(rows)
 
     def main_process(self, unit):
@@ -879,7 +891,9 @@ class StartupGate:
         require_errors(sample["errors"])
         if not isinstance(sample["journal"], list) or len(sample["journal"]) >= 512:
             raise RuntimeError("Invalid startup journal bound")
-        if not isinstance(sample["logs"], dict) or set(sample["logs"]) - {"vrserver", "vrcompositor"} or any(not isinstance(text, str) or len(text.encode()) > 128 * 1024 for text in sample["logs"].values()):
+        if (not isinstance(sample["logs"], dict) or set(sample["logs"]) - {"vrserver", "vrcompositor"} or
+                any(not isinstance(text, str) for text in sample["logs"].values()) or
+                sum(len(text.encode()) for text in sample["logs"].values()) > LIMIT):
             raise RuntimeError("Invalid startup log evidence")
         if now < self.last_progress: raise RuntimeError("Startup monotonic clock regressed")
         if unit["InvocationID"] == self.baseline["unit"]["InvocationID"]:

@@ -938,6 +938,66 @@ class OperatorArmTests(unittest.TestCase):
                 self.session.current_arm_health()
             self.assertFalse(self.session.marker.exists())
 
+    def test_failed_arm_sample_is_recorded_and_cannot_reuse_passed_budget(self):
+        self.stage(); self.activate()
+        saved = dict(self.ready_result, invocation="a" * 32,
+            process_identities={"compositor": {"pid": 123, "start_ticks": 500}},
+            launch_freeze_receipt_verified=True, gate_checkpoint={"fixture": True}, source_checkpoint={"fixture": True})
+        self.session.health_receipt("activation-startup-health.json", saved)
+        gate = mock.Mock(); gate.baseline = {"monotonic": 1.0}
+        gate.result.return_value = dict(saved, status="not-ready", ready=False, reason="evidence refused")
+        gate.checkpoint.return_value = {"failed": "recorded"}
+        self.health_source.sample.side_effect = RuntimeError("Startup evidence byte bound exceeded")
+        self.health_source.checkpoint.return_value = {"total": 457829}
+        before = self.restart_count()
+        with mock.patch.object(M.health.StartupGate, "resume", return_value=gate), \
+                self.assertRaisesRegex(RuntimeError, "health or invocation changed"):
+            self.session.current_arm_health()
+        recorded = json.loads((self.session.folder / "startup-monitor.json").read_bytes())
+        self.assertFalse(recorded["ready"])
+        self.assertEqual(recorded["source_checkpoint"], {"total": 457829})
+        self.assertIn("evidence byte bound", gate.failed)
+        self.assertFalse(self.session.marker.exists())
+        self.assertEqual(self.restart_count(), before)
+        calls = self.health_source.sample.call_count
+        with self.assertRaisesRegex(RuntimeError, "Passed cold-freeze startup"):
+            self.session.current_arm_health()
+        self.assertEqual(self.health_source.sample.call_count, calls)
+
+    def test_large_unterminated_log_still_persists_denied_arm_checkpoint(self):
+        self.stage(); self.activate()
+        saved = dict(self.ready_result, invocation="a" * 32,
+            process_identities={"compositor": {"pid": 123, "start_ticks": 500}},
+            launch_freeze_receipt_verified=True, gate_checkpoint={"fixture": True}, source_checkpoint={"fixture": True})
+        self.session.health_receipt("activation-startup-health.json", saved)
+        actual = M.health.NativeEvidenceSource(self.home)
+        actual.cursor = "s=fixture"
+        for name, path in actual.logs.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b""); actual.log_read(name, initial=True)
+        actual.logs["vrserver"].write_bytes(b"x" * (300 * 1024))
+        gate = mock.Mock(); gate.baseline = {"monotonic": 1.0}
+        gate.result.return_value = dict(saved, status="not-ready", ready=False, reason="line bound exceeded")
+        gate.checkpoint.return_value = {"failed": "recorded"}
+        self.health_source.sample.side_effect = lambda: {"logs": {"vrserver": actual.log_read("vrserver")}}
+        self.health_source.checkpoint.side_effect = actual.checkpoint
+        before = self.restart_count()
+        with mock.patch.object(M.health.StartupGate, "resume", return_value=gate), \
+                self.assertRaisesRegex(RuntimeError, "health or invocation changed"):
+            self.session.current_arm_health()
+        path = self.session.folder / "startup-monitor.json"
+        self.assertLess(path.stat().st_size, 262144)
+        recorded = json.loads(path.read_bytes())
+        self.assertFalse(recorded["ready"])
+        self.assertEqual(recorded["source_checkpoint"]["total"], 300 * 1024)
+        self.assertEqual(recorded["source_checkpoint"]["pending_lines"]["vrserver"], "")
+        self.assertIn("line bound exceeded", gate.failed)
+        with self.assertRaisesRegex(RuntimeError, "Passed cold-freeze startup"):
+            self.session.current_arm_health()
+        self.assertEqual(self.health_source.sample.call_count, 1)
+        self.assertFalse(self.session.marker.exists())
+        self.assertEqual(self.restart_count(), before)
+
 class NativeLayerTests(unittest.TestCase):
     setUp, tearDown = SessionTests.setUp, SessionTests.tearDown
     elf, profile = staticmethod(SessionTests.elf), staticmethod(SessionTests.profile)

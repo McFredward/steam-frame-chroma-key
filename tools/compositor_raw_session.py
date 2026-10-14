@@ -666,7 +666,15 @@ class Session(base.Session):
             raise RuntimeError("Passed cold-freeze startup/isolation required before operator arming")
         gate = health.StartupGate.resume(saved["gate_checkpoint"])
         self.health_source.resume(saved["source_checkpoint"])
-        result = gate.consume(self.health_source.sample(), stable_seconds=0)
+        try:
+            result = gate.consume(self.health_source.sample(), stable_seconds=0)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            # Persist the failed checkpoint, including already consumed log
+            # bytes. A later command must not restart from the older passed
+            # receipt and silently reuse its evidence budget.
+            gate.failed = "Operator arm evidence unreadable: " + str(error)[:384]
+            gate.ready = False
+            result = gate.result("not-ready", gate.failed)
         result.update(startup_receipt="activation-startup-health.json", monitor_samples=1,
             gate_checkpoint=gate.checkpoint(), source_checkpoint=self.health_source.checkpoint(),
             launch_freeze_receipt_verified=False)
