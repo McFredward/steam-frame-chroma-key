@@ -1,0 +1,20 @@
+#version 450
+// Original diagnostic shader. Preserve the native RGB_IDENTITY conversion;
+// these components are deliberately not labeled color-converted scene RGB.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D nativeSource;
+layout(std430, set = 0, binding = 1) buffer OwnedOutput { uint words[]; };
+
+void main()
+{
+    uvec2 extent = uvec2(textureSize(nativeSource, 0));
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(pixel, extent))) return;
+    vec2 center = (vec2(pixel) + vec2(0.5)) / vec2(extent);
+    // The raw P010 planes occupy 3*W*H bytes. Even W/H make that word aligned.
+    // Descriptor offset remains zero, avoiding a device-specific storage-buffer
+    // offset-alignment assumption for the independently positioned RGBA bytes.
+    uint base = (3u * extent.x * extent.y) / 4u;
+    words[base + pixel.y * extent.x + pixel.x] =
+        packUnorm4x8(textureLod(nativeSource, center, 0.0));
+}
