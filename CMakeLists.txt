@@ -269,6 +269,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_app_payload_probe.py)
         add_test(NAME pixel_payload_recovery COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_payload_recovery.py)
+        add_test(NAME pixel_refusal_status COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_refusal_status.py)
         add_test(NAME pixel_snapshot_session COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_snapshot_session.py)
         if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)

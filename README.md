@@ -16,8 +16,10 @@ See [mask implementation and tests](docs/MASK-TRANSPORT.md) and
 
 The GloomhavenVR source pattern has now been visually confirmed in both eyes,
 including manual menu restoration. The next [decoded-image snapshot experiment](docs/PIXEL-SNAPSHOT-PREPARATION-20261015.md)
-is locally prepared with a reversible public-Vulkan diagnostic. It has not been
-installed or tested on the headset and does not enable streamed passthrough.
+uses a reversible public-Vulkan diagnostic. Its [first approved Frame attempt](docs/PIXEL-SNAPSHOT-ATTEMPT-20261015.md)
+loaded normally but refused acquisition before arming. The original runtime was
+restored; bounded first-refusal diagnostics are prepared for a new attempt.
+This does not enable streamed passthrough.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
