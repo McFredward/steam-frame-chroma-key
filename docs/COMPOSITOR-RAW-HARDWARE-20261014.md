@@ -310,3 +310,68 @@ Focused software and final artifact evidence are retained privately under
 and independent review beside it. Passing software checks do not demonstrate a
 headset-visible result. The previous diagnostic has been fully removed; this
 new package requires fresh operator permission and readiness before deployment.
+
+## Successful video-format CPU join, unresolved draw selection (2026-10-15)
+
+The authorized v6 run on `74568c7` passed native startup and armed about 2.62 s
+into its unchanged capture window. The operator confirmed normally usable
+GloomhavenVR in the PC-VR stream. Public image selection excluded 56 candidates
+before one successful P010 (1000156013), 1152 by 4608, one-layer Facet import.
+Its native image/bind/view/send/reply path and the full local CPU resource join
+succeeded. All 31 compatibility predicates passed, as did initial delivery and
+consumer currentness on their first attempts. No transient recovery was
+exercised, so this does not retrospectively prove the preceding failure's cause.
+
+The resource generations were checked after unrelated journal publications had
+advanced; a newer global replay cursor did not invalidate the same target. The
+current client PID 10047 was publicly classified as `vrlinkrunthread` executing
+the installed Steam Link receiver. This is not an endpoint/import-epoch proof.
+Private acquisition was 425 bytes: 16 parent, 388 scalar, 21 wire. Raw output
+was 13,924 bytes; the journal was 152,892 bytes and replayed all 1,509,696
+publications without recorded loss or its byte cap. It ran for its full original
+120-second interval.
+
+The 4096 target probes produced **3824 Unknown, 272 Filtered, zero ExactMatch**.
+They were a first-N sample, not continuous 120-second draw coverage; 374,281
+later attempts were deliberately omitted. The old Unknown result conflated
+target retirement, command/layout/set state and descriptor completeness. Zero
+matches consequently cannot establish that the imported video image was unused.
+Retained earlier YUV snapshots already fit binding 9, sampled-image type 2,
+count 1 and the current metadata model. Neither unsupported bindings, view
+aliasing nor layout compatibility is established as this run's cause.
+
+Manual recovery passed original SteamVR startup, confirmed old compositor exit
+and no diagnostic mappings in 15 observed current managed processes. Twelve
+archive files were copied and hash-verified before removing 45 exact owned
+session/input files. The Frame was released for standby. Native/system files,
+the PC sender and rendered picture remained unchanged. Private evidence is under
+`build/private-compositor-join-target-integration-20261014/`; the independent
+read-only analysis is under `build/private-compositor-target-evidence-review-20261015/`.
+
+The next v7 passive package preserves the same private acquisition, 32 full
+snapshots, 64-KiB raw output, 1-MiB journal and original deadlines. It records 46
+typed public-metadata decisions without loosening any matching condition. A
+different view of the same image remains diagnostic evidence, not ExactMatch.
+Aggregate reasons include first/last replay orders, background-issued sampling
+periods, background replay times and all encountered reason bits. Sixteen small
+examples retain actual identities and explicit observation flags; eight places
+are reserved per sampling class so ordinary UI cannot consume every example.
+
+The existing background owner issues one generic and one `PS_DISTORT`-entry
+permit every 60 ms: at most 4000 published probes across 120 s, also constrained
+by the unchanged 4096 global cap. Unused periods never produce a catch-up burst.
+Before copying draw metadata, a separate 32-credit-per-period budget bounds
+classification to 64,000 attempts. Render callbacks use one atomic consumption
+attempt per budget, with no new clock, allocation, wait or filesystem work.
+Classifications admitted/omitted and each probe class are counted separately.
+Entry names only prioritize observations; they do not establish video or eye
+identity. Clock labels describe the diagnostic owner, never source frames.
+
+The exact final sampler is FCMSMP03, 60 bytes, including the classification
+bound. The earlier undeployed 56-byte prototype is not admitted. A raw-only
+64-KiB footer reservation retains the bounded decisions inside the unchanged
+1-MiB journal; normal tracing keeps its existing reservation. Source-frame,
+eye/UV, accepted-submit, GPU coherence and mask activation remain unproved and
+disabled. Final software evidence is kept beside the new package under
+`build/private-compositor-periodic-integration-20261015/`. This is not a visible
+passthrough implementation or authorization for another device installation.
