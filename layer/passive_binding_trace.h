@@ -247,6 +247,14 @@ enum TargetProbeObservation : std::uint32_t {
     ProbeSetLayoutObserved = 1U << 6, ProbeDescriptorObserved = 1U << 7,
     ProbeViewObserved = 1U << 8, ProbeImageObserved = 1U << 9
 };
+enum DescriptorStateObservation : std::uint32_t {
+    DescriptorWriteComplete = 1U << 0, DescriptorCurrentViewComplete = 1U << 1,
+    DescriptorCurrentImageComplete = 1U << 2, DescriptorConversionRequested = 1U << 3,
+    DescriptorConversionObserved = 1U << 4, DescriptorConversionComplete = 1U << 5,
+    DescriptorViewChainComplete = 1U << 6, DescriptorImageChainComplete = 1U << 7,
+    DescriptorImageHasDrmList = 1U << 8
+};
+enum class TrackedResourceKind : std::uint8_t { Image, View, Memory };
 struct TargetProbeDiagnostics {
     TargetProbeOutcome outcome = TargetProbeOutcome::Unknown;
     TargetProbeReason reason = TargetProbeReason::None;
@@ -260,16 +268,25 @@ struct TargetProbeDiagnostics {
     std::uint32_t binding = std::numeric_limits<std::uint32_t>::max(), examinedImageBindings = 0;
     std::uint32_t currentTargetErrors = 0;
     std::uint32_t observations = 0;
+    // Public write-time/current metadata only. Observing a current candidate
+    // never revives an incomplete descriptor or accepts a different generation.
+    std::uint32_t descriptorStateFlags = 0;
+    Identity descriptorConversion{};
+    extensions::ChainSummary descriptorViewChain{}, descriptorImageChain{};
 };
 static_assert(static_cast<unsigned>(TargetProbeReason::Count) <= 64, "Probe reasons exceed bounded bitset");
-static_assert(std::is_trivially_copyable_v<TargetProbeDiagnostics> && sizeof(TargetProbeDiagnostics) <= 384,
+static_assert(std::is_trivially_copyable_v<TargetProbeDiagnostics> && sizeof(TargetProbeDiagnostics) <= 512,
               "Probe diagnostics must remain small owned public metadata");
 // The optional pointer is owned by the replay callback's stack. Consumers must
-// copy a selected result before returning; nonmatches carry no large snapshot.
+// copy a selected result before returning. An explicitly admitted public draw
+// diagnostic may carry a snapshot without matching the imported target.
+enum class SnapshotProvenance : std::uint8_t { None, ExactTarget, UnassociatedPublicDraw };
 struct TargetSnapshotProbeResult {
     TargetProbeOutcome outcome = TargetProbeOutcome::Unknown;
     std::uint64_t replayOrder = 0, invocationTag = 0;
     const Snapshot* snapshot = nullptr;
+    SnapshotProvenance snapshotProvenance = SnapshotProvenance::None;
+    bool publicSnapshotQuotaOmitted = false;
     TargetProbeDiagnostics diagnostics{};
 };
 
@@ -799,15 +816,38 @@ public:
             out.observations &= ~(ProbeDescriptorObserved | ProbeViewObserved | ProbeImageObserved);
             out.observations |= ProbeDescriptorObserved;
             out.descriptorView = {}; out.candidateView = {}; out.candidateImage = {}; out.candidateMemory = {};
+            out.descriptorStateFlags = 0; out.descriptorConversion = {};
+            out.descriptorViewChain = {}; out.descriptorImageChain = {};
             const auto& value = set->values[pos]; out.descriptorView = value.view;
             if (!value.written) { note(TargetProbeReason::DescriptorUnwritten, true); continue; }
-            if (!value.complete) { note(TargetProbeReason::DescriptorIncomplete, true); continue; }
+            if (value.complete) out.descriptorStateFlags |= DescriptorWriteComplete;
             const auto* view = lookup(views_, device, value.view);
             const auto* image = view ? lookup(images_, device, view->metadata.image) : nullptr;
-            if (view) { out.candidateView = view->id; out.observations |= ProbeViewObserved; }
+            if (view) {
+                out.candidateView = view->id; out.observations |= ProbeViewObserved;
+                out.descriptorViewChain = view->metadata.extensions.chain;
+                if (view->complete) out.descriptorStateFlags |= DescriptorCurrentViewComplete;
+                if (out.descriptorViewChain.complete) out.descriptorStateFlags |= DescriptorViewChainComplete;
+                if (view->metadata.extensions.hasConversion) {
+                    out.descriptorStateFlags |= DescriptorConversionRequested;
+                    out.descriptorConversion = view->metadata.conversion.identity;
+                    const auto* conversion = lookup(conversions_, device, out.descriptorConversion);
+                    if (conversion) out.descriptorStateFlags |= DescriptorConversionObserved;
+                    if (conversion && conversion->complete) out.descriptorStateFlags |= DescriptorConversionComplete;
+                }
+            }
             // candidateMemory is the observed image's generation-bearing link,
             // not a separately validated allocation or GPU-consumption claim.
-            if (image) { out.candidateImage = image->id; out.candidateMemory = image->metadata.memory; out.observations |= ProbeImageObserved; }
+            if (image) {
+                out.candidateImage = image->id; out.candidateMemory = image->metadata.memory; out.observations |= ProbeImageObserved;
+                out.descriptorImageChain = image->metadata.extensions.chain;
+                if (image->complete) out.descriptorStateFlags |= DescriptorCurrentImageComplete;
+                if (out.descriptorImageChain.complete) out.descriptorStateFlags |= DescriptorImageChainComplete;
+                if (image->metadata.extensions.hasDrmList) out.descriptorStateFlags |= DescriptorImageHasDrmList;
+            }
+            // These additional observations explain an existing refusal. They
+            // never override write-time completeness or generation lookup.
+            if (!value.complete) { note(TargetProbeReason::DescriptorIncomplete, true); continue; }
             if (!view) { note(TargetProbeReason::ViewAbsentOrStale, true); continue; }
             if (!image) { note(TargetProbeReason::ImageAbsentOrStale, true); continue; }
             if (!view->complete) { note(TargetProbeReason::ViewIncomplete, true); continue; }
@@ -842,6 +882,15 @@ public:
     TargetProbeOutcome targetSnapshotMatch(std::uint64_t device, VkCommandBuffer commandValue,
                                          VkPipelineLayout layoutValue, const ImportResourceReceipt& target) noexcept {
         return targetSnapshotMatchDetailed(device, commandValue, layoutValue, target).outcome;
+    }
+    // Background replay owner only. A public destroy/free invocation can retire
+    // the currently tracked generation; this lookup provides no GPU completion.
+    Identity trackedResourceIdentity(TrackedResourceKind kind, std::uint64_t device, std::uint64_t value) noexcept {
+        auto lock = acquire(); if (!lock.owns_lock()) return {};
+        if (kind == TrackedResourceKind::Image) { const auto* p = find(images_, device, value); return p ? p->id : Identity{}; }
+        if (kind == TrackedResourceKind::View) { const auto* p = find(views_, device, value); return p ? p->id : Identity{}; }
+        if (kind == TrackedResourceKind::Memory) { const auto* p = find(memories_, device, value); return p ? p->id : Identity{}; }
+        return {};
     }
     void deviceDestroyed(std::uint64_t device) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;

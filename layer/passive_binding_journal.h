@@ -23,6 +23,19 @@
 
 namespace frame_bindings {
 
+enum class TargetRetirementOperation : std::uint8_t { None, DestroyImageCall, DestroyViewCall, FreeMemoryCall, DestroyDeviceCall };
+struct TargetRetirementRecord {
+    TrackedResourceKind resourceKind = TrackedResourceKind::Image;
+    Identity identity{};
+    std::uint64_t replayOrder = 0;
+    TargetRetirementOperation operation = TargetRetirementOperation::None;
+};
+struct TargetRetirementDiagnostics {
+    std::array<TargetRetirementRecord, 3> resources{};
+};
+static_assert(std::is_trivially_copyable_v<TargetRetirementDiagnostics> && sizeof(TargetRetirementDiagnostics) <= 120,
+              "Target retirement metadata must remain bounded owned scalars");
+
 class Journal {
     friend struct JournalTestAccess;
 public:
@@ -234,15 +247,32 @@ public:
                     diagnostic.reasonMask |= targetProbeReasonBit(diagnostic.reason);
                 }
                 diagnostic.outcome = result.outcome;
+                // Independent public state is not a fallback association. Its
+                // owning request still names this exact retained tag/cookie and
+                // device, but a retired target does not suppress observation of
+                // a different current draw. All original exact-match gates and
+                // outcomes remain unchanged.
+                const bool publicRequested = restored && !aborted_ && !lostState() && p.allowUnassociatedPublicSnapshot &&
+                    targetReceipt_.invocationTag && targetReceipt_.invocationTag == p.invocationTag &&
+                    targetReceipt_.cookie == p.ownedCookie && targetReceipt_.device == record->device &&
+                    result.outcome != TargetProbeOutcome::ExactMatch && result.outcome != TargetProbeOutcome::QuotaOmitted;
+                const bool publicAdmitted = publicRequested && targetSnapshots_ < TargetSnapshotLimit &&
+                    publicSnapshots_ < PublicSnapshotLimit;
+                result.publicSnapshotQuotaOmitted = publicRequested && !publicAdmitted;
                 if constexpr (std::is_invocable_v<Callback&, std::uint32_t, const TargetSnapshotProbeResult&>) {
-                    if (result.outcome == TargetProbeOutcome::ExactMatch) {
+                    if (result.outcome == TargetProbeOutcome::ExactMatch || publicAdmitted) {
                         const auto snapshot = core_.snapshot(record->device, p.command, p.layout);
                         ++targetSnapshots_;
+                        if (publicAdmitted) ++publicSnapshots_;
                         result.snapshot = &snapshot;
+                        result.snapshotProvenance = publicAdmitted ? SnapshotProvenance::UnassociatedPublicDraw : SnapshotProvenance::ExactTarget;
                         callback(p.slot, result);
                     } else callback(restored ? p.slot : std::numeric_limits<std::uint32_t>::max(), result);
                 }
-            } else if (!aborted_ && restored) replay(observation);
+            } else if (!aborted_ && restored) {
+                observeTargetRetirement(observation);
+                replay(observation);
+            }
             const auto replayLoss = core_.lostState() - lossBefore;
             const auto operationIndex = static_cast<std::size_t>(record->op);
             if (replayLoss && operationIndex < OperationCount)
@@ -263,12 +293,18 @@ public:
         return publish(Op::Snapshot, device, [&](Record& r) { r.payload.snapshot = {command, layout, cookie}; });
     }
     static constexpr std::uint32_t TargetSnapshotLimit = 32;
+    static constexpr std::uint32_t PublicSnapshotLimit = 16;
     bool requestTargetSnapshotProbe(std::uint64_t device, VkCommandBuffer command, VkPipelineLayout layout,
-                                   std::uint64_t invocationTag, std::uint64_t ownedCookie, std::uint32_t slot) noexcept {
+                                   std::uint64_t invocationTag, std::uint64_t ownedCookie, std::uint32_t slot,
+                                   bool allowUnassociatedPublicSnapshot = false) noexcept {
         return publish(Op::TargetSnapshotProbe, device, [&](Record& r) {
-            auto& p = construct(r.payload.targetProbe); p = {command, layout, invocationTag, ownedCookie, slot};
+            auto& p = construct(r.payload.targetProbe); p = {command, layout, invocationTag, ownedCookie, slot, allowUnassociatedPublicSnapshot};
         });
     }
+    // Background owner only, after drain(). These are ordered observations of
+    // public destroy/free calls for exact original generations, not GPU lifetime
+    // or destruction-completion receipts. Each resource has at most one record.
+    TargetRetirementDiagnostics targetRetirementDiagnostics() const noexcept { return targetRetirements_; }
     // Background-owner only, after drain() has returned. Never call from an API
     // hook or the drain receipt callback: pending lifecycle records must first
     // be replayed. Refuse a concurrent publication window or an unread ticket;
@@ -584,7 +620,7 @@ private:
         std::array<std::uint32_t, SetIndexCapacity * BindingCapacity> offsets;
     };
     struct SnapshotRecord { VkCommandBuffer command; VkPipelineLayout layout; std::uint32_t cookie; };
-    struct TargetProbeRecord { VkCommandBuffer command; VkPipelineLayout layout; std::uint64_t invocationTag, ownedCookie; std::uint32_t slot; };
+    struct TargetProbeRecord { VkCommandBuffer command; VkPipelineLayout layout; std::uint64_t invocationTag, ownedCookie; std::uint32_t slot; bool allowUnassociatedPublicSnapshot; };
     struct ImportReceiptRecord { VkImage image; VkImageView view; std::uint64_t invocationTag, cookie; };
     union Payload {
         std::uint64_t scalar;
@@ -899,6 +935,28 @@ private:
             for (std::uint32_t i = 0; i < count; ++i) p.values[i] = values[i];
         }, arrayBytes<VkCommandBuffer, CallCapacity>(offsetof(CommandRecord, values), count));
     }
+    void observeTargetRetirement(const Record& r) noexcept {
+        TargetRetirementOperation operation = TargetRetirementOperation::None;
+        switch (r.op) {
+        case Op::DestroyImage: operation = TargetRetirementOperation::DestroyImageCall; break;
+        case Op::DestroyView: operation = TargetRetirementOperation::DestroyViewCall; break;
+        case Op::FreeMemory: operation = TargetRetirementOperation::FreeMemoryCall; break;
+        case Op::DeviceDestroyed: operation = TargetRetirementOperation::DestroyDeviceCall; break;
+        default: return;
+        }
+        if (!targetReceipt_.invocationTag || targetReceipt_.device != r.device || lostState()) return;
+        const std::array<Identity, 3> identities{{targetReceipt_.image.identity, targetReceipt_.view.identity, targetReceipt_.memory.identity}};
+        for (std::size_t i = 0; i < identities.size(); ++i) {
+            auto& out = targetRetirements_.resources[i];
+            const auto kind = static_cast<TrackedResourceKind>(i);
+            if (out.replayOrder || (r.op != Op::DeviceDestroyed &&
+                ((r.op == Op::DestroyImage && kind != TrackedResourceKind::Image) ||
+                 (r.op == Op::DestroyView && kind != TrackedResourceKind::View) ||
+                 (r.op == Op::FreeMemory && kind != TrackedResourceKind::Memory) || r.payload.scalar != identities[i].handle))) continue;
+            const auto observed = core_.trackedResourceIdentity(kind, r.device, identities[i].handle);
+            if (same(observed, identities[i])) out = {kind, observed, r.ticket, operation};
+        }
+    }
     void replay(Record& r) noexcept {
         const auto d = r.device;
         switch (r.op) {
@@ -997,7 +1055,9 @@ private:
     std::array<std::atomic<std::uint64_t>, OperationCount> publicationLoss_{}, replayLoss_{};
     std::atomic<std::uint64_t> headerQueue_{0}, byteQueue_{0};
     ImportResourceReceipt targetReceipt_{}; // Background owner only.
-    std::uint32_t targetSnapshots_ = 0;
+    TargetRetirementDiagnostics targetRetirements_{}; // Background owner only.
+    std::uint32_t targetSnapshots_ = 0; // Shared exact/public full-snapshot ceiling.
+    std::uint32_t publicSnapshots_ = 0;
     std::atomic<std::uint64_t> receiptRequests_{0}, receiptDelivered_{0}, receiptUnconsumed_{0}, receiptCapRefused_{0};
     Lane* preferred_ = nullptr; // Background owner only; never read by hooks.
     std::uint64_t expected_ = 1;

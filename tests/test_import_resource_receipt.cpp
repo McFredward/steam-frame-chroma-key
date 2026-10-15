@@ -427,9 +427,11 @@ struct ProbeCollector {
                 (last.reasonMask & targetProbeReasonBit(last.reason)), "typed probe diagnostic disagrees with actual result");
         ++reasons[static_cast<std::size_t>(last.reason)];
         if(value.outcome==TargetProbeOutcome::ExactMatch) {
-            require(value.snapshot,"exact match omitted owned replay snapshot");++matched;selected.push_back(*value.snapshot);
+            require(value.snapshot && value.snapshotProvenance == SnapshotProvenance::ExactTarget,
+                    "exact match omitted owned replay snapshot/provenance");++matched;selected.push_back(*value.snapshot);
         } else {
-            require(!value.snapshot,"nonmatch constructed a full snapshot");
+            require(!value.snapshot && value.snapshotProvenance == SnapshotProvenance::None,
+                    "default nonmatch constructed a full snapshot");
             if(value.outcome==TargetProbeOutcome::Filtered)++filtered;
             else if(value.outcome==TargetProbeOutcome::QuotaOmitted)++omitted;
             else ++unknown;
@@ -670,6 +672,190 @@ void targetDenialDiagnostics() {
     for(unsigned i=0;i<static_cast<unsigned>(TargetProbeReason::Count);++i)
         require(std::string(targetProbeReasonName(static_cast<TargetProbeReason>(i)))!="invalid","typed probe name missing");
 }
+void incompleteDescriptorObservations() {
+    {
+        TargetFixture f;
+        auto unknown = info<VkBaseInStructure>(static_cast<VkStructureType>(0x7ffffffe));
+        auto vi = f.viewInfo; vi.image = f.unrelatedImage; vi.pNext = &unknown;
+        const auto badView = h<VkImageView>(120);
+        f.journal->createView(f.device,badView,vi); f.write(badView);
+        const auto result = f.probe();
+        require(result.reason == TargetProbeReason::DescriptorIncomplete && result.outcome == TargetProbeOutcome::Unknown,
+                "observed unsupported view revived an incomplete descriptor");
+        require(result.descriptorView.handle == 120 && same(result.descriptorView,result.candidateView) &&
+                result.candidateImage.handle == handle(f.unrelatedImage) &&
+                (result.observations & (ProbeViewObserved|ProbeImageObserved)) == (ProbeViewObserved|ProbeImageObserved),
+                "incomplete descriptor hid actual current view/image generations");
+        require(!(result.descriptorStateFlags & (DescriptorWriteComplete|DescriptorCurrentViewComplete|DescriptorViewChainComplete)) &&
+                (result.descriptorStateFlags & (DescriptorCurrentImageComplete|DescriptorImageChainComplete)) ==
+                    (DescriptorCurrentImageComplete|DescriptorImageChainComplete) &&
+                result.descriptorViewChain.count == 1 && result.descriptorViewChain.types[0] == unknown.sType &&
+                result.descriptorViewChain.error == extensions::ChainError::Unsupported && !result.descriptorViewChain.complete,
+                "unsupported view creation chain lost its truthful refusal metadata");
+        f.journal->destroyView(f.device,badView);
+        vi.pNext = nullptr; f.journal->createView(f.device,badView,vi);
+        const auto stale = f.probe();
+        require(stale.reason == TargetProbeReason::DescriptorIncomplete && !stale.candidateView.generation &&
+                !stale.candidateImage.generation && !(stale.observations & (ProbeViewObserved|ProbeImageObserved)),
+                "recycled view handle was looked up as the old descriptor generation");
+    }
+    {
+        TargetFixture f;
+        auto unknown = info<VkBaseInStructure>(static_cast<VkStructureType>(0x7ffffffd));
+        auto ii = f.imageInfo; ii.pNext = &unknown;
+        const auto badImage = h<VkImage>(121);
+        const auto badView = h<VkImageView>(122);
+        f.journal->createImage(f.device,badImage,ii);
+        auto vi = f.viewInfo; vi.image = badImage; f.journal->createView(f.device,badView,vi); f.write(badView);
+        const auto result = f.probe();
+        require(result.reason == TargetProbeReason::DescriptorIncomplete && result.candidateImage.handle == 121 &&
+                !(result.descriptorStateFlags & (DescriptorCurrentImageComplete|DescriptorImageChainComplete)) &&
+                result.descriptorImageChain.count == 1 && result.descriptorImageChain.types[0] == unknown.sType &&
+                result.descriptorImageChain.error == extensions::ChainError::Unsupported,
+                "incomplete image creation chain was hidden behind descriptor incompleteness");
+    }
+}
+struct PublicProbeCollector {
+    TargetSnapshotProbeResult last{};
+    Snapshot selected{};
+    bool hasSnapshot = false;
+    void operator()(std::uint32_t, const Snapshot&) noexcept {}
+    void operator()(std::uint64_t, const ImportResourceReceipt&) noexcept {}
+    void operator()(std::uint32_t, const TargetSnapshotProbeResult& value) noexcept {
+        last = value; hasSnapshot = value.snapshot != nullptr;
+        if (value.snapshot) selected = *value.snapshot;
+    }
+};
+PublicProbeCollector publicProbe(TargetFixture& f, bool enabled = true, std::uint64_t tag = 0,
+                                 std::uint64_t cookie = 0, std::uint64_t device = 0) {
+    monitorHookAllocations = true;
+    const auto published = f.journal->requestTargetSnapshotProbe(device ? device : f.device,f.command,f.pipeline,
+        tag ? tag : f.tag,cookie ? cookie : f.cookie,7,enabled);
+    monitorHookAllocations = false;
+    require(published,"independent public probe publication failed");
+    PublicProbeCollector collector; while(f.journal->drain(collector)) {}
+    require(collector.last.replayOrder,"independent public probe was not delivered"); return collector;
+}
+void independentPublicDrawSnapshots() {
+    {
+        TargetFixture f; f.write(f.unrelatedView); f.drain();
+        f.journal->destroyView(f.device,f.view); f.journal->destroyImage(f.device,f.image);
+        const auto disabled = publicProbe(f,false);
+        require(!disabled.hasSnapshot && disabled.last.snapshotProvenance == SnapshotProvenance::None &&
+                disabled.last.diagnostics.reason == TargetProbeReason::TargetCurrentIncomplete,
+                "default target retirement behavior changed");
+        const auto enabled = publicProbe(f);
+        require(enabled.hasSnapshot && enabled.last.snapshotProvenance == SnapshotProvenance::UnassociatedPublicDraw &&
+                enabled.last.outcome == TargetProbeOutcome::Unknown &&
+                enabled.last.diagnostics.reason == TargetProbeReason::TargetCurrentIncomplete &&
+                enabled.selected.sourceComplete && !enabled.selected.gpuConsumedCoherent &&
+                enabled.selected.bindings[5].view.identity.handle == handle(f.unrelatedView),
+                "retired target blocked independent current draw or promoted it to an association");
+        for(unsigned i=0;i<15;++i) require(publicProbe(f).hasSnapshot,"public snapshot subquota was shortened");
+        const auto omitted = publicProbe(f);
+        require(!omitted.hasSnapshot && omitted.last.publicSnapshotQuotaOmitted &&
+                omitted.last.outcome == TargetProbeOutcome::Unknown &&
+                omitted.last.diagnostics.reason == TargetProbeReason::TargetCurrentIncomplete,
+                "public snapshot subquota changed target outcome or exceeded16");
+    }
+    {
+        TargetFixture f; f.write(f.unrelatedView); f.drain();
+        for(unsigned i=0;i<16;++i) require(publicProbe(f).hasSnapshot,"public prefix snapshot missing");
+        f.write(f.view);
+        for(unsigned i=0;i<16;++i) {
+            const auto exact = publicProbe(f);
+            require(exact.hasSnapshot && exact.last.snapshotProvenance == SnapshotProvenance::ExactTarget &&
+                    exact.last.outcome == TargetProbeOutcome::ExactMatch,"shared quota misclassified an exact target");
+        }
+        const auto exactOmitted = publicProbe(f);
+        require(!exactOmitted.hasSnapshot && exactOmitted.last.outcome == TargetProbeOutcome::QuotaOmitted &&
+                exactOmitted.last.diagnostics.reason == TargetProbeReason::SnapshotQuota,
+                "combined public and exact snapshots exceeded32");
+    }
+    {
+        TargetFixture f;
+        for(unsigned i=0;i<32;++i) require(publicProbe(f).hasSnapshot,"exact shared quota was shortened");
+        f.write(f.unrelatedView);
+        const auto omitted = publicProbe(f);
+        require(!omitted.hasSnapshot && omitted.last.publicSnapshotQuotaOmitted,
+                "independent diagnostic bypassed the shared full-snapshot ceiling");
+    }
+    {
+        TargetFixture f; f.write(f.unrelatedView);
+        for(const auto& result : {publicProbe(f,true,f.tag+1),publicProbe(f,true,0,f.cookie+1),
+                                 publicProbe(f,true,0,0,f.device+1)})
+            require(!result.hasSnapshot && result.last.snapshotProvenance == SnapshotProvenance::None,
+                    "independent diagnostic bypassed retained target ownership");
+        f.journal->reportUnsupported(f.device);
+        require(!publicProbe(f).hasSnapshot,"independent diagnostic bypassed journal loss");
+    }
+    {
+        TargetFixture f; f.write(f.unrelatedView); f.drain();
+        JournalTestAccess::damageTargetState(*f.journal,TargetProbeReason::DescriptorIncomplete);
+        const auto incomplete = publicProbe(f);
+        require(incomplete.hasSnapshot && !incomplete.selected.sourceComplete &&
+                incomplete.last.snapshotProvenance == SnapshotProvenance::UnassociatedPublicDraw &&
+                incomplete.last.outcome == TargetProbeOutcome::Unknown,
+                "independent incomplete public metadata was suppressed or marked coherent");
+    }
+    {
+        TargetFixture f; JournalTestAccess::abort(*f.journal);
+        require(!publicProbe(f).hasSnapshot,"aborted journal produced independent public metadata");
+    }
+    {
+        TargetFixture f;
+        require(f.journal->requestTargetSnapshotProbe(f.device,f.command,f.pipeline,f.tag,f.cookie,7,true),
+                "unrestored independent probe publication failed");
+        JournalTestAccess::corruptReceipt(*f.journal,0);
+        PublicProbeCollector collector; while(f.journal->drain(collector)) {}
+        require(!collector.hasSnapshot && collector.last.diagnostics.reason == TargetProbeReason::JournalRestoreFailed,
+                "unrestored journal input produced independent public metadata");
+    }
+    {
+        Fixture f; f.create();
+        require(f.journal->requestTargetSnapshotProbe(f.device,h<VkCommandBuffer>(105),h<VkPipelineLayout>(102),f.tag,f.cookie,7,true),
+                "missing target independent probe publication failed");
+        PublicProbeCollector collector; while(f.journal->drain(collector)) {}
+        require(!collector.hasSnapshot && collector.last.diagnostics.reason == TargetProbeReason::JournalTargetMissing,
+                "missing retained target produced independent public metadata");
+    }
+    require(!hookAllocations.load(),"independent public probe hook allocated");
+}
+void exactTargetRetirementObservations() {
+    {
+        TargetFixture f;
+        const auto before = f.journal->transportCounters().published;
+        f.journal->destroyView(f.device,f.view); f.journal->destroyImage(f.device,f.image); f.journal->freeMemory(f.device,f.memory);
+        f.drain(); const auto result = f.journal->targetRetirementDiagnostics();
+        const std::array<Identity,3> expected{{f.target.image.identity,f.target.view.identity,f.target.memory.identity}};
+        const std::array<std::uint64_t,3> orders{{before+2,before+1,before+3}};
+        const std::array<TargetRetirementOperation,3> operations{{TargetRetirementOperation::DestroyImageCall,
+            TargetRetirementOperation::DestroyViewCall,TargetRetirementOperation::FreeMemoryCall}};
+        for(unsigned i=0;i<3;++i) require(result.resources[i].resourceKind == static_cast<TrackedResourceKind>(i) &&
+            same(result.resources[i].identity,expected[i]) && result.resources[i].replayOrder == orders[i] &&
+            result.resources[i].operation == operations[i],"retirement lost exact generation/public call replay order");
+        // Recycled handles carry different generations and must not overwrite
+        // the first observation of the original public destroy/free calls.
+        require(f.journal->createImageTagged(f.device,f.image,f.imageInfo,f.tag+5),"replacement image publication failed");
+        f.journal->allocateMemory(f.device,f.memory,f.memoryInfo); f.journal->bindImageMemory(f.device,f.image,f.memory,0);
+        require(f.journal->createViewTagged(f.device,f.view,f.viewInfo,f.tag+5),"replacement view publication failed");
+        f.journal->destroyView(f.device,f.view); f.journal->destroyImage(f.device,f.image); f.journal->freeMemory(f.device,f.memory);
+        f.drain(); const auto repeated = f.journal->targetRetirementDiagnostics();
+        for(unsigned i=0;i<3;++i) require(repeated.resources[i].replayOrder == orders[i] &&
+            same(repeated.resources[i].identity,expected[i]),"recycled resource replaced original retirement evidence");
+    }
+    {
+        TargetFixture f; const auto before = f.journal->transportCounters().published;
+        f.journal->deviceDestroyed(f.device); f.drain(); const auto result = f.journal->targetRetirementDiagnostics();
+        for(const auto& resource : result.resources) require(resource.replayOrder == before+1 && resource.identity.generation &&
+            resource.operation == TargetRetirementOperation::DestroyDeviceCall,"device destroy lost exact live target generations");
+    }
+    {
+        TargetFixture f; f.journal->destroyView(f.device,f.unrelatedView); f.drain();
+        for(const auto& resource : f.journal->targetRetirementDiagnostics().resources)
+            require(!resource.replayOrder,"unrelated resource was recorded as target retirement");
+    }
+}
 void backgroundOwnerValidation() {
     Fixture f; f.create();
     const auto receipt = f.receipt();
@@ -704,6 +890,9 @@ void backgroundOwnerValidation() {
 int main() {
     orderedOwnedSuccess(); unmatchedAndMissing(); retireReuseAndDeviceIsolation();
     unsupportedAndLoss(); duplicateCapacityAndMissingConsumer(); orderedInterleavedScopes(); backgroundOwnerValidation(); targetSnapshotSelection(); targetDenialDiagnostics();
+    incompleteDescriptorObservations(); independentPublicDrawSnapshots(); exactTargetRetirementObservations();
     std::cout << checks << " import resource receipt checks passed; " << sizeof(Journal)
-              << " bytes fixed state; no hook allocations; offline lifecycle proof only\n";
+              << " bytes fixed state; diagnostics=" << sizeof(TargetProbeDiagnostics)
+              << ", retirement=" << sizeof(TargetRetirementDiagnostics)
+              << "; no hook allocations; offline lifecycle proof only\n";
 }
