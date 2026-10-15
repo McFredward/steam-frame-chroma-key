@@ -207,12 +207,33 @@ public:
                 result.replayOrder = record->ticket;
                 const auto& p = observation.payload.targetProbe;
                 result.invocationTag = restored ? p.invocationTag : 0;
-                if (!aborted_ && restored && !lostState() && targetReceipt_.invocationTag == p.invocationTag &&
-                    targetReceipt_.cookie == p.ownedCookie && targetReceipt_.device == record->device) {
-                    result.outcome = core_.targetSnapshotMatch(record->device, p.command, p.layout, targetReceipt_);
+                auto& diagnostic = result.diagnostics;
+                if (restored) { diagnostic.requestedCommand = handle(p.command); diagnostic.requestedLayout = handle(p.layout); }
+                if (targetReceipt_.invocationTag) {
+                    diagnostic.observedTargetTag = targetReceipt_.invocationTag;
+                    diagnostic.observedTargetCookie = targetReceipt_.cookie;
+                    diagnostic.observedTargetDevice = targetReceipt_.device;
+                    diagnostic.observations |= ProbeJournalTargetObserved;
                 }
-                if (result.outcome == TargetProbeOutcome::ExactMatch && targetSnapshots_ >= TargetSnapshotLimit)
+                if (!restored) diagnostic.reason = TargetProbeReason::JournalRestoreFailed;
+                else if (aborted_) diagnostic.reason = TargetProbeReason::JournalAborted;
+                else if (lostState()) diagnostic.reason = TargetProbeReason::JournalLoss;
+                else if (!targetReceipt_.invocationTag) diagnostic.reason = TargetProbeReason::JournalTargetMissing;
+                else if (targetReceipt_.invocationTag != p.invocationTag) diagnostic.reason = TargetProbeReason::JournalTargetTagMismatch;
+                else if (targetReceipt_.cookie != p.ownedCookie) diagnostic.reason = TargetProbeReason::JournalTargetCookieMismatch;
+                else if (targetReceipt_.device != record->device) diagnostic.reason = TargetProbeReason::JournalTargetDeviceMismatch;
+                else {
+                    diagnostic = core_.targetSnapshotMatchDetailed(record->device, p.command, p.layout, targetReceipt_);
+                    diagnostic.observations |= ProbeJournalTargetObserved;
+                    result.outcome = diagnostic.outcome;
+                }
+                diagnostic.reasonMask |= targetProbeReasonBit(diagnostic.reason);
+                if (result.outcome == TargetProbeOutcome::ExactMatch && targetSnapshots_ >= TargetSnapshotLimit) {
                     result.outcome = TargetProbeOutcome::QuotaOmitted;
+                    diagnostic.reason = TargetProbeReason::SnapshotQuota;
+                    diagnostic.reasonMask |= targetProbeReasonBit(diagnostic.reason);
+                }
+                diagnostic.outcome = result.outcome;
                 if constexpr (std::is_invocable_v<Callback&, std::uint32_t, const TargetSnapshotProbeResult&>) {
                     if (result.outcome == TargetProbeOutcome::ExactMatch) {
                         const auto snapshot = core_.snapshot(record->device, p.command, p.layout);

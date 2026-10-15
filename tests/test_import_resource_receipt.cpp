@@ -35,10 +35,67 @@ RECEIPT_TEST_ALLOCATION void operator delete[](void* p, std::size_t) noexcept { 
 #undef RECEIPT_TEST_ALLOCATION
 
 namespace frame_bindings {
-struct TestAccess { static std::uint64_t serial(Core& core) noexcept { return core.serial_; } };
+struct TestAccess {
+    static std::uint64_t serial(Core& core) noexcept { return core.serial_; }
+    static void mixedBindingRefusals(Core& core) {
+        auto* set = Core::find(core.sets_,1,104); auto* layout=Core::find(core.layouts_,1,101);
+        layout->count=2;layout->bindings[1]=layout->bindings[0];layout->bindings[1].binding=31;
+        set->values[1]=set->values[0];set->values[1].view=Core::find(core.views_,1,111)->id;
+        set->values[0].written=false;
+    }
+    static std::mutex& mutex(Core& core) { return core.mutex_; }
+    // Deliberately isolate normally co-occurring incomplete metadata gates so
+    // a diagnostic label cannot silently move to a different refusal branch.
+    static void damageTargetState(Core& core, TargetProbeReason reason) {
+        auto* command = Core::find(core.commands_, 1, 105);
+        auto* layout = Core::find(core.pipelineLayouts_, 1, 102);
+        auto* set = Core::find(core.sets_, 1, 104);
+        auto* setLayout = Core::find(core.layouts_, 1, 101);
+        auto* aliasView = Core::find(core.views_, 1, 111);
+        auto* unrelatedView = Core::find(core.views_, 1, 108);
+        auto* unrelatedImage = Core::find(core.images_, 1, 107);
+        switch (reason) {
+        case TargetProbeReason::CommandAbsent: core.commands_.erase(1, 105); break;
+        case TargetProbeReason::LayoutAbsent: core.pipelineLayouts_.erase(1, 102); break;
+        case TargetProbeReason::CommandIncomplete: command->complete = false; break;
+        case TargetProbeReason::LayoutIncomplete: layout->complete = false; break;
+        case TargetProbeReason::LayoutEmpty: layout->count = 0; break;
+        case TargetProbeReason::CommandLayoutMismatch: ++command->layout.generation; break;
+        case TargetProbeReason::BoundSetIncomplete: command->sets[0].complete = false; break;
+        case TargetProbeReason::SetAbsentOrStale: ++command->sets[0].set.generation; break;
+        case TargetProbeReason::SetIncomplete: set->complete = false; break;
+        case TargetProbeReason::SetLayoutAbsentOrStale: core.layouts_.erase(1, 101); break;
+        case TargetProbeReason::SetLayoutIncomplete: setLayout->complete = false; break;
+        case TargetProbeReason::SetLayoutMismatch: ++set->layout.generation; break;
+        case TargetProbeReason::PoolAbsentOrStale: ++set->pool.generation; break;
+        case TargetProbeReason::DescriptorUnwritten: set->values[0].written = false; break;
+        case TargetProbeReason::DescriptorIncomplete: set->values[0].complete = false; break;
+        case TargetProbeReason::ViewAbsentOrStale: ++set->values[0].view.generation; break;
+        case TargetProbeReason::ViewIncomplete: set->values[0].view = aliasView->id; aliasView->complete = false; break;
+        case TargetProbeReason::ImageAbsentOrStale: set->values[0].view = aliasView->id; ++aliasView->metadata.image.generation; break;
+        case TargetProbeReason::ImageIncomplete: set->values[0].view = unrelatedView->id; unrelatedImage->complete = false; break;
+        case TargetProbeReason::ExactBindingIncomplete: setLayout->bindings[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; break;
+        case TargetProbeReason::NoSupportedImageBinding: setLayout->bindings[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; break;
+        default: require(false, "unhandled isolated target diagnostic fixture");
+        }
+    }
+};
 struct JournalTestAccess {
     static std::uint64_t coreSerial(Journal& journal) noexcept { return TestAccess::serial(journal.core_); }
     static bool validate(Journal& journal, const ImportResourceReceipt& previous) noexcept { return journal.core_.validate(previous); }
+    static TargetProbeDiagnostics target(Journal& journal, const ImportResourceReceipt& receipt) noexcept {
+        return journal.core_.targetSnapshotMatchDetailed(1, reinterpret_cast<VkCommandBuffer>(105),
+                                                         reinterpret_cast<VkPipelineLayout>(102), receipt);
+    }
+    static void damageTargetState(Journal& journal, TargetProbeReason reason) { TestAccess::damageTargetState(journal.core_, reason); }
+    static void mixedBindingRefusals(Journal& journal) { TestAccess::mixedBindingRefusals(journal.core_); }
+    static void lockedTarget(Journal& journal, const ImportResourceReceipt& receipt, std::atomic<bool>& entered,
+                             std::atomic<bool>& release) {
+        std::lock_guard<std::mutex> lock(TestAccess::mutex(journal.core_));
+        (void)receipt; entered.store(true,std::memory_order_release);
+        while(!release.load(std::memory_order_acquire)) std::this_thread::yield();
+    }
+    static void abort(Journal& journal) { journal.aborted_ = true; }
     static void gap(Journal& journal) noexcept { journal.tickets_.fetch_add(1); }
     static void delayedSnapshot(Journal& journal, std::atomic<bool>& entered, std::atomic<bool>& release) {
         journal.publish(Journal::Op::Snapshot, 1, [&](Journal::Record& record) {
@@ -359,10 +416,16 @@ void orderedInterleavedScopes() {
 struct ProbeCollector {
     std::uint64_t filtered=0, unknown=0, matched=0, omitted=0, lastOrder=0;
     std::vector<Snapshot> selected;
+    TargetProbeDiagnostics last{};
+    std::array<std::uint64_t, static_cast<std::size_t>(TargetProbeReason::Count)> reasons{};
     void operator()(std::uint32_t, const Snapshot&) noexcept {}
     void operator()(std::uint64_t, const ImportResourceReceipt&) noexcept {}
     void operator()(std::uint32_t, const TargetSnapshotProbeResult& value) noexcept {
         require(value.replayOrder>lastOrder,"probe replay order regressed");lastOrder=value.replayOrder;
+        last = value.diagnostics;
+        require(last.outcome == value.outcome && last.reason != TargetProbeReason::None &&
+                (last.reasonMask & targetProbeReasonBit(last.reason)), "typed probe diagnostic disagrees with actual result");
+        ++reasons[static_cast<std::size_t>(last.reason)];
         if(value.outcome==TargetProbeOutcome::ExactMatch) {
             require(value.snapshot,"exact match omitted owned replay snapshot");++matched;selected.push_back(*value.snapshot);
         } else {
@@ -420,6 +483,9 @@ void targetSnapshotSelection() {
     writeView(f.view);probe(f.tag,f.cookie);probe(f.tag+1,f.cookie);probe(f.tag,f.cookie+1);
     while(f.journal->drain(collector)){}
     require(collector.matched==2 && collector.filtered==4097 && collector.unknown==2,"ordered target selection lost identity gates");
+    require(collector.reasons[static_cast<std::size_t>(TargetProbeReason::JournalTargetTagMismatch)] == 1 &&
+            collector.reasons[static_cast<std::size_t>(TargetProbeReason::JournalTargetCookieMismatch)] == 1,
+            "different owning target/tag cookie refusals collapsed");
     require(collector.selected[0].setRevision<collector.selected[1].setRevision,
             "later descriptor revision replaced earlier draw state");
     for(const auto& selected:collector.selected) {
@@ -441,6 +507,168 @@ void targetSnapshotSelection() {
     require(collector.unknown==4 && f.journal->lostState()>0,"unsupported lifecycle loss was hidden as ordinary filter/quota");
     require(!hookAllocations.load(),"target probe callback allocated on hook thread");
     f.journal->close();require(f.journal->finished(),"filtered probes left a blocking queue head");
+}
+struct TargetFixture : Fixture {
+    const VkDescriptorSetLayout layout = h<VkDescriptorSetLayout>(101);
+    const VkPipelineLayout pipeline = h<VkPipelineLayout>(102);
+    const VkDescriptorPool pool = h<VkDescriptorPool>(103);
+    const VkDescriptorSet set = h<VkDescriptorSet>(104);
+    const VkCommandBuffer command = h<VkCommandBuffer>(105);
+    const VkCommandPool commandPool = h<VkCommandPool>(106);
+    const VkImage unrelatedImage = h<VkImage>(107);
+    const VkImageView unrelatedView = h<VkImageView>(108), aliasView = h<VkImageView>(111);
+    const VkDeviceMemory unrelatedMemory = h<VkDeviceMemory>(109);
+    ImportResourceReceipt target{};
+    TargetFixture() {
+        create(); target = receipt();
+        auto unrelatedCreate = imageInfo; unrelatedCreate.pNext = nullptr;
+        journal->createImage(device, unrelatedImage, unrelatedCreate);
+        auto allocation = memoryInfo; allocation.pNext = nullptr;
+        journal->allocateMemory(device, unrelatedMemory, allocation);
+        journal->bindImageMemory(device, unrelatedImage, unrelatedMemory, 0);
+        auto vi = viewInfo; vi.image = unrelatedImage; journal->createView(device, unrelatedView, vi);
+        journal->createView(device, aliasView, viewInfo);
+        VkDescriptorSetLayoutBinding binding{9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+        auto sli=info<VkDescriptorSetLayoutCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+        sli.bindingCount=1;sli.pBindings=&binding;journal->createSetLayout(device,layout,sli);
+        auto pli=info<VkPipelineLayoutCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+        pli.setLayoutCount=1;pli.pSetLayouts=&layout;journal->createPipelineLayout(device,pipeline,pli);
+        auto pci=info<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);pci.maxSets=1;
+        journal->createPool(device,pool,pci);
+        auto sai=info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+        sai.descriptorPool=pool;sai.descriptorSetCount=1;sai.pSetLayouts=&layout;journal->allocateSets(device,sai,&set);
+        journal->allocateCommands(device,commandPool,1,&command);journal->beginCommand(device,command);
+        journal->bindSets(device,command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline,0,1,&set,0,nullptr);
+        write(view); drain();
+    }
+    void write(VkImageView value) {
+        VkDescriptorImageInfo di{VK_NULL_HANDLE,value,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        auto write=info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+        write.dstSet=set;write.dstBinding=9;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        write.pImageInfo=&di;journal->updateSets(device,1,&write,0,nullptr);
+    }
+    void drain() { Collector collector; while(journal->drain(collector)){} }
+    TargetProbeDiagnostics probe(std::uint64_t selectedTag=0, std::uint64_t selectedCookie=0, std::uint64_t selectedDevice=0) {
+        require(journal->requestTargetSnapshotProbe(selectedDevice ? selectedDevice : device,command,pipeline,
+                    selectedTag ? selectedTag : tag,selectedCookie ? selectedCookie : cookie,7),"typed probe publication failed");
+        ProbeCollector collector; while(journal->drain(collector)){}
+        require(collector.lastOrder,"typed probe was not delivered");return collector.last;
+    }
+};
+void targetDenialDiagnostics() {
+    for (const auto reason : {TargetProbeReason::CommandAbsent, TargetProbeReason::LayoutAbsent,
+            TargetProbeReason::CommandIncomplete, TargetProbeReason::LayoutIncomplete, TargetProbeReason::LayoutEmpty,
+            TargetProbeReason::CommandLayoutMismatch, TargetProbeReason::BoundSetIncomplete,
+            TargetProbeReason::SetAbsentOrStale, TargetProbeReason::SetIncomplete,
+            TargetProbeReason::SetLayoutAbsentOrStale, TargetProbeReason::SetLayoutIncomplete,
+            TargetProbeReason::SetLayoutMismatch, TargetProbeReason::PoolAbsentOrStale,
+            TargetProbeReason::DescriptorUnwritten, TargetProbeReason::DescriptorIncomplete,
+            TargetProbeReason::ViewAbsentOrStale, TargetProbeReason::ImageAbsentOrStale,
+            TargetProbeReason::ViewIncomplete, TargetProbeReason::ImageIncomplete,
+            TargetProbeReason::ExactBindingIncomplete, TargetProbeReason::NoSupportedImageBinding}) {
+        TargetFixture f;
+        JournalTestAccess::damageTargetState(*f.journal,reason);
+        const auto result=f.probe();
+        require(result.reason==reason,"isolated existing refusal gate reported a different cause");
+        require(result.outcome==(reason==TargetProbeReason::NoSupportedImageBinding ? TargetProbeOutcome::Filtered : TargetProbeOutcome::Unknown),
+                "diagnostic changed existing refusal outcome");
+        require(result.requestedCommand==105 && result.requestedLayout==102 && result.observedTargetTag==f.tag &&
+                result.observedTargetCookie==f.cookie && (result.observations & ProbeJournalTargetObserved),
+                "probe dropped actual owning request/target identities");
+    }
+    {
+        TargetFixture f;
+        for(const auto reason : {TargetProbeReason::TargetIncomplete,TargetProbeReason::TargetDeviceMismatch,
+                TargetProbeReason::TargetJournalMismatch,TargetProbeReason::TargetImageStale,TargetProbeReason::TargetViewStale,
+                TargetProbeReason::TargetMemoryStale,TargetProbeReason::TargetBindingStale,TargetProbeReason::TargetOffsetMismatch}) {
+            auto stale=f.target;
+            if(reason==TargetProbeReason::TargetIncomplete)stale.resourceComplete=false;
+            if(reason==TargetProbeReason::TargetDeviceMismatch)++stale.device;
+            if(reason==TargetProbeReason::TargetJournalMismatch)++stale.journalInstance;
+            if(reason==TargetProbeReason::TargetImageStale)++stale.image.identity.generation;
+            if(reason==TargetProbeReason::TargetViewStale)++stale.view.identity.generation;
+            if(reason==TargetProbeReason::TargetMemoryStale)++stale.memory.identity.generation;
+            if(reason==TargetProbeReason::TargetBindingStale)++stale.image.memory.generation;
+            if(reason==TargetProbeReason::TargetOffsetMismatch)++stale.image.memoryOffset;
+            const auto result=JournalTestAccess::target(*f.journal,stale);
+            require(result.outcome==TargetProbeOutcome::Unknown && result.reason==reason,
+                    "permanent target generation/ownership mismatch lost its exact refusal label");
+        }
+    }
+    {
+        TargetFixture f;
+        JournalTestAccess::mixedBindingRefusals(*f.journal);
+        const auto result=f.probe();
+        require(result.outcome==TargetProbeOutcome::Unknown && result.reason==TargetProbeReason::DescriptorUnwritten &&
+                result.binding==9 && result.examinedImageBindings==2 &&
+                (result.reasonMask & targetProbeReasonBit(TargetProbeReason::DifferentViewSameImage)),
+                "multiple binding refusals discarded decisive identities or secondary evidence");
+    }
+    {
+        TargetFixture f; std::atomic<bool> entered{false},release{false};
+        std::thread owner([&]{JournalTestAccess::lockedTarget(*f.journal,f.target,entered,release);});
+        while(!entered.load(std::memory_order_acquire))std::this_thread::yield();
+        const auto result=JournalTestAccess::target(*f.journal,f.target);
+        release.store(true,std::memory_order_release);owner.join();
+        require(result.outcome==TargetProbeOutcome::Unknown && result.reason==TargetProbeReason::CoreOwnerUnavailable,
+                "Core ownership refusal was silently classified as missing metadata");
+        require(JournalTestAccess::target(*f.journal,f.target).reason==TargetProbeReason::CoreLoss,
+                "permanent Core loss after contention was hidden");
+    }
+    {
+        TargetFixture f;
+        f.write(f.aliasView); const auto sameImage=f.probe();
+        require(sameImage.outcome==TargetProbeOutcome::Filtered && sameImage.reason==TargetProbeReason::DifferentViewSameImage,
+                "same image under a different view was admitted as an exact imported view");
+        require(sameImage.descriptorView.handle==111 && sameImage.candidateView.handle==111 &&
+                same(sameImage.candidateImage,f.target.image.identity) && same(sameImage.candidateMemory,f.target.memory.identity) &&
+                sameImage.binding==9 && sameImage.examinedImageBindings==1 &&
+                (sameImage.observations & (ProbeDescriptorObserved | ProbeViewObserved | ProbeImageObserved)) ==
+                    (ProbeDescriptorObserved | ProbeViewObserved | ProbeImageObserved),
+                "same-image refusal did not retain actual candidate generations");
+        f.write(f.unrelatedView); const auto unrelated=f.probe();
+        require(unrelated.outcome==TargetProbeOutcome::Filtered && unrelated.reason==TargetProbeReason::NoMatch &&
+                (unrelated.reasonMask & targetProbeReasonBit(TargetProbeReason::DifferentImage)),
+                "genuine supported-subset nonmatch lacks its typed binding evidence");
+        f.write(f.view); const auto exact=f.probe();
+        require(exact.outcome==TargetProbeOutcome::ExactMatch && exact.reason==TargetProbeReason::ExactMatch &&
+                same(exact.candidateView,f.target.view.identity),"diagnostics broke exact ordered generation matching");
+    }
+    {
+        TargetFixture f;
+        require(f.probe(f.tag+1).reason==TargetProbeReason::JournalTargetTagMismatch,"tag denial not classified");
+        require(f.probe(0,f.cookie+1).reason==TargetProbeReason::JournalTargetCookieMismatch,"cookie denial not classified");
+        require(f.probe(0,0,f.device+1).reason==TargetProbeReason::JournalTargetDeviceMismatch,"device denial not classified");
+        f.journal->destroyView(f.device,f.view); const auto retired=f.probe();
+        require(retired.reason==TargetProbeReason::TargetCurrentIncomplete &&
+                (retired.currentTargetErrors & ImportMissingView) && retired.outcome==TargetProbeOutcome::Unknown,
+                "retired target view was hidden as an ordinary nonmatch");
+    }
+    {
+        TargetFixture f; f.journal->reportUnsupported(f.device);
+        require(f.probe().reason==TargetProbeReason::JournalLoss,"permanent owning-journal loss not classified");
+    }
+    {
+        Fixture f;
+        require(f.journal->requestTargetSnapshotProbe(f.device,h<VkCommandBuffer>(105),h<VkPipelineLayout>(102),f.tag,f.cookie,7),"missing-target probe failed");
+        ProbeCollector c; while(f.journal->drain(c)){}
+        require(c.last.reason==TargetProbeReason::JournalTargetMissing && !c.last.observations,
+                "missing target acquired invented observed identities");
+    }
+    {
+        TargetFixture f; JournalTestAccess::abort(*f.journal);
+        require(f.probe().reason==TargetProbeReason::JournalAborted,"aborted replay not classified");
+    }
+    {
+        TargetFixture f;
+        require(f.journal->requestTargetSnapshotProbe(f.device,f.command,f.pipeline,f.tag,f.cookie,7),"corrupt target probe publication failed");
+        JournalTestAccess::corruptReceipt(*f.journal,0);
+        ProbeCollector c; while(f.journal->drain(c)){}
+        require(c.last.reason==TargetProbeReason::JournalRestoreFailed && !c.last.requestedCommand &&
+                !c.last.requestedLayout,"unrestored probe read invented request identities");
+    }
+    for(unsigned i=0;i<static_cast<unsigned>(TargetProbeReason::Count);++i)
+        require(std::string(targetProbeReasonName(static_cast<TargetProbeReason>(i)))!="invalid","typed probe name missing");
 }
 void backgroundOwnerValidation() {
     Fixture f; f.create();
@@ -475,7 +703,7 @@ void backgroundOwnerValidation() {
 }
 int main() {
     orderedOwnedSuccess(); unmatchedAndMissing(); retireReuseAndDeviceIsolation();
-    unsupportedAndLoss(); duplicateCapacityAndMissingConsumer(); orderedInterleavedScopes(); backgroundOwnerValidation(); targetSnapshotSelection();
+    unsupportedAndLoss(); duplicateCapacityAndMissingConsumer(); orderedInterleavedScopes(); backgroundOwnerValidation(); targetSnapshotSelection(); targetDenialDiagnostics();
     std::cout << checks << " import resource receipt checks passed; " << sizeof(Journal)
               << " bytes fixed state; no hook allocations; offline lifecycle proof only\n";
 }

@@ -203,12 +203,74 @@ static_assert(std::is_trivially_copyable_v<ImportResourceReceipt>,
 static_assert(sizeof(ImportResourceReceipt) < 4096, "Import receipt exceeds its bounded budget");
 
 enum class TargetProbeOutcome : std::uint8_t { ExactMatch, Filtered, Unknown, QuotaOmitted };
+// Refusal reasons describe only the existing CPU metadata gates. In particular,
+// DifferentViewSameImage is diagnostic evidence, never an exact association.
+enum class TargetProbeReason : std::uint8_t {
+    None, ExactMatch, JournalAborted, JournalRestoreFailed, JournalLoss,
+    JournalTargetMissing, JournalTargetTagMismatch, JournalTargetCookieMismatch,
+    JournalTargetDeviceMismatch, CoreOwnerUnavailable, CoreLoss, TargetIncomplete,
+    TargetDeviceMismatch, TargetJournalMismatch, TargetCurrentIncomplete,
+    TargetImageStale, TargetViewStale, TargetMemoryStale, TargetBindingStale,
+    TargetOffsetMismatch, CommandAbsent, LayoutAbsent, CommandIncomplete,
+    LayoutIncomplete, LayoutEmpty, CommandLayoutMismatch, BoundSetIncomplete,
+    SetAbsentOrStale, SetIncomplete, SetLayoutAbsentOrStale, SetLayoutIncomplete,
+    SetLayoutMismatch, PoolAbsentOrStale, DescriptorUnwritten, DescriptorIncomplete,
+    ViewAbsentOrStale, ImageAbsentOrStale, ViewIncomplete, ImageIncomplete,
+    DifferentViewSameImage, DifferentImage, MemoryMismatch, ExactBindingIncomplete,
+    NoSupportedImageBinding, NoMatch, SnapshotQuota, Count
+};
+constexpr std::uint64_t targetProbeReasonBit(TargetProbeReason reason) noexcept {
+    return UINT64_C(1) << static_cast<unsigned>(reason);
+}
+inline const char* targetProbeReasonName(TargetProbeReason reason) noexcept {
+    static constexpr std::array<const char*, static_cast<std::size_t>(TargetProbeReason::Count)> names{{
+        "none", "exact_match", "journal_aborted", "journal_restore_failed", "journal_loss",
+        "journal_target_missing", "journal_target_tag_mismatch", "journal_target_cookie_mismatch",
+        "journal_target_device_mismatch", "core_owner_unavailable", "core_loss", "target_incomplete",
+        "target_device_mismatch", "target_journal_mismatch", "target_current_incomplete",
+        "target_image_stale", "target_view_stale", "target_memory_stale", "target_binding_stale",
+        "target_offset_mismatch", "command_absent", "layout_absent", "command_incomplete",
+        "layout_incomplete", "layout_empty", "command_layout_mismatch", "bound_set_incomplete",
+        "set_absent_or_stale", "set_incomplete", "set_layout_absent_or_stale", "set_layout_incomplete",
+        "set_layout_mismatch", "pool_absent_or_stale", "descriptor_unwritten", "descriptor_incomplete",
+        "view_absent_or_stale", "image_absent_or_stale", "view_incomplete", "image_incomplete",
+        "different_view_same_image", "different_image", "memory_mismatch", "exact_binding_incomplete",
+        "no_supported_image_binding", "no_match", "snapshot_quota"
+    }};
+    const auto index = static_cast<std::size_t>(reason);
+    return index < names.size() ? names[index] : "invalid";
+}
+enum TargetProbeObservation : std::uint32_t {
+    ProbeJournalTargetObserved = 1U << 0, ProbeCurrentTargetObserved = 1U << 1,
+    ProbeCommandObserved = 1U << 2, ProbeLayoutObserved = 1U << 3,
+    ProbeBoundSetObserved = 1U << 4, ProbeSetObserved = 1U << 5,
+    ProbeSetLayoutObserved = 1U << 6, ProbeDescriptorObserved = 1U << 7,
+    ProbeViewObserved = 1U << 8, ProbeImageObserved = 1U << 9
+};
+struct TargetProbeDiagnostics {
+    TargetProbeOutcome outcome = TargetProbeOutcome::Unknown;
+    TargetProbeReason reason = TargetProbeReason::None;
+    // Contains all encountered binding refusals, not just the decisive reason.
+    std::uint64_t reasonMask = 0;
+    std::uint64_t requestedCommand = 0, requestedLayout = 0;
+    std::uint64_t observedTargetTag = 0, observedTargetCookie = 0, observedTargetDevice = 0;
+    Identity command{}, layout{}, commandLayout{}, boundSet{}, set{}, setLayout{}, setDeclaredLayout{}, pool{};
+    Identity currentTargetImage{}, currentTargetView{}, currentTargetMemory{};
+    Identity descriptorView{}, candidateView{}, candidateImage{}, candidateMemory{};
+    std::uint32_t binding = std::numeric_limits<std::uint32_t>::max(), examinedImageBindings = 0;
+    std::uint32_t currentTargetErrors = 0;
+    std::uint32_t observations = 0;
+};
+static_assert(static_cast<unsigned>(TargetProbeReason::Count) <= 64, "Probe reasons exceed bounded bitset");
+static_assert(std::is_trivially_copyable_v<TargetProbeDiagnostics> && sizeof(TargetProbeDiagnostics) <= 384,
+              "Probe diagnostics must remain small owned public metadata");
 // The optional pointer is owned by the replay callback's stack. Consumers must
 // copy a selected result before returning; nonmatches carry no large snapshot.
 struct TargetSnapshotProbeResult {
     TargetProbeOutcome outcome = TargetProbeOutcome::Unknown;
     std::uint64_t replayOrder = 0, invocationTag = 0;
     const Snapshot* snapshot = nullptr;
+    TargetProbeDiagnostics diagnostics{};
 };
 
 // Instantaneous owner-side samples, not an atomic lease on native resources.
@@ -671,42 +733,115 @@ public:
     }
     // Single owning-Journal replay only. Selection precedes full snapshot
     // construction and compares generations, not recycled native handles.
-    TargetProbeOutcome targetSnapshotMatch(std::uint64_t device, VkCommandBuffer commandValue,
+    TargetProbeDiagnostics targetSnapshotMatchDetailed(std::uint64_t device, VkCommandBuffer commandValue,
                                          VkPipelineLayout layoutValue, const ImportResourceReceipt& target) noexcept {
+        TargetProbeDiagnostics out;
+        out.requestedCommand = handle(commandValue); out.requestedLayout = handle(layoutValue);
+        out.observedTargetTag = target.invocationTag; out.observedTargetCookie = target.cookie;
+        out.observedTargetDevice = target.device;
+        const auto reject = [&](TargetProbeReason reason) {
+            out.reason = reason; out.reasonMask |= targetProbeReasonBit(reason); return out;
+        };
         auto lock = acquire();
-        if (!lock.owns_lock() || lostState() || !target.resourceComplete || target.device != device ||
-            target.journalInstance != journalInstance_) return TargetProbeOutcome::Unknown;
+        if (!lock.owns_lock()) return reject(TargetProbeReason::CoreOwnerUnavailable);
+        if (lostState()) return reject(TargetProbeReason::CoreLoss);
+        if (!target.resourceComplete) return reject(TargetProbeReason::TargetIncomplete);
+        if (target.device != device) return reject(TargetProbeReason::TargetDeviceMismatch);
+        if (target.journalInstance != journalInstance_) return reject(TargetProbeReason::TargetJournalMismatch);
         const auto current = importResourceReceiptLocked(device, target.requestedImage, target.requestedView, target.invocationTag);
-        if (!current.resourceComplete || !same(target.image.identity, current.image.identity) ||
-            !same(target.view.identity, current.view.identity) || !same(target.memory.identity, current.memory.identity) ||
-            !same(target.image.memory, current.image.memory) || target.image.memoryOffset != current.image.memoryOffset)
-            return TargetProbeOutcome::Unknown;
+        out.currentTargetImage = current.image.identity; out.currentTargetView = current.view.identity;
+        out.currentTargetMemory = current.memory.identity; out.currentTargetErrors = current.errors;
+        out.observations |= ProbeCurrentTargetObserved;
+        if (!current.resourceComplete) return reject(TargetProbeReason::TargetCurrentIncomplete);
+        if (!same(target.image.identity, current.image.identity)) return reject(TargetProbeReason::TargetImageStale);
+        if (!same(target.view.identity, current.view.identity)) return reject(TargetProbeReason::TargetViewStale);
+        if (!same(target.memory.identity, current.memory.identity)) return reject(TargetProbeReason::TargetMemoryStale);
+        if (!same(target.image.memory, current.image.memory)) return reject(TargetProbeReason::TargetBindingStale);
+        if (target.image.memoryOffset != current.image.memoryOffset) return reject(TargetProbeReason::TargetOffsetMismatch);
         const auto* command = find(commands_, device, handle(commandValue));
         const auto* layout = find(pipelineLayouts_, device, handle(layoutValue));
-        if (!command || !layout || !command->complete || !layout->complete || !layout->count ||
-            !same(command->layout, layout->id)) return TargetProbeOutcome::Unknown;
-        const auto& bound = command->sets[0];
+        if (command) { out.command = command->id; out.commandLayout = command->layout; out.observations |= ProbeCommandObserved; }
+        if (layout) { out.layout = layout->id; out.observations |= ProbeLayoutObserved; }
+        if (!command) return reject(TargetProbeReason::CommandAbsent);
+        if (!layout) return reject(TargetProbeReason::LayoutAbsent);
+        if (!command->complete) return reject(TargetProbeReason::CommandIncomplete);
+        if (!layout->complete) return reject(TargetProbeReason::LayoutIncomplete);
+        if (!layout->count) return reject(TargetProbeReason::LayoutEmpty);
+        if (!same(command->layout, layout->id)) return reject(TargetProbeReason::CommandLayoutMismatch);
+        const auto& bound = command->sets[0]; out.boundSet = bound.set; out.observations |= ProbeBoundSetObserved;
         const auto* set = lookup(sets_, device, bound.set);
         const auto* setLayout = lookup(layouts_, device, layout->sets[0]);
-        if (!bound.complete || !set || !set->complete || !setLayout || !setLayout->complete ||
-            !same(set->layout, setLayout->id) || !lookup(pools_, device, set->pool)) return TargetProbeOutcome::Unknown;
+        // The requested generation is retained even when lookup rejects it.
+        out.setLayout = layout->sets[0];
+        if (set) { out.set = set->id; out.setDeclaredLayout = set->layout; out.pool = set->pool; out.observations |= ProbeSetObserved; }
+        if (setLayout) out.observations |= ProbeSetLayoutObserved;
+        if (!bound.complete) return reject(TargetProbeReason::BoundSetIncomplete);
+        if (!set) return reject(TargetProbeReason::SetAbsentOrStale);
+        if (!set->complete) return reject(TargetProbeReason::SetIncomplete);
+        if (!setLayout) return reject(TargetProbeReason::SetLayoutAbsentOrStale);
+        if (!setLayout->complete) return reject(TargetProbeReason::SetLayoutIncomplete);
+        if (!same(set->layout, setLayout->id)) return reject(TargetProbeReason::SetLayoutMismatch);
+        if (!lookup(pools_, device, set->pool)) return reject(TargetProbeReason::PoolAbsentOrStale);
         bool unknown = false;
+        TargetProbeDiagnostics firstUnknown{}, firstDifferentView{};
+        bool hasUnknown = false, hasDifferentView = false;
+        const auto note = [&](TargetProbeReason reason, bool isUnknown) {
+            out.reason = reason; out.reasonMask |= targetProbeReasonBit(reason);
+            if (isUnknown) { unknown = true; if (!hasUnknown) { firstUnknown = out; hasUnknown = true; } }
+            if (reason == TargetProbeReason::DifferentViewSameImage && !hasDifferentView) {
+                firstDifferentView = out; hasDifferentView = true;
+            }
+        };
         for (const auto bindingNumber : TargetBindings) {
             const auto pos = index(*setLayout, bindingNumber);
             if (pos == BindingCapacity || !imageType(setLayout->bindings[pos].type)) continue;
-            const auto& value = set->values[pos];
-            if (!value.written || !value.complete) { unknown = true; continue; }
+            ++out.examinedImageBindings; out.binding = bindingNumber;
+            out.observations &= ~(ProbeDescriptorObserved | ProbeViewObserved | ProbeImageObserved);
+            out.observations |= ProbeDescriptorObserved;
+            out.descriptorView = {}; out.candidateView = {}; out.candidateImage = {}; out.candidateMemory = {};
+            const auto& value = set->values[pos]; out.descriptorView = value.view;
+            if (!value.written) { note(TargetProbeReason::DescriptorUnwritten, true); continue; }
+            if (!value.complete) { note(TargetProbeReason::DescriptorIncomplete, true); continue; }
             const auto* view = lookup(views_, device, value.view);
             const auto* image = view ? lookup(images_, device, view->metadata.image) : nullptr;
-            if (!view || !image || !view->complete || !image->complete) { unknown = true; continue; }
-            if (!same(value.view, target.view.identity) || !same(view->metadata.image, target.image.identity) ||
-                !same(image->id, target.image.identity) || !same(image->metadata.memory, target.memory.identity)) continue;
+            if (view) { out.candidateView = view->id; out.observations |= ProbeViewObserved; }
+            // candidateMemory is the observed image's generation-bearing link,
+            // not a separately validated allocation or GPU-consumption claim.
+            if (image) { out.candidateImage = image->id; out.candidateMemory = image->metadata.memory; out.observations |= ProbeImageObserved; }
+            if (!view) { note(TargetProbeReason::ViewAbsentOrStale, true); continue; }
+            if (!image) { note(TargetProbeReason::ImageAbsentOrStale, true); continue; }
+            if (!view->complete) { note(TargetProbeReason::ViewIncomplete, true); continue; }
+            if (!image->complete) { note(TargetProbeReason::ImageIncomplete, true); continue; }
+            if (!same(value.view, target.view.identity)) {
+                const bool sameImage = same(view->metadata.image, target.image.identity) && same(image->id, target.image.identity);
+                note(sameImage ? TargetProbeReason::DifferentViewSameImage : TargetProbeReason::DifferentImage, false);
+                continue;
+            }
+            if (!same(view->metadata.image, target.image.identity) || !same(image->id, target.image.identity)) {
+                note(TargetProbeReason::DifferentImage, false); continue;
+            }
+            if (!same(image->metadata.memory, target.memory.identity)) { note(TargetProbeReason::MemoryMismatch, false); continue; }
             const auto selected = binding(device, *set, *setLayout, bound, bindingNumber);
             if (selected.complete && selected.image.complete && selected.view.complete && selected.image.allocation.complete &&
-                same(selected.image.allocation.identity, target.memory.identity)) return TargetProbeOutcome::ExactMatch;
-            unknown = true;
+                same(selected.image.allocation.identity, target.memory.identity)) {
+                out.outcome = TargetProbeOutcome::ExactMatch; return reject(TargetProbeReason::ExactMatch);
+            }
+            note(TargetProbeReason::ExactBindingIncomplete, true);
         }
-        return unknown ? TargetProbeOutcome::Unknown : TargetProbeOutcome::Filtered;
+        // A single representative retains its actual identities; the mask and
+        // count still describe every supported binding examined by this probe.
+        const auto mask = out.reasonMask; const auto examined = out.examinedImageBindings;
+        if (hasUnknown) out = firstUnknown;
+        else if (hasDifferentView) out = firstDifferentView;
+        else if (!examined) out.reason = TargetProbeReason::NoSupportedImageBinding;
+        else out.reason = TargetProbeReason::NoMatch;
+        out.reasonMask = mask | targetProbeReasonBit(out.reason); out.examinedImageBindings = examined;
+        out.outcome = unknown ? TargetProbeOutcome::Unknown : TargetProbeOutcome::Filtered;
+        return out;
+    }
+    TargetProbeOutcome targetSnapshotMatch(std::uint64_t device, VkCommandBuffer commandValue,
+                                         VkPipelineLayout layoutValue, const ImportResourceReceipt& target) noexcept {
+        return targetSnapshotMatchDetailed(device, commandValue, layoutValue, target).outcome;
     }
     void deviceDestroyed(std::uint64_t device) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
