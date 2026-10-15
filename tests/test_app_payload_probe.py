@@ -162,7 +162,8 @@ class AppPayloadProbeTests(unittest.TestCase):
                 + probe.chunk(b"IEND", b""))
         rgba = probe.PNG_SIGNATURE + probe.chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0))
         before = probe.PNG_SIGNATURE + probe.chunk(b"tEXt", b"abc") + clean[8:]
-        for bad in (bytes(corrupted), clean + b"x", clean[:-1], bomb, rgba, before):
+        invalid_stream = probe.PNG_SIGNATURE + ihdr + probe.chunk(b"IDAT", b"invalid zlib data") + probe.chunk(b"IEND", b"")
+        for bad in (bytes(corrupted), clean + b"x", clean[:-1], bomb, rgba, before, invalid_stream):
             with self.subTest(digest=hashlib.sha256(bad).hexdigest()[:8]), self.assertRaises(probe.ProbeError):
                 probe.decode_png(bad)
 

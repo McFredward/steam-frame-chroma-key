@@ -179,6 +179,13 @@ opaque green/red, transparent clear, 25/50/75-percent coverage, overlapping
 translucency, MSAA edges and asymmetric left/right coordinate grids. No sender
 hook or mask activation is needed to design these controls.
 
+The [offline app-owned payload probe](APP-PAYLOAD-PROBE.md) now supplies a bounded
+RGB/R8 canvas, redundant source headers, asymmetric fixtures and strict reference
+rejection controls. It does not yet attach to Gloomhaven's render output or prove
+moving material/MSAA coverage, native carriage or spatial mapping. Implementing
+that app-output adapter is the next transport prerequisite; repeating the prior
+YUV resource census alone does not advance it.
+
 Then obtain separately scoped approval for a reversible **app-output/Frame-side**
 feasibility test, not a PC sender observer. Require both payload planes and
 their IDs from one selected decoded resource; prove registration during head

@@ -138,7 +138,10 @@ def decode_png(data: bytes) -> Image:
         raise ProbeError("missing IEND or trailing PNG data")
     stride, expected = width * 3, (width * 3 + 1) * height
     inflater = zlib.decompressobj()
-    raw = inflater.decompress(bytes(compressed), expected + 1)
+    try:
+        raw = inflater.decompress(bytes(compressed), expected + 1)
+    except zlib.error as error:
+        raise ProbeError("invalid PNG compression") from error
     if len(raw) != expected or not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
         raise ProbeError("invalid or excessive PNG decompression")
     result, previous = bytearray(), bytearray(stride)
