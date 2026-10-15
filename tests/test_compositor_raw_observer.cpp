@@ -4,7 +4,26 @@
 #ifndef FRAME_COMPOSITOR_OBSERVER_SOURCE
 #define FRAME_COMPOSITOR_OBSERVER_SOURCE "../receiver/compositor_raw_observer.cpp"
 #endif
+#include <atomic>
+#include <cstdint>
+#include <time.h>
+namespace fixture_clock {
+std::atomic<bool> active{false};
+std::atomic<std::uint64_t> ticks{0};
+void begin() {ticks=UINT64_C(1000000000000);active=true;}
+}
+int frame_fixture_clock_gettime(clockid_t clock,timespec* value) noexcept {
+    if(clock==CLOCK_MONOTONIC && fixture_clock::active.load()) {
+        const auto ns=fixture_clock::ticks.fetch_add(250000);
+        value->tv_sec=static_cast<time_t>(ns/1000000000);value->tv_nsec=static_cast<long>(ns%1000000000);return 0;
+    }
+    return ::clock_gettime(clock,value);
+}
+// Test translation unit only. Production has no clock override, runtime getter
+// or adjusted deadline; all ordinary fixture cases retain the real clock.
+#define clock_gettime frame_fixture_clock_gettime
 #include FRAME_COMPOSITOR_OBSERVER_SOURCE
+#undef clock_gettime
 
 #include <algorithm>
 #include <fstream>
@@ -62,8 +81,11 @@ Validation validate_detailed(const Receipt& receipt) noexcept {
         writer_stubs::immutable_receipt=false;
     if(writer_stubs::validate_delay_ns) {
         const auto delay=writer_stubs::validate_delay_ns;
-        const timespec pause{static_cast<time_t>(delay/1000000000),static_cast<long>(delay%1000000000)};
-        nanosleep(&pause,nullptr);
+        if(fixture_clock::active.load())fixture_clock::ticks.fetch_add(delay);
+        else {
+            const timespec pause{static_cast<time_t>(delay/1000000000),static_cast<long>(delay%1000000000)};
+            nanosleep(&pause,nullptr);
+        }
     }
     if(writer_stubs::retire_during_validate)writer_stubs::current=false;
     if(writer_stubs::stop_during_validate)stopping=true;
@@ -298,6 +320,7 @@ void revalidation_controls() {
     const std::string dir(directory),name=dir+"/capture.jsonl";
     check(path(name.c_str(),output_path,sizeof(output_path)));owner_pid=getpid();
     const auto prepare=[&] {
+        fixture_clock::active=false;
         reset_validation();stopping=false;writer_stubs::finalized=false;writer_stubs::drained=0;
         writer_stubs::count=2;writer_stubs::arm_required=false;writer_stubs::armed=false;
         writer_stubs::records[0]={};writer_stubs::records[0].kind=runtime::Kind::RawMatched;writer_stubs::records[0].raw=raw_fixture();
@@ -351,10 +374,10 @@ void revalidation_controls() {
     prepare();++writer_stubs::records[1].receipt.resource.image.extent.width;
     text=run();check(!writer_stubs::validates);
     check(text.find("\"compatibility_reason_bits\":134217728")!=std::string::npos && text.find("\"attempt_count\":0")!=std::string::npos);
-    prepare();writer_stubs::initial_refusals=JoinAttemptLimit;capture_started_ns=now()-DurationNs+2000000;
+    prepare();writer_stubs::initial_refusals=JoinAttemptLimit;fixture_clock::begin();capture_started_ns=now()-DurationNs+5000000;
     text=run();check(writer_stubs::validates>0 && writer_stubs::validates<JoinAttemptLimit);
     check(text.find("\"last_outcome\":\"capture_deadline\"")!=std::string::npos && text.find("\"deadline_reached\":true")!=std::string::npos);
-    prepare();writer_stubs::validate_delay_ns=10000000;capture_started_ns=now()-DurationNs+5000000;
+    prepare();writer_stubs::validate_delay_ns=10000000;fixture_clock::begin();capture_started_ns=now()-DurationNs+5000000;
     text=run();check(writer_stubs::validates==1);
     check(text.find("\"local_cpu_resource_join\":false")!=std::string::npos && text.find("\"journal_current\":true")!=std::string::npos &&
         text.find("\"deadline_reached\":true")!=std::string::npos);
@@ -364,7 +387,7 @@ void revalidation_controls() {
     check(!unlink(name.c_str()));
     prepare();writer_stubs::count=1;writer_stubs::delivery_progress.delivered=0;
     writer_stubs::delivery_progress.transient_deferred=7;writer_stubs::delivery_progress.pending_waits=11;
-    capture_started_ns=now()-DurationNs+2000000;
+    fixture_clock::begin();capture_started_ns=now()-DurationNs+2000000;
     check(write_background(nullptr)==nullptr && !writer_stubs::validates && writer_stubs::drained==1);
     text=read_file(name);
     for(const auto* field:{"\"initial_receipt_delivery\":{\"attempt_limit\":64,\"requested\":1,\"delivered\":0",
