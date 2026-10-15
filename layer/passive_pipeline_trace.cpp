@@ -53,10 +53,10 @@
     static_cast<unsigned char>(((value) >> 16) & 255), \
     static_cast<unsigned char>(((value) >> 24) & 255)
 extern "C" {
-__attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_trace_sampling_scope[60] = {
-    'F','C','M','S','M','P','0','3',
+__attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_trace_sampling_scope[64] = {
+    'F','C','M','S','M','P','0','4',
     SAMPLING_LE(frame_compositor_sampling::Budget::Version),
-    SAMPLING_LE(60),
+    SAMPLING_LE(64),
     SAMPLING_LE(frame_compositor_sampling::Budget::DrawLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::ExecuteLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::SubmitLimit),
@@ -67,7 +67,8 @@ __attribute__((visibility("hidden"),used)) extern const unsigned char frame_comp
     SAMPLING_LE(2),
     SAMPLING_LE(frame_compositor_sampling::Budget::DenialSampleLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::DiagnosticsVersion),
-    SAMPLING_LE(32)
+    SAMPLING_LE(32),
+    SAMPLING_LE(frame_compositor_sampling::Budget::PublicSnapshotLimit)
 };
 }
 #undef SAMPLING_LE
@@ -107,6 +108,7 @@ struct Capture {
     std::array<ProbeSlot, ProbeSlotCount> probeSlots{};
     std::atomic<std::uint64_t> probeSlotOmitted{0}, probeMetadataUnavailable{0}, probePublicationRefused{0};
     std::uint64_t probesFiltered = 0, probesUnknown = 0, probesMatched = 0, probesQuotaOmitted = 0, probesOutputOmitted = 0;
+    std::uint64_t publicDrawSnapshots = 0, publicDrawSnapshotsQuotaOmitted = 0, exactTargetSnapshots = 0;
     std::atomic<std::uint64_t> probesTimeDeferred{0}, probesGeneral{0}, probesDistortion{0};
     std::atomic<std::uint64_t> probeClassificationsAdmitted{0}, probeClassificationsOmitted{0};
     struct ProbeReasonStats {
@@ -136,6 +138,7 @@ struct Capture {
         return true;
     }
     void consumeProbe(std::uint32_t slot, const frame_bindings::TargetSnapshotProbeResult& result) noexcept {
+        if (result.publicSnapshotQuotaOmitted) ++publicDrawSnapshotsQuotaOmitted;
         if (result.outcome == frame_bindings::TargetProbeOutcome::Filtered) ++probesFiltered;
         else if (result.outcome == frame_bindings::TargetProbeOutcome::QuotaOmitted) ++probesQuotaOmitted;
         else if (result.outcome == frame_bindings::TargetProbeOutcome::ExactMatch) ++probesMatched;
@@ -167,13 +170,16 @@ struct Capture {
                     event.probeSamplingPeriod, replayNs, event.pipeline, event.pipelineGeneration, event.probeSamplingClass};
             }
         }
-        if (result.outcome == frame_bindings::TargetProbeOutcome::ExactMatch && result.snapshot) {
+        if (result.snapshot && result.snapshotProvenance != frame_bindings::SnapshotProvenance::None) {
             const auto cookie = bindingSnapshots.fetch_add(1, std::memory_order_relaxed);
             if (cookie < BindingSnapshotLimit) {
                 bindingResults[cookie] = *result.snapshot; bindingReady[cookie] = true;
                 auto event = retained.event;
                 event.kind = Kind::Bindings; event.bindingCookie = cookie;
                 event.probeReplayOrder = result.replayOrder; event.probeInvocationTag = result.invocationTag;
+                event.probeSnapshotProvenance = result.snapshotProvenance;
+                if (result.snapshotProvenance == frame_bindings::SnapshotProvenance::UnassociatedPublicDraw) ++publicDrawSnapshots;
+                else ++exactTargetSnapshots;
                 if (!events.push(event)) ++probesOutputOmitted;
             }
         }
@@ -182,7 +188,7 @@ struct Capture {
     static_assert(sizeof(probeSlots) < 512 * 1024, "Probe retention must remain small and fixed");
     bool serializeProbeDiagnostics(char* out, std::size_t capacity, std::size_t& used) const {
         bool valid = append(out, capacity, used,
-            ",\"target_probe_diagnostics\":{\"version\":1,\"clock_scope\":\"background_replay_not_native_frame\","
+            ",\"target_probe_diagnostics\":{\"version\":2,\"clock_scope\":\"background_replay_not_native_frame\","
             "\"period_ns\":60000000,\"time_deferred\":%llu,\"general_samples\":%llu,\"distortion_samples\":%llu,"
             "\"classifications_admitted\":%llu,\"classifications_omitted\":%llu,"
             "\"encountered_reason_bits\":%llu,\"reasons\":{",
@@ -213,7 +219,8 @@ struct Capture {
                 "\"draw_pipeline\":\"%llx\",\"draw_pipeline_generation\":%llu,"
                 "\"requested_command\":\"%llx\",\"requested_layout\":\"%llx\","
                 "\"observed_target_tag\":%llu,\"observed_target_cookie\":%llu,\"observed_target_device\":%llu,"
-                "\"binding\":%u,\"examined_image_bindings\":%u,\"current_target_errors\":%u,\"identities\":{",
+                "\"binding\":%u,\"examined_image_bindings\":%u,\"current_target_errors\":%u,"
+                "\"descriptor_state_flags\":%u,\"identities\":{",
                 i ? "," : "", frame_bindings::targetProbeReasonName(d.reason), static_cast<unsigned>(d.outcome),
                 static_cast<unsigned long long>(d.reasonMask), d.observations,
                 static_cast<unsigned long long>(sample.order), static_cast<unsigned long long>(sample.period),
@@ -221,13 +228,15 @@ struct Capture {
                 static_cast<unsigned long long>(sample.pipeline), static_cast<unsigned long long>(sample.pipelineGeneration),
                 static_cast<unsigned long long>(d.requestedCommand), static_cast<unsigned long long>(d.requestedLayout),
                 static_cast<unsigned long long>(d.observedTargetTag), static_cast<unsigned long long>(d.observedTargetCookie),
-                static_cast<unsigned long long>(d.observedTargetDevice), d.binding, d.examinedImageBindings, d.currentTargetErrors);
+                static_cast<unsigned long long>(d.observedTargetDevice), d.binding, d.examinedImageBindings,
+                d.currentTargetErrors, d.descriptorStateFlags);
             const std::pair<const char*, frame_bindings::Identity> identities[] = {
                 {"command",d.command},{"layout",d.layout},{"command_layout",d.commandLayout},{"bound_set",d.boundSet},
                 {"set",d.set},{"set_layout",d.setLayout},{"set_declared_layout",d.setDeclaredLayout},{"pool",d.pool},
                 {"target_image",d.currentTargetImage},{"target_view",d.currentTargetView},{"target_memory",d.currentTargetMemory},
                 {"descriptor_view",d.descriptorView},{"candidate_view",d.candidateView},
-                {"candidate_image",d.candidateImage},{"candidate_memory",d.candidateMemory}};
+                {"candidate_image",d.candidateImage},{"candidate_memory",d.candidateMemory},
+                {"descriptor_conversion",d.descriptorConversion}};
             bool firstIdentity = true;
             for (const auto& identity : identities) {
                 valid = valid && append(out, capacity, used, "%s\"%s\":[\"%llx\",%llu]",
@@ -236,7 +245,42 @@ struct Capture {
                     static_cast<unsigned long long>(identity.second.generation));
                 firstIdentity = false;
             }
-            valid = valid && append(out, capacity, used, "}}");
+            valid = valid && append(out, capacity, used, "}");
+            const std::pair<const char*, const frame_bindings::extensions::ChainSummary*> chains[] = {
+                {"descriptor_view_chain", &d.descriptorViewChain}, {"descriptor_image_chain", &d.descriptorImageChain}};
+            for (const auto& entry : chains) {
+                const auto& chain = *entry.second;
+                const bool observed = d.observations & (entry.second == &d.descriptorViewChain ?
+                    frame_bindings::ProbeViewObserved : frame_bindings::ProbeImageObserved);
+                valid = valid && append(out, capacity, used,
+                    ",\"%s\":{\"observed\":%s,\"complete\":%s,\"error\":%u,\"error_flags\":%u,\"count\":%u,\"types\":[",
+                    entry.first, observed ? "true" : "false", observed && chain.complete ? "true" : "false",
+                    static_cast<unsigned>(chain.error), chain.errorFlags, chain.count);
+                for (std::size_t j = 0; j < std::min<std::size_t>(chain.count, chain.types.size()); ++j)
+                    valid = valid && append(out, capacity, used, "%s%u", j ? "," : "", static_cast<unsigned>(chain.types[j]));
+                valid = valid && append(out, capacity, used, "]}");
+            }
+            valid = valid && append(out, capacity, used, "}");
+        }
+        valid = valid && append(out, capacity, used,
+            "]},\"public_draw_diagnostics\":{\"snapshot_limit\":16,\"shared_snapshot_limit\":32,"
+            "\"snapshots\":%llu,\"quota_omitted\":%llu,\"exact_target_snapshots\":%llu,"
+            "\"source_frame_associated\":false,\"gpu_consumed\":false},"
+            "\"target_retirement_diagnostics\":{\"version\":1,"
+            "\"scope\":\"ordered_public_destroy_call_not_gpu_completion\",\"resources\":[",
+            static_cast<unsigned long long>(publicDrawSnapshots), static_cast<unsigned long long>(publicDrawSnapshotsQuotaOmitted),
+            static_cast<unsigned long long>(exactTargetSnapshots));
+        const auto retirements = bindings.targetRetirementDiagnostics();
+        constexpr const char* kinds[] = {"image", "view", "memory"};
+        constexpr const char* operations[] = {"none", "destroy_image_call", "destroy_view_call", "free_memory_call", "destroy_device_call"};
+        for (std::size_t i = 0; i < retirements.resources.size(); ++i) {
+            const auto& record = retirements.resources[i];
+            const auto operation = static_cast<unsigned>(record.operation);
+            valid = valid && append(out, capacity, used,
+                "%s{\"kind\":\"%s\",\"observed\":%s,\"identity\":[\"%llx\",%llu],\"replay_order\":%llu,\"operation\":\"%s\"}",
+                i ? "," : "", kinds[i], operation ? "true" : "false",
+                static_cast<unsigned long long>(record.identity.handle), static_cast<unsigned long long>(record.identity.generation),
+                static_cast<unsigned long long>(record.replayOrder), operation < std::size(operations) ? operations[operation] : "unknown");
         }
         return valid && append(out, capacity, used, "]}");
     }
@@ -457,8 +501,12 @@ struct Capture {
 #ifdef FRAME_MASK_COMPOSITOR_RAW
         if (e.kind == Kind::Bindings && e.probeInvocationTag)
             valid = valid && append(out, sizeof(out), used,
-                ",\"target_probe_replay_order\":%llu,\"target_probe_invocation_tag\":%llu",
-                static_cast<unsigned long long>(e.probeReplayOrder), static_cast<unsigned long long>(e.probeInvocationTag));
+                ",\"target_probe_replay_order\":%llu,\"target_probe_invocation_tag\":%llu,"
+                "\"snapshot_provenance\":\"%s\",\"target_matched\":%s,\"source_frame_associated\":false",
+                static_cast<unsigned long long>(e.probeReplayOrder), static_cast<unsigned long long>(e.probeInvocationTag),
+                e.probeSnapshotProvenance == frame_bindings::SnapshotProvenance::ExactTarget ? "exact_target" :
+                    e.probeSnapshotProvenance == frame_bindings::SnapshotProvenance::UnassociatedPublicDraw ? "unassociated_public_draw" : "none",
+                e.probeSnapshotProvenance == frame_bindings::SnapshotProvenance::ExactTarget ? "true" : "false");
 #endif
         if (e.kind == Kind::Bindings)
             valid = valid && binding && serializeBindings(*binding, out, sizeof(out), used);
@@ -560,13 +608,16 @@ struct Capture {
             "\"execute_child_limit\":%u,\"submit_command_limit\":%u,"
             "\"binding_snapshots_require_import_request\":true,"
             "\"lifecycle_survives_trace_cap\":true,\"binding_probe_limit\":%u,\"binding_probe_slots\":256,"
-            "\"binding_snapshots_require_target_match\":true,\"target_descriptor_set\":0,\"target_bindings\":[",
+            "\"binding_snapshots_require_target_match\":false,\"target_snapshots_require_target_match\":true,"
+            "\"public_draw_snapshot_limit\":16,\"public_draw_snapshot_entry\":\"PS_DISTORT\","
+            "\"public_draw_snapshots_unassociated\":true,\"target_retirement_diagnostics_version\":1,"
+            "\"target_descriptor_set\":0,\"target_bindings\":[",
             frame_compositor_sampling::Budget::DrawLimit, frame_compositor_sampling::Budget::ExecuteLimit,
             frame_compositor_sampling::Budget::SubmitLimit, frame_compositor_sampling::Budget::ProbeLimit);
         for (std::size_t i = 0; headerValid && i < frame_bindings::TargetBindings.size(); ++i)
             headerValid = append(header, sizeof(header), total, "%s%u", i ? "," : "", frame_bindings::TargetBindings[i]);
         headerValid = headerValid && append(header, sizeof(header), total,
-            "],\"target_diagnostics_version\":1,\"target_denial_sample_limit\":16,"
+            "],\"target_diagnostics_version\":2,\"target_denial_sample_limit\":16,"
             "\"probe_period_ns\":60000000,\"probe_general_per_period\":1,\"probe_distortion_per_period\":1,"
             "\"probe_distortion_entry\":\"PS_DISTORT\",\"probe_window_clock\":\"background_owner_elapsed\","
             "\"probe_deadline_reset_allowed\":false,\"probe_classifications_per_period\":32}");
@@ -894,7 +945,7 @@ void recordedDraw(std::uint64_t device, VkCommandBuffer command, std::uint32_t k
     event.drawKind = kind;
     if (!c.reserveProbeSlot(event, slot)) return;
     if (!c.bindings.requestTargetSnapshotProbe(device, command, (VkPipelineLayout)(std::uintptr_t)event.layout,
-                                               tag, ownedCookie, slot)) {
+                                               tag, ownedCookie, slot, distortion)) {
         c.probePublicationRefused.fetch_add(1, std::memory_order_relaxed);
         c.probeSlots[slot].owned.store(false, std::memory_order_release);
     }

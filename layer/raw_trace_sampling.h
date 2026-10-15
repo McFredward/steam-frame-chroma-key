@@ -60,16 +60,21 @@ private:
     std::atomic<std::uint64_t> attempts_{0};
 };
 struct Budget {
-    static constexpr std::uint32_t Version = 3;
+    static constexpr std::uint32_t Version = 4;
     static constexpr std::uint32_t DrawLimit = 32, ExecuteLimit = 16, SubmitLimit = 16, SnapshotLimit = 32, ProbeLimit = 4096;
     // Bit 0 reserves snapshots until import publication; bit 1 preserves the
     // lifecycle owner when optional trace output reaches its existing cap. Bit 2
-    // requires exact imported image/view/memory generations at ordered replay;
+    // requires exact imported image/view/memory generations for target-matched
+    // snapshots at ordered replay;
     // the inspected descriptor subset remains set 0 / frame_bindings::TargetBindings.
     // Bits 3/4/5 authenticate typed public denials, time-spread permits and a
     // separate permit for the observed PS_DISTORT pipeline entry. Entry names
     // only select observations; they never prove source video or eye identity.
-    static constexpr std::uint32_t Flags = 63, DenialSampleLimit = 16, DiagnosticsVersion = 1;
+    // Bit 6 permits a separately labelled public distortion diagnostic. Its
+    // snapshots share the existing total ceiling and never establish a match
+    // to the selected native import, source frame, eye or GPU execution.
+    static constexpr std::uint32_t Flags = 127, DenialSampleLimit = 16, DiagnosticsVersion = 2;
+    static constexpr std::uint32_t PublicSnapshotLimit = 16;
     ProbeSchedule general, distortion;
     ProbeClassificationSchedule classifications;
     Quota<ProbeLimit> probes;

@@ -59,10 +59,14 @@ void footer_capacity(Capture& c) {
         sample.order=sample.period=sample.replayNs=sample.pipeline=sample.pipelineGeneration=UINT64_MAX;
         sample.samplingClass=UINT32_MAX;d.reason=static_cast<frame_bindings::TargetProbeReason>(i);
         d.reasonMask=d.requestedCommand=d.requestedLayout=d.observedTargetTag=d.observedTargetCookie=d.observedTargetDevice=UINT64_MAX;
-        d.binding=d.examinedImageBindings=d.currentTargetErrors=d.observations=UINT32_MAX;
+        d.binding=d.examinedImageBindings=d.currentTargetErrors=d.observations=d.descriptorStateFlags=UINT32_MAX;
         for(auto* id:{&d.command,&d.layout,&d.commandLayout,&d.boundSet,&d.set,&d.setLayout,&d.setDeclaredLayout,&d.pool,
                      &d.currentTargetImage,&d.currentTargetView,&d.currentTargetMemory,&d.descriptorView,
-                     &d.candidateView,&d.candidateImage,&d.candidateMemory})*id={UINT64_MAX,UINT64_MAX};
+                     &d.candidateView,&d.candidateImage,&d.candidateMemory,&d.descriptorConversion})*id={UINT64_MAX,UINT64_MAX};
+        for(auto* chain:{&d.descriptorViewChain,&d.descriptorImageChain}) {
+            chain->count=UINT32_MAX;chain->errorFlags=UINT32_MAX;
+            for(auto& type:chain->types)type=static_cast<VkStructureType>(UINT32_MAX);
+        }
     }
     char buffer[FooterReserve];std::size_t used=0;
     require(c.serializeProbeDiagnostics(buffer,sizeof(buffer),used));
@@ -73,11 +77,12 @@ void footer_capacity(Capture& c) {
 }
 }
 int main(int argc,char** argv) {
-    const unsigned char scope[60]={'F','C','M','S','M','P','0','3',3,0,0,0,60,0,0,0,32,0,0,0,16,0,0,0,16,0,0,0,32,0,0,0,0,16,0,0,63,0,0,0,0,135,147,3,2,0,0,0,16,0,0,0,1,0,0,0,32,0,0,0};
+    const unsigned char scope[64]={'F','C','M','S','M','P','0','4',4,0,0,0,64,0,0,0,32,0,0,0,16,0,0,0,16,0,0,0,32,0,0,0,0,16,0,0,127,0,0,0,0,135,147,3,2,0,0,0,16,0,0,0,2,0,0,0,32,0,0,0,16,0,0,0};
     require(sizeof(frame_compositor_trace_sampling_scope)==sizeof(scope) && !std::memcmp(scope,frame_compositor_trace_sampling_scope,sizeof(scope)));
     const std::string mode=argc==1?"armed":argv[1];
     const bool armed_run=mode!="unarmed",deadline_run=mode=="deadline";
     const bool byte_cap=mode=="byte-cap",event_cap=mode=="event-cap",failed_writer=mode=="failed-writer";
+    const bool public_run=mode=="public-draw";
     char pattern[]="/tmp/frame-raw-arm-trace-XXXXXX";const auto directory=mkdtemp(pattern);require(directory);
     const std::string root(directory),journal=root+"/journal.jsonl",marker=root+"/capture-arm.marker";
     auto& c=capture();c.bindingsEnabled=true;c.core.enable(true);c.importProcessAdmitted=true;c.importJournalOpen=true;
@@ -232,6 +237,40 @@ int main(int argc,char** argv) {
             }
             wait_replayed(c);
             require(c.bindingSnapshots==0 && c.probesFiltered==80 && !c.probesUnknown);
+            if(public_run) {
+                // Reproduce the hardware blind spot: the selected import is
+                // retired while a different, live public descriptor is drawn.
+                // Such observations must remain explicitly unassociated.
+                observeBindings([&](auto& b){b.destroyView(1,handle<VkImageView>(22));
+                    b.destroyImage(1,handle<VkImage>(20));b.freeMemory(1,handle<VkDeviceMemory>(21));});
+                c.rawSampling.general.issue(300*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+                c.rawSampling.classifications.issue(300*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+                recordedDraw(1,command,1);wait_replayed(c);
+                require(c.bindingSnapshots==0 && c.publicDrawSnapshots==0 && c.probesUnknown==1);
+                require(c.publicDrawSnapshotsQuotaOmitted==0); // The public quota is still available.
+                copyEntry(stage.entry,"PS_DISTORT");c.core.pipelineDestroyed(1,12);
+                c.core.pipelineCreated(1,12,11,&stage,1,true,true);c.core.bind(1,number(command),12);
+                for(unsigned i=0;i<20;++i) {
+                    c.rawSampling.distortion.issue((400+i)*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+                    c.rawSampling.classifications.issue((400+i)*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+                    recordedDraw(1,command,1);
+                }
+                wait_replayed(c);
+                require(c.probesUnknown==21 && c.probesMatched==0 && c.bindingSnapshots==16);
+                require(c.publicDrawSnapshots==16 && c.exactTargetSnapshots==0 && c.publicDrawSnapshotsQuotaOmitted==4);
+                for(unsigned i=0;i<16;++i) {
+                    require(c.bindingReady[i] && c.bindingResults[i].sourceComplete && !c.bindingResults[i].gpuConsumedCoherent);
+                    require(c.bindingResults[i].bindings[5].view.identity.handle==number(uiView));
+                }
+                // Other pipeline names cannot spend the public diagnostic
+                // allowance. Their strict retired-target refusal is preserved.
+                copyEntry(stage.entry,"PS_MAIN");c.core.pipelineDestroyed(1,12);
+                c.core.pipelineCreated(1,12,11,&stage,1,true,true);c.core.bind(1,number(command),12);
+                c.rawSampling.general.issue(500*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+                c.rawSampling.classifications.issue(500*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+                recordedDraw(1,command,1);wait_replayed(c);
+                require(c.bindingSnapshots==16 && c.publicDrawSnapshots==16 && c.probesUnknown==22);
+            } else {
             di.imageView=handle<VkImageView>(22);observeBindings([&](auto& b){b.updateSets(1,1,&write,0,nullptr);});
             for(unsigned i=0;i<80;++i) {
                 c.rawSampling.general.issue((200+i)*frame_compositor_sampling::ProbeSchedule::PeriodNs);
@@ -252,6 +291,7 @@ int main(int argc,char** argv) {
             require(c.probesDistortion==1 && c.rawSampling.general.available() && !c.rawSampling.distortion.available());
             require(c.probesQuotaOmitted==49 && c.rawSampling.probes.sampled()==161 && c.bindingSnapshots==32);
             require(c.probeReasons[static_cast<unsigned>(frame_bindings::TargetProbeReason::SnapshotQuota)].count==49);
+            }
             require(c.lifecycleReady() && !c.events.finished() && !c.events.dropped());
             // A forked child cannot reopen/reset budgets or touch the copied
             // owning writer. Parent admission and counters stay unchanged.
@@ -278,9 +318,19 @@ int main(int argc,char** argv) {
     require(text.find("\"raw_trace_sampling\":{\"intentional\":true")!=std::string::npos);
     require(text.find("\"target_descriptor_set\":0,\"target_bindings\":[0,2,3,4,6,9,25,31]")!=std::string::npos);
     require(text.find("\"deadline_seconds\":120")!=std::string::npos);
-    require(text.find("\"target_diagnostics_version\":1")!=std::string::npos);
+    require(text.find("\"target_diagnostics_version\":2")!=std::string::npos);
+    require(text.find("\"public_draw_snapshot_limit\":16")!=std::string::npos);
+    require(text.find("\"target_snapshots_require_target_match\":true")!=std::string::npos);
     require(text.find("\"probe_period_ns\":60000000")!=std::string::npos);
     require(text.find("\"target_probe_diagnostics\":{")!=std::string::npos);
+    if(public_run) {
+        require(text.find("\"snapshot_provenance\":\"unassociated_public_draw\",\"target_matched\":false")!=std::string::npos);
+        require(text.find("\"snapshots\":16,\"quota_omitted\":4,\"exact_target_snapshots\":0")!=std::string::npos);
+        require(text.find("\"operation\":\"destroy_image_call\"")!=std::string::npos);
+        require(text.find("\"operation\":\"destroy_view_call\"")!=std::string::npos);
+        require(text.find("\"operation\":\"free_memory_call\"")!=std::string::npos);
+        require(text.find("\"descriptor_view_chain\":{\"observed\":false,\"complete\":false")!=std::string::npos);
+    }
     require((text.find("\"byte_cap_reached\":true")!=std::string::npos)==byte_cap);
     require((text.find("\"event\":\"bindings_armed\"")!=std::string::npos)==armed_run);
     require((text.find("\"event\":\"draw_recorded\"")!=std::string::npos)==armed_run);

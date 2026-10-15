@@ -375,3 +375,50 @@ eye/UV, accepted-submit, GPU coherence and mask activation remain unproved and
 disabled. Final software evidence is kept beside the new package under
 `build/private-compositor-periodic-integration-20261015/`. This is not a visible
 passthrough implementation or authorization for another device installation.
+
+## Periodic capture exposes the first-resource blind spot (2026-10-15)
+
+The authorized v7 run on `88f0e1e` passed native startup, armed before connection,
+and displayed GloomhavenVR normally according to the operator. It selected one
+P010, 1152 by 4608 import after excluding 57 public candidates. The unchanged
+CPU join succeeded on its second validation after one classified transient
+refusal. Private acquisition remained 425 bytes; neither the deadline nor the
+immutable candidate was replaced to obtain that result.
+
+The completed journal replayed all 1,182,572 publications without recorded loss,
+queue overflow or byte-cap closure. The new schedule recorded 2964 probes,
+including 1477 distortion-class observations, across the remaining window.
+It therefore distinguishes a real matching failure from the old first-N quota:
+
+- Six early probes, represented by a `PS_MAIN` draw, stopped at an incomplete
+  binding-9 descriptor. Its stored view was older and different from the tagged
+  view. Candidate view/image metadata was not looked up after that refusal, so
+  the precise cause of its incompleteness is not established.
+- The other 2958 probes stopped earlier at `target_current_incomplete`.
+  Errors 48 mean `ImportMissingImage | ImportMissingView`: both original target
+  entries were absent from current lifecycle tracking. The first such probe
+  replayed about 31.15 s after capture start, and the final one at 119.94 s.
+  They did not inspect the distortion descriptors at all. This proves neither
+  the specific public retirement call nor GPU completion.
+
+Raw output was 13,935 bytes and the complete journal 155,276 bytes. All admitted
+classification/probe bounds held, with zero exact-target snapshots. Increasing
+quotas, accepting a stale handle or treating a shader name as a frame identity
+would not repair this structural blind spot.
+
+Manual recovery passed the original SteamVR UI gate. The old compositor exited;
+all 15 observed current managed processes had no owned diagnostic mappings.
+Twelve archive files were copied and hash-verified before removing all 45 exact
+session/input files. The Frame was released for standby. Native files, pixels,
+shader behavior and the PC sender were unchanged. Private evidence and the
+independent read-only review are retained in
+`build/private-compositor-periodic-integration-20261015/` and
+`build/private-compositor-periodic-evidence-review-20261015/`.
+
+The resulting [public-draw diagnostic](COMPOSITOR-PUBLIC-DRAW-DIAGNOSTICS.md)
+keeps exact-target admission strict and separately labels bounded observations
+which cannot establish that association. An earlier catch-up capture already
+contains 16 complete distortion/YUV snapshots across eight generations. Merely
+repeating that census is not the next goal: prepare the app-owned payload
+carriage experiment, and require any further device capture to answer a new
+lifecycle or carriage question.
