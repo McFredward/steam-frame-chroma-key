@@ -48,5 +48,15 @@ int main() {
     require(issued == 4000 && issued < frame_compositor_sampling::Budget::ProbeLimit);
     require(!general.issue(ProbeSchedule::DurationNs) && !general.take(period));
     require(!general.issue(0)); // Expiration is permanent, not another window.
+    frame_compositor_sampling::ProbeClassificationSchedule classification;
+    unsigned classifications = 0;
+    for (std::uint64_t now = 0; now < ProbeSchedule::DurationNs; now += ProbeSchedule::PeriodNs) {
+        require(classification.issue(now));
+        for (unsigned i = 0; i < 32; ++i) {require(classification.take(period));++classifications;}
+        for (unsigned i = 0; i < 16; ++i) require(!classification.take(period));
+        require(!classification.issue(now));
+    }
+    require(classifications == 64000);
+    require(!classification.issue(ProbeSchedule::DurationNs) && !classification.take(period));
     std::cout << "bounded compositor probe schedule: " << checks << " checks passed\n";
 }

@@ -53,10 +53,10 @@
     static_cast<unsigned char>(((value) >> 16) & 255), \
     static_cast<unsigned char>(((value) >> 24) & 255)
 extern "C" {
-__attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_trace_sampling_scope[56] = {
+__attribute__((visibility("hidden"),used)) extern const unsigned char frame_compositor_trace_sampling_scope[60] = {
     'F','C','M','S','M','P','0','3',
     SAMPLING_LE(frame_compositor_sampling::Budget::Version),
-    SAMPLING_LE(56),
+    SAMPLING_LE(60),
     SAMPLING_LE(frame_compositor_sampling::Budget::DrawLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::ExecuteLimit),
     SAMPLING_LE(frame_compositor_sampling::Budget::SubmitLimit),
@@ -66,7 +66,8 @@ __attribute__((visibility("hidden"),used)) extern const unsigned char frame_comp
     SAMPLING_LE(frame_compositor_sampling::ProbeSchedule::PeriodNs),
     SAMPLING_LE(2),
     SAMPLING_LE(frame_compositor_sampling::Budget::DenialSampleLimit),
-    SAMPLING_LE(frame_compositor_sampling::Budget::DiagnosticsVersion)
+    SAMPLING_LE(frame_compositor_sampling::Budget::DiagnosticsVersion),
+    SAMPLING_LE(32)
 };
 }
 #undef SAMPLING_LE
@@ -107,6 +108,7 @@ struct Capture {
     std::atomic<std::uint64_t> probeSlotOmitted{0}, probeMetadataUnavailable{0}, probePublicationRefused{0};
     std::uint64_t probesFiltered = 0, probesUnknown = 0, probesMatched = 0, probesQuotaOmitted = 0, probesOutputOmitted = 0;
     std::atomic<std::uint64_t> probesTimeDeferred{0}, probesGeneral{0}, probesDistortion{0};
+    std::atomic<std::uint64_t> probeClassificationsAdmitted{0}, probeClassificationsOmitted{0};
     struct ProbeReasonStats {
         std::uint64_t count = 0, firstOrder = 0, lastOrder = 0, firstPeriod = 0, lastPeriod = 0;
         std::uint64_t firstReplayNs = 0, lastReplayNs = 0;
@@ -182,10 +184,13 @@ struct Capture {
         bool valid = append(out, capacity, used,
             ",\"target_probe_diagnostics\":{\"version\":1,\"clock_scope\":\"background_replay_not_native_frame\","
             "\"period_ns\":60000000,\"time_deferred\":%llu,\"general_samples\":%llu,\"distortion_samples\":%llu,"
+            "\"classifications_admitted\":%llu,\"classifications_omitted\":%llu,"
             "\"encountered_reason_bits\":%llu,\"reasons\":{",
             static_cast<unsigned long long>(probesTimeDeferred.load()),
             static_cast<unsigned long long>(probesGeneral.load()),
-            static_cast<unsigned long long>(probesDistortion.load()), static_cast<unsigned long long>(encounteredProbeReasons));
+            static_cast<unsigned long long>(probesDistortion.load()),
+            static_cast<unsigned long long>(probeClassificationsAdmitted.load()),
+            static_cast<unsigned long long>(probeClassificationsOmitted.load()), static_cast<unsigned long long>(encounteredProbeReasons));
         bool first = true;
         for (std::size_t i = 0; valid && i < probeReasons.size(); ++i) {
             const auto& value = probeReasons[i]; if (!value.count) continue;
@@ -564,7 +569,7 @@ struct Capture {
             "],\"target_diagnostics_version\":1,\"target_denial_sample_limit\":16,"
             "\"probe_period_ns\":60000000,\"probe_general_per_period\":1,\"probe_distortion_per_period\":1,"
             "\"probe_distortion_entry\":\"PS_DISTORT\",\"probe_window_clock\":\"background_owner_elapsed\","
-            "\"probe_deadline_reset_allowed\":false}");
+            "\"probe_deadline_reset_allowed\":false,\"probe_classifications_per_period\":32}");
 #endif
         headerValid = headerValid && append(header, sizeof(header), total, "}\n");
         bool ioGood = headerValid && writeAll(fd, header, total), capped = false;
@@ -608,6 +613,7 @@ struct Capture {
             const auto probeElapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now-writerStart).count());
             rawSampling.general.issue(probeElapsed);
             rawSampling.distortion.issue(probeElapsed);
+            rawSampling.classifications.issue(probeElapsed);
 #endif
             if (!draining && bindingsEnabled && !bindingsArmed.load() && !armPath.empty() && now >= armCheck) {
                 if (now < deadline && armRequested(armPath) && std::chrono::steady_clock::now() < deadline) {
@@ -629,6 +635,7 @@ struct Capture {
 #ifdef FRAME_MASK_COMPOSITOR_RAW
                 importJournalOpen.store(false, std::memory_order_release);
                 rawSampling.general.close(); rawSampling.distortion.close();
+                rawSampling.classifications.close();
 #endif
                 core.enable(false);
                 events.close();
@@ -861,6 +868,11 @@ void recordedDraw(std::uint64_t device, VkCommandBuffer command, std::uint32_t k
         c.probesTimeDeferred.fetch_add(1, std::memory_order_relaxed); return;
     }
     Event event;
+    std::uint64_t classificationPeriod = 0;
+    if (!c.rawSampling.classifications.take(classificationPeriod)) {
+        c.probeClassificationsOmitted.fetch_add(1, std::memory_order_relaxed); return;
+    }
+    c.probeClassificationsAdmitted.fetch_add(1, std::memory_order_relaxed);
     if (!c.core.describeDraw(device, number(command), event)) {
         c.probeMetadataUnavailable.fetch_add(1, std::memory_order_relaxed); return;
     }

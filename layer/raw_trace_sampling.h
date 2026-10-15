@@ -9,37 +9,40 @@
 namespace frame_compositor_sampling {
 // Only the background owner issues time-labelled permits. A draw callback
 // attempts one atomic consumption: no clock, allocation, wait or catch-up burst.
-class ProbeSchedule {
+template<unsigned Credits> class PeriodicCredits {
+    static_assert(Credits > 0 && Credits <= 32);
 public:
     static constexpr std::uint64_t PeriodNs = 60000000, DurationNs = 120000000000;
     bool issue(std::uint64_t elapsed_ns) noexcept {
         if (elapsed_ns >= DurationNs) { close(); return false; }
         const auto period = elapsed_ns / PeriodNs + 1;
         auto state = state_.load(std::memory_order_acquire);
-        while (state != Closed && period > (state >> 1)) {
-            if (state_.compare_exchange_weak(state, (period << 1) | 1,
+        while (state != Closed && period > (state >> 6)) {
+            if (state_.compare_exchange_weak(state, (period << 6) | Credits,
                     std::memory_order_acq_rel, std::memory_order_acquire)) return true;
         }
         return false;
     }
     bool take(std::uint64_t& period) noexcept {
         auto state = state_.load(std::memory_order_acquire);
-        if (state == Closed || !(state & 1)) return false;
+        if (state == Closed || !(state & 63)) return false;
         const auto issued = state;
-        if (!state_.compare_exchange_strong(state, state & ~UINT64_C(1),
+        if (!state_.compare_exchange_strong(state, state - 1,
                 std::memory_order_acq_rel, std::memory_order_acquire)) return false;
-        period = (issued >> 1) - 1;
+        period = (issued >> 6) - 1;
         return true;
     }
     bool available() const noexcept {
         const auto state = state_.load(std::memory_order_acquire);
-        return state != Closed && (state & 1);
+        return state != Closed && (state & 63);
     }
     void close() noexcept { state_.store(Closed, std::memory_order_release); }
 private:
     static constexpr std::uint64_t Closed = UINT64_MAX;
     std::atomic<std::uint64_t> state_{0};
 };
+using ProbeSchedule = PeriodicCredits<1>;
+using ProbeClassificationSchedule = PeriodicCredits<32>;
 template<std::uint32_t Limit> class Quota {
 public:
     bool take() noexcept {
@@ -68,6 +71,7 @@ struct Budget {
     // only select observations; they never prove source video or eye identity.
     static constexpr std::uint32_t Flags = 63, DenialSampleLimit = 16, DiagnosticsVersion = 1;
     ProbeSchedule general, distortion;
+    ProbeClassificationSchedule classifications;
     Quota<ProbeLimit> probes;
     Quota<DrawLimit> draws;
     Quota<ExecuteLimit> executes;
