@@ -7,6 +7,7 @@
 #include "pixel_snapshot_selection.h"
 #include "pixel_readback.h"
 #include "pixel_snapshot_io.h"
+#include "pixel_refusal_status.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -110,8 +111,8 @@ template<class T> Device* deviceFor(T value) {
     const auto found = c.devices.find(dispatchKey(value));
     return found == c.devices.end() ? nullptr : found->second.get();
 }
-template<class F> void observeBindings(F observer) {
-    if (session().allowed) session().tracker->observe(observer);
+template<class F> void observeBindingsAt(const char* site, F observer) {
+    if (session().allowed) session().tracker->observe(observer, site);
 }
 void status(int fd, const char* name, int result = 0) {
     if (fd < 0) return;
@@ -188,7 +189,17 @@ void writer(Device* d) noexcept {
             if (result == frame_pixels::Status::VulkanFailure) { status(progress,"gpu_failure",d->readback.lastResult()); break; }
         }
         if (!d->selected.load(std::memory_order_acquire) && session().tracker->poisoned()) {
-            status(progress,"tracking_refused"); break;
+            // The first failing API freezes these counters. Publication can
+            // briefly follow poisoned(), so retry on this background thread
+            // rather than replace the report with an uninformative refusal.
+            const auto refusal = session().tracker->failureSnapshot();
+            if (refusal.complete) {
+                char bytes[frame_pixel_status::MaximumRefusalBytes]{};
+                const auto count = frame_pixel_status::trackingRefusal(bytes, sizeof(bytes), refusal,
+                    d->selected.load(std::memory_order_acquire), session().armed.load(std::memory_order_acquire));
+                if (count) frame_pixel_io::writeAll(progress, bytes, count);
+                break;
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5)); // Background polling only; never restarts anything.
     }} catch(...) { status(progress,"writer_failed"); }
@@ -332,7 +343,9 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocation
     const auto key=dispatchKey(device);d->DestroyDevice(device,alloc);
     auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.devices.erase(key);
 }
+#define observeBindings(...) observeBindingsAt(__func__, __VA_ARGS__)
 #include "passive_binding_hooks.inc"
+#undef observeBindings
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateShaderModule(VkDevice device,const VkShaderModuleCreateInfo* info,const VkAllocationCallbacks* alloc,VkShaderModule* out) {
     auto* d=deviceFor(device);const auto result=d->CreateShaderModule(device,info,alloc,out);
     if(result==VK_SUCCESS)session().tracker->createShader(d->id,*out,*info);
