@@ -1,15 +1,17 @@
 #include "layer/pixel_capture_tracker.h"
 
 #include <cstdlib>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace frame_pixel_capture {
 struct TestAccess {
-    static std::unique_lock<std::mutex> hold(LiveTracker& tracker) {
-        return std::unique_lock<std::mutex>(tracker.mutex_);
-    }
     static void pinSyntheticModule(LiveTracker& tracker, std::uint64_t device, VkShaderModule module) {
         // The native SPIR-V is not redistributed. Positive state-machine
         // controls mark only this already observed synthetic shader as pinned;
@@ -24,12 +26,15 @@ struct TestAccess {
         return shader ? shader->hash : 0;
     }
     static void exhaustGeneration(LiveTracker& tracker) { tracker.serial_ = UINT64_MAX; }
+    static bool ownerPresent(const LiveTracker& tracker) {
+        return tracker.ownerPresent_.load(std::memory_order_acquire);
+    }
 };
 }
 
 namespace {
 using namespace frame_pixel_capture;
-unsigned checks = 0;
+std::atomic<unsigned> checks{0};
 void require(bool value, const char* message) {
     ++checks;
     if (!value) { std::cerr << "FAIL: " << message << '\n'; std::exit(1); }
@@ -39,6 +44,51 @@ template<class T> T h(std::uint64_t value) {
     else return static_cast<T>(value);
 }
 template<class T> T info(VkStructureType type) { T value{}; value.sType = type; return value; }
+
+// Hold an actual production observe callback, rather than manually locking a
+// test-only mutex. The timeout bounds a broken fixture; it is not an admission
+// deadline, retry loop or automatic timer in the compositor implementation.
+struct ObservationGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false, released = false;
+    void hold() {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true; changed.notify_all();
+        require(changed.wait_for(lock, std::chrono::seconds(5), [&] { return released; }),
+                "test releases the observed metadata owner");
+    }
+    void waitEntered() {
+        std::unique_lock<std::mutex> lock(mutex);
+        require(changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }),
+                "actual metadata observation acquired tracker owner");
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true; changed.notify_all();
+    }
+};
+
+struct CallerProgress {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool started = false, returned = false;
+    void start() {
+        std::lock_guard<std::mutex> lock(mutex);
+        started = true; changed.notify_all();
+    }
+    void finish() {
+        std::lock_guard<std::mutex> lock(mutex);
+        returned = true; changed.notify_all();
+    }
+    void requireWaiting() {
+        std::unique_lock<std::mutex> lock(mutex);
+        require(changed.wait_for(lock, std::chrono::seconds(5), [&] { return started; }),
+                "second native-observation caller started");
+        require(!changed.wait_for(lock, std::chrono::milliseconds(25), [&] { return returned; }),
+                "parallel metadata caller cannot return or drop before owner finishes");
+    }
+};
 constexpr std::uint64_t device = 1;
 const auto sl = h<VkDescriptorSetLayout>(10), uiSl = h<VkDescriptorSetLayout>(11);
 const auto pl = h<VkPipelineLayout>(20), uiPl = h<VkPipelineLayout>(21);
@@ -339,18 +389,6 @@ void commandReuseAndLoss() {
     require(!loss->tracker.observe([](auto& core) { core.reportLoss(frame_bindings::Reason::Capacity); }), "Core loss poisons capture");
     require(loss->tracker.poisoned() && loss->tracker.failure() == Failure::CoreLoss, "Core loss remains sticky");
     loss.reset();
-    auto contended = std::make_unique<LiveTracker>();
-    std::atomic<bool> held{false}, release{false};
-    std::thread owner([&] {
-        auto lock = TestAccess::hold(*contended);
-        held.store(true, std::memory_order_release);
-        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
-    });
-    while (!held.load(std::memory_order_acquire)) std::this_thread::yield();
-    require(!contended->observe([](auto&) {}) && contended->poisoned(), "outer try-lock contention never waits or recovers silently");
-    release.store(true, std::memory_order_release); owner.join();
-    require(!contended->observe([](auto&) {}), "poison survives later available lock");
-    contended.reset();
     auto exhausted = std::make_unique<LiveTracker>();
     TestAccess::exhaustGeneration(*exhausted);
     auto create = info<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
@@ -470,36 +508,213 @@ void firstFailureTelemetry() {
             std::strcmp(ownFull.site, "createCommandPool") == 0 && !ownFull.coreLostState,
             "tracker capacity remains distinct from Core table exhaustion");
 }
-void contentionTelemetry() {
-    // Two actual blocked callers race to publish. A third thread may inspect
-    // the report before they return: it must never see a mixed or partial record.
-    for (unsigned repeat = 0; repeat < 32; ++repeat) {
+void overlappingImageBinding() {
+    auto f = std::make_unique<Fixture>();
+    const auto extraImage = h<VkImage>(71);
+    const auto extraView = h<VkImageView>(91);
+    const auto extraMemory = h<VkDeviceMemory>(81);
+    require(f->tracker.observe([&](auto& core) {
+        core.createImage(device, extraImage, f->imageInfo);
+    }, "traceCreateImage"), "observe actual image before parallel allocation/bind");
+    ObservationGate owner;
+    CallerProgress other;
+    bool allocated = false, bound = false;
+    std::thread allocator([&] {
+        allocated = f->tracker.observe([&](auto& core) {
+            auto allocation = info<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+            allocation.allocationSize = 32 * 1024 * 1024;
+            core.allocateMemory(device, extraMemory, allocation);
+            owner.hold();
+        }, "traceAllocateMemory");
+    });
+    owner.waitEntered();
+    std::thread binder([&] {
+        other.start();
+        bound = f->tracker.observe([&](auto& core) {
+            core.bindImageMemory(device, extraImage, extraMemory, 128);
+            auto create = f->viewInfo; create.image = extraImage;
+            core.createView(device, extraView, create);
+        }, "traceBindImageMemory");
+        other.finish();
+    });
+    other.requireWaiting();
+    require(!f->tracker.poisoned() && TestAccess::ownerPresent(f->tracker),
+            "real parallel native metadata overlap is not a global tracking failure");
+    owner.release(); allocator.join(); binder.join();
+    require(allocated && bound && !f->tracker.poisoned(),
+            "both overlapping resource observations finish without loss");
+    f->write(ds, extraView);
+    const auto candidate = f->finishPass();
+    require(candidate.binding.image.identity.handle == frame_bindings::handle(extraImage) &&
+            candidate.binding.view.identity.handle == frame_bindings::handle(extraView) &&
+            candidate.binding.image.memory.handle == frame_bindings::handle(extraMemory) &&
+            candidate.binding.image.memory.generation && candidate.binding.image.memoryOffset == 128 &&
+            candidate.binding.image.allocation.complete,
+            "parallel traceBindImageMemory retains exact current image, view, allocation generation and offset");
+    require(!f->tracker.failureSnapshot().complete && !TestAccess::ownerPresent(f->tracker),
+            "successful contention produces no refusal record and releases the metadata owner");
+}
+
+void reentryAndExceptionRefusal() {
+    for (unsigned kind = 0; kind < 2; ++kind) {
         auto tracker = std::make_unique<LiveTracker>();
-        auto lock = TestAccess::hold(*tracker);
-        std::atomic<unsigned> ready{0};
-        std::atomic<bool> start{false};
-        bool leftResult = true, rightResult = true;
-        auto blocked = [&](const char* site, bool& result) {
-            ready.fetch_add(1, std::memory_order_release);
-            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
-            result = tracker->observe([](auto&) { std::abort(); }, site);
-        };
-        std::thread left(blocked, "vkBlockedLeft", std::ref(leftResult));
-        std::thread right(blocked, "vkBlockedRight", std::ref(rightResult));
-        while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
-        start.store(true, std::memory_order_release);
-        FailureSnapshot first;
-        do { first = tracker->failureSnapshot(); } while (!first.complete);
-        require(first.failure == Failure::Contention && first.site &&
-                (std::strcmp(first.site, "vkBlockedLeft") == 0 || std::strcmp(first.site, "vkBlockedRight") == 0) &&
-                !first.coreLostState,
-                "contention winner publishes its own API and complete cause atomically");
-        left.join(); right.join(); lock.unlock();
-        require(!leftResult && !rightResult && sameFailure(first, tracker->failureSnapshot()),
-                "later competing refusal cannot replace the first API site");
-        require(!tracker->observe([](auto&) { std::abort(); }, "vkAfterContention") &&
-                sameFailure(first, tracker->failureSnapshot()), "unlocking never heals or mutates first refusal");
+        bool innerRan = false, innerResult = true;
+        require(!tracker->observe([&](auto&) {
+            if (!kind) innerResult = tracker->observe([&](auto&) { innerRan = true; }, "recursiveObservation");
+            else innerResult = tracker->destroyShader(device, fs);
+        }, "outerObservation"), "same-thread reentry refuses without deadlocking");
+        const auto failure = tracker->failureSnapshot();
+        require(!innerResult && !innerRan && failure.complete && failure.failure == Failure::Contention &&
+                std::strcmp(failure.site, kind ? "destroyShader" : "recursiveObservation") == 0 && !failure.coreLostState,
+                "true recursive caller publishes its own site and never enters Core");
+        require(!TestAccess::ownerPresent(*tracker), "recursive failure clears the outer owner before unlocking");
+        require(!tracker->observe([](auto&) { std::abort(); }, "afterReentry") &&
+                sameFailure(failure, tracker->failureSnapshot()), "recursive failure remains sticky");
     }
+    auto tracker = std::make_unique<LiveTracker>();
+    require(!tracker->observe([](auto&) { throw std::runtime_error("malformed metadata callback"); }, "throwingObservation"),
+            "callback exception is contained before crossing native API boundary");
+    const auto failure = tracker->failureSnapshot();
+    require(failure.complete && failure.failure == Failure::Unknown &&
+            std::strcmp(failure.site, "throwingObservation") == 0 && !TestAccess::ownerPresent(*tracker),
+            "exception publishes exact first site and releases metadata ownership");
+}
+
+void concurrentFirstRealFailure() {
+    for (unsigned repeat = 0; repeat < 8; ++repeat) {
+        auto tracker = std::make_unique<LiveTracker>();
+        ObservationGate owner;
+        CallerProgress other;
+        bool leftResult = true, rightResult = true, laterRan = false;
+        std::thread left([&] {
+            leftResult = tracker->observe([&](auto& core) {
+                auto create = info<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+                core.createImage(device, VK_NULL_HANDLE, create); // Actual Core unknown handle.
+                owner.hold();
+            }, "traceFirstInvalidImage");
+        });
+        owner.waitEntered();
+        std::thread right([&] {
+            other.start();
+            rightResult = tracker->observe([&](auto&) { laterRan = true; }, "traceLaterObservation");
+            other.finish();
+        });
+        other.requireWaiting();
+        require(!tracker->failureSnapshot().complete, "cold readers do not see a partial first failure");
+        owner.release(); left.join(); right.join();
+        const auto failure = tracker->failureSnapshot();
+        require(!leftResult && !rightResult && !laterRan && failure.complete && failure.failure == Failure::CoreLoss &&
+                std::strcmp(failure.site, "traceFirstInvalidImage") == 0 && failure.coreLostState == 1 &&
+                failure.coreReasonCounts[static_cast<std::size_t>(frame_bindings::Reason::Unknown)] == 1,
+                "real Core failure wins over waiting caller with exact cause and API site");
+        require(!tracker->observe([](auto&) { std::abort(); }, "traceAfterFailure") &&
+                sameFailure(failure, tracker->failureSnapshot()), "waiting and later callers cannot rewrite first failure");
+    }
+}
+
+void concurrentDrawAndRetirement() {
+    auto f = std::make_unique<Fixture>(true, 0);
+    // A second independent primary recording is legal on a different externally
+    // synchronized native pool. Retiring it must never replace the source CB.
+    const auto otherPool = h<VkCommandPool>(51);
+    const auto otherCb = h<VkCommandBuffer>(61);
+    require(f->tracker.createCommandPool(device, otherPool, f->poolInfo), "create independent concurrent pool");
+    auto allocate = f->allocate; allocate.commandPool = otherPool;
+    require(f->tracker.allocateCommands(device, allocate, &otherCb) &&
+            f->tracker.beginCommand(device, otherCb, f->beginInfo, true), "begin independent concurrent recording");
+    const auto independentOld = f->tracker.prepareRetirement(device, otherCb);
+    require(independentOld.eligible, "save exact other command generation before native retirement");
+    require(f->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE), "begin source scope before concurrent draw");
+    ObservationGate owner;
+    CallerProgress drawProgress, resetProgress;
+    bool ownerResult = false, drawn = false, reset = false;
+    std::thread metadata([&] {
+        ownerResult = f->tracker.observe([&](auto&) { owner.hold(); }, "traceIndependentMetadata");
+    });
+    owner.waitEntered();
+    std::thread renderer([&] { drawProgress.start(); drawn = f->tracker.draw(device, cb); drawProgress.finish(); });
+    std::thread retire([&] { resetProgress.start(); reset = f->tracker.resetCommand(device, otherCb); resetProgress.finish(); });
+    drawProgress.requireWaiting(); resetProgress.requireWaiting();
+    owner.release(); metadata.join(); renderer.join(); retire.join();
+    const auto independentNew = f->tracker.prepareRetirement(device, otherCb);
+    Candidate candidate;
+    require(ownerResult && drawn && reset && f->tracker.endRenderPass(device, cb, candidate) &&
+            candidate.command == cb && candidate.commandGeneration != independentOld.commandGeneration &&
+            independentNew.eligible && independentNew.commandGeneration != independentOld.commandGeneration &&
+            independentOld.pool == otherPool && candidate.pool == pool,
+            "serialized parallel draw and independent reset retain both exact command/pool generations");
+    require(f->tracker.endCommand(device, cb, true), "end source command for concurrent delayed return");
+    const auto submitted = f->tracker.prepareSubmit(device, cb);
+    const auto oldRetirement = f->tracker.prepareRetirement(device, cb);
+    require(submitted.eligible && oldRetirement.commandGeneration == candidate.commandGeneration,
+            "pre-native submit and retirement refer to selected original generation");
+    ObservationGate resetOwner;
+    CallerProgress acceptProgress;
+    bool resetMetadata = false, nativeAccepted = false;
+    std::thread replacement([&] {
+        require(f->tracker.beginCommand(device, cb, f->beginInfo, true), "legal native completion precedes delayed QueueSubmit return");
+        resetMetadata = f->tracker.observe([&](auto&) { resetOwner.hold(); }, "tracePostResetMetadata");
+    });
+    resetOwner.waitEntered();
+    std::thread delayedSubmit([&] {
+        acceptProgress.start(); nativeAccepted = f->tracker.acceptSubmit(submitted, true); acceptProgress.finish();
+    });
+    acceptProgress.requireWaiting();
+    resetOwner.release(); replacement.join(); delayedSubmit.join();
+    const auto current = f->tracker.prepareRetirement(device, cb);
+    require(resetMetadata && nativeAccepted && current.eligible &&
+            current.commandGeneration != oldRetirement.commandGeneration && !f->tracker.poisoned(),
+            "parallel delayed submit accepts only saved native recording while replacement identity stays current");
+    require(!f->tracker.acceptSubmit(submitted, true), "concurrent return ticket still cannot be replayed");
+}
+
+void threadedResourceLifecycle() {
+    auto tracker = std::make_unique<LiveTracker>();
+    constexpr unsigned Threads = 4, Iterations = 256;
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> start{false};
+    std::array<std::uint64_t, Threads> lastGeneration{};
+    std::vector<std::thread> callers;
+    for (unsigned thread = 0; thread < Threads; ++thread) callers.emplace_back([&, thread] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        const auto im = h<VkImage>(10000 + thread);
+        const auto vw = h<VkImageView>(20000 + thread);
+        const auto mem = h<VkDeviceMemory>(30000 + thread);
+        for (unsigned iteration = 0; iteration < Iterations; ++iteration) {
+            require(tracker->observe([&](auto& core) {
+                auto create = info<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+                create.imageType = VK_IMAGE_TYPE_2D; create.format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+                create.extent = {1152, 4608, 1}; create.mipLevels = create.arrayLayers = 1;
+                create.samples = VK_SAMPLE_COUNT_1_BIT; create.tiling = VK_IMAGE_TILING_OPTIMAL;
+                create.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                core.createImage(device, im, create);
+                auto allocation = info<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+                allocation.allocationSize = 32 * 1024 * 1024; core.allocateMemory(device, mem, allocation);
+            }, "traceStressCreate"), "parallel finite native resource births retained");
+            require(tracker->observe([&](auto& core) {
+                core.bindImageMemory(device, im, mem, 0);
+                auto create = info<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+                create.image = im; create.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                create.format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+                create.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                core.createView(device, vw, create);
+                const auto current = core.trackedResourceIdentity(frame_bindings::TrackedResourceKind::Image, device,
+                                                                  frame_bindings::handle(im));
+                require(current.handle == frame_bindings::handle(im) && current.generation > lastGeneration[thread],
+                        "same native handle receives a fresh generation on every observed lifetime");
+                lastGeneration[thread] = current.generation;
+            }, "traceStressBind"), "parallel finite native binds retained");
+            require(tracker->observe([&](auto& core) {
+                core.destroyView(device, vw); core.destroyImage(device, im); core.freeMemory(device, mem);
+            }, "traceStressDestroy"), "parallel finite native resource retirements retained");
+        }
+    });
+    while (ready.load(std::memory_order_acquire) != Threads) std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    for (auto& caller : callers) caller.join();
+    require(!tracker->poisoned() && !tracker->failureSnapshot().complete && !TestAccess::ownerPresent(*tracker),
+            "all interleaved native resource lifetimes finish with no lost metadata or leaked owner");
 }
 
 void reusableRetirementIdentity() {
@@ -533,6 +748,7 @@ void reusableRetirementIdentity() {
 int main() {
     baselineAndImmutableDraw(); beginAndPipelineGuards(); sourceCurrentness();
     sourceShapeGuards(); scopesAndUnknownPaths(); commandReuseAndLoss(); reusableRetirementIdentity();
-    firstFailureTelemetry(); contentionTelemetry();
+    firstFailureTelemetry(); overlappingImageBinding(); reentryAndExceptionRefusal();
+    concurrentFirstRealFailure(); concurrentDrawAndRetirement(); threadedResourceLifecycle();
     std::cout << "pixel live tracker: " << checks << " checks passed; no GPU/native video association claimed\n";
 }

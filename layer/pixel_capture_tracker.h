@@ -10,6 +10,7 @@
 // again until retirement. The owner never changes native recording flags.
 #include "passive_pipeline_trace.h"
 
+#include <pthread.h>
 #include <utility>
 
 namespace frame_pixel_capture {
@@ -59,8 +60,9 @@ constexpr std::size_t CoreTableCount = static_cast<std::size_t>(frame_bindings::
 static_assert(CoreReasonCount == 8, "Audit telemetry when the Core reason enumeration changes");
 
 // The first refusal is published exactly once. Counters are atomic observations
-// taken by its winner: a contention refusal can overlap the lock owner's final
-// Core mutation, so these counts are not claimed to be a transactional Core dump.
+// taken by its winner. Ordinary parallel observations are serialized; only
+// actual reentry or invalid metadata poisons the capture. The counters remain
+// observations, not an independently inferred native resource lifetime proof.
 struct FailureSnapshot {
     bool complete = false;
     Failure failure = Failure::None;
@@ -118,6 +120,10 @@ public:
     // (or before native void destruction). Do not expose Core to another owner.
     // A non-default site must have static storage duration (for example __func__
     // or a string literal). It is retained without allocation or string copying.
+    // The callback must contain only finite, owned CPU metadata work: never
+    // downstream Vulkan/driver calls, GPU waits, I/O, allocations or another
+    // tracker entry. This serializes independent native callers without losing
+    // a resource mutation or holding the lock across their native API calls.
     template<class F> bool observe(F&& mutation, const char* site = "observe") noexcept {
         return locked(site, [&] {
             mutation(bindings_);
@@ -390,23 +396,60 @@ public:
     }
 
 private:
+    struct OwnerScope {
+        explicit OwnerScope(std::atomic<bool>& present) noexcept : present_(present) {}
+        ~OwnerScope() { present_.store(false, std::memory_order_release); }
+        OwnerScope(const OwnerScope&) = delete;
+        OwnerScope& operator=(const OwnerScope&) = delete;
+        std::atomic<bool>& present_;
+    };
     template<class F> bool locked(const char* site, F&& action) noexcept {
         const auto* origin = site ? site : "unspecified";
         if (poisoned()) return false;
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-        if (!lock.owns_lock()) { poison(Failure::Contention, origin); return false; }
-        if (poisoned()) return false;
-        activeSite_.store(origin, std::memory_order_relaxed);
-        if (!coreHealthy()) return false;
-        const bool result = action();
-        return !poisoned() && coreHealthy() && result;
+        // pthread_self uses the caller's existing thread identity. Do not add
+        // thread_local storage to a layer loaded into an already running Steam
+        // process. A separate flag avoids assigning meaning to pthread_t{}.
+        const auto self = pthread_self();
+        if (ownerPresent_.load(std::memory_order_acquire) &&
+            pthread_equal(owner_.load(std::memory_order_relaxed), self)) {
+            poison(Failure::Contention, origin);
+            return false;
+        }
+        try {
+            // The native compositor legitimately observes unrelated resources
+            // on parallel CPU threads. Waiting for this finite metadata-only
+            // section preserves every observation instead of poisoning the
+            // entire session on an ordinary scheduling overlap. There is no
+            // timed retry, deferred journal, native call or GPU wait here.
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (poisoned()) return false;
+            owner_.store(self, std::memory_order_relaxed);
+            ownerPresent_.store(true, std::memory_order_release);
+            OwnerScope ownerScope(ownerPresent_); // Cleared before mutex unlock.
+            activeSite_.store(origin, std::memory_order_relaxed);
+            try {
+                if (!coreHealthy()) return false;
+                const bool result = action();
+                return !poisoned() && coreHealthy() && result;
+            } catch (...) {
+                // Never let a malformed observation unwind through a Vulkan
+                // ABI hook, or release the owner before publishing its failure.
+                poison(Failure::Unknown, origin);
+                return false;
+            }
+        } catch (...) {
+            // std::mutex can report a system error. It is not a recoverable
+            // metadata observation and must not escape the noexcept hook.
+            poison(Failure::Unknown, origin);
+            return false;
+        }
     }
     void poison(Failure reason, const char* site = nullptr) noexcept {
         auto expected = Failure::None;
         if (!failure_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel,
                                               std::memory_order_relaxed)) return;
-        // Only the winning refusal writes these bounded fields. A contender
-        // supplies its own site instead of borrowing the current lock owner's.
+        // Only the winning refusal writes these bounded fields. A reentrant
+        // caller supplies its own site, not the outer observation's site.
         firstSite_.store(site ? site : activeSite_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         firstCoreLost_.store(bindings_.lostState(), std::memory_order_relaxed);
         for (std::size_t i = 0; i < firstCoreReasons_.size(); ++i)
@@ -525,6 +568,10 @@ private:
     }
 
     std::mutex mutex_;
+    static_assert(std::atomic<pthread_t>::is_always_lock_free,
+                  "Thread owner admission must not acquire an implementation lock");
+    std::atomic<pthread_t> owner_{};
+    std::atomic<bool> ownerPresent_{false};
     std::atomic<Failure> failure_{Failure::None};
     std::atomic<const char*> activeSite_{"unentered"}, firstSite_{nullptr};
     std::atomic<bool> failurePublished_{false};
