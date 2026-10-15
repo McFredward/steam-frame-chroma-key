@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors><Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../ProbePolicy.cs" Link="ProbePolicy.cs" />
+    <Compile Include="../ProbeManifest.cs" Link="ProbeManifest.cs" />
+    <Compile Include="PortableControls.cs" />
+  </ItemGroup>
+</Project>

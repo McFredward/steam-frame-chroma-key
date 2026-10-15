@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>FrameAppPayloadCore</AssemblyName>
+    <RootNamespace>FrameAppPayloadProbe</RootNamespace>
+    <LangVersion>7.3</LangVersion><Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AutomaticallyUseReferenceAssemblyPackages>false</AutomaticallyUseReferenceAssemblyPackages>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors><DebugType>embedded</DebugType>
+    <FrameworkPathOverride>$(FrameworkReferenceDir)</FrameworkPathOverride>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="ProbePolicy.cs" />
+    <Compile Include="ProbeManifest.cs" />
+    <Compile Include="ProbeTextures.cs" />
+    <Compile Include="PayloadOutput.cs" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(UnityReferenceDir)/UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.ImageConversionModule" HintPath="$(UnityReferenceDir)/UnityEngine.ImageConversionModule.dll" Private="false" />
+    <Reference Include="UnityEngine.VRModule" HintPath="$(UnityReferenceDir)/UnityEngine.VRModule.dll" Private="false" />
+    <Reference Include="UnityEngine.XRModule" HintPath="$(UnityReferenceDir)/UnityEngine.XRModule.dll" Private="false" />
+    <Reference Include="System.Runtime.Serialization" />
+  </ItemGroup>
+  <Target Name="RequireExplicitLocalReferences" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="'$(UnityReferenceDir)' == '' or '$(FrameworkReferenceDir)' == ''"
+           Text="Supply local UnityReferenceDir and FrameworkReferenceDir; no reference download is performed." />
+    <Error Condition="!Exists('$(UnityReferenceDir)/UnityEngine.CoreModule.dll') or !Exists('$(UnityReferenceDir)/UnityEngine.ImageConversionModule.dll') or !Exists('$(UnityReferenceDir)/UnityEngine.VRModule.dll') or !Exists('$(UnityReferenceDir)/UnityEngine.XRModule.dll') or !Exists('$(FrameworkReferenceDir)/mscorlib.dll')"
+           Text="The explicit local reference directories are incomplete." />
+  </Target>
+</Project>
