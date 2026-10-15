@@ -5,7 +5,7 @@ using UnityEngine.XR;
 
 namespace FrameAppPayloadProbe
 {
-    // Attached only after explicit F8 start. Unknown callbacks always retain the source blit.
+    // Attached only after an explicit mod-settings start. Unknown callbacks retain the source blit.
     [DisallowMultipleComponent]
     [RequireComponent(typeof(Camera))]
     public sealed class PayloadOutput : MonoBehaviour
