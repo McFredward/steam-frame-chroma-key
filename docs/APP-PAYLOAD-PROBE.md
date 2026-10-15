@@ -8,7 +8,9 @@ setting. No additional sender modification is required to generate its files.
 The missing application output adapter and a separately approved receiver capture
 are still required before an actual transport test can happen.
 
-`tools/app_payload_probe.py` uses only Python's standard library. It accepts
+`tools/app_payload_probe.py` uses only Python's standard library on POSIX hosts;
+its bounded file handling requires `O_NOFOLLOW` and `O_NONBLOCK`. The Windows
+GloomhavenVR integration does not execute this offline producer. It accepts
 owned, immutable RGB8 color and R8 coverage buffers from **one app generation and
 one eye**. Coverage is never classified from scene RGB. It writes a normal RGB8
 PNG carrying distinct color and grayscale coverage regions, plus a small JSON

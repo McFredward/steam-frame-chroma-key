@@ -219,9 +219,9 @@ if(BUILD_TESTING)
     target_include_directories(test_mask_module_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME mask_module_guard COMMAND test_mask_module_guard)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    add_test(NAME app_owned_payload_reference COMMAND ${Python3_EXECUTABLE} -B
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_app_payload_probe.py)
     if(UNIX)
+        add_test(NAME app_owned_payload_reference COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_app_payload_probe.py)
         add_executable(test_compositor_bootstrap tests/test_compositor_bootstrap.cpp
             import/compositor_main_preparation.cpp import/import_main_preparation.cpp
             import/import_loader_reader.cpp import/import_module_identity.cpp)
