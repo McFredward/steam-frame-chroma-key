@@ -5,9 +5,12 @@
 // never from physical-device support alone. Refusal disables only the extra
 // diagnostic; it does not alter native device creation or native rendering.
 #include <vulkan/vulkan.h>
+#include <vulkan/vk_layer.h>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <type_traits>
 
 namespace frame_pixel_sampler {
 
@@ -73,12 +76,34 @@ inline DeviceEligibility inspectDeviceCreate(const VkDeviceCreateInfo& info,
     std::array<const VkBaseInStructure*, MaximumDeviceChain> visited{};
     std::size_t count = 0;
     bool seenFeatures2 = false, seenYcbcr = false;
+    std::uint32_t loaderFunctions = 0;
     auto* node = static_cast<const VkBaseInStructure*>(info.pNext);
     for (; node; node = node->pNext) {
         if (count == visited.size()) return out;
+        const bool loader = node->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO;
         for (std::size_t i = 0; i < count; ++i)
-            if (visited[i] == node || visited[i]->sType == node->sType) return out;
+            if (visited[i] == node || (!loader && visited[i]->sType == node->sType)) return out;
         visited[count++] = node;
+        if (loader) {
+            // The public loader ABI uses one sType for several distinct data
+            // records. They are not duplicate feature enablements. Retain the
+            // input chain and never dereference/call its union callbacks.
+            const auto* data = reinterpret_cast<const VkLayerDeviceCreateInfo*>(node);
+            std::underlying_type_t<VkLayerFunction> function = 0;
+            // Unknown future wire values must be rejected without first
+            // evaluating an out-of-range C++ enum value.
+            std::memcpy(&function, &data->function, sizeof(function));
+            std::uint32_t bit = 0;
+            switch (function) {
+            case VK_LAYER_LINK_INFO: bit = 1u << 0; break;
+            case VK_LOADER_DATA_CALLBACK: bit = 1u << 1; break;
+            case VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK: bit = 1u << 2; break;
+            case VK_LOADER_FEATURES: bit = 1u << 3; break;
+            default: return out;
+            }
+            if (loaderFunctions & bit) return out;
+            loaderFunctions |= bit;
+        }
         switch (node->sType) {
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
             if (seenFeatures2 || info.pEnabledFeatures) return out;

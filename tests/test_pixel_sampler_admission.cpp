@@ -162,9 +162,42 @@ void boundedMalformedInputs() {
     nodes[nodes.size() - 2].pNext = &nodes.back();
     require(!inspectDeviceCreate(create, routes).complete, "33rd node is refused without unbounded traversal");
 }
+
+void publicLoaderChainRecords() {
+    auto create = info<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+    auto ycbcr = info<VkPhysicalDeviceSamplerYcbcrConversionFeatures>(
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES);
+    ycbcr.samplerYcbcrConversion = VK_TRUE;
+    auto link = info<VkLayerDeviceCreateInfo>(VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
+    auto callback = info<VkLayerDeviceCreateInfo>(VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
+    link.function = VK_LAYER_LINK_INFO; callback.function = VK_LOADER_DATA_CALLBACK;
+    link.pNext = &callback; callback.pNext = &ycbcr; create.pNext = &link;
+    const auto originalLink = link; const auto originalCallback = callback;
+    ReviewedRoutes routes; routes.coreComputeRoutesObserved = true;
+    require(!inspectDeviceCreate(create, routes).complete, "loader ABI nodes still need explicit owner review");
+    const VkStructureType loaderType = VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO;
+    routes.additionalChainTypes = &loaderType; routes.additionalChainTypeCount = 1;
+    require(inspectDeviceCreate(create, routes).eligible(),
+            "real public LINK_INFO plus DATA_CALLBACK chain preserves enabled YCbCr admission");
+    require(link.pNext == originalLink.pNext && callback.pNext == originalCallback.pNext &&
+            link.function == originalLink.function && callback.function == originalCallback.function,
+            "loader nodes are inspected without stripping, rewriting or calling native data");
+    auto features = info<VkLayerDeviceCreateInfo>(VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
+    auto layerCallback = info<VkLayerDeviceCreateInfo>(VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
+    features.function = VK_LOADER_FEATURES; layerCallback.function = VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK;
+    callback.pNext = &features; features.pNext = &layerCallback; layerCallback.pNext = &ycbcr;
+    require(inspectDeviceCreate(create, routes).eligible(), "distinct recognized public loader functions may share their ABI sType");
+    callback.function = VK_LAYER_LINK_INFO;
+    require(!inspectDeviceCreate(create, routes).complete, "same loader function repeated is still refused");
+    const std::underlying_type_t<VkLayerFunction> unknownFunction = 99;
+    std::memcpy(&callback.function, &unknownFunction, sizeof(unknownFunction));
+    require(!inspectDeviceCreate(create, routes).complete, "unknown future loader function is refused without union access");
+    callback.function = VK_LOADER_DATA_CALLBACK; layerCallback.pNext = &link;
+    require(!inspectDeviceCreate(create, routes).complete, "loader-node exception never permits a pNext pointer cycle");
+}
 } // namespace
 
 int main() {
-    enabledFeatureInputs(); routesAndQueueCapabilities(); boundedMalformedInputs();
+    enabledFeatureInputs(); routesAndQueueCapabilities(); boundedMalformedInputs(); publicLoaderChainRecords();
     std::cout << "pixel sampler admission: " << checks << " checks passed; no device support or native mapping inferred\n";
 }
