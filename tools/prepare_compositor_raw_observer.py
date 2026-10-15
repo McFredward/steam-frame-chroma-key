@@ -48,8 +48,8 @@ CANDIDATE_SELECTION = {'schema': 'frame-compositor-public-image-selection-v1',
     'stream_origin_proven': False}
 ARM_CONTENTS = b'FRAME_COMPOSITOR_RAW/1\n'
 SAMPLING_SCOPE = 'frame_compositor_trace_sampling_scope'
-SAMPLING_MARKER = b'FCMSMP03' + struct.pack('<12I',
-    3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1)
+SAMPLING_MARKER = b'FCMSMP03' + struct.pack('<13I',
+    3, 60, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1, 32)
 RAW_TRACE_SAMPLING = {'intentional': True, 'draw_call_limit': 32,
                       'execute_child_limit': 16, 'submit_command_limit': 16,
                       'binding_snapshots_require_import_request': True,
@@ -58,6 +58,7 @@ RAW_TRACE_SAMPLING = {'intentional': True, 'draw_call_limit': 32,
                       'target_descriptor_set': 0, 'target_bindings': [0, 2, 3, 4, 6, 9, 25, 31],
                       'target_diagnostics_version': 1, 'target_denial_sample_limit': 16,
                       'probe_period_ns': 60000000, 'probe_general_per_period': 1,
+                      'probe_classifications_per_period': 32,
                       'probe_distortion_per_period': 1, 'probe_distortion_entry': 'PS_DISTORT',
                       'probe_window_clock': 'background_owner_elapsed',
                       'probe_deadline_reset_allowed': False}

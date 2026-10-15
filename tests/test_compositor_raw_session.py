@@ -244,16 +244,18 @@ class SessionTests(unittest.TestCase):
         self.plan['schema'] = M.PERIODIC_TARGET_SCHEMA
         self.plan['observer']['raw_trace_sampling'] = copy.deepcopy(M.PERIODIC_TARGET_TRACE_SAMPLING)
         self.plan['observer']['trace_sampling_marker'].update(
-            bytes=56, sha256=M.digest(M.PERIODIC_TARGET_SAMPLING_MARKER))
+            bytes=60, sha256=M.digest(M.PERIODIC_TARGET_SAMPLING_MARKER))
         main = bytearray(self.artifacts[M.MAIN].read_bytes())
-        main[160:216] = M.PERIODIC_TARGET_SAMPLING_MARKER
+        main[160:220] = M.PERIODIC_TARGET_SAMPLING_MARKER
         # The larger read-only object has its own exact span, followed by the
-        # relocated string table; neither overlaps the unchanged symbol table.
+        # relocated string and symbol tables do not overlap any section.
         strings = b'\0' + M.TRACE_SAMPLING_SYMBOL.encode('ascii') + b'\0'
-        main[216:216 + len(strings)] = strings
-        struct.pack_into('<IBBHQQ', main, 280, 1, 1, 0, 1, 0x10a0, 56)
-        struct.pack_into('<II4QII2Q', main, 384, 0, 1, 2, 0x1080, 128, 88, 0, 0, 8, 0)
-        struct.pack_into('<II4QII2Q', main, 448, 0, 3, 0, 0, 216, len(strings), 0, 0, 1, 0)
+        main[220:220 + len(strings)] = strings
+        main[264:312] = bytes(48)
+        struct.pack_into('<IBBHQQ', main, 288, 1, 1, 0, 1, 0x10a0, 60)
+        struct.pack_into('<II4QII2Q', main, 384, 0, 1, 2, 0x1080, 128, 92, 0, 0, 8, 0)
+        struct.pack_into('<II4QII2Q', main, 448, 0, 3, 0, 0, 220, len(strings), 0, 0, 1, 0)
+        struct.pack_into('<II4QII2Q', main, 512, 0, 2, 0, 0, 264, 48, 2, 2, 8, 24)
         SessionTests.alter_artifact(self, M.MAIN, bytes(main))
         profile = self.profile(5, main)
         self.plan['observer_profile'].update(file_sha256=M.digest(main), profile_sha256=profile[-32:].hex())
@@ -271,9 +273,9 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.plan['capture_limits'], M.CAPTURE_LIMITS)
         self.assertEqual(self.plan['journal_limits'], M.JOURNAL_LIMITS)
         self.assertEqual(self.plan['envelope']['schema'], 5)
-        self.assertEqual(len(M.PERIODIC_TARGET_SAMPLING_MARKER), 56)
-        self.assertEqual(struct.unpack_from('<12I', M.PERIODIC_TARGET_SAMPLING_MARKER, 8),
-                         (3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1))
+        self.assertEqual(len(M.PERIODIC_TARGET_SAMPLING_MARKER), 60)
+        self.assertEqual(struct.unpack_from('<13I', M.PERIODIC_TARGET_SAMPLING_MARKER, 8),
+                         (3, 60, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1, 32))
         self.session.rollback(restart_ready=True)
         self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
         self.assertTrue(json.loads((self.session.folder / 'rollback-complete.json').read_text())['restored'])
@@ -286,6 +288,8 @@ class SessionTests(unittest.TestCase):
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_denial_sample_limit=16.0),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_period_ns=60000001),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_general_per_period=2),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_classifications_per_period=33),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_classifications_per_period=32.0),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_distortion_per_period=True),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_distortion_entry='PS_OTHER'),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_window_clock='render_callback'),
@@ -299,15 +303,16 @@ class SessionTests(unittest.TestCase):
                 self.stage()
             self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
 
-    def test_v7_requires_the_exact_actual_56_byte_marker_not_only_json(self):
+    def test_v7_requires_the_exact_actual_60_byte_marker_not_only_json(self):
         self.promote_periodic_target_plan()
         original = self.artifacts[M.MAIN].read_bytes()
-        for marker in (M.TRACE_SAMPLING_MARKER, M.TARGET_SAMPLING_MARKER):
+        superseded = b'FCMSMP03' + struct.pack('<12I', 3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1)
+        for marker in (M.TRACE_SAMPLING_MARKER, M.TARGET_SAMPLING_MARKER, superseded):
             changed = bytearray(original); changed[160:160 + len(marker)] = marker
             self.alter_artifact(M.MAIN, bytes(changed))
             with self.subTest(legacy_marker=marker[:8]), self.assertRaisesRegex(RuntimeError, 'sampling marker'):
                 self.stage()
-        for word in range(12):
+        for word in range(13):
             changed = bytearray(original); at = 168 + 4 * word
             struct.pack_into('<I', changed, at, struct.unpack_from('<I', changed, at)[0] + 1)
             self.alter_artifact(M.MAIN, bytes(changed))
@@ -956,6 +961,8 @@ class OperatorArmTests(unittest.TestCase):
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_diagnostics_version=True),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_denial_sample_limit=17),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_general_per_period=2),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_classifications_per_period=33),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_classifications_per_period=32.0),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_distortion_per_period=2),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_window_clock='render_callback'),
             dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_deadline_reset_allowed=True),

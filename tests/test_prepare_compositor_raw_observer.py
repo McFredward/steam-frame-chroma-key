@@ -178,13 +178,14 @@ class PackageControls(unittest.TestCase):
                        {'sampling': b'FCMSMP01' + struct.pack('<6I', 1, 32, 16, 16, 32, 1)},
                        {'sampling': b'FCMSMP01' + struct.pack('<6I', 1, 33, 16, 16, 32, 3)},
                        {'sampling': b'FCMSMP02' + struct.pack('<8I', 2, 40, 32, 16, 16, 32, 4096, 7)},
+                       {'sampling': b'FCMSMP03' + struct.pack('<12I', 3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1)},
                        {'sampling_visibility': 0}, {'sampling_size': 31},
                        {'sampling_rva': 0x2400}, {'sampling_rva': 0x7080}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError): self.validate(fixture(**kwargs))
-        self.assertEqual(len(tool.SAMPLING_MARKER), 56)
-        self.assertEqual(struct.unpack_from('<12I', tool.SAMPLING_MARKER, 8),
-                         (3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1))
-        for word in range(12):
+        self.assertEqual(len(tool.SAMPLING_MARKER), 60)
+        self.assertEqual(struct.unpack_from('<13I', tool.SAMPLING_MARKER, 8),
+                         (3, 60, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1, 32))
+        for word in range(13):
             changed = bytearray(tool.SAMPLING_MARKER)
             at = 8 + 4 * word
             struct.pack_into('<I', changed, at, struct.unpack_from('<I', changed, at)[0] + 1)

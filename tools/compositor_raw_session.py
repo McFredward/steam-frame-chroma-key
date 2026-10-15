@@ -93,10 +93,11 @@ TARGET_SAMPLING_MARKER = b"FCMSMP02" + struct.pack("<8I", 2, 40, 32, 16, 16, 32,
 PERIODIC_TARGET_TRACE_SAMPLING = dict(TARGET_TRACE_SAMPLING,
     target_diagnostics_version=1, target_denial_sample_limit=16,
     probe_period_ns=60000000, probe_general_per_period=1,
+    probe_classifications_per_period=32,
     probe_distortion_per_period=1, probe_distortion_entry="PS_DISTORT",
     probe_window_clock="background_owner_elapsed", probe_deadline_reset_allowed=False)
-PERIODIC_TARGET_SAMPLING_MARKER = b"FCMSMP03" + struct.pack("<12I",
-    3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1)
+PERIODIC_TARGET_SAMPLING_MARKER = b"FCMSMP03" + struct.pack("<13I",
+    3, 60, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1, 32)
 RESOURCE_JOIN_VALIDATION = {"schema": "frame-compositor-resource-join-validation-v1",
     "attempt_limit": 64, "retry_delay_ns": 1000000, "same_capture_deadline": True,
     "immutable_snapshot": True, "unchanged_owning_journal_validator": True,
