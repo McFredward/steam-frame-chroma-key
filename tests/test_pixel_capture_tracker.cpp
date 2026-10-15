@@ -347,7 +347,8 @@ void scopesAndUnknownPaths() {
         if (invalid == 1) require(!nested->tracker.nextSubpass(device, cb, VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS), "secondary subpass rejected");
         if (invalid == 2) require(!nested->tracker.unknownCommand(device, cb), "unknown command invalidates recording");
         if (invalid == 3) require(!nested->tracker.endRendering(device, cb, out), "mismatched end operation rejected");
-        require(!nested->tracker.endRenderPass(device, cb, out) && !out.serial, "invalid recording cannot recover by closing pass");
+        require(!nested->tracker.endRenderPass(device, cb, out) && !out.serial && !out.noPriorComputeState,
+                "unknown/secondary/invalid recording cannot fabricate raw or sampler admission by closing pass");
     }
     for (auto flags : {VkRenderingFlags(0), VkRenderingFlags(VK_RENDERING_SUSPENDING_BIT),
                        VkRenderingFlags(VK_RENDERING_RESUMING_BIT), VkRenderingFlags(VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)}) {
@@ -743,6 +744,66 @@ void reusableRetirementIdentity() {
     require(!f->tracker.prepareRetirement(device, h<VkCommandBuffer>(999)).eligible,
             "unknown recording provides no retirement proof");
 }
+
+void computeStateAdmissionHistory() {
+    require(!Candidate{}.noPriorComputeState, "invented candidate cannot assume clean native compute state");
+    auto clean = std::make_unique<Fixture>();
+    require(clean->finishPass().noPriorComputeState, "observed successful primary Begin admits clean compute history");
+    clean.reset();
+    for (unsigned route = 0; route < 4; ++route) {
+        auto f = std::make_unique<Fixture>();
+        if (route == 0)
+            require(f->tracker.bindPipeline(device, cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline),
+                    "native compute pipeline marks only sampler history dirty");
+        else if (route == 1)
+            require(f->tracker.touchComputeState(device, cb), "descriptor/dispatch wrapper marks sampler history dirty");
+        else if (route == 2)
+            require(f->tracker.bindPipeline(device, cb, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline),
+                    "other non-graphics pipeline state is refused conservatively for sampler insertion");
+        else {
+            require(f->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE) && f->tracker.draw(device, cb),
+                    "select original draw before later compute-state observation");
+            require(f->tracker.touchComputeState(device, cb), "later compute observation cannot borrow earlier clean draw flag");
+            Candidate candidate;
+            require(f->tracker.endRenderPass(device, cb, candidate) && !candidate.noPriorComputeState,
+                    "end-scope candidate reflects complete native compute history at actual injection");
+        }
+        if (route < 3) require(!f->finishPass().noPriorComputeState,
+                               "prior compute state disables sampler insertion without suppressing independent raw copy");
+        require(!f->tracker.poisoned(), "valid native compute use is not global metadata loss");
+        const auto old = f->tracker.prepareRetirement(device, cb);
+        require(f->tracker.resetCommand(device, cb), "retire compute-dirty command before new recording");
+        Candidate unbegun;
+        require(!f->tracker.endRenderPass(device, cb, unbegun) && !unbegun.noPriorComputeState,
+                "reset alone cannot invent clean recording admission");
+        require(!f->tracker.beginCommand(device, cb, f->beginInfo, false), "failed native Begin provides no clean admission");
+        require(f->tracker.beginCommand(device, cb, f->beginInfo, true), "actual successful Begin initializes new clean history");
+        f->bind();
+        const auto next = f->finishPass();
+        require(next.noPriorComputeState && next.commandGeneration != old.commandGeneration,
+                "only actual new native generation can restore clean compute admission");
+    }
+    auto reused = std::make_unique<Fixture>();
+    require(reused->tracker.touchComputeState(device, cb), "dirty original command before handle recycling");
+    const auto old = reused->tracker.prepareRetirement(device, cb);
+    require(reused->tracker.freeCommands(device, pool, 1, &cb) &&
+            reused->tracker.allocateCommands(device, reused->allocate, &cb), "recycle exact native command handle");
+    require(reused->tracker.beginCommand(device, cb, reused->beginInfo, true), "observe recycled handle's new Begin");
+    reused->bind(); const auto candidate = reused->finishPass();
+    require(candidate.noPriorComputeState && candidate.commandGeneration != old.commandGeneration,
+            "recycled handle has independent generation and fresh observed compute history");
+    reused.reset();
+    auto independent = std::make_unique<Fixture>();
+    const auto otherPool = h<VkCommandPool>(51);
+    const auto otherCb = h<VkCommandBuffer>(61);
+    require(independent->tracker.createCommandPool(device, otherPool, independent->poolInfo), "create separate native pool");
+    auto allocation = independent->allocate; allocation.commandPool = otherPool;
+    require(independent->tracker.allocateCommands(device, allocation, &otherCb) &&
+            independent->tracker.beginCommand(device, otherCb, independent->beginInfo, true) &&
+            independent->tracker.touchComputeState(device, otherCb), "observe dirty compute history in another command generation");
+    require(independent->finishPass().noPriorComputeState,
+            "other command's compute state never dirties the selected primary generation");
+}
 }
 
 int main() {
@@ -750,5 +811,6 @@ int main() {
     sourceShapeGuards(); scopesAndUnknownPaths(); commandReuseAndLoss(); reusableRetirementIdentity();
     firstFailureTelemetry(); overlappingImageBinding(); reentryAndExceptionRefusal();
     concurrentFirstRealFailure(); concurrentDrawAndRetirement(); threadedResourceLifecycle();
+    computeStateAdmissionHistory();
     std::cout << "pixel live tracker: " << checks << " checks passed; no GPU/native video association claimed\n";
 }

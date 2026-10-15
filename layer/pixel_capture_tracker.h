@@ -31,6 +31,9 @@ struct Candidate {
     std::uint32_t queueFamily = VK_QUEUE_FAMILY_IGNORED;
     VkCommandBufferUsageFlags beginFlags = 0;
     bool oneTimeSubmit = false, noSimultaneousUse = false, retirementRequired = true;
+    // Only an observed successful primary Begin can establish a clean history.
+    // This does not prove the device/queue or unsupported routes are eligible.
+    bool noPriorComputeState = false;
     frame_bindings::Binding binding{};
 };
 static_assert(std::is_trivially_copyable_v<Candidate>, "Pixel candidates must own bounded metadata");
@@ -89,6 +92,7 @@ class LiveTracker {
         Scope scope = Scope::None;
         bool supported = false, recording = false, executable = false;
         bool selected = false, issued = false, submitted = false, prepared = false;
+        bool noPriorComputeState = false;
         Candidate candidate{};
     };
 
@@ -176,12 +180,23 @@ public:
     }
     bool bindPipeline(std::uint64_t device, VkCommandBuffer value, VkPipelineBindPoint point,
                       VkPipeline pipeline) noexcept {
-        if (point != VK_PIPELINE_BIND_POINT_GRAPHICS) return !poisoned();
+        if (point != VK_PIPELINE_BIND_POINT_GRAPHICS) return touchComputeState(device, value);
         return locked("bindPipeline", [&] {
             auto* command = recording(device, value); if (!command) return false;
             const auto* current = pipelines_.find(device, frame_bindings::handle(pipeline));
             command->pipeline = current ? current->id : Identity{};
             return true; // An ordinary non-distortion pipeline is not a loss.
+        });
+    }
+    // Call for every observed route which can set or consume native compute
+    // state. The owner additionally rejects devices with enabled routes it
+    // cannot intercept. No native call or graphics/push-constant state changes
+    // occur here; the ordinary raw-copy candidate remains independently valid.
+    bool touchComputeState(std::uint64_t device, VkCommandBuffer value) noexcept {
+        return locked("touchComputeState", [&] {
+            auto* command = recording(device, value); if (!command) return false;
+            command->noPriorComputeState = false;
+            return true;
         });
     }
 
@@ -258,6 +273,7 @@ public:
                 (info.flags == 0 || info.flags == VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
             command->beginFlags = info.flags;
             command->recording = true;
+            command->noPriorComputeState = command->supported;
             bindings_.beginCommand(device, value);
             return coreHealthy();
         });
@@ -331,6 +347,7 @@ public:
             command->candidate.oneTimeSubmit = (command->beginFlags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) != 0;
             command->candidate.noSimultaneousUse = (command->beginFlags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) == 0;
             command->candidate.retirementRequired = !command->candidate.oneTimeSubmit;
+            command->candidate.noPriorComputeState = command->noPriorComputeState;
             command->candidate.queueFamily = command->family; command->candidate.binding = *source;
             command->selectedPipeline = pipeline->id; command->selected = true;
             return true;
@@ -520,6 +537,10 @@ private:
                 !bindings_.validateBindingResources(command->candidate.binding) || !coreHealthy()) return false;
             const auto serial = next(); if (!serial) return false;
             command->candidate.serial = serial; command->issued = true;
+            // Compute state can change after the selected draw but before its
+            // native render scope ends. Sample insertion uses the full history
+            // at this actual injection boundary, not just the draw snapshot.
+            command->candidate.noPriorComputeState = command->noPriorComputeState;
             out = command->candidate;
             return true;
         });
