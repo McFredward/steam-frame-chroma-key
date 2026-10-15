@@ -183,8 +183,14 @@ Status SamplerProbe::record(VkCommandBuffer command, const Dispatch& dispatch) n
     p_.dispatch(command, (dispatch.extent_.width + 7u) / 8u, (dispatch.extent_.height + 7u) / 8u, 1);
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    // Publishing the owned output to HOST alone does not order our inserted
+    // COMPUTE source reads before later native image writes/releases. Their
+    // original FRAGMENT-only dependencies do not know about this new reader.
+    // Complete this read before every following native GPU command as well as
+    // making both owned output regions visible to the eventual fenced reader.
     p_.barrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-               VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+               0, 0, nullptr, 1, &barrier, 0, nullptr);
     state_.store(State::Recorded, std::memory_order_release);
     return Status::Ok;
 }

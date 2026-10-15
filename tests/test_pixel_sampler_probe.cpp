@@ -329,8 +329,9 @@ int main() {
             && f.bufferBarriers[0].srcAccessMask == VK_ACCESS_TRANSFER_WRITE_BIT
             && f.bufferBarriers[0].dstAccessMask == VK_ACCESS_SHADER_WRITE_BIT, "raw write completion precedes compute writes");
         require(f.srcStages[1] == (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
-            && f.dstStages[1] == VK_PIPELINE_STAGE_HOST_BIT
-            && f.bufferBarriers[1].srcAccessMask == (VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
+            && f.dstStages[1] == (VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT),
+            "inserted compute source reads complete before all following native GPU work");
+        require(f.bufferBarriers[1].srcAccessMask == (VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
             && f.bufferBarriers[1].dstAccessMask == VK_ACCESS_HOST_READ_BIT, "both raw and sampled writes become host visible");
         for (const auto& b : f.bufferBarriers) require(b.buffer == preparation().targetBuffer && b.offset == 0
             && b.size == d.totalBytes() && b.srcQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED
