@@ -1,5 +1,9 @@
 # Decoded image snapshot preparation, 2026-10-15
 
+Historical preparation record. Subsequent approved attempts and the
+[first complete native capture](PIXEL-SNAPSHOT-CAPTURE-20261015.md) are documented
+separately; the original not-yet-authorized statements below apply to preparation.
+
 ## Current evidence and next question
 
 GloomhavenVR build676's application-owned diagnostic was observed in both eyes

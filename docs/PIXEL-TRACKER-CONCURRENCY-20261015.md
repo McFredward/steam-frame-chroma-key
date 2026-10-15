@@ -1,5 +1,9 @@
 # Native pixel tracker concurrency, 2026-10-15
 
+The subsequent approved [complete native capture](PIXEL-SNAPSHOT-CAPTURE-20261015.md)
+now verifies progress beyond this refusal on the actual Frame, followed by full
+restoration. The local preparation and limits below remain the original record.
+
 ## Actual second attempt and restoration
 
 The approved first-refusal package (`59cd2f688e311b32b39dc6ec10d82bf81b0f7db57090c49daa5bfeb1298023e0`,

@@ -20,8 +20,10 @@ uses a reversible public-Vulkan diagnostic. Its [first approved Frame attempt](d
 loaded normally but refused acquisition before arming. The original runtime was
 restored. The [second attempt](docs/PIXEL-TRACKER-CONCURRENCY-20261015.md)
 identified an internal metadata lock refusal before arming; the original runtime
-was restored again. The targeted repair now passes the reproducing local Vulkan
-concurrency case; successful Frame image acquisition remains to be verified.
+was restored again. The targeted repair now also permits the
+[first complete native pixel snapshot](docs/PIXEL-SNAPSHOT-CAPTURE-20261015.md).
+The exact image and metadata are secured, and the diagnostic was fully removed.
+Source-payload recovery and native frame/eye/UV association remain open.
 This does not enable streamed passthrough.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
