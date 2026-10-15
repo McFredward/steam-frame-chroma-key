@@ -61,6 +61,10 @@ inline DeviceEligibility inspectDeviceCreate(const VkDeviceCreateInfo& info,
         (routes.extensionCount && !routes.extensionNames) ||
         routes.additionalChainTypeCount > MaximumReviewedChainTypes ||
         (routes.additionalChainTypeCount && !routes.additionalChainTypes)) return out;
+    // An extra compute dispatch would change a native active statistics query.
+    // This diagnostic does not track query scopes, so enabled support is refused
+    // regardless of whether a query happens to be active in one observed draw.
+    if (info.pEnabledFeatures && info.pEnabledFeatures->pipelineStatisticsQuery != VK_FALSE) return out;
     for (std::uint32_t i = 0; i < info.enabledExtensionCount; ++i) {
         for (std::uint32_t previous = 0; previous < i; ++previous)
             if (exactExtensionName(info.ppEnabledExtensionNames[i], info.ppEnabledExtensionNames[previous])) return out;
@@ -108,6 +112,8 @@ inline DeviceEligibility inspectDeviceCreate(const VkDeviceCreateInfo& info,
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
             if (seenFeatures2 || info.pEnabledFeatures) return out;
             seenFeatures2 = true;
+            if (reinterpret_cast<const VkPhysicalDeviceFeatures2*>(node)->features.pipelineStatisticsQuery != VK_FALSE)
+                return out;
             break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: {
             if (seenYcbcr) return out;

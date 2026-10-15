@@ -45,6 +45,13 @@ Status Readback::prepare(VkDevice device, PFN_vkGetDeviceProcAddr next,
         state_.store(State::Failed, std::memory_order_release);
         return Status::Refused;
     }
+    if (config.sampledCompanion && (config.mode != Mode::NativeP010 || config.format != NativeP010 ||
+        (!dynamicExtent_ && VkDeviceSize(config.extent.width) * config.extent.height > MaximumBytes / 7u))) {
+        state_.store(State::Failed, std::memory_order_release);
+        return Status::Refused;
+    }
+    capacity_ = dynamicExtent_ ? MaximumBytes : (config.sampledCompanion
+        ? VkDeviceSize(config.extent.width) * config.extent.height * 7u : layout_.bytes);
     if (!device || !next) {
         state_.store(State::Failed, std::memory_order_release);
         return Status::Refused;
@@ -69,8 +76,9 @@ Status Readback::prepare(VkDevice device, PFN_vkGetDeviceProcAddr next,
 #undef RESOLVE
     VkBufferCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    info.size = layout_.bytes;
+    info.size = capacity_;
     info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (config.sampledCompanion) info.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult r = p_.createBuffer(device_, &info, nullptr, &buffer_);
     if (r != VK_SUCCESS) { fail(r); return Status::VulkanFailure; }
@@ -118,6 +126,8 @@ Status Readback::record(VkCommandBuffer command, const Source& s, const Admissio
     Config candidate = config_;
     candidate.extent = {s.extent.width, s.extent.height};
     if (!describe(candidate, selected)) return Status::Refused;
+    if (config_.sampledCompanion && VkDeviceSize(s.extent.width) * s.extent.height > capacity_ / 7u)
+        return Status::Refused; // Refuse before recording ANY part of a paired copy.
     if (!command || !s.image || !s.generation || !a.commandGeneration
         || !a.complete || !a.primary || !a.outsideRenderPass || !a.afterMatchingDistortDraw
         || !a.queueOwnsImage || !a.beforeExternalRelease || !a.ordinaryUnprotected
@@ -228,7 +238,7 @@ Status Readback::poll(View& out) noexcept {
         }
         state_.store(State::Complete, std::memory_order_release);
     }
-    out.data = static_cast<const std::uint8_t*>(mapped_); out.bytes = layout_.bytes;
+    out.data = static_cast<const std::uint8_t*>(mapped_); out.bytes = layout_.bytes; out.capacity = capacity_;
     out.layout = layout_; out.source = source_; out.sourceGeneration = sourceGeneration_;
     out.commandGeneration = commandGeneration_;
     out.oneTimeSubmit = oneTimeSubmit_; out.retirementRequired = retirementRequired_;

@@ -46,6 +46,7 @@ struct Fake {
     VkResult createResult = VK_SUCCESS, submitResult = VK_SUCCESS, fenceResult = VK_NOT_READY;
     VkResult invalidateResult = VK_SUCCESS;
     VkDeviceSize requested = 0, requirements = 0;
+    VkBufferUsageFlags requestedUsage = 0;
     unsigned created = 0, destroyed = 0, freed = 0, unmapped = 0, barriers = 0, copies = 0;
     unsigned submits = 0, polls = 0, invalidates = 0;
     std::uint32_t copyCount = 0;
@@ -57,7 +58,7 @@ struct Fake {
     const char* missing = nullptr;
     Fake() { active = this; }
     static VKAPI_ATTR VkResult VKAPI_CALL createBuffer(VkDevice, const VkBufferCreateInfo* i, const VkAllocationCallbacks*, VkBuffer* out) {
-        auto& f = *active; f.requested = i->size; ++f.created;
+        auto& f = *active; f.requested = i->size; f.requestedUsage = i->usage; ++f.created;
         if (f.createResult == VK_SUCCESS) *out = handle<VkBuffer>(51);
         return f.createResult;
     }
@@ -130,6 +131,29 @@ static void geometryControls() {
     c.extent={2,2}; require(Readback::describe(c,l) && l.bytes==12 && l.planes[1].bufferOffset==8,"smallest even geometry aligned");
     c.format=VK_FORMAT_R8G8B8A8_UNORM; require(!Readback::describe(c,l),"RGBA not admitted in native mode");
     c.mode=Mode::OwnedRgbaFixture; require(Readback::describe(c,l) && l.bytes==16,"explicit owned generic fixture mode");
+}
+
+static void companionControls() {
+    { Fake f; Readback r; auto c=small();
+      require(Fake::prepare(r,true,c)==Status::Ok && r.companionBuffer()==VK_NULL_HANDLE && !r.companionCapacity(),
+              "ordinary copy cannot expose an unprepared sampler storage binding");r.release(); }
+    { Fake f; Readback r; Config c{}; c.sampledCompanion=true;
+      require(Fake::prepare(r,true,c)==Status::Ok && f.requested==MaximumBytes &&
+              f.requestedUsage==(VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
+              "paired control reserves one shared bounded storage/transfer allocation cold");
+      require(r.companionBuffer()!=VK_NULL_HANDLE && r.companionCapacity()==MaximumBytes,"storage capability available only during cold preparation");
+      auto actual=source(small());actual.extent={4096,4096,1};
+      require(r.record(handle<VkCommandBuffer>(61),actual,admission())==Status::Refused && !f.barriers && !f.copies,
+              "raw fitting alone never admits a companion exceeding total storage budget");
+      actual=source(small());const auto cb=handle<VkCommandBuffer>(61);
+      require(r.record(cb,actual,admission())==Status::Ok && !r.companionBuffer() && !r.companionCapacity(),
+              "recorded storage capability is not offered for another cold sampler owner");
+      View v;require(r.poll(v)==Status::NotReady && !v.data && !v.capacity,"no paired CPU storage before GPU completion");
+      r.submitCompletion(handle<VkQueue>(71),cb,19,VK_SUCCESS);f.fenceResult=VK_SUCCESS;
+      require(r.poll(v)==Status::Complete && v.capacity==MaximumBytes && v.bytes==144,"one completion proof publishes raw length and shared immutable capacity");
+      require(r.release()==Status::Ok && !r.companionBuffer(),"completed one-time fixture release revokes storage capability"); }
+    { Fake f; Readback r; auto c=small();c.sampledCompanion=true;c.extent={4096,4096};
+      require(Fake::prepare(r,true,c)==Status::Refused && !f.created,"oversized fixed paired allocation rejected before native allocation");r.release(); }
 }
 
 static void admissionControls() {
@@ -350,7 +374,7 @@ static void realCopy(OwnedGpu& g,Mode mode,bool retirement=false) {
     std::memcpy(upload.mapped,expected.data(),expected.size());
     if(!upload.coherent) { VkMappedMemoryRange r{}; r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE; r.memory=upload.memory; r.size=VK_WHOLE_SIZE; vkcheck(vkFlushMappedMemoryRanges(g.device,1,&r)); }
     Config preparation=c;
-    if(mode==Mode::NativeP010)preparation.extent={0,0};
+    if(mode==Mode::NativeP010){preparation.extent={0,0};preparation.sampledCompanion=true;}
     Readback reader; require(reader.prepare(g.device,vkGetDeviceProcAddr,g.memory,preparation)==Status::Ok,"real cold preparation including dynamic native capacity");
     View view; require(reader.poll(view)==Status::NotReady && !view.data,"real no bytes before submitted completion");
     auto cb=g.command(); VkCommandBufferBeginInfo begin{}; begin.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO; begin.flags=retirement?0:VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; vkcheck(vkBeginCommandBuffer(cb,&begin));
@@ -418,7 +442,7 @@ int main(int argc,char** argv) {
     try {
         const std::string mode = argc>1 ? argv[1] : "all";
         if(mode!="all" && mode!="controls" && mode!="gpu")throw std::runtime_error("Expected all, controls, or gpu");
-        if(mode!="gpu") { geometryControls(); admissionControls(); failureControls(); concurrentRecordControl(); retirementControls(); }
+        if(mode!="gpu") { geometryControls(); companionControls(); admissionControls(); failureControls(); concurrentRecordControl(); retirementControls(); }
         if(mode=="controls") { std::cout << "{\"controls\":" << checks << ",\"real_gpu_tested\":false}\n"; return 0; }
         const auto controlCount=checks;
         OwnedGpu gpu; gpu.init();

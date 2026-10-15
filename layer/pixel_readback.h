@@ -22,6 +22,9 @@ struct Config {
     // bounded even source extent at record time. Otherwise exact extent pin.
     VkExtent2D extent{};
     Mode mode = Mode::NativeP010; // RGBA exists only for the owned offline GPU fixture.
+    // Reserve a disjoint RGBA8 sampler-control tail in this SAME bounded buffer.
+    // It shares the exact native submission/retirement proof, not a second lease.
+    bool sampledCompanion = false;
 };
 struct Layout {
     VkFormat format = VK_FORMAT_UNDEFINED;
@@ -59,6 +62,7 @@ struct Admission {
 struct View {
     const std::uint8_t* data = nullptr;
     VkDeviceSize bytes = 0;
+    VkDeviceSize capacity = 0; // Only published after the same complete GPU proof.
     Layout layout{};
     VkImage source = VK_NULL_HANDLE;
     std::uint64_t sourceGeneration = 0, commandGeneration = 0;
@@ -94,6 +98,14 @@ public:
     Status poll(View&) noexcept;
     State state() const noexcept { return state_.load(std::memory_order_acquire); }
     VkResult lastResult() const noexcept { return lastResult_.load(std::memory_order_relaxed); }
+    // Cold preparation access only. The sampler owner never owns/frees this
+    // buffer, and may not publish mapped data before poll() returns Complete.
+    VkBuffer companionBuffer() const noexcept {
+        return state() == State::Ready && config_.sampledCompanion ? buffer_ : VK_NULL_HANDLE;
+    }
+    VkDeviceSize companionCapacity() const noexcept {
+        return state() == State::Ready && config_.sampledCompanion ? capacity_ : 0;
+    }
     // Safe without proof only before any commands were recorded or after our
     // successful completion fence in strict one-time mode. Retirement mode
     // retains its allocation until explicit shutdown proof EVEN after a view
@@ -128,6 +140,7 @@ private:
     VkFence fence_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
     Layout layout_{};
+    VkDeviceSize capacity_ = 0;
     VkCommandBuffer command_ = VK_NULL_HANDLE;
     VkImage source_ = VK_NULL_HANDLE;
     std::uint64_t commandGeneration_ = 0, sourceGeneration_ = 0;

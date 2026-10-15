@@ -186,6 +186,9 @@ VKAPI_ATTR void VKAPI_CALL traceCmdBindDescriptorSets(VkCommandBuffer command, V
     VkPipelineLayout layout, std::uint32_t firstSet, std::uint32_t count, const VkDescriptorSet* sets,
     std::uint32_t dynamicCount, const std::uint32_t* offsets) {
     auto* d = deviceFor(command);
+#ifdef FRAME_PIXEL_COMPUTE_BIND
+    FRAME_PIXEL_COMPUTE_BIND(d,command,point);
+#endif
     observeBindings([&](auto& b) { b.bindSets(d->id, command, point, layout, firstSet, count, sets, dynamicCount, offsets); });
     d->CmdBindDescriptorSets(command, point, layout, firstSet, count, sets, dynamicCount, offsets);
 }

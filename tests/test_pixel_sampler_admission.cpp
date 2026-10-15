@@ -30,6 +30,12 @@ void enabledFeatureInputs() {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES);
     ycbcr.samplerYcbcrConversion = VK_TRUE; create.pNext = &ycbcr;
     require(inspectDeviceCreate(create, routes).eligible(), "actual enabled KHR/core YCbCr feature is recognized");
+    oldFeatures.pipelineStatisticsQuery = VK_TRUE; create.pEnabledFeatures = &oldFeatures;
+    require(!inspectDeviceCreate(create, routes).complete,
+            "enabled legacy pipeline statistics refuses inserted compute work even outside known query scopes");
+    oldFeatures.pipelineStatisticsQuery = VK_FALSE;
+    require(inspectDeviceCreate(create, routes).eligible(), "disabled legacy query feature retains the ordinary diagnostic");
+    create.pEnabledFeatures = nullptr;
     require(!inspectDeviceCreate(create, {}).eligible(), "missing explicit core-route coverage refuses sampling");
     ycbcr.samplerYcbcrConversion = VK_FALSE;
     const auto disabled = inspectDeviceCreate(create, routes);
@@ -45,6 +51,9 @@ void enabledFeatureInputs() {
     auto features2 = info<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
     features2.pNext = &vulkan11; create.pNext = &features2;
     require(inspectDeviceCreate(create, routes).eligible(), "actual device Features2 chain is traversed to enabled feature");
+    features2.features.pipelineStatisticsQuery = VK_TRUE;
+    require(!inspectDeviceCreate(create, routes).complete, "Features2-enabled pipeline statistics is refused independently");
+    features2.features.pipelineStatisticsQuery = VK_FALSE;
     create.pEnabledFeatures = &oldFeatures;
     require(!inspectDeviceCreate(create, routes).complete, "conflicting Features2 and pEnabledFeatures is not silently accepted");
     create.pEnabledFeatures = nullptr;

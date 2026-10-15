@@ -8,6 +8,10 @@
 #include "pixel_readback.h"
 #include "pixel_snapshot_io.h"
 #include "pixel_refusal_status.h"
+#include "pixel_sampler_probe.h"
+#include "pixel_sampler_admission.h"
+#include "pixel_sampler_format.h"
+#include "pixel_sampler_routes.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -65,9 +69,23 @@ Session& session() {
 template<class T> void* dispatchKey(T value) { return *reinterpret_cast<void**>(value); }
 struct Instance {
     VkInstance native{};
+    std::uint32_t apiVersion = VK_API_VERSION_1_0;
     PFN_vkGetInstanceProcAddr gipa{};
     PFN_GetPhysicalDeviceProcAddr gpdpa{};
 };
+enum class SamplerRefusal : unsigned { None, Device, ComputeState, Queue, Format, Extent, Conversion, Profile };
+const char* refusalName(SamplerRefusal refusal) noexcept {
+    switch(refusal) {
+    case SamplerRefusal::Device:return "device_not_admitted";
+    case SamplerRefusal::ComputeState:return "prior_compute_state";
+    case SamplerRefusal::Queue:return "queue_without_compute";
+    case SamplerRefusal::Format:return "unqueried_native_image_profile";
+    case SamplerRefusal::Extent:return "extent_outside_reader_budget";
+    case SamplerRefusal::Conversion:return "incomplete_native_conversion";
+    case SamplerRefusal::Profile:return "native_view_or_conversion_profile";
+    default:return "none";
+    }
+}
 struct Device {
     VkDevice native{};
     std::uint64_t id = 0;
@@ -79,6 +97,7 @@ struct Device {
     FIELD(ResetCommandBuffer) FIELD(ResetCommandPool) FIELD(DestroyCommandPool) FIELD(CmdBindPipeline)
     FIELD(CmdDraw) FIELD(CmdDrawIndexed) FIELD(CmdDrawIndirect) FIELD(CmdDrawIndexedIndirect)
     FIELD(CmdBindShadersEXT)
+    FIELD(CmdDispatch) FIELD(CmdDispatchIndirect) FIELD(CmdDispatchBase)
     FIELD(CmdExecuteCommands) FIELD(CmdBeginRenderPass) FIELD(CmdNextSubpass) FIELD(CmdEndRenderPass)
     FIELD(CmdBeginRenderPass2) FIELD(CmdNextSubpass2) FIELD(CmdEndRenderPass2)
     FIELD(CmdBeginRendering) FIELD(CmdEndRendering) FIELD(QueueSubmit) FIELD(QueueSubmit2)
@@ -87,6 +106,18 @@ struct Device {
 #undef BINDING_FIELD
 #undef FIELD
     frame_pixels::Readback readback;
+    frame_pixel_sampler::SamplerProbe sampler;
+    frame_pixel_sampler::Dispatch samplerDispatch;
+    frame_pixel_sampler::DeviceEligibility samplerEligibility;
+    frame_pixel_sampler_format::Support samplerFormats;
+    std::array<VkQueueFlags,64> queueFlags{};
+    std::uint32_t queueFamilyCount = 0;
+    bool nativeComputeQueue = false;
+    std::uint32_t instanceApiVersion = 0;
+    char unreviewedExtension[VK_MAX_EXTENSION_NAME_SIZE]{};
+    VkResult samplerPrepareResult = VK_ERROR_FEATURE_NOT_PRESENT;
+    bool samplerRecorded = false;
+    std::atomic<SamplerRefusal> samplerRefusal{SamplerRefusal::None};
     Candidate candidate{};
     std::thread writer;
     std::atomic<bool> stop{false}, selected{false};
@@ -125,11 +156,24 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
     const auto& config = session().config;
     const auto bytes = static_cast<std::size_t>(view.bytes);
     const auto yBytes = static_cast<std::size_t>(view.layout.planes[1].bufferOffset);
+    const auto& dispatch=d.samplerDispatch;
+    if(!d.samplerRecorded || d.sampler.state()!=frame_pixel_sampler::State::Recorded ||
+        dispatch.offset()!=view.bytes || dispatch.totalBytes()>view.capacity ||
+        dispatch.extent().width!=view.layout.extent.width || dispatch.extent().height!=view.layout.extent.height ||
+        dispatch.sourceViewGeneration()!=d.candidate.binding.view.identity.generation) {
+        status(progress,"sampler_record_refused");return;
+    }
     const int raw = frame_pixel_io::create(config, "snapshot.p010");
     if (raw < 0) { status(progress, "output_refused"); return; }
     const bool written = frame_pixel_io::writeAll(raw, view.data, bytes) && !fsync(raw);
     close(raw);
     if (!written) { status(progress, "output_failed"); return; }
+    const auto sampledBytes=static_cast<std::size_t>(dispatch.sampledBytes());
+    const auto* sampledData=view.data+bytes;
+    const int sampledOutput=frame_pixel_io::create(config,"sampler-components.rgba8");
+    if(sampledOutput<0){status(progress,"sampler_output_refused");return;}
+    const bool sampledWritten=frame_pixel_io::writeAll(sampledOutput,sampledData,sampledBytes) && !fsync(sampledOutput);
+    close(sampledOutput);if(!sampledWritten){status(progress,"sampler_output_failed");return;}
     const auto& b = d.candidate.binding;
     const auto& conversion = b.view.conversion;
     std::ostringstream record;
@@ -155,6 +199,8 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
                << "\",\"chroma_filter\":\"" << (conversion.chromaFilter == VK_FILTER_LINEAR ? "linear" : "nearest") << "\"}";
     } else record << "null";
     record << ",\"observed_vulkan_conversion\":{\"complete\":" << (conversion.complete ? "true" : "false")
+        << ",\"has_view_conversion\":" << (b.view.extensions.hasConversion?"true":"false")
+        << ",\"format\":" << int(conversion.format) << ",\"force_explicit_reconstruction\":" << int(conversion.forceExplicitReconstruction)
         << ",\"model\":" << int(conversion.model) << ",\"range\":" << int(conversion.range)
         << ",\"components\":[" << int(conversion.components.r) << ',' << int(conversion.components.g) << ','
         << int(conversion.components.b) << ',' << int(conversion.components.a) << "],\"chroma_offsets\":["
@@ -165,7 +211,32 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
         << ",\"generation_retired\":" << (view.generationRetired ? "true" : "false")
         << ",\"command_generation\":" << view.commandGeneration << ",\"view_generation\":"
         << b.view.identity.generation << ",\"queue_family\":" << d.candidate.queueFamily
-        << "},\"source_frame_associated\":false,\"uv_owned\":false,\"passthrough_authorized\":false}\n";
+        << "},\"sampler_control\":{\"schema\":\"frame-decoded-p010-sampler-control-v1\","
+           "\"file\":\"sampler-components.rgba8\",\"capture_id\":\"" << config.captureId
+        << "\",\"image_generation\":" << view.sourceGeneration
+        << ",\"conversion_generation\":" << conversion.identity.generation
+        << ",\"command_generation\":" << view.commandGeneration
+        << ",\"view_generation\":" << b.view.identity.generation
+        << ",\"width\":" << view.layout.extent.width << ",\"height\":" << view.layout.extent.height
+        << ",\"byte_length\":" << sampledBytes
+        << ",\"sha256\":\"" << frame_pixel_io::digest(sampledData,sampledBytes)
+        << "\",\"encoding\":\"RGBA8_UNORM sampled RGB_IDENTITY components; not reconstructed scene RGB\","
+           "\"sample_positions\":\"normalized logical texel centers, explicit LOD zero\","
+           "\"same_command_generation\":true,\"same_image_view_generation\":true,\"graphics_state_untouched\":true,"
+           "\"no_prior_compute_state\":" << (d.candidate.noPriorComputeState?"true":"false")
+        << ",\"shared_storage_capacity\":" << view.capacity << ",\"buffer_offset\":" << dispatch.offset()
+        << ",\"total_paired_bytes\":" << dispatch.totalBytes() << "},\"native_image_layout\":{\"tiling\":" << int(b.image.tiling)
+        << ",\"flags\":" << b.image.flags << ",\"usage\":" << b.image.usage
+        << ",\"sharing_mode\":" << int(b.image.sharingMode) << ",\"allocation_bytes\":" << b.image.allocation.allocationSize
+        << ",\"explicit_drm_modifier\":" << (b.image.extensions.hasDrmExplicit?"true":"false")
+        << ",\"drm_modifier\":" << b.image.extensions.drmModifier << ",\"memory_planes\":[";
+    for(std::uint32_t n=0;n<b.image.extensions.planeCount && n<b.image.extensions.planes.size();++n) {
+        if(n)record<<',';
+        const auto& plane=b.image.extensions.planes[n];
+        record<<"{\"offset\":"<<plane.offset<<",\"row_pitch\":"<<plane.rowPitch
+              <<",\"array_pitch\":"<<plane.arrayPitch<<",\"depth_pitch\":"<<plane.depthPitch<<'}';
+    }
+    record<<"]},\"source_frame_associated\":false,\"uv_owned\":false,\"passthrough_authorized\":false}\n";
     const int meta = frame_pixel_io::create(config, "snapshot.json");
     if (meta < 0) { status(progress, "metadata_refused"); return; }
     const auto text = record.str();
@@ -175,8 +246,21 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
 void writer(Device* d) noexcept {
     const int progress = frame_pixel_io::create(session().config,"status.jsonl");
     if (progress < 0 || flock(progress,LOCK_EX|LOCK_NB)) { if(progress>=0)close(progress); return; }
-    status(progress,"prepared");
-    bool announced = false;
+    // One cold background record. It must explain a refused preparation before
+    // asking the maintainer to start a stream; never emit per-frame diagnostics.
+    char preparation[1024]{};
+    const auto preparedCount=std::snprintf(preparation,sizeof(preparation),
+        "{\"event\":\"prepared\",\"vk_result\":0,\"sampler_ready\":%s,\"sampler_vk_result\":%d,"
+        "\"device_admission_complete\":%s,\"ycbcr_enabled\":%s,\"compute_routes_observed\":%s,"
+        "\"instance_api_version\":%u,\"unreviewed_extension\":\"%s\",\"format_queries_complete\":%s,"
+        "\"format_routes\":%u,\"pool_descriptor_count\":%u,\"native_compute_queue\":%s,\"mask_enabled\":false,\"native_frame_association_proven\":false}\n",
+        d->sampler.state()==frame_pixel_sampler::State::Ready?"true":"false",int(d->samplerPrepareResult),
+        d->samplerEligibility.complete?"true":"false",d->samplerEligibility.samplerYcbcrConversionEnabled?"true":"false",
+        d->samplerEligibility.computeRoutesObserved?"true":"false",d->instanceApiVersion,d->unreviewedExtension,
+        d->samplerFormats.complete?"true":"false",d->samplerFormats.routeCount,d->samplerFormats.poolDescriptorCount,d->nativeComputeQueue?"true":"false");
+    if(preparedCount>0 && static_cast<std::size_t>(preparedCount)<sizeof(preparation))
+        frame_pixel_io::writeAll(progress,preparation,static_cast<std::size_t>(preparedCount));
+    bool announced = false, refusalAnnounced = false;
     try { while (!d->stop.load(std::memory_order_acquire)) {
         if (!session().armed.load(std::memory_order_acquire) && frame_pixel_io::armed(session().config)) {
             session().armed.store(true,std::memory_order_release); status(progress,"armed");
@@ -187,6 +271,16 @@ void writer(Device* d) noexcept {
             const auto result = d->readback.poll(view);
             if (result == frame_pixels::Status::Complete) { save(*d,view,progress); break; }
             if (result == frame_pixels::Status::VulkanFailure) { status(progress,"gpu_failure",d->readback.lastResult()); break; }
+        }
+        const auto samplerRefusal=d->samplerRefusal.load(std::memory_order_relaxed);
+        if(!refusalAnnounced && samplerRefusal!=SamplerRefusal::None) {
+            char report[256]{};
+            const auto count=std::snprintf(report,sizeof(report),
+                "{\"event\":\"sampler_admission_refused\",\"reason\":\"%s\",\"mask_enabled\":false}\n",
+                refusalName(samplerRefusal));
+            if(count>0 && static_cast<std::size_t>(count)<sizeof(report))
+                frame_pixel_io::writeAll(progress,report,static_cast<std::size_t>(count));
+            refusalAnnounced=true; // First observation only, not a permanent native-path failure.
         }
         if (!d->selected.load(std::memory_order_acquire) && session().tracker->poisoned()) {
             // The first failing API freezes these counters. Publication can
@@ -226,10 +320,39 @@ void afterRenderPass(Device* d, VkCommandBuffer command, bool dynamic) {
     if (!ready || !d->ownsCapture || d->selected.load(std::memory_order_acquire) ||
         !session().armed.load(std::memory_order_acquire)) return;
     const auto& image = candidate.binding.image;
+    const auto refuse=[&](SamplerRefusal reason) noexcept {
+        auto empty=SamplerRefusal::None;
+        d->samplerRefusal.compare_exchange_strong(empty,reason,std::memory_order_relaxed);
+    };
+    // Updating our own cold descriptor and appending COMPUTE must never replace
+    // native compute state. Known unsupported extension routes disable only this
+    // experiment, and the actual command history/queue are checked at admission.
+    if(!d->samplerEligibility.eligible()){refuse(SamplerRefusal::Device);return;}
+    if(!candidate.noPriorComputeState){refuse(SamplerRefusal::ComputeState);return;}
+    if(candidate.queueFamily>=d->queueFamilyCount ||
+       !frame_pixel_sampler::queueSupportsCompute(d->queueFlags[candidate.queueFamily])){refuse(SamplerRefusal::Queue);return;}
+    if(!frame_pixel_sampler_format::admitSource(d->samplerFormats,candidate.binding)){refuse(SamplerRefusal::Format);return;}
     // The offline recovery/PNG reader has the same independent 12M-pixel bound.
     // Reserve 64 MiB cold, but never save an extent that its reader cannot use.
     if (image.extent.width>8192 || image.extent.height>8192 ||
-        std::uint64_t(image.extent.width)*image.extent.height>12000000) return;
+        std::uint64_t(image.extent.width)*image.extent.height>12000000){refuse(SamplerRefusal::Extent);return;}
+    const auto& view=candidate.binding.view;
+    const auto& conversion=view.conversion;
+    frame_pixel_sampler::Source sampled;
+    sampled.complete=candidate.binding.complete;
+    sampled.view=reinterpret_cast<VkImageView>(static_cast<std::uintptr_t>(view.identity.handle));
+    sampled.viewGeneration=view.identity.generation;sampled.extent={image.extent.width,image.extent.height};
+    sampled.viewType=view.type;sampled.format=view.format;sampled.components=view.components;
+    sampled.subresource=view.subresource;sampled.layout=candidate.binding.imageLayout;
+    sampled.hasViewConversion=view.extensions.hasConversion;sampled.conversionComplete=conversion.complete;
+    sampled.conversion=frame_pixel_sampler::SamplerProbe::profile();
+    sampled.conversion.format=conversion.format;sampled.conversion.ycbcrModel=conversion.model;
+    sampled.conversion.ycbcrRange=conversion.range;sampled.conversion.components=conversion.components;
+    sampled.conversion.xChromaOffset=conversion.xChromaOffset;sampled.conversion.yChromaOffset=conversion.yChromaOffset;
+    sampled.conversion.chromaFilter=conversion.chromaFilter;sampled.conversion.forceExplicitReconstruction=conversion.forceExplicitReconstruction;
+    if (!conversion.extensions.chain.complete || conversion.extensions.chain.count){refuse(SamplerRefusal::Conversion);return;}
+    frame_pixel_sampler::Dispatch dispatch;
+    if(!d->sampler.admit(sampled,dispatch)){refuse(SamplerRefusal::Profile);return;} // Pure; no descriptor/GPU mutation.
     frame_pixels::Source source;
     source.image = reinterpret_cast<VkImage>(static_cast<std::uintptr_t>(image.identity.handle));
     source.generation=image.identity.generation; source.format=image.format; source.extent=image.extent;
@@ -243,7 +366,12 @@ void afterRenderPass(Device* d, VkCommandBuffer command, bool dynamic) {
     admission.noSimultaneousUse=candidate.noSimultaneousUse;
     admission.retirementRequired=candidate.retirementRequired;
     if (d->readback.record(command,source,admission) == frame_pixels::Status::Ok) {
-        d->candidate=candidate; d->selected.store(true,std::memory_order_release);
+        // Only the successful raw-copy CAS owner may update the one prepared set.
+        // Both operations stay within this same valid native primary recording.
+        const auto result=d->sampler.record(command,dispatch);
+        d->candidate=candidate;d->samplerDispatch=dispatch;
+        d->samplerRecorded=result==frame_pixel_sampler::Status::Ok;
+        d->selected.store(true,std::memory_order_release);
     }
 }
 } // namespace
@@ -265,6 +393,8 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateInstance(const VkInstanceCreateInfo* i
     const auto result=next(info,alloc,out);
     if(result==VK_SUCCESS){
         record->native=*out;
+        record->apiVersion=info->pApplicationInfo && info->pApplicationInfo->apiVersion
+            ?info->pApplicationInfo->apiVersion:VK_API_VERSION_1_0;
         const auto destroy=reinterpret_cast<PFN_vkDestroyInstance>(record->gipa(*out,"vkDestroyInstance"));
         try{auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.instances.emplace(dispatchKey(*out),std::move(record));}
         catch(...){destroy(*out,alloc);*out=VK_NULL_HANDLE;return VK_ERROR_OUT_OF_HOST_MEMORY;}
@@ -287,6 +417,26 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     link->u.pLayerInfo=link->u.pLayerInfo->pNext;
     const auto result=next(physical,info,alloc,out);if(result!=VK_SUCCESS)return result;
     d->native=*out;d->id=++nextDevice;
+    d->instanceApiVersion=i->apiVersion;
+    frame_pixel_sampler::ReviewedRoutes reviewed;
+    reviewed.coreComputeRoutesObserved=VK_API_VERSION_VARIANT(i->apiVersion)==0 &&
+        VK_API_VERSION_MAJOR(i->apiVersion)==1 && VK_API_VERSION_MINOR(i->apiVersion)<=4;
+    reviewed.extensionNames=frame_pixel_sampler_routes::DeviceExtensions;
+    reviewed.extensionCount=sizeof(frame_pixel_sampler_routes::DeviceExtensions)/sizeof(*frame_pixel_sampler_routes::DeviceExtensions);
+    reviewed.additionalChainTypes=frame_pixel_sampler_routes::DeviceChainTypes;
+    reviewed.additionalChainTypeCount=sizeof(frame_pixel_sampler_routes::DeviceChainTypes)/sizeof(*frame_pixel_sampler_routes::DeviceChainTypes);
+    d->samplerEligibility=frame_pixel_sampler::inspectDeviceCreate(*info,reviewed);
+    // Retain only the first unknown, bounded ASCII extension for the cold
+    // report; never retain borrowed vkCreateDevice input pointers or long lists.
+    if(info->enabledExtensionCount<=128 && info->ppEnabledExtensionNames)
+        for(std::uint32_t n=0;n<info->enabledExtensionCount && !d->unreviewedExtension[0];++n) {
+            const auto* name=info->ppEnabledExtensionNames[n];bool known=false;
+            for(std::uint32_t k=0;name && k<reviewed.extensionCount;++k)
+                known=known || frame_pixel_sampler::exactExtensionName(name,reviewed.extensionNames[k]);
+            if(!known && name)for(std::size_t k=0;k<sizeof(d->unreviewedExtension)-1 && name[k];++k)
+                d->unreviewedExtension[k]=(name[k]>='A' && name[k]<='Z') || (name[k]>='a' && name[k]<='z') ||
+                    (name[k]>='0' && name[k]<='9') || name[k]=='_' ?name[k]:'_';
+        }
 #define LOAD(name) d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,"vk" #name));
     LOAD(DestroyDevice) LOAD(DeviceWaitIdle) LOAD(CreateShaderModule) LOAD(DestroyShaderModule)
     LOAD(CreateGraphicsPipelines) LOAD(DestroyPipeline) LOAD(CreateCommandPool)
@@ -294,6 +444,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     LOAD(ResetCommandBuffer) LOAD(ResetCommandPool) LOAD(DestroyCommandPool) LOAD(CmdBindPipeline)
     LOAD(CmdDraw) LOAD(CmdDrawIndexed) LOAD(CmdDrawIndirect) LOAD(CmdDrawIndexedIndirect) LOAD(CmdExecuteCommands)
     LOAD(CmdBindShadersEXT)
+    LOAD(CmdDispatch) LOAD(CmdDispatchIndirect) LOAD(CmdDispatchBase)
     LOAD(CmdBeginRenderPass) LOAD(CmdNextSubpass) LOAD(CmdEndRenderPass) LOAD(CmdBeginRenderPass2) LOAD(CmdNextSubpass2) LOAD(CmdEndRenderPass2)
     LOAD(CmdBeginRendering) LOAD(CmdEndRendering) LOAD(QueueSubmit) LOAD(QueueSubmit2)
 #define BINDING_FIELD(name) LOAD(name)
@@ -303,6 +454,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
 #define ALIAS(name,suffix) if(!d->name)d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,"vk" #name suffix));
     ALIAS(CmdBeginRenderPass2,"KHR") ALIAS(CmdNextSubpass2,"KHR") ALIAS(CmdEndRenderPass2,"KHR")
     ALIAS(CmdBeginRendering,"KHR") ALIAS(CmdEndRendering,"KHR") ALIAS(QueueSubmit2,"KHR")
+    ALIAS(CmdDispatchBase,"KHR")
 #undef ALIAS
 #define BINDING_ALIAS(alias,name) if(!d->name)d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,alias));
 #include "passive_binding_aliases.inc"
@@ -322,10 +474,41 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     if(session().allowed && ordinary && !session().deviceClaimed.exchange(true)) {
         VkPhysicalDeviceMemoryProperties properties{};
         reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(i->gipa(i->native,"vkGetPhysicalDeviceMemoryProperties"))(physical,&properties);
-        if(published->readback.prepare(*out,published->gdpa,properties,{})==frame_pixels::Status::Ok) {
+        auto queueProperties=reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(i->gipa(i->native,"vkGetPhysicalDeviceQueueFamilyProperties"));
+        std::array<VkQueueFamilyProperties,64> queueData{};
+        std::uint32_t queueCount=0;
+        if(queueProperties)queueProperties(physical,&queueCount,nullptr);
+        if(queueCount && queueCount<=queueData.size()) {
+            auto count=queueCount;queueProperties(physical,&count,queueData.data());
+            if(count==queueCount) {
+                published->queueFamilyCount=count;
+                for(std::uint32_t n=0;n<count;++n)published->queueFlags[n]=queueData[n].queueFlags;
+                for(std::uint32_t n=0;n<info->queueCreateInfoCount;++n) {
+                    const auto family=info->pQueueCreateInfos[n].queueFamilyIndex;
+                    published->nativeComputeQueue=published->nativeComputeQueue ||
+                        (family<count && frame_pixel_sampler::queueSupportsCompute(queueData[family].queueFlags));
+                }
+            }
+        }
+        auto formatProperties=reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(i->gipa(i->native,"vkGetPhysicalDeviceFormatProperties2"));
+        if(!formatProperties)formatProperties=reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(i->gipa(i->native,"vkGetPhysicalDeviceFormatProperties2KHR"));
+        auto imageProperties=reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(i->gipa(i->native,"vkGetPhysicalDeviceImageFormatProperties2"));
+        if(!imageProperties)imageProperties=reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(i->gipa(i->native,"vkGetPhysicalDeviceImageFormatProperties2KHR"));
+        if(published->samplerEligibility.eligible())
+            published->samplerFormats=frame_pixel_sampler_format::querySupport(physical,formatProperties,imageProperties);
+        frame_pixels::Config readbackConfig;readbackConfig.sampledCompanion=true;
+        if(published->readback.prepare(*out,published->gdpa,properties,readbackConfig)==frame_pixels::Status::Ok) {
+            if(published->samplerEligibility.eligible() && published->nativeComputeQueue && published->samplerFormats.complete && published->samplerFormats.routeCount) {
+                frame_pixel_sampler::Preparation preparation;
+                preparation.targetBuffer=published->readback.companionBuffer();preparation.capacity=published->readback.companionCapacity();
+                preparation.samplerYcbcrConversionEnabled=published->samplerEligibility.samplerYcbcrConversionEnabled;
+                preparation.combinedImageSamplerDescriptorCount=published->samplerFormats.poolDescriptorCount;
+                const auto prepared=published->sampler.prepare(*out,published->gdpa,preparation);
+                published->samplerPrepareResult=prepared==frame_pixel_sampler::Status::Ok?VK_SUCCESS:published->sampler.lastResult();
+            }
             published->ownsCapture=true;
             try{published->writer=std::thread(writer,published);}
-            catch(...){published->ownsCapture=false;published->readback.release();}
+            catch(...){published->ownsCapture=false;published->sampler.release();published->readback.release();}
         }
     }
     return result;
@@ -338,13 +521,16 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocation
     const auto state=d->readback.state();
     if(state!=frame_pixels::State::Empty && state!=frame_pixels::State::Released) {
         const auto idle=d->DeviceWaitIdle(device);
+        d->sampler.release(idle==VK_SUCCESS || idle==VK_ERROR_DEVICE_LOST);
         d->readback.release(idle==VK_SUCCESS || idle==VK_ERROR_DEVICE_LOST);
     }
     const auto key=dispatchKey(device);d->DestroyDevice(device,alloc);
     auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.devices.erase(key);
 }
 #define observeBindings(...) observeBindingsAt(__func__, __VA_ARGS__)
+#define FRAME_PIXEL_COMPUTE_BIND(d,command,point) do { if((point)!=VK_PIPELINE_BIND_POINT_GRAPHICS) session().tracker->touchComputeState((d)->id,command); } while(false)
 #include "passive_binding_hooks.inc"
+#undef FRAME_PIXEL_COMPUTE_BIND
 #undef observeBindings
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateShaderModule(VkDevice device,const VkShaderModuleCreateInfo* info,const VkAllocationCallbacks* alloc,VkShaderModule* out) {
     auto* d=deviceFor(device);const auto result=d->CreateShaderModule(device,info,alloc,out);
@@ -426,6 +612,15 @@ VKAPI_ATTR void VKAPI_CALL traceCmdBindShadersEXT(VkCommandBuffer command,std::u
     auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
     d->CmdBindShadersEXT(command,count,stages,shaders);
 }
+VKAPI_ATTR void VKAPI_CALL traceCmdDispatch(VkCommandBuffer command,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
+    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);d->CmdDispatch(command,x,y,z);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdDispatchIndirect(VkCommandBuffer command,VkBuffer buffer,VkDeviceSize offset) {
+    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);d->CmdDispatchIndirect(command,buffer,offset);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdDispatchBase(VkCommandBuffer command,std::uint32_t bx,std::uint32_t by,std::uint32_t bz,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
+    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);d->CmdDispatchBase(command,bx,by,bz,x,y,z);
+}
 VKAPI_ATTR void VKAPI_CALL traceCmdDraw(VkCommandBuffer command,std::uint32_t vertices,std::uint32_t instances,std::uint32_t firstVertex,std::uint32_t firstInstance) {
     auto* d=deviceFor(command);if(vertices && instances)session().tracker->draw(d->id,command);
     d->CmdDraw(command,vertices,instances,firstVertex,firstInstance);
@@ -505,6 +700,7 @@ PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
     HOOK(AllocateCommandBuffers) HOOK(FreeCommandBuffers) HOOK(BeginCommandBuffer) HOOK(EndCommandBuffer) HOOK(ResetCommandBuffer)
     HOOK(CmdBindPipeline) HOOK(CmdDraw) HOOK(CmdDrawIndexed) HOOK(CmdDrawIndirect) HOOK(CmdDrawIndexedIndirect) HOOK(CmdExecuteCommands)
     HOOK(CmdBindShadersEXT)
+    HOOK(CmdDispatch) HOOK(CmdDispatchIndirect) HOOK(CmdDispatchBase)
     HOOK(CmdBeginRenderPass) HOOK(CmdNextSubpass) HOOK(CmdEndRenderPass)
     HOOK(CmdBeginRenderPass2) HOOK(CmdNextSubpass2) HOOK(CmdEndRenderPass2) HOOK(CmdBeginRendering) HOOK(CmdEndRendering)
     HOOK(QueueSubmit) HOOK(QueueSubmit2)
@@ -518,6 +714,7 @@ PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
 #undef BINDING_ALIAS
     ALIAS("vkCmdBeginRenderPass2KHR",CmdBeginRenderPass2) ALIAS("vkCmdNextSubpass2KHR",CmdNextSubpass2) ALIAS("vkCmdEndRenderPass2KHR",CmdEndRenderPass2)
     ALIAS("vkCmdBeginRenderingKHR",CmdBeginRendering) ALIAS("vkCmdEndRenderingKHR",CmdEndRendering) ALIAS("vkQueueSubmit2KHR",QueueSubmit2)
+    ALIAS("vkCmdDispatchBaseKHR",CmdDispatchBase)
 #undef ALIAS
     return native;
 }
