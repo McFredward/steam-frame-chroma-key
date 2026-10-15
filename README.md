@@ -18,7 +18,10 @@ The GloomhavenVR source pattern has now been visually confirmed in both eyes,
 including manual menu restoration. The next [decoded-image snapshot experiment](docs/PIXEL-SNAPSHOT-PREPARATION-20261015.md)
 uses a reversible public-Vulkan diagnostic. Its [first approved Frame attempt](docs/PIXEL-SNAPSHOT-ATTEMPT-20261015.md)
 loaded normally but refused acquisition before arming. The original runtime was
-restored; bounded first-refusal diagnostics are prepared for a new attempt.
+restored. The [second attempt](docs/PIXEL-TRACKER-CONCURRENCY-20261015.md)
+identified an internal metadata lock refusal before arming; the original runtime
+was restored again. The targeted repair now passes the reproducing local Vulkan
+concurrency case; successful Frame image acquisition remains to be verified.
 This does not enable streamed passthrough.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded

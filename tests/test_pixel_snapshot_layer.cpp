@@ -4,6 +4,7 @@
 #include <vulkan/vk_layer.h>
 #include <dlfcn.h>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -136,9 +137,62 @@ int main(int argc,char** argv) {
     function<PFN_vkDestroyImageView>(gdpa(device,"vkDestroyImageView"),"image-view-destroy-proc")(device,view,nullptr);
     function<PFN_vkDestroyImage>(gdpa(device,"vkDestroyImage"),"image-destroy-proc")(device,image,nullptr);
     function<PFN_vkFreeMemory>(gdpa(device,"vkFreeMemory"),"memory-free-proc")(device,memory,nullptr);
+    // The real Frame refused traceBindImageMemory merely because another
+    // resource observer held the tracker mutex. Exercise the actual production
+    // wrappers with independent native objects on simultaneous CPU threads.
+    // All queue operations stay on the original thread; the workers never
+    // share an image, memory allocation or view that needs external ownership.
+    const auto createImage=function<PFN_vkCreateImage>(gdpa(device,"vkCreateImage"),"parallel-image-create-proc");
+    const auto imageRequirements=function<PFN_vkGetImageMemoryRequirements>(gdpa(device,"vkGetImageMemoryRequirements"),"parallel-image-requirements-proc");
+    const auto allocateMemory=function<PFN_vkAllocateMemory>(gdpa(device,"vkAllocateMemory"),"parallel-memory-allocate-proc");
+    const auto bindImage=function<PFN_vkBindImageMemory>(gdpa(device,"vkBindImageMemory"),"parallel-image-bind-proc");
+    const auto createView=function<PFN_vkCreateImageView>(gdpa(device,"vkCreateImageView"),"parallel-view-create-proc");
+    const auto destroyView=function<PFN_vkDestroyImageView>(gdpa(device,"vkDestroyImageView"),"parallel-view-destroy-proc");
+    const auto destroyImage=function<PFN_vkDestroyImage>(gdpa(device,"vkDestroyImage"),"parallel-image-destroy-proc");
+    const auto freeMemory=function<PFN_vkFreeMemory>(gdpa(device,"vkFreeMemory"),"parallel-memory-free-proc");
+    std::atomic<unsigned> ready{0},completed{0};
+    std::atomic<bool> go{false},parallelOkay{true};
+    std::array<std::thread,3> resourceThreads;
+    for(auto& worker:resourceThreads)worker=std::thread([&] {
+        ready.fetch_add(1,std::memory_order_release);
+        while(!go.load(std::memory_order_acquire))std::this_thread::yield();
+        for(unsigned round=0;round<24;++round) {
+            VkImage ownImage{};VkDeviceMemory ownMemory{};VkImageView ownView{};
+            bool okay=createImage(device,&ii,nullptr,&ownImage)==VK_SUCCESS;
+            if(okay) {
+                VkMemoryRequirements ownRequirements{};
+                imageRequirements(device,ownImage,&ownRequirements);
+                unsigned ownType=0;
+                while(ownType<memoryProperties.memoryTypeCount && !(ownRequirements.memoryTypeBits&(1u<<ownType)))++ownType;
+                okay=ownType<memoryProperties.memoryTypeCount;
+                if(okay) {
+                    auto ownAllocation=ma;
+                    ownAllocation.allocationSize=ownRequirements.size;ownAllocation.memoryTypeIndex=ownType;
+                    okay=allocateMemory(device,&ownAllocation,nullptr,&ownMemory)==VK_SUCCESS;
+                }
+                if(okay)okay=bindImage(device,ownImage,ownMemory,0)==VK_SUCCESS;
+                if(okay) {
+                    auto ownViewInfo=vi;ownViewInfo.image=ownImage;
+                    okay=createView(device,&ownViewInfo,nullptr,&ownView)==VK_SUCCESS;
+                }
+            }
+            if(ownView)destroyView(device,ownView,nullptr);
+            if(ownImage)destroyImage(device,ownImage,nullptr);
+            if(ownMemory)freeMemory(device,ownMemory,nullptr);
+            if(!okay){parallelOkay.store(false,std::memory_order_relaxed);break;}
+            completed.fetch_add(1,std::memory_order_relaxed);
+        }
+    });
+    while(ready.load(std::memory_order_acquire)!=resourceThreads.size())std::this_thread::yield();
+    go.store(true,std::memory_order_release);
+    for(auto& worker:resourceThreads)worker.join();
+    require(parallelOkay.load() && completed.load()==72,"parallel-native-image-memory-view-lifecycles");
+    // Fixture-only observation window for the existing 5-ms background writer;
+    // do not tear it down before a sticky metadata refusal can be reported.
+    if(argc==5)std::this_thread::sleep_for(std::chrono::milliseconds(20));
     success(function<PFN_vkDeviceWaitIdle>(gdpa(device,"vkDeviceWaitIdle"),"device-idle-proc")(device),"actual-device-idle");
     function<PFN_vkDestroyDevice>(gdpa(device,"vkDestroyDevice"),"device-destroy-proc")(device,nullptr);
     function<PFN_vkDestroyInstance>(gipa(instance,"vkDestroyInstance"),"instance-destroy-proc")(instance,nullptr);
     require(!dlclose(loader) && !dlclose(layer),"native-library-close");
-    std::printf("RESULT={\"checks\":%u,\"driver\":\"%s\",\"query_pool\":true,\"query_not_ready_native\":true,\"image_bind_view\":true,\"command_submit_reset\":true,\"teardown\":true,\"matched_capture\":false,\"native_frame\":false,\"mask_enabled\":false}\n",checks,properties.deviceName);
+    std::printf("RESULT={\"checks\":%u,\"driver\":\"%s\",\"query_pool\":true,\"query_not_ready_native\":true,\"image_bind_view\":true,\"parallel_image_memory_view\":true,\"parallel_lifecycles\":72,\"command_submit_reset\":true,\"teardown\":true,\"matched_capture\":false,\"native_frame\":false,\"mask_enabled\":false}\n",checks,properties.deviceName);
 }

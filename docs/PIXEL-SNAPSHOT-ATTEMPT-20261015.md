@@ -1,5 +1,9 @@
 # First native pixel snapshot attempt, 2026-10-15
 
+This is the first attempt's historical record. The subsequently approved
+[second attempt and concurrency repair](PIXEL-TRACKER-CONCURRENCY-20261015.md)
+identify the previously unavailable concrete refusal site and reason.
+
 ## Observed result
 
 The maintainer explicitly approved the temporary user-directory package, one

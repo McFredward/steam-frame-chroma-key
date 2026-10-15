@@ -51,8 +51,9 @@ def smoke(result):
     assert result["exit_code"] == 0, result
     line = next(x for x in result["stdout"].splitlines() if x.startswith("RESULT="))
     facts = json.loads(line[len("RESULT="):])
-    for key in ("query_pool", "query_not_ready_native", "image_bind_view", "command_submit_reset", "teardown"):
+    for key in ("query_pool", "query_not_ready_native", "image_bind_view", "parallel_image_memory_view", "command_submit_reset", "teardown"):
         assert facts[key] is True, (key, facts)
+    assert facts["parallel_lifecycles"] == 72, facts
     assert facts["checks"] >= 80, facts
     assert facts["matched_capture"] is False and facts["native_frame"] is False and facts["mask_enabled"] is False
     return facts
