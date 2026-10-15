@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 include(CTest)
 option(FRAME_MASK_BUILD_TRACE "Build the opt-in passive compositor diagnostic layer" OFF)
+option(FRAME_MASK_BUILD_PIXEL_SNAPSHOT
+    "Build an uninstalled one-shot explicit-pattern GPU pixel diagnostic" OFF)
 option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
 option(FRAME_MASK_BUILD_IMPORT_ENTRY
@@ -137,7 +139,7 @@ if(FRAME_MASK_BUILD_RECEIVER_OBSERVER)
     endif()
 endif()
 
-if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE OR FRAME_MASK_BUILD_IMPORT_ENTRY))
+if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE OR FRAME_MASK_BUILD_IMPORT_ENTRY OR FRAME_MASK_BUILD_PIXEL_SNAPSHOT))
     if(CMAKE_CROSSCOMPILING AND NOT BUILD_TESTING)
         # A dispatch layer resolves the next native functions through the loader
         # chain; it needs headers, not a foreign target libvulkan to link against.
@@ -194,6 +196,49 @@ elseif(FRAME_MASK_BUILD_TRACE)
     message(FATAL_ERROR "The passive compositor trace targets Linux Vulkan")
 endif()
 
+if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
+    if(NOT UNIX)
+        message(FATAL_ERROR "The receiver pixel snapshot targets Linux Vulkan")
+    endif()
+    add_library(VkLayer_frame_pixel_snapshot SHARED
+        layer/pixel_snapshot_layer.cpp layer/pixel_readback.cpp)
+    target_include_directories(VkLayer_frame_pixel_snapshot PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(VkLayer_frame_pixel_snapshot PRIVATE
+        -Wall -Wextra -Wpedantic -Werror -fvisibility=hidden)
+    target_link_options(VkLayer_frame_pixel_snapshot PRIVATE -Wl,-Bsymbolic-functions
+        -Wl,--no-undefined "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/layer/pixel_snapshot_exports.map")
+    set_property(TARGET VkLayer_frame_pixel_snapshot APPEND PROPERTY LINK_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/layer/pixel_snapshot_exports.map)
+    target_link_libraries(VkLayer_frame_pixel_snapshot PRIVATE Threads::Threads)
+    set(FRAME_PIXEL_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}VkLayer_frame_pixel_snapshot${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    configure_file(layer/VkLayer_frame_pixel_snapshot.json.in
+        ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json @ONLY)
+endif()
+
+if(BUILD_TESTING AND UNIX)
+    add_executable(test_pixel_readback tests/test_pixel_readback.cpp layer/pixel_readback.cpp)
+    target_include_directories(test_pixel_readback PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_readback PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_readback PRIVATE Vulkan::Vulkan Threads::Threads)
+    add_test(NAME pixel_readback_controls COMMAND test_pixel_readback controls)
+    add_test(NAME pixel_readback_gpu COMMAND test_pixel_readback gpu)
+    add_executable(test_pixel_capture_tracker tests/test_pixel_capture_tracker.cpp)
+    target_include_directories(test_pixel_capture_tracker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_capture_tracker PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_capture_tracker PRIVATE Threads::Threads)
+    add_test(NAME pixel_capture_tracker COMMAND test_pixel_capture_tracker)
+    add_executable(test_pixel_snapshot_io tests/test_pixel_snapshot_io.cpp)
+    target_include_directories(test_pixel_snapshot_io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_snapshot_io PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_snapshot_io PRIVATE Threads::Threads)
+    add_test(NAME pixel_snapshot_io COMMAND test_pixel_snapshot_io)
+    add_executable(test_pixel_snapshot_selection tests/test_pixel_snapshot_selection.cpp)
+    target_include_directories(test_pixel_snapshot_selection PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_snapshot_selection PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_snapshot_selection PRIVATE Threads::Threads)
+    add_test(NAME pixel_snapshot_selection COMMAND test_pixel_snapshot_selection)
+endif()
+
 add_library(frame_mask STATIC mask/mask_protocol.cpp mask/frame_association.cpp)
 target_include_directories(frame_mask PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(frame_mask PRIVATE -Wall -Wextra -Wpedantic)
@@ -222,6 +267,21 @@ if(BUILD_TESTING)
     if(UNIX)
         add_test(NAME app_owned_payload_reference COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_app_payload_probe.py)
+        add_test(NAME pixel_payload_recovery COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_payload_recovery.py)
+        add_test(NAME pixel_snapshot_session COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_snapshot_session.py)
+        if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
+            add_executable(test_pixel_snapshot_layer tests/test_pixel_snapshot_layer.cpp)
+            target_include_directories(test_pixel_snapshot_layer PRIVATE ${Vulkan_INCLUDE_DIRS})
+            target_compile_options(test_pixel_snapshot_layer PRIVATE -Wall -Wextra -Wpedantic -Werror)
+            target_link_libraries(test_pixel_snapshot_layer PRIVATE Vulkan::Vulkan Threads::Threads ${CMAKE_DL_LIBS})
+            add_test(NAME pixel_snapshot_real_loader COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_snapshot_layer.py
+                $<TARGET_FILE:test_pixel_snapshot_layer> $<TARGET_FILE:VkLayer_frame_pixel_snapshot>
+                ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json)
+            set_tests_properties(pixel_snapshot_real_loader PROPERTIES TIMEOUT 90)
+        endif()
         add_executable(test_compositor_bootstrap tests/test_compositor_bootstrap.cpp
             import/compositor_main_preparation.cpp import/import_main_preparation.cpp
             import/import_loader_reader.cpp import/import_module_identity.cpp)

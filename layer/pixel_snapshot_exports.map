@@ -1,0 +1,7 @@
+{
+    global:
+        frame_pixel_vkGetInstanceProcAddr;
+        frame_pixel_vkGetDeviceProcAddr;
+        frame_pixel_vkNegotiateLoaderLayerInterfaceVersion;
+    local: *;
+};

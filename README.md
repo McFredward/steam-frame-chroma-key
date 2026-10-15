@@ -14,6 +14,11 @@ Development branch: [`dev`](https://github.com/McFredward/steam-frame-chroma-key
 See [mask implementation and tests](docs/MASK-TRANSPORT.md) and
 [remaining Steam Link integration](docs/MASK-BRIDGE-INVESTIGATION.md).
 
+The GloomhavenVR source pattern has now been visually confirmed in both eyes,
+including manual menu restoration. The next [decoded-image snapshot experiment](docs/PIXEL-SNAPSHOT-PREPARATION-20261015.md)
+is locally prepared with a reversible public-Vulkan diagnostic. It has not been
+installed or tested on the headset and does not enable streamed passthrough.
+
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
 client. The [PC source collector](docs/PC-MASK-SOURCE.md) inspects the installed

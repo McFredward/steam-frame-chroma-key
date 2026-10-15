@@ -76,8 +76,8 @@ struct Fake {
         auto& f=*active;
         if (f.barriers<2 && ic==1) f.imageBarriers[f.barriers]=*i;
         if (bc==1) f.hostBarrier=*b;
-        require(src == (f.barriers ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),"barrier source stage");
-        require(dst == (f.barriers ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_HOST_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT),"barrier destination stage");
+        require(src == (f.barriers ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT),"all native sampling stages precede copy");
+        require(dst == (f.barriers ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT),"restore covers all native sampling stages and host");
         ++f.barriers;
     }
     static VKAPI_ATTR void VKAPI_CALL copy(VkCommandBuffer, VkImage, VkImageLayout l, VkBuffer, uint32_t n, const VkBufferImageCopy* p) {

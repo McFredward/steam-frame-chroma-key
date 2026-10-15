@@ -1,0 +1,17 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_GHVR_pixel_snapshot",
+    "type": "GLOBAL",
+    "library_path": "@FRAME_PIXEL_LIBRARY@",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "One-shot explicit-pattern pixel carriage diagnostic, not passthrough",
+    "functions": {
+      "vkGetInstanceProcAddr": "frame_pixel_vkGetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "frame_pixel_vkGetDeviceProcAddr",
+      "vkNegotiateLoaderLayerInterfaceVersion": "frame_pixel_vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": {"GHVR_PIXEL_SNAPSHOT_DISABLE": "1"}
+  }
+}

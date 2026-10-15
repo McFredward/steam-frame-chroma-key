@@ -24,7 +24,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends glslc spirv-tools libvulkan-dev mesa-vulkan-drivers g++-mingw-w64-x86-64-win32 binutils-aarch64-linux-gnu
       - name: Configure and build
         run: |
-          cmake -S . -B build/mask -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFRAME_MASK_BUILD_RECEIVER_OBSERVER=ON
+          cmake -S . -B build/mask -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFRAME_MASK_BUILD_RECEIVER_OBSERVER=ON -DFRAME_MASK_BUILD_PIXEL_SNAPSHOT=ON
           cmake --build build/mask --parallel 4
       - name: Focused checks in parallel
         run: ctest --test-dir build/mask --output-on-failure --parallel 4

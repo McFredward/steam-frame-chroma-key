@@ -595,6 +595,21 @@ public:
         m.chromaFilter = info.chromaFilter; m.forceExplicitReconstruction = info.forceExplicitReconstruction; m.complete = out->complete;
     }
     void destroyConversion(std::uint64_t device, VkSamplerYcbcrConversion value) noexcept { eraseGuarded(conversions_, device, handle(value)); }
+    // Live adapters reuse the same per-object bind validation as journal replay.
+    // Every input is public successful Vulkan API metadata, never a copied
+    // asynchronous pointer. Keep the batch finite before touching its members.
+    void bindBufferMemory2(std::uint64_t device,std::uint32_t count,const VkBindBufferMemoryInfo* info) noexcept {
+        if(count>32 || (count && !info)){reportLoss(Reason::Bounds);return;}
+        for(std::uint32_t i=0;i<count;++i)
+            bindBufferMemory(device,info[i].buffer,info[i].memory,info[i].memoryOffset,
+                info[i].sType==VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO && !info[i].pNext);
+    }
+    void bindImageMemory2(std::uint64_t device,std::uint32_t count,const VkBindImageMemoryInfo* info) noexcept {
+        if(count>32 || (count && !info)){reportLoss(Reason::Bounds);return;}
+        for(std::uint32_t i=0;i<count;++i)
+            bindImageMemory(device,info[i].image,info[i].memory,info[i].memoryOffset,
+                info[i].sType==VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO && !info[i].pNext);
+    }
     void bindBufferMemory(std::uint64_t device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset, bool supportedInfo = true) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         auto* out = find(buffers_, device, handle(buffer)); const auto* allocation = find(memories_, device, handle(memory));

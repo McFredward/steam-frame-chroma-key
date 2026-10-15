@@ -6,8 +6,9 @@ a production passthrough implementation, or an additional PC Steam sender hook.
 It never starts/stops a service, restarts Steam/SteamVR, connects over SSH,
 changes shaders, installs a preload/audit library, or starts a timer.
 
-The source test in GloomhavenVR must already be enabled and visibly streamed to
-the Frame. The layer copies at most one admitted decoded P010 image; pixel
+Before arming, the source test in GloomhavenVR must be enabled and visibly
+streamed to the Frame. The layer saves at most one immutable decoded P010 image;
+a reusable native recording may repeat its GPU copy until retirement. Pixel
 recovery is offline. Source-frame identity, eye placement, native foveation/UV
 mapping and working passthrough remain unproved.
 

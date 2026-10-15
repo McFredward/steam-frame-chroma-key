@@ -146,7 +146,11 @@ Status Readback::record(VkCommandBuffer command, const Source& s, const Admissio
     image.srcQueueFamilyIndex = image.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     image.image = s.image;
     image.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    p_.barrier(command, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    // A selected distortion fragment does not prove that its vertex stage (or
+    // earlier/later native work) never samples this resource. Cover all command
+    // stages for this single diagnostic transition rather than assume fragment
+    // exclusivity. Layout, access and ownership remain restored for native use.
+    p_.barrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                0, 0, nullptr, 0, nullptr, 1, &image);
     p_.copy(command, s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer_,
             layout_.planeCount, layout_.planes.data());
@@ -161,7 +165,7 @@ Status Readback::record(VkCommandBuffer command, const Source& s, const Admissio
     buffer.srcQueueFamilyIndex = buffer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     buffer.buffer = buffer_; buffer.size = layout_.bytes;
     p_.barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                0, 0, nullptr, 1, &buffer, 1, &image);
     state_.store(State::Recorded, std::memory_order_release);
     return Status::Ok;
