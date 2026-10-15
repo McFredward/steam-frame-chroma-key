@@ -79,6 +79,11 @@ Focused evidence composes existing unchanged checks with the affected repairs:
   MIDPOINT/LINEAR P010 profile; no native-profile GPU pass is claimed.
 - Integrated original-loader forwarding/concurrency smoke and strict host/ARM
   builds. This fixture does not issue the pinned native distortion draw.
+- Thirteen paired-reader cases are covered by the focused initial pass and the
+  two affected reusable-retirement controls. They include exact integrity,
+  generations, missing retirement/fence, code differences, trusted-header
+  recovery, input links and output collision refusals. The earlier unpaired
+  actual capture is correctly refused as a pair before its raw data is read.
 - Independent final source review found no remaining known blocker after the
   targeted route, query and GPU-ordering repairs.
 
@@ -107,3 +112,19 @@ expiry, rollback or restart is introduced. The Steam PC sender stays untouched.
 Frame/eye/foveation binding, real game coverage and working passthrough remain
 separate later milestones; an interpretable static sample does not establish
 dynamic source-video frame association.
+
+Offline inspection after exact transfer, using a new private output directory:
+
+```sh
+python3 -B tools/pixel_sampler_recovery.py \
+  --snapshot /private/run/snapshot.p010 \
+  --sampler /private/run/sampler-components.rgba8 \
+  --metadata /private/run/snapshot.json \
+  --png /private/run/sampler-components.png \
+  --green-png /private/run/sampler-green.png \
+  --record /private/run/sampler-validation.json
+```
+
+The optional header stage additionally requires the exact original source PNG,
+trusted source manifest, explicit tested mapping and expected session/content/eye.
+It never infers those expectations from the captured image itself.

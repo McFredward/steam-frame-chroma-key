@@ -285,6 +285,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_sampler_shader.py)
         add_test(NAME pixel_sampler_routes COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_sampler_routes.py)
+        add_test(NAME pixel_sampler_recovery COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_sampler_recovery.py)
         add_test(NAME app_owned_payload_reference COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_app_payload_probe.py)
         add_test(NAME pixel_payload_recovery COMMAND ${Python3_EXECUTABLE} -B
