@@ -24,6 +24,9 @@ was restored again. The targeted repair now also permits the
 [first complete native pixel snapshot](docs/PIXEL-SNAPSHOT-CAPTURE-20261015.md).
 The exact image and metadata are secured, and the diagnostic was fully removed.
 Source-payload recovery and native frame/eye/UV association remain open.
+The next [same-image sampler comparison](docs/PIXEL-SAMPLER-PREPARATION-20261016.md)
+checks the raw-copy interpretation against native converted-view sampling.
+It is locally prepared and has not been installed on the Frame.
 This does not enable streamed passthrough.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
