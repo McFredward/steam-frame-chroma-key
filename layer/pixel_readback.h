@@ -14,7 +14,7 @@ constexpr VkDeviceSize MaximumBytes = 64u * 1024u * 1024u;
 constexpr VkFormat NativeP010 = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
 
 enum class Mode : std::uint8_t { NativeP010, OwnedRgbaFixture };
-enum class State : std::uint8_t { Empty, Preparing, Ready, Recording, Recorded, Submitting, Pending, Polling, Complete, Failed, Released };
+enum class State : std::uint8_t { Empty, Preparing, Ready, Recording, Recorded, Submitting, Pending, Polling, AwaitingRetirement, Complete, Failed, Released };
 enum class Status : std::uint8_t { Ok, Refused, NotReady, Pending, Complete, VulkanFailure, UnsafeToRelease };
 struct Config {
     VkFormat format = NativeP010;
@@ -52,6 +52,9 @@ struct Admission {
     // Without this recorded copy commands could be replayed later, rewriting
     // the mapped result or retaining a reference to already freed staging.
     bool oneTimeSubmit = false, noSimultaneousUse = false;
+    // Explicit alternative for reusable native CBs. No CPU data is published
+    // until valid native retirement proves no pending or future replay.
+    bool retirementRequired = false;
 };
 struct View {
     const std::uint8_t* data = nullptr;
@@ -59,6 +62,7 @@ struct View {
     Layout layout{};
     VkImage source = VK_NULL_HANDLE;
     std::uint64_t sourceGeneration = 0, commandGeneration = 0;
+    bool oneTimeSubmit = false, retirementRequired = false, generationRetired = false;
 };
 
 // No mutex, allocation, file I/O or blocking wait in record(),
@@ -81,11 +85,19 @@ public:
     // The native result/fence are untouched. A mismatched CB is a no-op refusal.
     Status submitCompletion(VkQueue, VkCommandBuffer, std::uint64_t commandGeneration,
                             VkResult nativeSubmitResult) noexcept;
+    // Publish only after the ORIGINAL valid native reset/begin/free/pool
+    // retirement succeeds with this old generation NOT pending. A new Begin
+    // retires its previous recording, not the new generation being created.
+    // Atomic notification only; no native call, readback, allocation or wait.
+    Status retireCommand(VkCommandBuffer, std::uint64_t oldCommandGeneration,
+                         bool nativeSuccessfulReset) noexcept;
     Status poll(View&) noexcept;
     State state() const noexcept { return state_.load(std::memory_order_acquire); }
     VkResult lastResult() const noexcept { return lastResult_.load(std::memory_order_relaxed); }
     // Safe without proof only before any commands were recorded or after our
-    // successful completion fence. After ANY recording/failure the caller must
+    // successful completion fence in strict one-time mode. Retirement mode
+    // retains its allocation until explicit shutdown proof EVEN after a view
+    // was published. After ANY recording/failure the caller must
     // first join hook/writer users and establish native device quiescence
     // (downstream DeviceWaitIdle VK_SUCCESS) or terminal VK_ERROR_DEVICE_LOST
     // outside hooks. Never call a speculative wait here.
@@ -123,6 +135,8 @@ private:
     bool coherent_ = false, dynamicExtent_ = false;
     // Set before issuing any copy command; failure never clears this marker.
     bool recorded_ = false;
+    bool oneTimeSubmit_ = false, retirementRequired_ = false;
+    std::atomic<bool> retired_{false};
     std::atomic<State> state_{State::Empty};
     std::atomic<VkResult> lastResult_{VK_SUCCESS};
 };

@@ -121,7 +121,7 @@ Status Readback::record(VkCommandBuffer command, const Source& s, const Admissio
     if (!command || !s.image || !s.generation || !a.commandGeneration
         || !a.complete || !a.primary || !a.outsideRenderPass || !a.afterMatchingDistortDraw
         || !a.queueOwnsImage || !a.beforeExternalRelease || !a.ordinaryUnprotected
-        || !a.oneTimeSubmit || !a.noSimultaneousUse
+        || (!a.oneTimeSubmit && !a.retirementRequired) || !a.noSimultaneousUse
         || s.format != config_.format
         || (!dynamicExtent_ && (s.extent.width != config_.extent.width || s.extent.height != config_.extent.height))
         || s.extent.depth != 1
@@ -135,6 +135,7 @@ Status Readback::record(VkCommandBuffer command, const Source& s, const Admissio
     layout_ = selected;
     command_ = command; commandGeneration_ = a.commandGeneration;
     source_ = s.image; sourceGeneration_ = s.generation;
+    oneTimeSubmit_ = a.oneTimeSubmit; retirementRequired_ = a.retirementRequired;
     recorded_ = true;
     VkImageMemoryBarrier image{};
     image.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -181,20 +182,44 @@ Status Readback::submitCompletion(VkQueue queue, VkCommandBuffer command,
     return Status::Pending;
 }
 
+Status Readback::retireCommand(VkCommandBuffer command, std::uint64_t generation,
+                               bool nativeSuccessfulReset) noexcept {
+    const auto s = state();
+    if (s != State::Recorded && s != State::Submitting && s != State::Pending
+        && s != State::Polling && s != State::AwaitingRetirement && s != State::Complete
+        && s != State::Failed) return Status::Refused;
+    if (!nativeSuccessfulReset || !command || command != command_ || !generation
+        || generation != commandGeneration_) return Status::Refused;
+    retired_.store(true, std::memory_order_release);
+    return Status::Ok;
+}
+
 Status Readback::poll(View& out) noexcept {
     out = {};
-    State expected = State::Pending;
-    if (!state_.compare_exchange_strong(expected, State::Polling, std::memory_order_acq_rel)) {
-        if (expected != State::Complete) return expected == State::Failed ? Status::VulkanFailure : Status::NotReady;
-    } else {
-        auto r = p_.fenceStatus(device_, fence_);
-        if (r == VK_NOT_READY) { state_.store(State::Pending, std::memory_order_release); return Status::Pending; }
-        if (r != VK_SUCCESS) { fail(r); return Status::VulkanFailure; }
+    auto expected = state();
+    if (expected != State::Complete) {
+        if (expected != State::Pending && expected != State::AwaitingRetirement)
+            return expected == State::Failed ? Status::VulkanFailure : Status::NotReady;
+        const bool fenceAlreadyReady = expected == State::AwaitingRetirement;
+        if (!state_.compare_exchange_strong(expected, State::Polling, std::memory_order_acq_rel))
+            return Status::NotReady;
+        if (!fenceAlreadyReady) {
+            const auto r = p_.fenceStatus(device_, fence_);
+            if (r == VK_NOT_READY) { state_.store(State::Pending, std::memory_order_release); return Status::Pending; }
+            if (r != VK_SUCCESS) { fail(r); return Status::VulkanFailure; }
+        }
+        // A first-submission fence alone cannot protect CPU reads from later
+        // native CB replay. Native successful retirement supplies the separate
+        // NOT-pending/no-future-recorded-copy proof; never read before BOTH.
+        if (retirementRequired_ && !retired_.load(std::memory_order_acquire)) {
+            state_.store(State::AwaitingRetirement, std::memory_order_release);
+            return Status::Pending;
+        }
         if (!coherent_) {
             VkMappedMemoryRange range{};
             range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
             range.memory = memory_; range.size = VK_WHOLE_SIZE;
-            r = p_.invalidate(device_, 1, &range);
+            const auto r = p_.invalidate(device_, 1, &range);
             if (r != VK_SUCCESS) { fail(r); return Status::VulkanFailure; }
         }
         state_.store(State::Complete, std::memory_order_release);
@@ -202,6 +227,8 @@ Status Readback::poll(View& out) noexcept {
     out.data = static_cast<const std::uint8_t*>(mapped_); out.bytes = layout_.bytes;
     out.layout = layout_; out.source = source_; out.sourceGeneration = sourceGeneration_;
     out.commandGeneration = commandGeneration_;
+    out.oneTimeSubmit = oneTimeSubmit_; out.retirementRequired = retirementRequired_;
+    out.generationRetired = retired_.load(std::memory_order_acquire);
     return Status::Complete;
 }
 
@@ -220,7 +247,7 @@ Status Readback::release(bool deviceQuiescent) noexcept {
     const auto s = state();
     if (s == State::Preparing || s == State::Recording || s == State::Submitting || s == State::Polling)
         return Status::UnsafeToRelease;
-    if (recorded_ && s != State::Complete && !deviceQuiescent) return Status::UnsafeToRelease;
+    if (recorded_ && (s != State::Complete || retirementRequired_) && !deviceQuiescent) return Status::UnsafeToRelease;
     destroyOwned();
     state_.store(State::Released, std::memory_order_release);
     return Status::Ok;

@@ -197,6 +197,41 @@ static void concurrentRecordControl() {
     require(r.release(true)==Status::Ok,"joined concurrent fixture quiescent cleanup");
 }
 
+static void retirementControls() {
+    Fake f; Readback r; require(Fake::prepare(r,false)==Status::Ok,"retirement mode cold preparation");
+    auto a=admission(); a.oneTimeSubmit=false; a.retirementRequired=true;
+    const auto cb=handle<VkCommandBuffer>(61); const auto queue=handle<VkQueue>(71);
+    require(r.retireCommand(cb,19,true)==Status::Refused,"cannot retire unrecorded generation");
+    auto simultaneous=a; simultaneous.noSimultaneousUse=false;
+    require(r.record(cb,source(small()),simultaneous)==Status::Refused && f.copies==0,"retirement alternative still refuses simultaneous use");
+    require(r.record(cb,source(small()),a)==Status::Ok,"explicit retirement mode accepts reusable CB");
+    require(r.submitCompletion(queue,cb,19,VK_SUCCESS)==Status::Pending,"first reusable submit owns one completion fence");
+    f.fenceResult=VK_SUCCESS;
+    View v;
+    require(r.poll(v)==Status::Pending && !v.data && r.state()==State::AwaitingRetirement && f.invalidates==0,"first fence success without retirement never publishes or invalidates bytes");
+    for(unsigned i=0;i<10;++i)require(r.poll(v)==Status::Pending && !v.data && f.polls==1 && f.invalidates==0,"unretired generation remains unreadable without fence polling churn");
+    require(r.submitCompletion(queue,cb,19,VK_SUCCESS)==Status::Refused && f.submits==1,"native replay cannot rearm own completion fence");
+    require(r.retireCommand(handle<VkCommandBuffer>(62),19,true)==Status::Refused,"foreign CB retirement refused");
+    require(r.retireCommand(cb,20,true)==Status::Refused,"different generation retirement refused");
+    require(r.retireCommand(cb,19,false)==Status::Refused,"failed native retirement refused");
+    require(r.poll(v)==Status::Pending && !v.data,"wrong retire facts do not unlock CPU bytes");
+    require(r.retireCommand(cb,19,true)==Status::Ok,"exact successfully retired recorded generation published");
+    require(r.poll(v)==Status::Complete && v.data && f.invalidates==1,"fence and retirement jointly unlock background invalidation/read");
+    require(!v.oneTimeSubmit && v.retirementRequired && v.generationRetired,"actual reusable admission facts accompany bytes");
+    require(r.release()==Status::UnsafeToRelease && f.destroyed==0,"retirement staging retained through publication until shutdown proof");
+    require(r.release(true)==Status::Ok && f.destroyed==1,"joined device-quiescent retirement cleanup");
+    require(r.retireCommand(cb,19,true)==Status::Refused,"released generation cannot revive");
+    { Fake other; Readback beforeFence; require(Fake::prepare(beforeFence)==Status::Ok,"early retirement control preparation");
+      require(beforeFence.record(cb,source(small()),a)==Status::Ok,"early retirement recording");
+      beforeFence.submitCompletion(queue,cb,19,VK_SUCCESS);
+      require(beforeFence.retireCommand(cb,19,true)==Status::Ok,"native CB may retire before later zero-submit fence is signaled");
+      require(beforeFence.poll(v)==Status::Pending && !v.data,"retirement without own fence success also exposes no bytes");
+      other.fenceResult=VK_SUCCESS;
+      require(beforeFence.poll(v)==Status::Complete && v.generationRetired,"later own fence completes both independent proofs");
+      beforeFence.release(true);
+    }
+}
+
 static void failureControls() {
     { Fake f; Readback r; f.missing="vkQueueSubmit"; require(Fake::prepare(r)==Status::Refused && f.created==0,"missing next procedure refuses cold"); require(r.release()==Status::Ok,"failed cold setup safe release"); }
     { Fake f; Readback r; f.requirements=MaximumBytes+1; require(Fake::prepare(r)==Status::Refused && f.destroyed==1 && !f.freed,"oversized native allocation refused"); r.release(); }
@@ -260,7 +295,7 @@ struct OwnedGpu {
         float priority=1; VkDeviceQueueCreateInfo q{}; q.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO; q.queueFamilyIndex=family; q.queueCount=1; q.pQueuePriorities=&priority;
         VkDeviceCreateInfo dc{}; dc.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO; dc.queueCreateInfoCount=1; dc.pQueueCreateInfos=&q;
         vkcheck(vkCreateDevice(physical,&dc,nullptr,&device)); vkGetDeviceQueue(device,family,0,&queue);
-        VkCommandPoolCreateInfo pc{}; pc.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO; pc.queueFamilyIndex=family;
+        VkCommandPoolCreateInfo pc{}; pc.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO; pc.queueFamilyIndex=family; pc.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         vkcheck(vkCreateCommandPool(device,&pc,nullptr,&pool));
     }
     unsigned type(std::uint32_t bits, VkMemoryPropertyFlags flags) {
@@ -304,7 +339,7 @@ static void transition(VkCommandBuffer cb,VkImage image,VkImageLayout before,VkI
     b.image=image; b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
     vkCmdPipelineBarrier(cb,src,dst,0,0,nullptr,0,nullptr,1,&b);
 }
-static void realCopy(OwnedGpu& g,Mode mode) {
+static void realCopy(OwnedGpu& g,Mode mode,bool retirement=false) {
     auto c=small(mode);
     if(mode==Mode::NativeP010)c.extent={1152,4608};
     Layout l{}; require(Readback::describe(c,l),"real fixture layout valid");
@@ -318,12 +353,13 @@ static void realCopy(OwnedGpu& g,Mode mode) {
     if(mode==Mode::NativeP010)preparation.extent={0,0};
     Readback reader; require(reader.prepare(g.device,vkGetDeviceProcAddr,g.memory,preparation)==Status::Ok,"real cold preparation including dynamic native capacity");
     View view; require(reader.poll(view)==Status::NotReady && !view.data,"real no bytes before submitted completion");
-    auto cb=g.command(); VkCommandBufferBeginInfo begin{}; begin.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO; begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; vkcheck(vkBeginCommandBuffer(cb,&begin));
+    auto cb=g.command(); VkCommandBufferBeginInfo begin{}; begin.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO; begin.flags=retirement?0:VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; vkcheck(vkBeginCommandBuffer(cb,&begin));
     transition(cb,image.handle,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
     vkCmdCopyBufferToImage(cb,upload.handle,image.handle,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,l.planeCount,l.planes.data());
     transition(cb,image.handle,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     auto s=source(c); s.image=image.handle;
-    require(reader.record(cb,s,admission())==Status::Ok,"real recording uses backend copy");
+    auto gate=admission(); gate.oneTimeSubmit=!retirement; gate.retirementRequired=retirement;
+    require(reader.record(cb,s,gate)==Status::Ok,"real recording uses backend copy with actual admitted flags");
     // A SECOND independent readback immediately uses the restored source layout
     // and verifies original contents, not just the diagnostic staging buffer.
     transition(cb,image.handle,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_SHADER_READ_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -338,15 +374,43 @@ static void realCopy(OwnedGpu& g,Mode mode) {
     require(reader.submitCompletion(g.queue,cb,19,native)==Status::Pending,"real independent zero-submit completion fence");
     const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
     Status status{};
+    if(retirement) {
+        // Test-only waits prove valid non-simultaneous native replay. Production
+        // readback hooks contain no wait and receive only successful retirement.
+        vkcheck(vkWaitForFences(g.device,1,&original,VK_TRUE,10000000000ULL));
+        do { status=reader.poll(view); std::this_thread::yield(); }
+        while(status==Status::Pending && reader.state()!=State::AwaitingRetirement && std::chrono::steady_clock::now()<deadline);
+        require(reader.state()==State::AwaitingRetirement && !view.data,"real first GPU fence ready still hides unretired mapped source");
+        // Make the final execution observably different: publishing an earlier
+        // copy would now fail byte equality, even if its first fence succeeded.
+        for(std::size_t i=0;i<expected.size();++i)expected[i]^=std::uint8_t(mode==Mode::NativeP010 ? ((i&1u)?0x55u:0xc0u) : 0x55u);
+        std::memcpy(upload.mapped,expected.data(),expected.size());
+        if(!upload.coherent) { VkMappedMemoryRange r{}; r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE; r.memory=upload.memory; r.size=VK_WHOLE_SIZE; vkcheck(vkFlushMappedMemoryRanges(g.device,1,&r)); }
+        VkFence replay{}; vkcheck(vkCreateFence(g.device,&fc,nullptr,&replay));
+        const auto replayResult=vkQueueSubmit(g.queue,1,&submit,replay); vkcheck(replayResult);
+        require(reader.submitCompletion(g.queue,cb,19,replayResult)==Status::Refused,"real native second execution does not rearm diagnostic fence");
+        require(reader.poll(view)==Status::Pending && !view.data,"real replay cannot expose mutable staging");
+        vkcheck(vkWaitForFences(g.device,1,&replay,VK_TRUE,10000000000ULL));
+        require(reader.retireCommand(cb,20,true)==Status::Refused && reader.retireCommand(cb,19,false)==Status::Refused,"real wrong or failed retirement does not publish");
+        require(reader.poll(view)==Status::Pending && !view.data,"real completed second submission alone still insufficient");
+        const auto resetResult=vkResetCommandBuffer(cb,0); vkcheck(resetResult);
+        require(reader.retireCommand(cb,19,resetResult==VK_SUCCESS)==Status::Ok,"real successful original native reset retires final reusable generation");
+        vkDestroyFence(g.device,replay,nullptr);
+    }
     do { status=reader.poll(view); if(status==Status::Pending) std::this_thread::yield(); }
     while(status==Status::Pending && std::chrono::steady_clock::now()<deadline);
-    require(status==Status::Complete && view.data && view.bytes==l.bytes,"real asynchronous completion returns bytes");
+    require(status==Status::Complete && view.data && view.bytes==l.bytes,"real asynchronous completion returns bytes only after required proofs");
+    require(view.oneTimeSubmit==!retirement && view.retirementRequired==retirement && view.generationRetired==retirement,"real view describes actual recording and retirement mode");
     require(view.layout.extent.width==c.extent.width && view.layout.extent.height==c.extent.height,"real view contains actual recorded extent");
     require(!std::memcmp(view.data,expected.data(),expected.size()),"all real readback bytes match original source");
     if(!verify.coherent) { VkMappedMemoryRange r{}; r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE; r.memory=verify.memory; r.size=VK_WHOLE_SIZE; vkcheck(vkInvalidateMappedMemoryRanges(g.device,1,&r)); }
     require(!std::memcmp(verify.mapped,expected.data(),expected.size()),"source remains byte-for-byte unchanged after copy");
     require(vkGetFenceStatus(g.device,original)==VK_SUCCESS,"original native fence semantics preserved");
-    require(reader.release()==Status::Ok,"real completion permits nonblocking cleanup");
+    if(retirement) {
+        require(reader.release()==Status::UnsafeToRelease,"real retirement output retains allocation until shutdown");
+        vkcheck(vkDeviceWaitIdle(g.device)); // Fixture-only explicit shutdown proof.
+        require(reader.release(true)==Status::Ok,"real retired allocation released with joined idle proof");
+    } else require(reader.release()==Status::Ok,"real one-time completion permits nonblocking cleanup");
     vkDestroyFence(g.device,original,nullptr); vkFreeCommandBuffers(g.device,g.pool,1,&cb);
     g.release(verify); g.release(upload); g.release(image);
 }
@@ -354,17 +418,18 @@ int main(int argc,char** argv) {
     try {
         const std::string mode = argc>1 ? argv[1] : "all";
         if(mode!="all" && mode!="controls" && mode!="gpu")throw std::runtime_error("Expected all, controls, or gpu");
-        if(mode!="gpu") { geometryControls(); admissionControls(); failureControls(); concurrentRecordControl(); }
+        if(mode!="gpu") { geometryControls(); admissionControls(); failureControls(); concurrentRecordControl(); retirementControls(); }
         if(mode=="controls") { std::cout << "{\"controls\":" << checks << ",\"real_gpu_tested\":false}\n"; return 0; }
         const auto controlCount=checks;
         OwnedGpu gpu; gpu.init();
         realCopy(gpu,Mode::OwnedRgbaFixture);
         auto nativeConfig=small(); nativeConfig.extent={1152,4608};
         const bool p010=gpu.supports(nativeConfig);
-        if(p010)realCopy(gpu,Mode::NativeP010);
+        if(p010)realCopy(gpu,Mode::NativeP010,true);
+        else realCopy(gpu,Mode::OwnedRgbaFixture,true);
         std::cout << "{\"controls\":" << controlCount << ",\"total_checks\":" << checks
                   << ",\"device\":\"" << gpu.properties.deviceName << "\",\"real_rgba_readback\":true,\"real_source_unchanged\":true,\"native_fence_preserved\":true,\"real_p010_readback\":" << (p010?"true":"false")
-                  << ",\"p010_test_extent\":[1152,4608],\"p010_dynamic_capacity\":67108864,\"p010_skip\":\"" << (p010?"":"driver format/usage unsupported; no P010 GPU proof claimed")
+                  << ",\"real_p010_reusable_native_executions\":" << (p010?2:0) << ",\"real_retirement_after_native_reset\":true,\"p010_test_extent\":[1152,4608],\"p010_dynamic_capacity\":67108864,\"p010_skip\":\"" << (p010?"":"driver format/usage unsupported; no P010 GPU proof claimed")
                   << "\",\"frame_hardware_tested\":false,\"native_source_association_proved\":false}\n";
         return 0;
     } catch(const std::exception& e) { std::cerr << "pixel readback test failed: " << e.what() << '\n'; return 1; }
