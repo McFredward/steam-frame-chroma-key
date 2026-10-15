@@ -75,6 +75,8 @@ struct ImageMetadata {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
     VkImageUsageFlags usage = 0;
+    VkImageCreateFlags flags = 0;
+    VkSharingMode sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     extensions::ImageExtensions extensions{};
     Identity memory{};
     VkDeviceSize memoryOffset = 0;
@@ -516,7 +518,8 @@ public:
             (info.flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_DISJOINT_BIT)) == 0;
         auto& m = out->metadata;
         m.identity = out->id; m.type = info.imageType; m.format = info.format; m.extent = info.extent; m.mipLevels = info.mipLevels;
-        m.arrayLayers = info.arrayLayers; m.samples = info.samples; m.tiling = info.tiling; m.usage = info.usage; m.extensions = extension;
+        m.arrayLayers = info.arrayLayers; m.samples = info.samples; m.tiling = info.tiling; m.usage = info.usage;
+        m.flags = info.flags; m.sharingMode = info.sharingMode; m.extensions = extension;
         out->invocationTag = invocationTag;
         if (invocationTag) {
             if (auto* tag = importTag(invocationTag, device, true)) {
@@ -712,6 +715,41 @@ public:
         return current.sourceComplete && same(previous.command, current.command) && same(previous.pipelineLayout, current.pipelineLayout) &&
             same(previous.set, current.set) && same(previous.setLayout, current.setLayout) && previous.setRevision == current.setRevision &&
             previous.commandBindingRevision == current.commandBindingRevision;
+    }
+    // Live-owner resource check for an immutable previously observed image
+    // binding. Descriptor rebinding is deliberately irrelevant: a later UI
+    // draw must not replace the original sampled source. This is an instant
+    // public-API graph check, not a native/GPU resource lifetime lease.
+    bool validateBindingResources(const Binding& previous) noexcept {
+        auto lock = acquire();
+        if (!lock.owns_lock() || lostState() || !previous.complete ||
+            previous.state != BindingState::Written || !imageType(previous.type) ||
+            !previous.view.complete || !previous.image.complete || !previous.image.allocation.complete)
+            return false;
+        // Core generations are unique across devices. Recover the device from
+        // the exact image generation, never from its reusable numeric handle.
+        const Image* image = nullptr;
+        for (const auto& entry : images_)
+            if (same(entry.id, previous.image.identity)) { image = &entry; break; }
+        if (!image || !image->complete) return false;
+        const auto device = image->device;
+        const auto* view = lookup(views_, device, previous.view.identity);
+        const auto* memory = lookup(memories_, device, previous.image.memory);
+        if (!view || !view->complete || !memory || !memory->complete ||
+            !same(view->metadata.image, image->id) || !same(previous.view.image, image->id) ||
+            !same(image->metadata.memory, memory->id) ||
+            !same(previous.image.allocation.identity, memory->id) ||
+            previous.image.memoryOffset != image->metadata.memoryOffset)
+            return false;
+        const auto currentAllocation = allocation(device, memory->id);
+        if (!currentAllocation.complete || image->metadata.memoryOffset >= currentAllocation.allocationSize)
+            return false;
+        if (view->metadata.extensions.hasConversion) {
+            const auto* conversion = lookup(conversions_, device, view->metadata.conversion.identity);
+            if (!conversion || !conversion->complete ||
+                !same(previous.view.conversion.identity, conversion->id)) return false;
+        }
+        return true;
     }
     // Only the journal's background owner calls this lookup. Numeric handles
     // select candidate entries, but original tagged creation generations are
