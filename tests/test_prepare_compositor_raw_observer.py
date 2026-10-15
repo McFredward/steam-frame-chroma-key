@@ -177,9 +177,19 @@ class PackageControls(unittest.TestCase):
         for kwargs in ({'sampling': None}, {'sampling': b'FCMSMP00' + tool.SAMPLING_MARKER[8:]},
                        {'sampling': b'FCMSMP01' + struct.pack('<6I', 1, 32, 16, 16, 32, 1)},
                        {'sampling': b'FCMSMP01' + struct.pack('<6I', 1, 33, 16, 16, 32, 3)},
+                       {'sampling': b'FCMSMP02' + struct.pack('<8I', 2, 40, 32, 16, 16, 32, 4096, 7)},
                        {'sampling_visibility': 0}, {'sampling_size': 31},
                        {'sampling_rva': 0x2400}, {'sampling_rva': 0x7080}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError): self.validate(fixture(**kwargs))
+        self.assertEqual(len(tool.SAMPLING_MARKER), 56)
+        self.assertEqual(struct.unpack_from('<12I', tool.SAMPLING_MARKER, 8),
+                         (3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1))
+        for word in range(12):
+            changed = bytearray(tool.SAMPLING_MARKER)
+            at = 8 + 4 * word
+            struct.pack_into('<I', changed, at, struct.unpack_from('<I', changed, at)[0] + 1)
+            with self.subTest(word=word), self.assertRaises(ValueError):
+                self.validate(fixture(sampling=bytes(changed)))
 
     def test_launch_configuration_is_exact_and_child_service_only_preloads_selector(self):
         config = tool.launch_config(Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw'))
@@ -304,7 +314,7 @@ class PackageControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='frame-compositor-preparer-controls-') as temporary:
             output = Path(temporary) / 'bundle'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, REMOTE)
-            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v6')
+            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v7')
             self.assertEqual(plan['raw_limits'], tool.RAW_LIMITS)
             self.assertEqual(plan['capture_limits'], tool.CAPTURE_LIMITS)
             self.assertEqual(plan['operator_arm'], tool.operator_arm_descriptor(Path(REMOTE).parent))

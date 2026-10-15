@@ -239,6 +239,124 @@ class SessionTests(unittest.TestCase):
         envelope[112 + 2032 * 3:-32] = profile; envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
         SessionTests.alter_artifact(self, M.ENVELOPE, bytes(envelope))
 
+    def promote_periodic_target_plan(self):
+        SessionTests.promote_join_target_plan(self)
+        self.plan['schema'] = M.PERIODIC_TARGET_SCHEMA
+        self.plan['observer']['raw_trace_sampling'] = copy.deepcopy(M.PERIODIC_TARGET_TRACE_SAMPLING)
+        self.plan['observer']['trace_sampling_marker'].update(
+            bytes=56, sha256=M.digest(M.PERIODIC_TARGET_SAMPLING_MARKER))
+        main = bytearray(self.artifacts[M.MAIN].read_bytes())
+        main[160:216] = M.PERIODIC_TARGET_SAMPLING_MARKER
+        # The larger read-only object has its own exact span, followed by the
+        # relocated string table; neither overlaps the unchanged symbol table.
+        strings = b'\0' + M.TRACE_SAMPLING_SYMBOL.encode('ascii') + b'\0'
+        main[216:216 + len(strings)] = strings
+        struct.pack_into('<IBBHQQ', main, 280, 1, 1, 0, 1, 0x10a0, 56)
+        struct.pack_into('<II4QII2Q', main, 384, 0, 1, 2, 0x1080, 128, 88, 0, 0, 8, 0)
+        struct.pack_into('<II4QII2Q', main, 448, 0, 3, 0, 0, 216, len(strings), 0, 0, 1, 0)
+        SessionTests.alter_artifact(self, M.MAIN, bytes(main))
+        profile = self.profile(5, main)
+        self.plan['observer_profile'].update(file_sha256=M.digest(main), profile_sha256=profile[-32:].hex())
+        self.plan['envelope'].update(reviewed_observer_profile_identity=profile[-32:].hex())
+        envelope = bytearray(self.artifacts[M.ENVELOPE].read_bytes())
+        envelope[16:48] = profile[-32:]
+        envelope[112 + 2032 * 3:-32] = profile
+        envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
+        SessionTests.alter_artifact(self, M.ENVELOPE, bytes(envelope))
+
+    def test_v7_periodic_probe_stage_activate_and_original_restore(self):
+        self.promote_periodic_target_plan(); self.stage(); self.activate()
+        self.assertTrue(self.session.readcheck()['active'])
+        self.assertEqual(self.plan['raw_limits'], M.RAW_LIMITS)
+        self.assertEqual(self.plan['capture_limits'], M.CAPTURE_LIMITS)
+        self.assertEqual(self.plan['journal_limits'], M.JOURNAL_LIMITS)
+        self.assertEqual(self.plan['envelope']['schema'], 5)
+        self.assertEqual(len(M.PERIODIC_TARGET_SAMPLING_MARKER), 56)
+        self.assertEqual(struct.unpack_from('<12I', M.PERIODIC_TARGET_SAMPLING_MARKER, 8),
+                         (3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1))
+        self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertTrue(json.loads((self.session.folder / 'rollback-complete.json').read_text())['restored'])
+
+    def test_v7_rejects_unbounded_mistyped_or_wrong_periodic_contract_before_stage(self):
+        self.promote_periodic_target_plan(); original = copy.deepcopy(self.plan)
+        variants = [None, {}, M.TARGET_TRACE_SAMPLING,
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_diagnostics_version=2),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_denial_sample_limit=17),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_denial_sample_limit=16.0),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_period_ns=60000001),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_general_per_period=2),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_distortion_per_period=True),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_distortion_entry='PS_OTHER'),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_window_clock='render_callback'),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_deadline_reset_allowed=True),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_deadline_reset_allowed=0),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_bindings=[False, 2, 3, 4, 6, 9, 25, 31])]
+        for metadata in variants:
+            self.plan = copy.deepcopy(original)
+            self.plan['observer']['raw_trace_sampling'] = metadata; self.save_plan()
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(RuntimeError, 'sampling metadata'):
+                self.stage()
+            self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_v7_requires_the_exact_actual_56_byte_marker_not_only_json(self):
+        self.promote_periodic_target_plan()
+        original = self.artifacts[M.MAIN].read_bytes()
+        for marker in (M.TRACE_SAMPLING_MARKER, M.TARGET_SAMPLING_MARKER):
+            changed = bytearray(original); changed[160:160 + len(marker)] = marker
+            self.alter_artifact(M.MAIN, bytes(changed))
+            with self.subTest(legacy_marker=marker[:8]), self.assertRaisesRegex(RuntimeError, 'sampling marker'):
+                self.stage()
+        for word in range(12):
+            changed = bytearray(original); at = 168 + 4 * word
+            struct.pack_into('<I', changed, at, struct.unpack_from('<I', changed, at)[0] + 1)
+            self.alter_artifact(M.MAIN, bytes(changed))
+            with self.subTest(word=word), self.assertRaisesRegex(RuntimeError, 'sampling marker'):
+                self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_v7_cannot_be_relabelled_as_v6_and_v6_still_authenticates_its_own_marker(self):
+        self.promote_periodic_target_plan()
+        self.plan['schema'] = M.JOIN_TARGET_SCHEMA
+        self.plan['observer']['raw_trace_sampling'] = copy.deepcopy(M.TARGET_TRACE_SAMPLING)
+        self.plan['observer']['trace_sampling_marker'].update(bytes=40, sha256=M.digest(M.TARGET_SAMPLING_MARKER))
+        self.save_plan()
+        with self.assertRaisesRegex(RuntimeError, 'sampling marker'): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_v7_stored_contract_tamper_blocks_activation_without_blocking_recovery(self):
+        self.promote_periodic_target_plan(); self.stage()
+        path = self.session.folder / 'deployment-plan.json'
+        stored = json.loads(path.read_bytes())
+        stored['observer']['raw_trace_sampling']['probe_deadline_reset_allowed'] = True
+        path.write_bytes(M.json_bytes(stored))
+        # Re-sign only the synthetic owned manifest to reach the independent
+        # acquisition guard rather than failing the earlier plan hash check.
+        manifest_path = self.session.folder / 'owned.json'
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest['plan_sha256'] = M.digest(path.read_bytes())
+        manifest['owned_files']['deployment-plan.json'] = manifest['plan_sha256']
+        manifest_path.write_bytes(M.json_bytes(manifest))
+        with self.assertRaisesRegex(RuntimeError, 'sampling metadata'): self.activate()
+        self.assertEqual(self.restart_count(), 0)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 1)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+
+    def test_v7_preserves_exact_image_selection_join_limits_and_legacy_arm_refusal(self):
+        self.promote_periodic_target_plan(); original = copy.deepcopy(self.plan)
+        cases = [('resource_join_validation', dict(M.RESOURCE_JOIN_VALIDATION, attempt_limit=65)),
+                 ('resource_join_validation', dict(M.RESOURCE_JOIN_VALIDATION, delivery_attempt_limit=64.0)),
+                 ('candidate_selection', dict(M.CANDIDATE_SELECTION, public_formats=[True, 1000156013]))]
+        for key, value in cases:
+            self.plan = copy.deepcopy(original); self.plan['observer'][key] = value; self.save_plan()
+            with self.subTest(key=key), self.assertRaises(RuntimeError): self.stage()
+        self.plan = copy.deepcopy(original)
+        self.plan['operator_arm'] = self.session.operator_arm_descriptor(schema=M.LEGACY_ARM_RECEIPT_SCHEMA)
+        self.save_plan()
+        with self.assertRaisesRegex(RuntimeError, 'public image selection'): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
     def test_v6_target_join_stage_activate_and_original_restore(self):
         self.promote_join_target_plan(); self.stage(); self.activate()
         self.assertTrue(self.session.readcheck()['active'])
@@ -826,6 +944,38 @@ class OperatorArmTests(unittest.TestCase):
         self.assertTrue(receipt['operator_arm_requested'])
         self.assertFalse(receipt['source_frame_associated'])
         self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
+
+    def test_v7_live_arm_requires_exact_typed_periodic_header_and_original_deadline(self):
+        SessionTests.promote_periodic_target_plan(self); self.live_fixture()
+        self.header['candidate_selection'] = copy.deepcopy(M.CANDIDATE_SELECTION)
+        self.header['resource_join_validation'] = copy.deepcopy(M.RESOURCE_JOIN_VALIDATION)
+        self.journal_header['raw_trace_sampling'] = copy.deepcopy(M.PERIODIC_TARGET_TRACE_SAMPLING)
+        original = copy.deepcopy(self.journal_header)
+        variants = [M.TARGET_TRACE_SAMPLING,
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_period_ns=60000000.0),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_diagnostics_version=True),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_denial_sample_limit=17),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_general_per_period=2),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_distortion_per_period=2),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_window_clock='render_callback'),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, probe_deadline_reset_allowed=True),
+            dict(M.PERIODIC_TARGET_TRACE_SAMPLING, target_bindings=[False, 2, 3, 4, 6, 9, 25, 31])]
+        for value in variants:
+            wrong = copy.deepcopy(original); wrong['raw_trace_sampling'] = value
+            self.save_live_records([self.header], [wrong])
+            with self.subTest(metadata=value), self.assertRaisesRegex(RuntimeError, 'sampling metadata'):
+                self.session.arm(stream_start_intent=True)
+            self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+        wrong = copy.deepcopy(self.header); wrong['capture_deadline_ns'] += 60000000
+        self.save_live_records([wrong], [original])
+        with self.assertRaisesRegex(RuntimeError, 'deadline expired or was reset'):
+            self.session.arm(stream_start_intent=True)
+        self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+        self.save_live_records([self.header], [original])
+        receipt = self.session.arm(stream_start_intent=True)
+        self.assertEqual(receipt['capture_deadline_ns'], self.header['capture_deadline_ns'])
+        self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
+        self.assertFalse(receipt['source_frame_associated']); self.assertFalse(receipt['mask_enabled'])
 
     def live_fixture(self):
         self.stage(); self.activate()
