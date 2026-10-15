@@ -1,6 +1,7 @@
 #include "layer/pixel_capture_tracker.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
 
@@ -363,6 +364,144 @@ void commandReuseAndLoss() {
             "capacity loss poisons rather than selecting untracked objects");
 }
 
+
+bool sameFailure(const FailureSnapshot& a, const FailureSnapshot& b) {
+    return a.complete == b.complete && a.failure == b.failure && a.site == b.site &&
+        a.coreLostState == b.coreLostState && a.coreReasonCounts == b.coreReasonCounts &&
+        a.coreCapacityCounts == b.coreCapacityCounts;
+}
+void firstFailureTelemetry() {
+    auto healthy = std::make_unique<LiveTracker>();
+    const auto empty = healthy->failureSnapshot();
+    require(!empty.complete && empty.failure == Failure::None && !empty.site && !empty.coreLostState,
+            "healthy tracker reports no invented refusal or API site");
+    require(healthy->observe([](auto&) {}, "vkHealthyObservation") && !healthy->failureSnapshot().complete,
+            "successful observation does not publish a first failure");
+    healthy.reset();
+    auto unspecified = std::make_unique<LiveTracker>();
+    require(!unspecified->observe([](auto& core) { core.reportUnsupported(device); }, nullptr),
+            "null external site does not weaken refusal");
+    const auto unnamed = unspecified->failureSnapshot();
+    require(unnamed.complete && std::strcmp(unnamed.site, "unspecified") == 0,
+            "null external label has a stable bounded fallback");
+    unspecified.reset();
+
+    // Every existing Core counter is copied, including zero categories. The
+    // report is a bounded atomic observation, not an independently guessed cause.
+    auto all = std::make_unique<LiveTracker>();
+    require(!all->observe([](auto& core) {
+        for (std::size_t i = 1; i < CoreReasonCount; ++i)
+            for (std::size_t n = 0; n < i; ++n) core.reportLoss(static_cast<frame_bindings::Reason>(i));
+    }, "vkAllCoreReasons"), "existing Core reason counters retain capture refusal");
+    const auto allReasons = all->failureSnapshot();
+    require(allReasons.complete && allReasons.failure == Failure::CoreLoss &&
+            std::strcmp(allReasons.site, "vkAllCoreReasons") == 0,
+            "Core-loss winner keeps exact external API site");
+    require(allReasons.coreLostState == CoreReasonCount * (CoreReasonCount - 1) / 2,
+            "first Core report retains observed total loss count");
+    for (std::size_t i = 0; i < CoreReasonCount; ++i)
+        require(allReasons.coreReasonCounts[i] == i, "each Core loss category is independently retained");
+    for (auto count : allReasons.coreCapacityCounts) require(!count, "reported loss alone invents no table exhaustion");
+    bool invoked = false;
+    require(!all->observe([&](auto& core) { invoked = true; core.reportUnsupported(device); }, "vkLaterFailure"),
+            "poisoned owner never mutates Core for later observations");
+    require(!all->destroyCommandPool(device, pool) && !invoked && sameFailure(allReasons, all->failureSnapshot()),
+            "later calls cannot overwrite first cause, site or counters");
+    all.reset();
+
+    auto capacity = std::make_unique<LiveTracker>();
+    require(!capacity->observe([](auto& core) {
+        auto create = info<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+        for (std::size_t i = 0; i <= frame_bindings::ImageCapacity; ++i)
+            core.createImage(device, h<VkImage>(10000 + i), create);
+    }, "vkCreateImage"), "actual Core image table exhaustion remains a global refusal");
+    const auto full = capacity->failureSnapshot();
+    require(full.complete && full.failure == Failure::CoreLoss && std::strcmp(full.site, "vkCreateImage") == 0 &&
+            full.coreLostState == 1 && full.coreReasonCounts[static_cast<std::size_t>(frame_bindings::Reason::Capacity)] == 1 &&
+            full.coreCapacityCounts[static_cast<std::size_t>(frame_bindings::Table::Image)] == 1,
+            "capacity telemetry identifies actual failing Core table and API");
+    for (std::size_t i = 0; i < CoreTableCount; ++i)
+        require(full.coreCapacityCounts[i] == (i == static_cast<std::size_t>(frame_bindings::Table::Image) ? 1u : 0u),
+                "unrelated table counters stay zero");
+    capacity.reset();
+
+    for (unsigned cause = 0; cause < 3; ++cause) {
+        auto tracker = std::make_unique<LiveTracker>();
+        const auto reason = cause == 0 ? frame_bindings::Reason::Unsupported :
+                            cause == 1 ? frame_bindings::Reason::Stale : frame_bindings::Reason::Unknown;
+        require(!tracker->observe([&](auto& core) {
+            if (cause == 0) core.reportUnsupported(device);
+            else {
+                auto create = info<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+                if (cause == 1) {
+                    core.createImage(device, image, create);
+                    core.createImage(device, image, create); // Actual duplicate native identity.
+                } else core.createImage(device, VK_NULL_HANDLE, create);
+            }
+        }, "vkExternalCoreMutation"), "unsupported/stale/unknown Core mutations remain refusals");
+        const auto snapshot = tracker->failureSnapshot();
+        require(snapshot.complete && snapshot.failure == Failure::CoreLoss &&
+                std::strcmp(snapshot.site, "vkExternalCoreMutation") == 0 && snapshot.coreLostState == 1 &&
+                snapshot.coreReasonCounts[static_cast<std::size_t>(reason)] == 1,
+                "unsupported/stale/unknown reason and API are published without recovery");
+    }
+    auto unknown = std::make_unique<LiveTracker>();
+    require(!unknown->destroyShader(device, fs), "untracked shader retirement refuses capture");
+    const auto unknownSnapshot = unknown->failureSnapshot();
+    require(unknownSnapshot.complete && unknownSnapshot.failure == Failure::Unknown &&
+            std::strcmp(unknownSnapshot.site, "destroyShader") == 0 && !unknownSnapshot.coreLostState,
+            "tracker unknown failure is distinct from an invented Core unknown");
+    unknown.reset();
+    auto exhausted = std::make_unique<LiveTracker>();
+    TestAccess::exhaustGeneration(*exhausted);
+    auto create = info<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
+    require(!exhausted->createCommandPool(device, pool, create), "generation exhaustion is still refused");
+    const auto wrap = exhausted->failureSnapshot();
+    require(wrap.complete && wrap.failure == Failure::GenerationWrap &&
+            std::strcmp(wrap.site, "createCommandPool") == 0 && !wrap.coreLostState,
+            "internal helper failure retains invoking method site");
+    exhausted.reset();
+    auto ownCapacity = std::make_unique<LiveTracker>();
+    for (std::size_t i = 0; i < PoolCapacity; ++i)
+        require(ownCapacity->createCommandPool(device, h<VkCommandPool>(20000 + i), create), "fill tracker pool inventory");
+    require(!ownCapacity->createCommandPool(device, h<VkCommandPool>(30000), create), "tracker capacity is still refused");
+    const auto ownFull = ownCapacity->failureSnapshot();
+    require(ownFull.complete && ownFull.failure == Failure::Capacity &&
+            std::strcmp(ownFull.site, "createCommandPool") == 0 && !ownFull.coreLostState,
+            "tracker capacity remains distinct from Core table exhaustion");
+}
+void contentionTelemetry() {
+    // Two actual blocked callers race to publish. A third thread may inspect
+    // the report before they return: it must never see a mixed or partial record.
+    for (unsigned repeat = 0; repeat < 32; ++repeat) {
+        auto tracker = std::make_unique<LiveTracker>();
+        auto lock = TestAccess::hold(*tracker);
+        std::atomic<unsigned> ready{0};
+        std::atomic<bool> start{false};
+        bool leftResult = true, rightResult = true;
+        auto blocked = [&](const char* site, bool& result) {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            result = tracker->observe([](auto&) { std::abort(); }, site);
+        };
+        std::thread left(blocked, "vkBlockedLeft", std::ref(leftResult));
+        std::thread right(blocked, "vkBlockedRight", std::ref(rightResult));
+        while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        start.store(true, std::memory_order_release);
+        FailureSnapshot first;
+        do { first = tracker->failureSnapshot(); } while (!first.complete);
+        require(first.failure == Failure::Contention && first.site &&
+                (std::strcmp(first.site, "vkBlockedLeft") == 0 || std::strcmp(first.site, "vkBlockedRight") == 0) &&
+                !first.coreLostState,
+                "contention winner publishes its own API and complete cause atomically");
+        left.join(); right.join(); lock.unlock();
+        require(!leftResult && !rightResult && sameFailure(first, tracker->failureSnapshot()),
+                "later competing refusal cannot replace the first API site");
+        require(!tracker->observe([](auto&) { std::abort(); }, "vkAfterContention") &&
+                sameFailure(first, tracker->failureSnapshot()), "unlocking never heals or mutates first refusal");
+    }
+}
+
 void reusableRetirementIdentity() {
     auto f = std::make_unique<Fixture>(true, 0);
     const auto candidate = f->finishPass();
@@ -394,5 +533,6 @@ void reusableRetirementIdentity() {
 int main() {
     baselineAndImmutableDraw(); beginAndPipelineGuards(); sourceCurrentness();
     sourceShapeGuards(); scopesAndUnknownPaths(); commandReuseAndLoss(); reusableRetirementIdentity();
+    firstFailureTelemetry(); contentionTelemetry();
     std::cout << "pixel live tracker: " << checks << " checks passed; no GPU/native video association claimed\n";
 }

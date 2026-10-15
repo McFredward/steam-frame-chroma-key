@@ -54,6 +54,21 @@ struct RetirementTicket {
 };
 
 enum class Failure : std::uint8_t { None, Contention, Capacity, CoreLoss, Unknown, GenerationWrap };
+constexpr std::size_t CoreReasonCount = static_cast<std::size_t>(frame_bindings::Reason::LayoutMismatch) + 1;
+constexpr std::size_t CoreTableCount = static_cast<std::size_t>(frame_bindings::Table::Count);
+static_assert(CoreReasonCount == 8, "Audit telemetry when the Core reason enumeration changes");
+
+// The first refusal is published exactly once. Counters are atomic observations
+// taken by its winner: a contention refusal can overlap the lock owner's final
+// Core mutation, so these counts are not claimed to be a transactional Core dump.
+struct FailureSnapshot {
+    bool complete = false;
+    Failure failure = Failure::None;
+    const char* site = nullptr;
+    std::uint64_t coreLostState = 0;
+    std::array<std::uint64_t, CoreReasonCount> coreReasonCounts{};
+    std::array<std::uint64_t, CoreTableCount> coreCapacityCounts{};
+};
 
 class LiveTracker {
     friend struct TestAccess;
@@ -79,11 +94,32 @@ public:
     bool poisoned() const noexcept { return failure_.load(std::memory_order_acquire) != Failure::None; }
     Failure failure() const noexcept { return failure_.load(std::memory_order_acquire); }
 
+    FailureSnapshot failureSnapshot() const noexcept {
+        FailureSnapshot out;
+        // Never read partially published fields, or wait on the render thread.
+        // A cold observer may retry if poison won but publication is unfinished.
+        if (!failurePublished_.load(std::memory_order_acquire)) {
+            out.failure = failure();
+            return out;
+        }
+        out.complete = true;
+        out.failure = failure();
+        out.site = firstSite_.load(std::memory_order_relaxed);
+        out.coreLostState = firstCoreLost_.load(std::memory_order_relaxed);
+        for (std::size_t i = 0; i < out.coreReasonCounts.size(); ++i)
+            out.coreReasonCounts[i] = firstCoreReasons_[i].load(std::memory_order_relaxed);
+        for (std::size_t i = 0; i < out.coreCapacityCounts.size(); ++i)
+            out.coreCapacityCounts[i] = firstCoreCapacities_[i].load(std::memory_order_relaxed);
+        return out;
+    }
+
     // This is the sole external access to the live Core. Forward updates,
     // copies, creations and retirements under this owner, after native success
     // (or before native void destruction). Do not expose Core to another owner.
-    template<class F> bool observe(F&& mutation) noexcept {
-        return locked([&] {
+    // A non-default site must have static storage duration (for example __func__
+    // or a string literal). It is retained without allocation or string copying.
+    template<class F> bool observe(F&& mutation, const char* site = "observe") noexcept {
+        return locked(site, [&] {
             mutation(bindings_);
             return coreHealthy();
         });
@@ -91,7 +127,7 @@ public:
 
     bool createShader(std::uint64_t device, VkShaderModule value,
                       const VkShaderModuleCreateInfo& info) noexcept {
-        return locked([&] {
+        return locked("createShader", [&] {
             auto* shader = insert(shaders_, device, frame_bindings::handle(value));
             if (!shader) return false;
             shader->complete = info.sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO && !info.pNext &&
@@ -103,11 +139,11 @@ public:
         });
     }
     bool destroyShader(std::uint64_t device, VkShaderModule value) noexcept {
-        return locked([&] { return erase(shaders_, device, frame_bindings::handle(value)); });
+        return locked("destroyShader", [&] { return erase(shaders_, device, frame_bindings::handle(value)); });
     }
     bool createPipeline(std::uint64_t device, VkPipeline value,
                         const VkGraphicsPipelineCreateInfo& info) noexcept {
-        return locked([&] {
+        return locked("createPipeline", [&] {
             auto* pipeline = insert(pipelines_, device, frame_bindings::handle(value));
             if (!pipeline) return false;
             pipeline->layout = info.layout;
@@ -130,12 +166,12 @@ public:
         });
     }
     bool destroyPipeline(std::uint64_t device, VkPipeline value) noexcept {
-        return locked([&] { return erase(pipelines_, device, frame_bindings::handle(value)); });
+        return locked("destroyPipeline", [&] { return erase(pipelines_, device, frame_bindings::handle(value)); });
     }
     bool bindPipeline(std::uint64_t device, VkCommandBuffer value, VkPipelineBindPoint point,
                       VkPipeline pipeline) noexcept {
         if (point != VK_PIPELINE_BIND_POINT_GRAPHICS) return !poisoned();
-        return locked([&] {
+        return locked("bindPipeline", [&] {
             auto* command = recording(device, value); if (!command) return false;
             const auto* current = pipelines_.find(device, frame_bindings::handle(pipeline));
             command->pipeline = current ? current->id : Identity{};
@@ -145,7 +181,7 @@ public:
 
     bool createCommandPool(std::uint64_t device, VkCommandPool value,
                            const VkCommandPoolCreateInfo& info) noexcept {
-        return locked([&] {
+        return locked("createCommandPool", [&] {
             auto* pool = insert(pools_, device, frame_bindings::handle(value)); if (!pool) return false;
             pool->family = info.queueFamilyIndex;
             constexpr auto allowed = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -155,7 +191,7 @@ public:
         });
     }
     bool destroyCommandPool(std::uint64_t device, VkCommandPool value) noexcept {
-        return locked([&] {
+        return locked("destroyCommandPool", [&] {
             const auto key = frame_bindings::handle(value);
             const auto* pool = pools_.find(device, key); if (!pool) return unknown();
             const auto id = pool->id;
@@ -165,7 +201,7 @@ public:
         });
     }
     bool resetCommandPool(std::uint64_t device, VkCommandPool value) noexcept {
-        return locked([&] {
+        return locked("resetCommandPool", [&] {
             const auto* pool = pools_.find(device, frame_bindings::handle(value)); if (!pool) return unknown();
             for (auto& command : commands_) if (command.device == device && frame_bindings::same(command.pool, pool->id))
                 clearRecording(command);
@@ -175,7 +211,7 @@ public:
     }
     bool allocateCommands(std::uint64_t device, const VkCommandBufferAllocateInfo& info,
                           const VkCommandBuffer* values) noexcept {
-        return locked([&] {
+        return locked("allocateCommands", [&] {
             if (info.sType != VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO || info.pNext ||
                 info.commandBufferCount > CommandCapacity || (info.commandBufferCount && !values)) return unknown();
             const auto* pool = pools_.find(device, frame_bindings::handle(info.commandPool));
@@ -191,7 +227,7 @@ public:
     }
     bool freeCommands(std::uint64_t device, VkCommandPool pool, std::uint32_t count,
                       const VkCommandBuffer* values) noexcept {
-        return locked([&] {
+        return locked("freeCommands", [&] {
             if (count > CommandCapacity || (count && !values)) return unknown();
             const auto* knownPool = pools_.find(device, frame_bindings::handle(pool)); if (!knownPool) return unknown();
             for (std::uint32_t i = 0; i < count; ++i) {
@@ -205,7 +241,7 @@ public:
     }
     bool beginCommand(std::uint64_t device, VkCommandBuffer value,
                       const VkCommandBufferBeginInfo& info, bool nativeSuccess) noexcept {
-        return locked([&] {
+        return locked("beginCommand", [&] {
             auto* command = commands_.find(device, frame_bindings::handle(value)); if (!command) return unknown();
             clearRecording(*command);
             if (!nativeSuccess) return false;
@@ -221,7 +257,7 @@ public:
         });
     }
     bool endCommand(std::uint64_t device, VkCommandBuffer value, bool nativeSuccess) noexcept {
-        return locked([&] {
+        return locked("endCommand", [&] {
             auto* command = commands_.find(device, frame_bindings::handle(value)); if (!command) return unknown();
             if (!command->recording) return invalidate(*command);
             command->executable = nativeSuccess && command->supported && command->scope == Scope::None;
@@ -232,23 +268,23 @@ public:
         });
     }
     bool resetCommand(std::uint64_t device, VkCommandBuffer value) noexcept {
-        return locked([&] {
+        return locked("resetCommand", [&] {
             auto* command = commands_.find(device, frame_bindings::handle(value)); if (!command) return unknown();
             clearRecording(*command); bindings_.resetCommand(device, value); return coreHealthy();
         });
     }
     bool unknownCommand(std::uint64_t device, VkCommandBuffer value) noexcept {
-        return locked([&] {
+        return locked("unknownCommand", [&] {
             auto* command = commands_.find(device, frame_bindings::handle(value)); if (!command) return unknown();
             return invalidate(*command);
         });
     }
 
     bool beginRenderPass(std::uint64_t device, VkCommandBuffer value, VkSubpassContents contents) noexcept {
-        return beginScope(device, value, Scope::RenderPass, contents == VK_SUBPASS_CONTENTS_INLINE);
+        return beginScope(device, value, Scope::RenderPass, contents == VK_SUBPASS_CONTENTS_INLINE, "beginRenderPass");
     }
     bool nextSubpass(std::uint64_t device, VkCommandBuffer value, VkSubpassContents contents) noexcept {
-        return locked([&] {
+        return locked("nextSubpass", [&] {
             auto* command = recording(device, value); if (!command) return false;
             if (command->scope != Scope::RenderPass || contents != VK_SUBPASS_CONTENTS_INLINE)
                 return invalidate(*command);
@@ -257,20 +293,20 @@ public:
     }
     // Call only AFTER the corresponding original native end operation.
     bool endRenderPass(std::uint64_t device, VkCommandBuffer value, Candidate& out) noexcept {
-        return endScope(device, value, Scope::RenderPass, out);
+        return endScope(device, value, Scope::RenderPass, out, "endRenderPass");
     }
     bool beginRendering(std::uint64_t device, VkCommandBuffer value, const VkRenderingInfo& info) noexcept {
         // Suspended/resumed rendering can cross command buffers/submits; that
         // is explicitly outside this single-primary end-scope acquisition.
         return beginScope(device, value, Scope::Dynamic, info.sType == VK_STRUCTURE_TYPE_RENDERING_INFO &&
-            !info.pNext && info.flags == 0 && info.viewMask == 0 && info.layerCount == 1);
+            !info.pNext && info.flags == 0 && info.viewMask == 0 && info.layerCount == 1, "beginRendering");
     }
     bool endRendering(std::uint64_t device, VkCommandBuffer value, Candidate& out) noexcept {
-        return endScope(device, value, Scope::Dynamic, out);
+        return endScope(device, value, Scope::Dynamic, out, "endRendering");
     }
 
     bool draw(std::uint64_t device, VkCommandBuffer value) noexcept {
-        return locked([&] {
+        return locked("draw", [&] {
             auto* command = recording(device, value); if (!command) return false;
             if (!command->supported || command->scope == Scope::None || command->selected || command->issued) return false;
             const auto* pipeline = pipelines_.find(device, command->pipeline.handle);
@@ -297,7 +333,7 @@ public:
 
     SubmitTicket prepareSubmit(std::uint64_t device, VkCommandBuffer value) noexcept {
         SubmitTicket out;
-        const bool ready = locked([&] {
+        const bool ready = locked("prepareSubmit", [&] {
             auto* command = commands_.find(device, frame_bindings::handle(value));
             if (!command || !command->supported || !command->executable || command->recording ||
                 command->scope != Scope::None || !command->issued || command->submitted || command->prepared) return false;
@@ -314,7 +350,7 @@ public:
     // Captured before native QueueSubmit; native success associates this exact
     // recording, never the newest recording after the native call returned.
     bool acceptSubmit(const SubmitTicket& ticket, bool nativeSuccess) noexcept {
-        return locked([&] {
+        return locked("acceptSubmit", [&] {
             if (!ticket.eligible || !ticket.serial || !ticket.admissionGeneration) return false;
             auto* pending = pendingSubmits_.find(ticket.device, ticket.serial);
             if (!pending || pending->id.generation != ticket.admissionGeneration ||
@@ -333,7 +369,7 @@ public:
 
     RetirementTicket prepareRetirement(std::uint64_t device, VkCommandBuffer value) noexcept {
         RetirementTicket out;
-        const bool ready = locked([&] {
+        const bool ready = locked("prepareRetirement", [&] {
             const auto* command = commands_.find(device, frame_bindings::handle(value));
             if (!command) return false;
             const auto* pool = pools_.find(device, command->pool.handle);
@@ -346,7 +382,7 @@ public:
         return ready ? out : RetirementTicket{};
     }
     bool ownsCommandPool(std::uint64_t device, VkCommandBuffer value, VkCommandPool poolValue) noexcept {
-        return locked([&] {
+        return locked("ownsCommandPool", [&] {
             const auto* command = commands_.find(device, frame_bindings::handle(value));
             const auto* pool = pools_.find(device, frame_bindings::handle(poolValue));
             return command && pool && frame_bindings::same(command->pool, pool->id);
@@ -354,17 +390,32 @@ public:
     }
 
 private:
-    template<class F> bool locked(F&& action) noexcept {
+    template<class F> bool locked(const char* site, F&& action) noexcept {
+        const auto* origin = site ? site : "unspecified";
         if (poisoned()) return false;
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-        if (!lock.owns_lock()) { poison(Failure::Contention); return false; }
-        if (poisoned() || !coreHealthy()) return false;
+        if (!lock.owns_lock()) { poison(Failure::Contention, origin); return false; }
+        if (poisoned()) return false;
+        activeSite_.store(origin, std::memory_order_relaxed);
+        if (!coreHealthy()) return false;
         const bool result = action();
         return !poisoned() && coreHealthy() && result;
     }
-    void poison(Failure reason) noexcept {
+    void poison(Failure reason, const char* site = nullptr) noexcept {
         auto expected = Failure::None;
-        failure_.compare_exchange_strong(expected, reason, std::memory_order_release, std::memory_order_relaxed);
+        if (!failure_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel,
+                                              std::memory_order_relaxed)) return;
+        // Only the winning refusal writes these bounded fields. A contender
+        // supplies its own site instead of borrowing the current lock owner's.
+        firstSite_.store(site ? site : activeSite_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        firstCoreLost_.store(bindings_.lostState(), std::memory_order_relaxed);
+        for (std::size_t i = 0; i < firstCoreReasons_.size(); ++i)
+            firstCoreReasons_[i].store(bindings_.lossCount(static_cast<frame_bindings::Reason>(i)),
+                                       std::memory_order_relaxed);
+        for (std::size_t i = 0; i < firstCoreCapacities_.size(); ++i)
+            firstCoreCapacities_[i].store(bindings_.capacityLossCount(static_cast<frame_bindings::Table>(i)),
+                                          std::memory_order_relaxed);
+        failurePublished_.store(true, std::memory_order_release);
     }
     bool unknown() noexcept { poison(Failure::Unknown); return false; }
     bool coreHealthy() noexcept {
@@ -405,17 +456,17 @@ private:
         command = {}; command.device = device; command.id = {handle, next()};
         command.pool = pool; command.family = family; command.level = level;
     }
-    bool beginScope(std::uint64_t device, VkCommandBuffer value, Scope scope, bool supported) noexcept {
-        return locked([&] {
+    bool beginScope(std::uint64_t device, VkCommandBuffer value, Scope scope, bool supported, const char* site) noexcept {
+        return locked(site, [&] {
             auto* command = recording(device, value); if (!command) return false;
             if (!command->supported || !supported || command->scope != Scope::None) return invalidate(*command);
             command->scope = scope; command->selected = false;
             return true;
         });
     }
-    bool endScope(std::uint64_t device, VkCommandBuffer value, Scope scope, Candidate& out) noexcept {
+    bool endScope(std::uint64_t device, VkCommandBuffer value, Scope scope, Candidate& out, const char* site) noexcept {
         out = {};
-        return locked([&] {
+        return locked(site, [&] {
             auto* command = recording(device, value); if (!command) return false;
             if (command->scope != scope || !command->supported) return invalidate(*command);
             command->scope = Scope::None;
@@ -475,6 +526,11 @@ private:
 
     std::mutex mutex_;
     std::atomic<Failure> failure_{Failure::None};
+    std::atomic<const char*> activeSite_{"unentered"}, firstSite_{nullptr};
+    std::atomic<bool> failurePublished_{false};
+    std::atomic<std::uint64_t> firstCoreLost_{0};
+    std::array<std::atomic<std::uint64_t>, CoreReasonCount> firstCoreReasons_{};
+    std::array<std::atomic<std::uint64_t>, CoreTableCount> firstCoreCapacities_{};
     std::uint64_t serial_ = 0;
     frame_bindings::Core bindings_{};
     frame_bindings::ObjectTable<Pool, PoolCapacity> pools_{};
