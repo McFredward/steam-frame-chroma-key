@@ -280,6 +280,150 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
         self.assertTrue(json.loads((self.session.folder / 'rollback-complete.json').read_text())['restored'])
 
+    def promote_public_draw_plan(self):
+        SessionTests.promote_periodic_target_plan(self)
+        self.plan['schema'] = M.PUBLIC_DRAW_SCHEMA
+        self.plan['observer']['raw_trace_sampling'] = copy.deepcopy(M.PUBLIC_DRAW_TRACE_SAMPLING)
+        self.plan['observer']['trace_sampling_marker'].update(
+            bytes=64, sha256=M.digest(M.PUBLIC_DRAW_SAMPLING_MARKER))
+        main = bytearray(self.artifacts[M.MAIN].read_bytes())
+        main[160:224] = M.PUBLIC_DRAW_SAMPLING_MARKER
+        strings = b'\0' + M.TRACE_SAMPLING_SYMBOL.encode('ascii') + b'\0'
+        main[224:224 + len(strings)] = strings
+        struct.pack_into('<IBBHQQ', main, 288, 1, 1, 0, 1, 0x10a0, 64)
+        struct.pack_into('<II4QII2Q', main, 384, 0, 1, 2, 0x1080, 128, 96, 0, 0, 8, 0)
+        struct.pack_into('<II4QII2Q', main, 448, 0, 3, 0, 0, 224, len(strings), 0, 0, 1, 0)
+        SessionTests.alter_artifact(self, M.MAIN, bytes(main))
+        profile = self.profile(5, main)
+        self.plan['observer_profile'].update(file_sha256=M.digest(main), profile_sha256=profile[-32:].hex())
+        self.plan['envelope'].update(reviewed_observer_profile_identity=profile[-32:].hex())
+        envelope = bytearray(self.artifacts[M.ENVELOPE].read_bytes())
+        envelope[16:48] = profile[-32:]
+        envelope[112 + 2032 * 3:-32] = profile
+        envelope[-32:] = bytes.fromhex(M.digest(envelope[:-32]))
+        SessionTests.alter_artifact(self, M.ENVELOPE, bytes(envelope))
+
+    def test_v8_public_draw_stage_activate_and_original_restore(self):
+        self.promote_public_draw_plan(); self.stage(); self.activate()
+        self.assertTrue(self.session.readcheck()['active'])
+        self.assertEqual(self.plan['raw_limits'], M.RAW_LIMITS)
+        self.assertEqual(self.plan['capture_limits'], M.CAPTURE_LIMITS)
+        self.assertEqual(self.plan['journal_limits'], M.JOURNAL_LIMITS)
+        self.assertEqual(self.plan['envelope']['schema'], 5)
+        self.assertEqual(M.acquisition_marker(self.plan), M.JOIN_TARGET_MARKER)
+        self.assertEqual(len(M.PUBLIC_DRAW_SAMPLING_MARKER), 64)
+        self.assertEqual(struct.unpack_from('<14I', M.PUBLIC_DRAW_SAMPLING_MARKER, 8),
+                         (4, 64, 32, 16, 16, 32, 4096, 127, 60000000, 2, 16, 2, 32, 16))
+        self.assertIs(self.plan['observer']['raw_trace_sampling']['target_snapshots_require_target_match'], True)
+        self.assertIs(self.plan['observer']['raw_trace_sampling']['public_draw_snapshots_unassociated'], True)
+        self.assertIs(self.plan['source_frame_associated'], False)
+        self.assertIs(self.plan['gpu_coherent'], False)
+        self.assertIs(self.plan['shader_or_mask_activation'], False)
+        self.session.rollback(restart_ready=True)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+        self.assertTrue(json.loads((self.session.folder / 'rollback-complete.json').read_text())['restored'])
+
+    @staticmethod
+    def invalid_public_draw_sampling():
+        exact = M.PUBLIC_DRAW_TRACE_SAMPLING
+        values = [None, {}, M.PERIODIC_TARGET_TRACE_SAMPLING,
+                  dict(exact, unexpected_scope=True)]
+        for key, value in exact.items():
+            changed = copy.deepcopy(exact)
+            if type(value) is bool:
+                changed[key] = not value
+            elif type(value) is int:
+                changed[key] = value + 1
+            elif isinstance(value, list):
+                changed[key] = value[:-1]
+            else:
+                changed[key] = value + '_other'
+            values.append(changed)
+            mistyped = copy.deepcopy(exact)
+            mistyped[key] = int(value) if type(value) is bool else (
+                float(value) if type(value) is int else (
+                    [False, *value[1:]] if isinstance(value, list) else False))
+            values.append(mistyped)
+        return values
+
+    def test_v8_requires_exact_typed_and_bounded_public_draw_scope_before_stage(self):
+        self.promote_public_draw_plan(); original = copy.deepcopy(self.plan)
+        for metadata in self.invalid_public_draw_sampling():
+            self.plan = copy.deepcopy(original)
+            self.plan['observer']['raw_trace_sampling'] = metadata; self.save_plan()
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(RuntimeError, 'sampling metadata'):
+                self.stage()
+            self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_v8_requires_actual_64_byte_readonly_hidden_marker(self):
+        self.promote_public_draw_plan(); original = self.artifacts[M.MAIN].read_bytes()
+        for marker in (M.TRACE_SAMPLING_MARKER, M.TARGET_SAMPLING_MARKER, M.PERIODIC_TARGET_SAMPLING_MARKER):
+            changed = bytearray(original); changed[160:160 + len(marker)] = marker
+            self.alter_artifact(M.MAIN, bytes(changed))
+            with self.subTest(marker=marker[:8]), self.assertRaisesRegex(RuntimeError, 'sampling marker'):
+                self.stage()
+        for word in range(14):
+            changed = bytearray(original); at = 168 + 4 * word
+            struct.pack_into('<I', changed, at, struct.unpack_from('<I', changed, at)[0] + 1)
+            self.alter_artifact(M.MAIN, bytes(changed))
+            with self.subTest(word=word), self.assertRaisesRegex(RuntimeError, 'sampling marker'):
+                self.stage()
+        for offset, layout, value in ((68, '<I', 6), (292, '<B', 2), (294, '<B', 0), (304, '<Q', 60)):
+            changed = bytearray(original); struct.pack_into(layout, changed, offset, value)
+            with self.subTest(offset=offset), self.assertRaisesRegex(RuntimeError, 'sampling'):
+                M.Session.validate_trace_sampling_marker(bytes(changed), self.plan)
+        visible = bytearray(original); visible[292] = 0x11; visible[293] = 0
+        with self.assertRaisesRegex(RuntimeError, 'sampling'):
+            M.Session.validate_trace_sampling_marker(bytes(visible), self.plan)
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
+    def test_v8_and_v7_cannot_be_relabelled_as_each_other(self):
+        self.promote_public_draw_plan()
+        for schema, sampling, marker in ((M.PERIODIC_TARGET_SCHEMA, M.PERIODIC_TARGET_TRACE_SAMPLING, M.PERIODIC_TARGET_SAMPLING_MARKER),
+                                         (M.JOIN_TARGET_SCHEMA, M.TARGET_TRACE_SAMPLING, M.TARGET_SAMPLING_MARKER)):
+            self.plan['schema'] = schema
+            self.plan['observer']['raw_trace_sampling'] = copy.deepcopy(sampling)
+            self.plan['observer']['trace_sampling_marker'].update(bytes=len(marker), sha256=M.digest(marker))
+            self.save_plan()
+            with self.subTest(schema=schema), self.assertRaisesRegex(RuntimeError, 'sampling marker'): self.stage()
+        self.promote_periodic_target_plan()
+        self.plan['schema'] = M.PUBLIC_DRAW_SCHEMA
+        self.plan['observer']['raw_trace_sampling'] = copy.deepcopy(M.PUBLIC_DRAW_TRACE_SAMPLING)
+        self.plan['observer']['trace_sampling_marker'].update(bytes=64, sha256=M.digest(M.PUBLIC_DRAW_SAMPLING_MARKER))
+        self.save_plan()
+        with self.assertRaisesRegex(RuntimeError, 'sampling marker'): self.stage()
+
+    def test_v8_contract_tamper_blocks_activation_but_preserves_recovery(self):
+        self.promote_public_draw_plan(); self.stage()
+        path = self.session.folder / 'deployment-plan.json'
+        stored = json.loads(path.read_bytes())
+        stored['observer']['raw_trace_sampling']['target_snapshots_require_target_match'] = False
+        path.write_bytes(M.json_bytes(stored))
+        manifest_path = self.session.folder / 'owned.json'
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest['plan_sha256'] = M.digest(path.read_bytes())
+        manifest['owned_files']['deployment-plan.json'] = manifest['plan_sha256']
+        manifest_path.write_bytes(M.json_bytes(manifest))
+        with self.assertRaisesRegex(RuntimeError, 'sampling metadata'): self.activate()
+        self.assertEqual(self.restart_count(), 0)
+        self.session.rollback(restart_ready=True)
+        self.assertEqual(self.restart_count(), 1)
+        self.assertFalse(self.session.layer.exists()); self.assertFalse(self.session.dropin.exists())
+
+    def test_v8_retains_candidate_join_limits_and_requires_current_arm(self):
+        self.promote_public_draw_plan(); original = copy.deepcopy(self.plan)
+        for key, value in (
+                ('candidate_selection', dict(M.CANDIDATE_SELECTION, begin_early_private_replay=True)),
+                ('resource_join_validation', dict(M.RESOURCE_JOIN_VALIDATION, same_capture_deadline=False)),
+                ('resource_join_validation', dict(M.RESOURCE_JOIN_VALIDATION, attempt_limit=65))):
+            self.plan = copy.deepcopy(original); self.plan['observer'][key] = value; self.save_plan()
+            with self.subTest(key=key), self.assertRaises(RuntimeError): self.stage()
+        self.plan = copy.deepcopy(original)
+        self.plan['operator_arm'] = self.session.operator_arm_descriptor(schema=M.LEGACY_ARM_RECEIPT_SCHEMA)
+        self.save_plan()
+        with self.assertRaisesRegex(RuntimeError, 'public image selection'): self.stage()
+        self.assertFalse(self.session.folder.exists()); self.assertEqual(self.restart_count(), 0)
+
     def test_v7_rejects_unbounded_mistyped_or_wrong_periodic_contract_before_stage(self):
         self.promote_periodic_target_plan(); original = copy.deepcopy(self.plan)
         variants = [None, {}, M.TARGET_TRACE_SAMPLING,
@@ -971,6 +1115,29 @@ class OperatorArmTests(unittest.TestCase):
             wrong = copy.deepcopy(original); wrong['raw_trace_sampling'] = value
             self.save_live_records([self.header], [wrong])
             with self.subTest(metadata=value), self.assertRaisesRegex(RuntimeError, 'sampling metadata'):
+                self.session.arm(stream_start_intent=True)
+            self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+        wrong = copy.deepcopy(self.header); wrong['capture_deadline_ns'] += 60000000
+        self.save_live_records([wrong], [original])
+        with self.assertRaisesRegex(RuntimeError, 'deadline expired or was reset'):
+            self.session.arm(stream_start_intent=True)
+        self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
+        self.save_live_records([self.header], [original])
+        receipt = self.session.arm(stream_start_intent=True)
+        self.assertEqual(receipt['capture_deadline_ns'], self.header['capture_deadline_ns'])
+        self.assertEqual(self.session.marker.read_bytes(), M.ARM_CONTENTS)
+        self.assertFalse(receipt['source_frame_associated']); self.assertFalse(receipt['mask_enabled'])
+
+    def test_v8_live_arm_requires_exact_public_draw_scope_without_association_or_deadline_reset(self):
+        SessionTests.promote_public_draw_plan(self); self.live_fixture()
+        self.header['candidate_selection'] = copy.deepcopy(M.CANDIDATE_SELECTION)
+        self.header['resource_join_validation'] = copy.deepcopy(M.RESOURCE_JOIN_VALIDATION)
+        self.journal_header['raw_trace_sampling'] = copy.deepcopy(M.PUBLIC_DRAW_TRACE_SAMPLING)
+        original = copy.deepcopy(self.journal_header)
+        for metadata in SessionTests.invalid_public_draw_sampling():
+            wrong = copy.deepcopy(original); wrong['raw_trace_sampling'] = metadata
+            self.save_live_records([self.header], [wrong])
+            with self.subTest(metadata=metadata), self.assertRaisesRegex(RuntimeError, 'sampling metadata'):
                 self.session.arm(stream_start_intent=True)
             self.assertFalse(self.session.marker.exists()); self.assertFalse(self.session.arm_receipt.exists())
         wrong = copy.deepcopy(self.header); wrong['capture_deadline_ns'] += 60000000

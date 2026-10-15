@@ -48,15 +48,18 @@ CANDIDATE_SELECTION = {'schema': 'frame-compositor-public-image-selection-v1',
     'stream_origin_proven': False}
 ARM_CONTENTS = b'FRAME_COMPOSITOR_RAW/1\n'
 SAMPLING_SCOPE = 'frame_compositor_trace_sampling_scope'
-SAMPLING_MARKER = b'FCMSMP03' + struct.pack('<13I',
-    3, 60, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1, 32)
+SAMPLING_MARKER = b'FCMSMP04' + struct.pack('<14I',
+    4, 64, 32, 16, 16, 32, 4096, 127, 60000000, 2, 16, 2, 32, 16)
 RAW_TRACE_SAMPLING = {'intentional': True, 'draw_call_limit': 32,
                       'execute_child_limit': 16, 'submit_command_limit': 16,
                       'binding_snapshots_require_import_request': True,
                       'lifecycle_survives_trace_cap': True, 'binding_probe_limit': 4096,
-                      'binding_probe_slots': 256, 'binding_snapshots_require_target_match': True,
+                      'binding_probe_slots': 256, 'binding_snapshots_require_target_match': False,
+                      'target_snapshots_require_target_match': True,
+                      'public_draw_snapshot_limit': 16, 'public_draw_snapshot_entry': 'PS_DISTORT',
+                      'public_draw_snapshots_unassociated': True, 'target_retirement_diagnostics_version': 1,
                       'target_descriptor_set': 0, 'target_bindings': [0, 2, 3, 4, 6, 9, 25, 31],
-                      'target_diagnostics_version': 1, 'target_denial_sample_limit': 16,
+                      'target_diagnostics_version': 2, 'target_denial_sample_limit': 16,
                       'probe_period_ns': 60000000, 'probe_general_per_period': 1,
                       'probe_classifications_per_period': 32,
                       'probe_distortion_per_period': 1, 'probe_distortion_entry': 'PS_DISTORT',
@@ -452,7 +455,7 @@ def prepare(native_directory, observer, reviewed_sha256, output, observer_remote
     inventory = [{'name': name, 'bytes': len(value), 'sha256': digest(value).hex(),
                   'frame_path': None if name in ('audit-preparation.cpp', SELECTOR_SOURCE) else str(frame / name),
                   'owned_source': True, 'native_bytes': False, 'mode': '0600'} for name, value in artifacts.items()]
-    plan = {'schema': 'frame-compositor-raw-offline-bundle-v7', 'prepared': True, 'installed': False, 'activated': False,
+    plan = {'schema': 'frame-compositor-raw-offline-bundle-v8', 'prepared': True, 'installed': False, 'activated': False,
             'runtime_authorized': False, 'frame_access': False, 'network_access': False, 'automatic_restart': False,
             'native_binary_or_script_changes': False, 'shader_or_mask_activation': False, 'source_frame_associated': False,
             'gpu_coherent': False, 'continuous_connection_owned': False, 'native_namespace_associated': False,

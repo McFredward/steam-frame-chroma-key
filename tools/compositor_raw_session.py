@@ -38,6 +38,7 @@ SCHEMA = "frame-compositor-raw-offline-bundle-v4"
 STREAM_IMAGE_SCHEMA = "frame-compositor-raw-offline-bundle-v5"
 JOIN_TARGET_SCHEMA = "frame-compositor-raw-offline-bundle-v6"
 PERIODIC_TARGET_SCHEMA = "frame-compositor-raw-offline-bundle-v7"
+PUBLIC_DRAW_SCHEMA = "frame-compositor-raw-offline-bundle-v8"
 SESSION_SCHEMA = "frame-compositor-raw-owned-session-v4"
 MAIN, AUDIT, ENVELOPE = "libVkLayer_frame_mask_trace.so", "libframe_compositor_raw_audit.so", "compositor-raw-envelope.bin"
 SELECTOR = "libframe_compositor_launch_selector.so"
@@ -98,6 +99,16 @@ PERIODIC_TARGET_TRACE_SAMPLING = dict(TARGET_TRACE_SAMPLING,
     probe_window_clock="background_owner_elapsed", probe_deadline_reset_allowed=False)
 PERIODIC_TARGET_SAMPLING_MARKER = b"FCMSMP03" + struct.pack("<13I",
     3, 60, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1, 32)
+PUBLIC_DRAW_TRACE_SAMPLING = dict(PERIODIC_TARGET_TRACE_SAMPLING,
+    # Independent public draw snapshots spend the same global snapshot quota;
+    # they carry no target/frame association. Exact-target admission is intact.
+    binding_snapshots_require_target_match=False,
+    target_snapshots_require_target_match=True,
+    public_draw_snapshot_limit=16, public_draw_snapshot_entry="PS_DISTORT",
+    public_draw_snapshots_unassociated=True, target_retirement_diagnostics_version=1,
+    target_diagnostics_version=2)
+PUBLIC_DRAW_SAMPLING_MARKER = b"FCMSMP04" + struct.pack("<14I",
+    4, 64, 32, 16, 16, 32, 4096, 127, 60000000, 2, 16, 2, 32, 16)
 RESOURCE_JOIN_VALIDATION = {"schema": "frame-compositor-resource-join-validation-v1",
     "attempt_limit": 64, "retry_delay_ns": 1000000, "same_capture_deadline": True,
     "immutable_snapshot": True, "unchanged_owning_journal_validator": True,
@@ -107,12 +118,13 @@ RESOURCE_JOIN_VALIDATION = {"schema": "frame-compositor-resource-join-validation
 def acquisition_marker(plan):
     return {SCHEMA: SCOPE_MARKER, STREAM_IMAGE_SCHEMA: STREAM_IMAGE_MARKER,
             JOIN_TARGET_SCHEMA: JOIN_TARGET_MARKER,
-            PERIODIC_TARGET_SCHEMA: JOIN_TARGET_MARKER}.get((plan or {}).get("schema"), SCOPE_MARKER)
+            PERIODIC_TARGET_SCHEMA: JOIN_TARGET_MARKER,
+            PUBLIC_DRAW_SCHEMA: JOIN_TARGET_MARKER}.get((plan or {}).get("schema"), SCOPE_MARKER)
 
 
 def envelope_schema(plan):
     return {SCHEMA: 3, STREAM_IMAGE_SCHEMA: 4, JOIN_TARGET_SCHEMA: 5,
-            PERIODIC_TARGET_SCHEMA: 5}.get(plan.get("schema"))
+            PERIODIC_TARGET_SCHEMA: 5, PUBLIC_DRAW_SCHEMA: 5}.get(plan.get("schema"))
 
 
 STARTUP_RECEIPTS = frozenset({"activation-startup-baseline.json", "activation-startup-health.json",
@@ -316,7 +328,7 @@ class Session(base.Session):
     @staticmethod
     def validate_candidate_selection(plan, header=None):
         report = plan.get("observer", {}).get("candidate_selection")
-        if plan.get("schema") not in (STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA, PERIODIC_TARGET_SCHEMA):
+        if plan.get("schema") not in (STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA, PERIODIC_TARGET_SCHEMA, PUBLIC_DRAW_SCHEMA):
             if report is not None or header is not None and "candidate_selection" in header:
                 raise RuntimeError("Legacy acquisition cannot be relabelled as public image selection")
             return
@@ -333,7 +345,8 @@ class Session(base.Session):
         if plan["operator_arm"]["schema"] == LEGACY_ARM_RECEIPT_SCHEMA:
             return
         marker = {JOIN_TARGET_SCHEMA: TARGET_SAMPLING_MARKER,
-                  PERIODIC_TARGET_SCHEMA: PERIODIC_TARGET_SAMPLING_MARKER}.get(plan.get("schema"), TRACE_SAMPLING_MARKER)
+                  PERIODIC_TARGET_SCHEMA: PERIODIC_TARGET_SAMPLING_MARKER,
+                  PUBLIC_DRAW_SCHEMA: PUBLIC_DRAW_SAMPLING_MARKER}.get(plan.get("schema"), TRACE_SAMPLING_MARKER)
         marker_bytes = len(marker)
         observer = plan.get("observer")
         report = observer.get("trace_sampling_marker") if isinstance(observer, dict) else None
@@ -429,7 +442,7 @@ class Session(base.Session):
         if not re.fullmatch(r"[0-9a-f]{64}", expected or "") or digest(raw) != expected:
             raise RuntimeError("Separately reviewed plan SHA required")
         plan = json.loads(raw)
-        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA, PERIODIC_TARGET_SCHEMA) or plan.get("prepared") is not True or
+        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA, PERIODIC_TARGET_SCHEMA, PUBLIC_DRAW_SCHEMA) or plan.get("prepared") is not True or
             plan.get("frame_directory") != str(self.folder) or plan.get("frame_user_home") != str(self.home) or
             plan.get("directory_mode") != "0700" or plan.get("environment") != self.activation_values()):
             raise RuntimeError("Unsupported compositor raw bundle scope/paths")
@@ -554,7 +567,8 @@ class Session(base.Session):
         if plan["operator_arm"]["schema"] == LEGACY_ARM_RECEIPT_SCHEMA:
             return
         expected = {JOIN_TARGET_SCHEMA: TARGET_TRACE_SAMPLING,
-                    PERIODIC_TARGET_SCHEMA: PERIODIC_TARGET_TRACE_SAMPLING}.get(plan.get("schema"), RAW_TRACE_SAMPLING)
+                    PERIODIC_TARGET_SCHEMA: PERIODIC_TARGET_TRACE_SAMPLING,
+                    PUBLIC_DRAW_SCHEMA: PUBLIC_DRAW_TRACE_SAMPLING}.get(plan.get("schema"), RAW_TRACE_SAMPLING)
         observer = plan.get("observer")
         reports = [("observer", observer.get("raw_trace_sampling") if isinstance(observer, dict) else None)]
         if journal_header is not None:
@@ -567,7 +581,7 @@ class Session(base.Session):
     @staticmethod
     def validate_resource_join(plan, header=None):
         report = plan.get("observer", {}).get("resource_join_validation")
-        if plan.get("schema") not in (JOIN_TARGET_SCHEMA, PERIODIC_TARGET_SCHEMA):
+        if plan.get("schema") not in (JOIN_TARGET_SCHEMA, PERIODIC_TARGET_SCHEMA, PUBLIC_DRAW_SCHEMA):
             if report is not None or header is not None and "resource_join_validation" in header:
                 raise RuntimeError("Legacy acquisition cannot be relabelled as bounded resource join")
             return
@@ -706,7 +720,7 @@ class Session(base.Session):
         # restarting the original service takes priority over proof failures.
         plan = json.loads(read_regular(self.folder / "deployment-plan.json", private=True))
         expected_envelope_schema = envelope_schema(plan)
-        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA, PERIODIC_TARGET_SCHEMA) or plan.get("raw_limits") != RAW_LIMITS or
+        if (plan.get("schema") not in (SCHEMA, STREAM_IMAGE_SCHEMA, JOIN_TARGET_SCHEMA, PERIODIC_TARGET_SCHEMA, PUBLIC_DRAW_SCHEMA) or plan.get("raw_limits") != RAW_LIMITS or
                 plan.get("capture_limits") != CAPTURE_LIMITS or plan.get("journal_limits") != JOURNAL_LIMITS or
                 plan.get("envelope", {}).get("schema") != expected_envelope_schema):
             raise RuntimeError("Stored acquisition scope cannot authorize this artifact")

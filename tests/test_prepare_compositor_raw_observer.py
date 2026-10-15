@@ -1,6 +1,7 @@
 """Offline package controls; synthetic own metadata never authorizes Frame use."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -179,18 +180,33 @@ class PackageControls(unittest.TestCase):
                        {'sampling': b'FCMSMP01' + struct.pack('<6I', 1, 33, 16, 16, 32, 3)},
                        {'sampling': b'FCMSMP02' + struct.pack('<8I', 2, 40, 32, 16, 16, 32, 4096, 7)},
                        {'sampling': b'FCMSMP03' + struct.pack('<12I', 3, 56, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1)},
+                       {'sampling': b'FCMSMP03' + struct.pack('<13I', 3, 60, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1, 32)},
                        {'sampling_visibility': 0}, {'sampling_size': 31},
                        {'sampling_rva': 0x2400}, {'sampling_rva': 0x7080}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError): self.validate(fixture(**kwargs))
-        self.assertEqual(len(tool.SAMPLING_MARKER), 60)
-        self.assertEqual(struct.unpack_from('<13I', tool.SAMPLING_MARKER, 8),
-                         (3, 60, 32, 16, 16, 32, 4096, 63, 60000000, 2, 16, 1, 32))
-        for word in range(13):
+        self.assertEqual(len(tool.SAMPLING_MARKER), 64)
+        self.assertEqual(struct.unpack_from('<14I', tool.SAMPLING_MARKER, 8),
+                         (4, 64, 32, 16, 16, 32, 4096, 127, 60000000, 2, 16, 2, 32, 16))
+        for word in range(14):
             changed = bytearray(tool.SAMPLING_MARKER)
             at = 8 + 4 * word
             struct.pack_into('<I', changed, at, struct.unpack_from('<I', changed, at)[0] + 1)
             with self.subTest(word=word), self.assertRaises(ValueError):
                 self.validate(fixture(sampling=bytes(changed)))
+
+    def test_v8_preparer_and_session_share_exact_scope_without_weakening_target_admission(self):
+        spec = importlib.util.spec_from_file_location('package_session_scope', ROOT / 'tools/compositor_raw_session.py')
+        session = importlib.util.module_from_spec(spec); spec.loader.exec_module(session)
+        self.assertEqual(tool.SAMPLING_MARKER, session.PUBLIC_DRAW_SAMPLING_MARKER)
+        self.assertEqual(json.dumps(tool.RAW_TRACE_SAMPLING, sort_keys=True),
+                         json.dumps(session.PUBLIC_DRAW_TRACE_SAMPLING, sort_keys=True))
+        self.assertEqual(tool.LIMIT_WORDS, session.ENVELOPE_LIMITS)
+        self.assertEqual(tool.MARKER, session.JOIN_TARGET_MARKER)
+        self.assertEqual(tool.RAW_TRACE_SAMPLING['public_draw_snapshot_limit'], 16)
+        self.assertEqual(tool.RAW_TRACE_SAMPLING['public_draw_snapshot_entry'], 'PS_DISTORT')
+        self.assertIs(tool.RAW_TRACE_SAMPLING['public_draw_snapshots_unassociated'], True)
+        self.assertIs(tool.RAW_TRACE_SAMPLING['target_snapshots_require_target_match'], True)
+        self.assertEqual(tool.JOURNAL_LIMITS['binding_records'], 32)
 
     def test_launch_configuration_is_exact_and_child_service_only_preloads_selector(self):
         config = tool.launch_config(Path('/home/steamos/.local/share/GloomhavenVR/frame-compositor-raw'))
@@ -315,7 +331,7 @@ class PackageControls(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='frame-compositor-preparer-controls-') as temporary:
             output = Path(temporary) / 'bundle'
             plan = tool.prepare(PRIVATE_NATIVE, FINAL_OBSERVER, FINAL_SHA, output, REMOTE)
-            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v7')
+            self.assertEqual(plan['schema'], 'frame-compositor-raw-offline-bundle-v8')
             self.assertEqual(plan['raw_limits'], tool.RAW_LIMITS)
             self.assertEqual(plan['capture_limits'], tool.CAPTURE_LIMITS)
             self.assertEqual(plan['operator_arm'], tool.operator_arm_descriptor(Path(REMOTE).parent))
