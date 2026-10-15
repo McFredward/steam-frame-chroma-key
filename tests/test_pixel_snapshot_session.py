@@ -7,8 +7,11 @@ import os
 from pathlib import Path
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("pixel_snapshot_session", Path(__file__).parents[1] / "tools/pixel_snapshot_session.py")
 mod = importlib.util.module_from_spec(SPEC)
@@ -312,9 +315,112 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(mod.main(["status", *args]), 0)
             self.assertEqual(mod.main(["rollback", *args]), 0)
         source = (Path(__file__).parents[1] / "tools/pixel_snapshot_session.py").read_text()
-        self.assertNotIn("import subprocess", source)
         self.assertNotIn("import socket", source)
         self.assertNotIn("os.system(", source)
+
+    def denied_maps(self):
+        original = os.open
+        def guarded(path, *args, **kwargs):
+            if path == "maps":
+                raise PermissionError("fixture maps permission")
+            return original(path, *args, **kwargs)
+        return mock.patch.object(mod.os, "open", side_effect=guarded)
+
+    def protected_session(self, reader):
+        return mod.Session(self.home, self.run, proc_root=self.proc, host_fixture=True,
+                           read_protected_maps=True, protected_map_reader=reader)
+
+    def test_default_denied_maps_never_attempt_privilege(self):
+        self.process("")
+        with self.denied_maps(), mock.patch.object(mod.subprocess, "Popen", side_effect=AssertionError("unexpected sudo")):
+            self.assertTrue(self.session.active()["uncertain"])
+
+    def test_explicit_protected_read_records_mode_and_preserves_mapping_guard(self):
+        self.prepare()
+        self.process("")
+        for value, expected in ((b"", []),
+                                (("1000-2000 r-xp 00000000 00:00 0 " + str(self.session.library) + "\n").encode(), [101])):
+            reader = mock.Mock(return_value=value)
+            session = self.protected_session(reader)
+            with self.denied_maps():
+                result = session.active()
+            self.assertFalse(result["uncertain"])
+            self.assertTrue(result["protected_maps_read_enabled"])
+            self.assertEqual(result["protected_maps_read_pids"], [101])
+            self.assertEqual(result["owned_mapping_pids"], expected)
+            reader.assert_called_once_with("101")
+
+    def test_protected_oversize_or_privilege_failure_remains_uncertain(self):
+        self.process("")
+        for reader in (mock.Mock(return_value=b"x" * (mod.MAX_MAP + 1)),
+                       mock.Mock(side_effect=mod.SafetyError("sudo unavailable")),
+                       mock.Mock(side_effect=PermissionError("refused"))):
+            with self.denied_maps():
+                self.assertTrue(self.protected_session(reader).active()["uncertain"])
+
+    def test_readable_or_wrong_owner_never_uses_protected_reader(self):
+        self.process("")
+        reader = mock.Mock(side_effect=AssertionError("unexpected privilege"))
+        self.assertFalse(self.protected_session(reader).active()["uncertain"])
+        original = os.fstat
+        process_inode = (self.proc / "101").stat().st_ino
+        def other_owner(fd):
+            value = original(fd)
+            if value.st_ino == process_inode:
+                items = list(value)
+                items[4] = os.getuid() + 1
+                return os.stat_result(items)
+            return value
+        with self.denied_maps(), mock.patch.object(mod.os, "fstat", side_effect=other_owner):
+            self.assertFalse(self.protected_session(reader).active()["uncertain"])
+        reader.assert_not_called()
+
+    def test_fake_proc_never_uses_real_privileged_runner(self):
+        self.process("")
+        session = mod.Session(self.home, self.run, proc_root=self.proc, host_fixture=True,
+                              read_protected_maps=True)
+        with self.denied_maps(), mock.patch.object(mod.subprocess, "Popen", side_effect=AssertionError("unexpected sudo")):
+            self.assertTrue(session.active()["uncertain"])
+
+    def test_nonnumeric_and_out_of_range_process_names_are_not_privileged_paths(self):
+        for name in ("-1", "1;true", "2147483648", "１０１", "0"):
+            self.process("", name=name)
+        reader = mock.Mock(side_effect=AssertionError("unexpected privilege"))
+        with self.denied_maps():
+            self.assertFalse(self.protected_session(reader).active()["uncertain"])
+        reader.assert_not_called()
+
+    def test_privileged_reader_uses_exact_readonly_argv_and_bounded_pipes(self):
+        original = subprocess.Popen
+        seen = []
+        def fixture(argv, **kwargs):
+            seen.append((argv, kwargs))
+            return original([sys.executable, "-c", "import os; os.write(1,b'owned maps\\n')"], **kwargs)
+        with mock.patch.object(mod.subprocess, "Popen", side_effect=fixture):
+            self.assertEqual(mod.read_protected_maps("101"), b"owned maps\n")
+        self.assertEqual(seen[0][0], ["sudo", "-n", "/usr/bin/head", "-c", str(mod.MAX_MAP + 1), "/proc/101/maps"])
+        self.assertEqual(seen[0][1], {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+                                     "stderr": subprocess.PIPE, "shell": False, "close_fds": True})
+        for pid in ("101/../1", "-1", "0", "2147483648", "１０１", "1;true"):
+            with self.assertRaises(mod.SafetyError):
+                mod.read_protected_maps(pid)
+
+    def test_privileged_reader_reaps_failure_timeout_and_excess_output(self):
+        original = subprocess.Popen
+        for code in ("raise SystemExit(1)",
+                     "import os; os.write(2,b'x'*4097)",
+                     "import os; os.write(1,b'x'*1048578)",
+                     "import time; time.sleep(1)"):
+            children = []
+            def fixture(argv, **kwargs):
+                child = original([sys.executable, "-c", code], **kwargs)
+                children.append(child)
+                return child
+            with self.subTest(code=code), mock.patch.object(mod, "MAP_READ_TIMEOUT", 0.1), \
+                    mock.patch.object(mod.subprocess, "Popen", side_effect=fixture):
+                with self.assertRaises(mod.SafetyError):
+                    mod.read_protected_maps("101")
+            self.assertIsNotNone(children[0].returncode)
 
 if __name__ == "__main__":
     unittest.main()

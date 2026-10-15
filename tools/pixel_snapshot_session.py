@@ -7,15 +7,20 @@ import json
 import os
 from pathlib import Path
 import secrets
+import selectors
 import stat
 import struct
+import subprocess
 import sys
+import time
 
 MAX_LIBRARY = 8 * 1024 * 1024
 MAX_JSON = 16 * 1024
 MAX_MAP = 1024 * 1024
 MAX_MAP_TOTAL = 64 * MAX_MAP
 MAX_PROCESSES = 4096
+MAX_MAP_STDERR = 4096
+MAP_READ_TIMEOUT = 3.0
 CONFIG_MAGIC = b"GHVR_PIXEL_SNAPSHOT/1\n"
 ARM_MAGIC = b"GHVR_PIXEL_SNAPSHOT_ARM/1\n"
 CLAIM_MAGIC = b"GHVR_PIXEL_CLAIM/1\n"
@@ -177,10 +182,57 @@ def verify_library(raw, wanted, *, host_fixture=False):
         raise SafetyError("ELF has no bounded load segment")
     return machine
 
+def read_protected_maps(pid):
+    """Read only one numeric proc map; never prompt, use a shell, or write as root."""
+    if not isinstance(pid, str) or not pid.isascii() or not pid.isdecimal() or not 0 < int(pid) <= 2147483647:
+        raise SafetyError("protected maps require a bounded numeric PID")
+    argv = ["sudo", "-n", "/usr/bin/head", "-c", str(MAX_MAP + 1), "/proc/" + pid + "/maps"]
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, shell=False, close_fds=True)
+    output = bytearray()
+    deadline = time.monotonic() + MAP_READ_TIMEOUT
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream, limit in ((process.stdout, MAX_MAP + 1), (process.stderr, MAX_MAP_STDERR)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, [bytearray(), limit])
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SafetyError("protected maps read timed out")
+                for key, _ in selector.select(remaining):
+                    data, limit = key.data
+                    chunk = os.read(key.fd, min(65536, limit + 1 - len(data)))
+                    if not chunk:
+                        if key.fileobj is process.stdout:
+                            output = data
+                        selector.unregister(key.fileobj)
+                    else:
+                        if len(chunk) > limit - len(data):
+                            raise SafetyError("protected maps output exceeded its bound")
+                        data.extend(chunk)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or process.wait(timeout=remaining) != 0:
+                raise SafetyError("protected maps read failed")
+        return bytes(output)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SafetyError("protected maps read failed") from error
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        process.stdout.close()
+        process.stderr.close()
+
 class Session:
-    def __init__(self, home, run_dir, *, proc_root=Path("/proc"), host_fixture=False):
+    def __init__(self, home, run_dir, *, proc_root=Path("/proc"), host_fixture=False,
+                 read_protected_maps=False, protected_map_reader=None):
         self.home, self.run = absolute(home), absolute(run_dir)
         self.proc, self.host_fixture = absolute(proc_root), bool(host_fixture)
+        self.read_protected_maps = bool(read_protected_maps)
+        if protected_map_reader is not None and not self.host_fixture:
+            raise SafetyError("alternate protected-map readers require host-fixture mode")
+        self.protected_map_reader = protected_map_reader
         if not host_fixture and (self.home != Path("/home/steamos") or self.proc != Path("/proc")):
             raise SafetyError("alternate home/proc paths require explicit host-fixture mode")
         self.base = self.home / ".local/share/GloomhavenVR/SteamLinkMaskProbe"
@@ -224,7 +276,9 @@ class Session:
 
     def active(self):
         """Conservative bounded same-user map scan; uncertainty blocks deletion."""
-        result = {"owned_mapping_pids": [], "foreign_mapping_pids": [], "uncertain": False}
+        result = {"owned_mapping_pids": [], "foreign_mapping_pids": [], "uncertain": False,
+                  "protected_maps_read_enabled": self.read_protected_maps,
+                  "protected_maps_read_pids": []}
         try:
             root = directory(self.proc, owned=False)
         except (OSError, SafetyError):
@@ -242,7 +296,7 @@ class Session:
             names = []
             with os.scandir(root) as entries:
                 for entry in entries:
-                    if entry.name.isdecimal():
+                    if entry.name.isascii() and entry.name.isdecimal() and 0 < int(entry.name) <= 2147483647:
                         if len(names) >= MAX_PROCESSES:
                             result["uncertain"] = True
                             return result
@@ -252,14 +306,33 @@ class Session:
                 try:
                     process = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root)
                     try:
-                        if os.fstat(process).st_uid != os.getuid():
+                        process_info = os.fstat(process)
+                        if process_info.st_uid != os.getuid():
                             continue
-                        fd = os.open("maps", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=process)
                         try:
-                            with os.fdopen(fd, "rb", closefd=False) as stream:
-                                raw = stream.read(MAX_MAP + 1)
-                        finally:
-                            os.close(fd)
+                            fd = os.open("maps", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=process)
+                            try:
+                                with os.fdopen(fd, "rb", closefd=False) as stream:
+                                    raw = stream.read(MAX_MAP + 1)
+                            finally:
+                                os.close(fd)
+                        except PermissionError:
+                            if (not self.read_protected_maps
+                                    or (self.proc != Path("/proc") and self.protected_map_reader is None)):
+                                raise
+                            # The privileged path is fixed /proc/PID/maps, not any
+                            # caller-supplied file. Preserve the pinned same-UID
+                            # identity across the read; PID reuse stays unknown.
+                            def same_process():
+                                current = os.stat(name, dir_fd=root, follow_symlinks=False)
+                                return (current.st_uid == os.getuid()
+                                        and (current.st_dev, current.st_ino) == (process_info.st_dev, process_info.st_ino))
+                            if not same_process():
+                                raise SafetyError("process changed before protected maps read")
+                            raw = (self.protected_map_reader or read_protected_maps)(name)
+                            if not same_process():
+                                raise SafetyError("process changed during protected maps read")
+                            result["protected_maps_read_pids"].append(int(name))
                     finally:
                         os.close(process)
                     total += len(raw)
@@ -424,12 +497,15 @@ def main(argv=None):
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--proc-root", type=Path, default=Path("/proc"))
     parser.add_argument("--host-fixture", action="store_true", help="local controlled fixtures only; never a device deployment bypass")
+    parser.add_argument("--read-protected-maps", action="store_true",
+                        help="explicitly allow bounded, read-only sudo -n head for denied same-user /proc maps; never prompts")
     parser.add_argument("--library", type=Path)
     parser.add_argument("--library-sha256")
     parser.add_argument("--capture-id")
     args = parser.parse_args(argv)
     try:
-        session = Session(args.home, args.run_dir, proc_root=args.proc_root, host_fixture=args.host_fixture)
+        session = Session(args.home, args.run_dir, proc_root=args.proc_root, host_fixture=args.host_fixture,
+                          read_protected_maps=args.read_protected_maps)
         if args.command in ("prepare", "stage"):
             if args.library is None or args.library_sha256 is None:
                 raise SafetyError("prepare requires --library and its explicit --library-sha256")

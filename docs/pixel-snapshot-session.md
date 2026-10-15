@@ -75,6 +75,22 @@ same-user loaded-library mappings, including inode aliases and deleted mappings;
 uncertain or excessive process scans block deletion. No output is a claim that
 an image, native association or visible headset result has been validated.
 
+Some SteamOS same-user processes protect `/proc/PID/maps` even though their UID
+is visible. The default scan remains unprivileged and refuses an incomplete
+result. With separately authorized read-only administration, explicitly add
+`--read-protected-maps` to permit a fallback **only** after an ordinary maps read
+raises `PermissionError` for a pinned same-UID, numeric PID. It runs exactly
+`sudo -n /usr/bin/head -c 1048577 /proc/PID/maps`, without a shell or password
+prompt. Each child is reaped, limited to three seconds, at most 1 MiB plus one
+sentinel byte of stdout, and 4 KiB of stderr. Nonzero exit, excess output,
+timeout, changed process identity, or missing privilege leaves the scan
+uncertain. Readable maps and other users' processes never use this fallback.
+The scan result records whether the mode is enabled and which PIDs needed it.
+The helper never obtains credentials, writes as root, or changes services.
+Do not run it with `sudo` as a whole; authenticate any separately approved
+read-only administration outside this helper. Fake proc roots can only use an
+explicitly injected test reader; they cannot invoke the real privileged reader.
+
 ## Disarm and exact rollback
 
 ```sh
