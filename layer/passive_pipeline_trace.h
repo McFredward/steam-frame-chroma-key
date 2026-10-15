@@ -84,6 +84,9 @@ struct Event {
     // Internal writer correlation only; never serialized or a video-frame identity.
     std::uint32_t bindingCookie = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t probeReplayOrder = 0, probeInvocationTag = 0;
+    // Background-issued sampling period, not a native frame or timestamp.
+    std::uint64_t probeSamplingPeriod = 0;
+    std::uint32_t probeSamplingClass = 0;
     frame_bindings::Reason bindingFailure = frame_bindings::Reason::Unknown;
 };
 static_assert(sizeof(Event) <= 1024, "Render events must not carry background snapshots");

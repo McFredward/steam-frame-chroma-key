@@ -47,9 +47,31 @@ void wait_replayed(Capture& c) {
     }
     require(false);
 }
+void footer_capacity(Capture& c) {
+    // Formatting bounds only: deliberately impossible maximum counters are
+    // not native observations or admission evidence.
+    for(auto& reason:c.probeReasons)reason={UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX};
+    c.probeDenialCount=c.probeDenials.size();
+    for(unsigned i=0;i<c.probeDenials.size();++i) {
+        auto& sample=c.probeDenials[i];auto& d=sample.diagnostics;
+        sample.order=sample.period=sample.replayNs=sample.pipeline=sample.pipelineGeneration=UINT64_MAX;
+        sample.samplingClass=UINT32_MAX;d.reason=static_cast<frame_bindings::TargetProbeReason>(i);
+        d.reasonMask=d.requestedCommand=d.requestedLayout=d.observedTargetTag=d.observedTargetCookie=d.observedTargetDevice=UINT64_MAX;
+        d.binding=d.examinedImageBindings=d.currentTargetErrors=d.observations=UINT32_MAX;
+        for(auto* id:{&d.command,&d.layout,&d.commandLayout,&d.boundSet,&d.set,&d.setLayout,&d.setDeclaredLayout,&d.pool,
+                     &d.currentTargetImage,&d.currentTargetView,&d.currentTargetMemory,&d.descriptorView,
+                     &d.candidateView,&d.candidateImage,&d.candidateMemory})*id={UINT64_MAX,UINT64_MAX};
+    }
+    char buffer[FooterReserve];std::size_t used=0;
+    require(c.serializeProbeDiagnostics(buffer,sizeof(buffer),used));
+    require(used+8192<FooterReserve); // Reserve unchanged common footer fields too.
+    std::printf("bounded target diagnostic maximum formatter: %zu bytes +8192 common reserve\n",used);
+    char shortBuffer[64];used=0;
+    require(!c.serializeProbeDiagnostics(shortBuffer,sizeof(shortBuffer),used) && used<sizeof(shortBuffer));
+}
 }
 int main(int argc,char** argv) {
-    const unsigned char scope[40]={'F','C','M','S','M','P','0','2',2,0,0,0,40,0,0,0,32,0,0,0,16,0,0,0,16,0,0,0,32,0,0,0,0,16,0,0,7,0,0,0};
+    const unsigned char scope[56]={'F','C','M','S','M','P','0','3',3,0,0,0,56,0,0,0,32,0,0,0,16,0,0,0,16,0,0,0,32,0,0,0,0,16,0,0,63,0,0,0,0,135,147,3,2,0,0,0,16,0,0,0,1,0,0,0};
     require(sizeof(frame_compositor_trace_sampling_scope)==sizeof(scope) && !std::memcmp(scope,frame_compositor_trace_sampling_scope,sizeof(scope)));
     const std::string mode=argc==1?"armed":argv[1];
     const bool armed_run=mode!="unarmed",deadline_run=mode=="deadline";
@@ -199,14 +221,32 @@ int main(int argc,char** argv) {
                 b.bindImageMemory(1,uiImage,uiMemory,0);b.createView(1,uiView,uiViewInfo);});
             di.imageView=uiView;observeBindings([&](auto& b){b.updateSets(1,1,&write,0,nullptr);});
             c.core.commandBegin(1,number(command));c.core.bind(1,number(command),12);
-            for(unsigned i=0;i<80;++i)recordedDraw(1,command,1);
+            for(unsigned i=0;i<80;++i) {
+                // Advance the actual permit issuer with controlled public
+                // owner-clock values; no test-only runtime getter or delay.
+                c.rawSampling.general.issue((100+i)*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+                recordedDraw(1,command,1);
+            }
             wait_replayed(c);
             require(c.bindingSnapshots==0 && c.probesFiltered==80 && !c.probesUnknown);
             di.imageView=handle<VkImageView>(22);observeBindings([&](auto& b){b.updateSets(1,1,&write,0,nullptr);});
-            for(unsigned i=0;i<80;++i)recordedDraw(1,command,1);
+            for(unsigned i=0;i<80;++i) {
+                c.rawSampling.general.issue((200+i)*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+                recordedDraw(1,command,1);
+            }
             wait_replayed(c);
             require(c.bindingSnapshots==32 && c.rawSampling.draws.sampled()==32 && c.rawSampling.probes.sampled()==160);
             require(c.probesMatched==32 && c.probesQuotaOmitted==48 && c.probesFiltered==80 && c.probesUnknown==0);
+            // Native distortion entry selection spends its separate permit;
+            // it does not grant an association or consume the generic permit.
+            copyEntry(stage.entry,"PS_DISTORT");c.core.pipelineDestroyed(1,12);
+            c.core.pipelineCreated(1,12,11,&stage,1,true,true);c.core.bind(1,number(command),12);
+            c.rawSampling.general.issue(301*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+            c.rawSampling.distortion.issue(300*frame_compositor_sampling::ProbeSchedule::PeriodNs);
+            recordedDraw(1,command,1);wait_replayed(c);
+            require(c.probesDistortion==1 && c.rawSampling.general.available() && !c.rawSampling.distortion.available());
+            require(c.probesQuotaOmitted==49 && c.rawSampling.probes.sampled()==161 && c.bindingSnapshots==32);
+            require(c.probeReasons[static_cast<unsigned>(frame_bindings::TargetProbeReason::SnapshotQuota)].count==49);
             require(c.lifecycleReady() && !c.events.finished() && !c.events.dropped());
             // A forked child cannot reopen/reset budgets or touch the copied
             // owning writer. Parent admission and counters stay unchanged.
@@ -233,6 +273,9 @@ int main(int argc,char** argv) {
     require(text.find("\"raw_trace_sampling\":{\"intentional\":true")!=std::string::npos);
     require(text.find("\"target_descriptor_set\":0,\"target_bindings\":[0,2,3,4,6,9,25,31]")!=std::string::npos);
     require(text.find("\"deadline_seconds\":120")!=std::string::npos);
+    require(text.find("\"target_diagnostics_version\":1")!=std::string::npos);
+    require(text.find("\"probe_period_ns\":60000000")!=std::string::npos);
+    require(text.find("\"target_probe_diagnostics\":{")!=std::string::npos);
     require((text.find("\"byte_cap_reached\":true")!=std::string::npos)==byte_cap);
     require((text.find("\"event\":\"bindings_armed\"")!=std::string::npos)==armed_run);
     require((text.find("\"event\":\"draw_recorded\"")!=std::string::npos)==armed_run);
@@ -242,6 +285,7 @@ int main(int argc,char** argv) {
     require(c.bindings.transportCounters().published==published);
     if(armed_run)require(text.find("\"import_request_published\":true")!=std::string::npos);
     else require(text.find("\"published\":1,\"replayed\":1")!=std::string::npos);
+    footer_capacity(c);
     require(!unlink(journal.c_str()));if(armed_run)require(!unlink(marker.c_str()));require(!rmdir(root.c_str()));
     std::printf("PASS: %u production raw-mode writer/provider controls (%s, %lld ms); no native admission or GPU proof\n",checks,mode.c_str(),static_cast<long long>(elapsed));
 }
