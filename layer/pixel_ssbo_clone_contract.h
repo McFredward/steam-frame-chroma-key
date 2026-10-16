@@ -16,7 +16,7 @@
 
 namespace frame_pixel_ssbo_clone {
 constexpr std::size_t MaxBindings=32, MaxArray=16, MaxPushRanges=8, MaxVertexBindings=16;
-constexpr std::size_t MaxAttributes=32, MaxViewports=4, MaxAttachments=8, MaxDynamics=16, MaxDependencies=8;
+constexpr std::size_t MaxAttributes=32, MaxViewports=4, MaxAttachments=8, MaxDynamics=64, MaxDependencies=8;
 constexpr std::size_t MaxChain=32, ShaderBytes=9460, MaxSubpasses=8;
 enum class Reason : std::uint8_t {
     None, NativeCreationFailed, Type, Extension, Bounds, NullArray, Identity,
@@ -402,7 +402,7 @@ struct RenderPassDefinition:SubpassDefinition {
             // RP2 input aspect selection has no corresponding legacy field.
             // Keep the older no-input lowering proof, never discard a used mask.
             if(route2)for(std::uint32_t i=0;i<src.inputCount;++i)
-                if(src.inputs[i].attachment!=VK_ATTACHMENT_UNUSED && src.inputAspects[i])return false;
+                if(src.inputs[i].attachment!=VK_ATTACHMENT_UNUSED)return false;
             dst.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;dst.inputAttachmentCount=src.inputCount;
             dst.pInputAttachments=src.inputCount?src.inputs.data():nullptr;dst.colorAttachmentCount=src.colorCount;
             dst.pColorAttachments=src.colorCount?src.colors.data():nullptr;dst.pResolveAttachments=src.hasResolves?src.resolves.data():nullptr;
@@ -462,7 +462,7 @@ inline bool captureRenderPass(const VkRenderPassCreateInfo* in,RenderPassDefinit
     if(!in->pSubpasses)return refuse(why,Reason::NullArray);
     if(!copyArray(in->pAttachments,in->attachmentCount,out.attachments,why) || !copyArray(in->pDependencies,in->dependencyCount,out.dependencies,why))return false;
     out.attachmentCount=in->attachmentCount;out.dependencyCount=in->dependencyCount;out.subpassCount=in->subpassCount;
-    for(std::uint32_t i=0;i<out.attachmentCount;++i)if(out.attachments[i].flags || !sampleCount(out.attachments[i].samples) || out.attachments[i].format==VK_FORMAT_UNDEFINED)return refuse(why,Reason::RenderPassShape,i);
+    for(std::uint32_t i=0;i<out.attachmentCount;++i)if((out.attachments[i].flags&~VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT) || !sampleCount(out.attachments[i].samples) || out.attachments[i].format==VK_FORMAT_UNDEFINED)return refuse(why,Reason::RenderPassShape,i);
     for(std::uint32_t n=0;n<out.subpassCount;++n){const auto& sub=in->pSubpasses[n];auto& dst=*out.subpass(n);
         if(sub.flags || sub.pipelineBindPoint!=VK_PIPELINE_BIND_POINT_GRAPHICS)return refuse(why,Reason::RenderPassShape,n);
         if(!copyArray(sub.pInputAttachments,sub.inputAttachmentCount,dst.inputs,why) || !copyArray(sub.pColorAttachments,sub.colorAttachmentCount,dst.colors,why) || !copyArray(sub.pPreserveAttachments,sub.preserveAttachmentCount,dst.preserves,why))return false;
@@ -488,7 +488,7 @@ inline bool captureRenderPass2(const VkRenderPassCreateInfo2* in,RenderPassDefin
     if(!in->pSubpasses || (in->attachmentCount && !in->pAttachments) || (in->dependencyCount && !in->pDependencies))return refuse(why,Reason::NullArray);
     out.attachmentCount=in->attachmentCount;out.dependencyCount=in->dependencyCount;out.subpassCount=in->subpassCount;
     for(std::uint32_t i=0;i<out.attachmentCount;++i){const auto& a=in->pAttachments[i];if(!ordinary(a,VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,why))return false;
-        if(a.flags || !sampleCount(a.samples) || a.format==VK_FORMAT_UNDEFINED)return refuse(why,Reason::RenderPassShape,i);
+        if((a.flags&~VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT) || !sampleCount(a.samples) || a.format==VK_FORMAT_UNDEFINED)return refuse(why,Reason::RenderPassShape,i);
         out.attachments[i]={a.flags,a.format,a.samples,a.loadOp,a.storeOp,a.stencilLoadOp,a.stencilStoreOp,a.initialLayout,a.finalLayout};
     }
     for(std::uint32_t n=0;n<out.subpassCount;++n){const auto& sub=in->pSubpasses[n];auto& dst=*out.subpass(n);
@@ -580,7 +580,7 @@ inline bool capture(const Inputs& in,Recipe& out,Refusal& why) noexcept {
        !captureSet0(*in.set0,out.set0,why,in.probeInterface) || !captureLayout(*in.layout,set0,out.layout,why) ||
        !captureRenderPass(in.renderPass,out.renderPass,why) || !captureShader(*in.vertex,ShaderRole::Vertex,out.vertex,why) ||
        !captureShader(*in.fragment,ShaderRole::Fragment,out.fragment,why) ||
-       !captureGraphics(*in.graphics,layout,pass,vs,ps,out.renderPass,out.graphics,why))return false;
+       !captureGraphics(*in.graphics,layout,pass,vs,ps,out.renderPass,out.graphics,why,&out.feature))return false;
     out.provenance=identities;out.definitionComplete=true;return true;
 }
 } // namespace frame_pixel_ssbo_clone

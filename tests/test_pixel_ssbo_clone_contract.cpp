@@ -492,7 +492,7 @@ void definitions(){
     VkSpecializationInfo specialization{};bad.stages[0].pSpecializationInfo=&specialization;require(!bad.copyGraphics(g,why),"specialization refused");reason(why,Reason::Stage);bad.stages[0].pSpecializationInfo=nullptr;
     bad.stages[0].pName="main";require(!bad.copyGraphics(g,why),"exact original entry required");reason(why,Reason::Stage);bad.stages[0].pName="PS_DISTORT";
     bad.dynamic.dynamicStateCount=MaxDynamics+1;bad.dynamic.pDynamicStates=reinterpret_cast<const VkDynamicState*>(std::uintptr_t(1));require(!bad.copyGraphics(g,why),"dynamic array cap before dereference");reason(why,Reason::Bounds);bad.dynamic.dynamicStateCount=2;bad.dynamic.pDynamicStates=bad.dynamics.data();
-    bad.dynamics[1]=VK_DYNAMIC_STATE_CULL_MODE;require(!bad.copyGraphics(g,why),"unreviewed extended dynamic state refused");reason(why,Reason::DynamicState);bad.dynamics[1]=VK_DYNAMIC_STATE_SCISSOR;
+    bad.dynamics[1]=static_cast<VkDynamicState>(0x6fffffff);require(!bad.copyGraphics(g,why),"unreviewed extended dynamic state refused");reason(why,Reason::DynamicState);bad.dynamics[1]=VK_DYNAMIC_STATE_SCISSOR;
     bad.dynamics={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};bad.viewport.pViewports=nullptr;bad.viewport.pScissors=nullptr;require(bad.copyGraphics(g,why),"null static viewport arrays accepted only for declared dynamic states");bad.dynamic.dynamicStateCount=0;require(!bad.copyGraphics(g,why),"absent static and dynamic viewport refused");reason(why,Reason::NullArray);bad.dynamic.dynamicStateCount=2;
     bad.viewport.pViewports=reinterpret_cast<const VkViewport*>(std::uintptr_t(1));bad.viewport.pScissors=reinterpret_cast<const VkRect2D*>(std::uintptr_t(1));
     require(bad.copyGraphics(g,why) && !g.hasViewports && !g.hasScissors,"ignored dynamic viewport poison pointers never dereferenced");
@@ -505,7 +505,7 @@ void definitions(){
     Fixture bounds;
     bounds.vertex.vertexAttributeDescriptionCount=MaxAttributes+1;bounds.vertex.pVertexAttributeDescriptions=reinterpret_cast<const VkVertexInputAttributeDescription*>(std::uintptr_t(1));require(!bounds.copyGraphics(g,why),"attribute count bound");reason(why,Reason::Bounds);
     require(!captureRenderPass(nullptr,rp,why),"async renderpass handle is insufficient");reason(why,Reason::RenderPassMissing);
-    bad.pass.subpassCount=2;require(!captureRenderPass(&bad.pass,rp,why),"multiple subpasses conservative refusal");reason(why,Reason::RenderPassShape);bad.pass.subpassCount=1;
+    bad.pass.subpassCount=MaxSubpasses+1;bad.pass.pSubpasses=reinterpret_cast<const VkSubpassDescription*>(std::uintptr_t(1));require(!captureRenderPass(&bad.pass,rp,why),"subpass count bound before array read");reason(why,Reason::Bounds);bad.pass.subpassCount=1;bad.pass.pSubpasses=&bad.sub;
     bad.color[0].attachment=UINT32_MAX-1;require(!captureRenderPass(&bad.pass,rp,why),"invalid attachment index");reason(why,Reason::AttachmentIndex);
     bad.pass.attachmentCount=MaxAttachments+1;bad.pass.pAttachments=reinterpret_cast<const VkAttachmentDescription*>(std::uintptr_t(1));require(!captureRenderPass(&bad.pass,rp,why),"attachment count cap before dereference");reason(why,Reason::Bounds);
 }
@@ -532,21 +532,57 @@ void renderPass2(){
     ci.correlatedViewMaskCount=1;ci.pCorrelatedViewMasks=reinterpret_cast<const std::uint32_t*>(poison);rejected();ci.correlatedViewMaskCount=0;
     sub.viewMask=1;rejected();sub.viewMask=0;dependency.viewOffset=1;rejected();dependency.viewOffset=0;
     dependency.dependencyFlags=VK_DEPENDENCY_VIEW_LOCAL_BIT;rejected();dependency.dependencyFlags=d.dependencyFlags;
-    sub.inputAttachmentCount=1;sub.pInputAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);rejected();sub.inputAttachmentCount=0;
+    sub.inputAttachmentCount=MaxAttachments+1;sub.pInputAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);rejected();sub.inputAttachmentCount=0;
     ci.attachmentCount=MaxAttachments+1;ci.pAttachments=reinterpret_cast<const VkAttachmentDescription2*>(poison);rejected();reason(why,Reason::Bounds);ci.attachmentCount=2;ci.pAttachments=attachments.data();
     ci.dependencyCount=MaxDependencies+1;ci.pDependencies=reinterpret_cast<const VkSubpassDependency2*>(poison);rejected();ci.dependencyCount=1;ci.pDependencies=&dependency;
     sub.colorAttachmentCount=MaxAttachments+1;sub.pColorAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);rejected();sub.colorAttachmentCount=1;sub.pColorAttachments=&color;
-    color.attachment=VK_ATTACHMENT_UNUSED;sub.pResolveAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);rejected();reason(why,Reason::RenderPassShape);color.attachment=0;sub.pResolveAttachments=nullptr;
+    sub.colorAttachmentCount=0;sub.pColorAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);sub.pResolveAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);require(captureRenderPass2(&ci,out,why) && !out.colorCount && !out.hasResolves,"zero color count ignores both RP2 reference arrays");sub.colorAttachmentCount=1;sub.pColorAttachments=&color;sub.pResolveAttachments=nullptr;
     color.attachment=2;rejected();reason(why,Reason::AttachmentIndex);color.attachment=0;
     color.sType=VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;rejected();reason(why,Reason::Type);color.sType=VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
     require(!captureRenderPass2(nullptr,out,why),"missing RP2 input refuses");reason(why,Reason::RenderPassMissing);matches();
 }
 void unusedColor(){
-    Fixture unused;RenderPassDefinition rp;Refusal why;
-    unused.color[0].attachment=VK_ATTACHMENT_UNUSED;unused.sub.pResolveAttachments=reinterpret_cast<const VkAttachmentReference*>(std::uintptr_t(1));
-    // This proves branch-before-unneeded-read, not that a poison array is valid
-    // Vulkan input under the generic optional-array parameter rules.
-    require(!captureRenderPass(&unused.pass,rp,why),"all-unused color refused before dependent resolve pointer");reason(why,Reason::RenderPassShape);
+    Fixture f;RenderPassDefinition rp;Refusal why;
+    f.sub.colorAttachmentCount=0;f.sub.pColorAttachments=reinterpret_cast<const VkAttachmentReference*>(std::uintptr_t(1));f.sub.pResolveAttachments=f.sub.pColorAttachments;
+    f.sub.inputAttachmentCount=0;f.sub.pInputAttachments=f.sub.pColorAttachments;f.sub.preserveAttachmentCount=0;f.sub.pPreserveAttachments=reinterpret_cast<const std::uint32_t*>(std::uintptr_t(1));
+    require(captureRenderPass(&f.pass,rp,why) && !rp.colorCount && !rp.hasResolves,"zero counts ignore native dependent arrays while retaining depth-only subpass");
+}
+void renderPassCohort(){
+    Refusal why;
+    // All top-level shapes actually observed in r3. The nested payloads below
+    // are deliberate owned models, not invented replay of missing native facts.
+    constexpr std::uint32_t shapes[][3]{{1,2,2},{3,2,3},{3,3,4},{1,2,3},{2,2,3},{2,1,1}};
+    for(const auto& shape:shapes){
+        std::array<VkAttachmentDescription2,3> attachments{};for(auto& a:attachments){a.sType=VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;a.format=VK_FORMAT_R32G32B32A32_SFLOAT;a.samples=VK_SAMPLE_COUNT_1_BIT;a.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;a.storeOp=VK_ATTACHMENT_STORE_OP_STORE;a.finalLayout=VK_IMAGE_LAYOUT_GENERAL;}
+        std::array<VkSubpassDescription2,3> subs{};std::array<VkAttachmentReference2,3> colors{};
+        for(unsigned i=0;i<subs.size();++i){colors[i]={VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,nullptr,0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_ASPECT_COLOR_BIT};subs[i].sType=VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2;subs[i].pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;subs[i].colorAttachmentCount=1;subs[i].pColorAttachments=&colors[i];}
+        std::array<VkSubpassDependency2,4> deps{};for(unsigned i=0;i<deps.size();++i){deps[i].sType=VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2;deps[i].srcSubpass=i?std::min(i-1,shape[1]-1):VK_SUBPASS_EXTERNAL;deps[i].dstSubpass=std::min(i,shape[1]-1);deps[i].srcStageMask=deps[i].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;deps[i].srcAccessMask=deps[i].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;}
+        auto ci=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);ci.attachmentCount=shape[0];ci.pAttachments=attachments.data();ci.subpassCount=shape[1];ci.pSubpasses=subs.data();ci.dependencyCount=shape[2];ci.pDependencies=deps.data();
+        RenderPassDefinition pass;require(captureRenderPass2(&ci,pass,why) && pass.route2 && pass.subpassCount==shape[1],"entire observed top-level cohort has bounded RP2 representation");
+        RenderPass2View view;require(pass.view2(view) && view.info.subpassCount==shape[1] && view.info.dependencyCount==shape[2],"complete same-route RP2 view preserves all subpasses/dependencies");
+        require(pass.subpass(shape[1])==nullptr && pass.subpass(shape[1]-1)->colorCount==1,"selected immutable subpass lookup bounds exact");
+        auto copied=pass;colors[0].attachment=VK_ATTACHMENT_UNUSED;attachments[0].format=VK_FORMAT_R8_UNORM;
+        require(copied.view2(view) && view.info.pAttachments[0].format==VK_FORMAT_R32G32B32A32_SFLOAT && view.info.pSubpasses[0].pColorAttachments[0].attachment==0,"cohort copied without borrowed native arrays");
+    }
+    Fixture f;std::array<VkSubpassDescription,3> subs{{f.sub,f.sub,f.sub}};
+    VkAttachmentReference input{0,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},resolve{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};std::uint32_t preserve=1;
+    subs[0].pResolveAttachments=&resolve;subs[1].inputAttachmentCount=1;subs[1].pInputAttachments=&input;subs[2].colorAttachmentCount=0;subs[2].pColorAttachments=nullptr;subs[2].pDepthStencilAttachment=nullptr;subs[2].preserveAttachmentCount=1;subs[2].pPreserveAttachments=&preserve;
+    f.attachments[0].flags=VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT;
+    auto ci=f.pass;ci.subpassCount=3;ci.pSubpasses=subs.data();RenderPassDefinition pass;require(captureRenderPass(&ci,pass,why),"legacy full cohort includes inputs/resolves/depth/preserves");
+    require(pass.attachments[0].flags==VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT,"ordinary may-alias attachment flag retained without native mutation");
+    RenderPassView view;require(pass.view(view) && view.info.pSubpasses[1].pInputAttachments[0].layout==input.layout && view.info.pSubpasses[0].pResolveAttachments[0].attachment==0 && view.info.pSubpasses[2].pPreserveAttachments[0]==1,"legacy nested arrays exact and rebased");
+    auto bounded=pass;bounded.subpassCount=MaxSubpasses+1;require(!bounded.view(view),"forged oversized owned view refuses before array traversal");
+    ci.subpassCount=MaxSubpasses+1;ci.pSubpasses=reinterpret_cast<const VkSubpassDescription*>(std::uintptr_t(1));require(!captureRenderPass(&ci,pass,why),"legacy oversized subpass pointer unread");reason(why,Reason::Bounds);
+    ci.subpassCount=3;ci.pSubpasses=subs.data();f.dependency.dstSubpass=3;require(!captureRenderPass(&ci,pass,why),"out-of-range dependency endpoint refuses");f.dependency.dstSubpass=0;
+    std::array<VkAttachmentDescription2,2> attachments{};for(unsigned i=0;i<2;++i){const auto& a=f.attachments[i];attachments[i]={VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,nullptr,a.flags,a.format,a.samples,a.loadOp,a.storeOp,a.stencilLoadOp,a.stencilStoreOp,a.initialLayout,a.finalLayout};}
+    std::array<VkSubpassDescription2,3> second{};VkAttachmentReference2 color{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,nullptr,0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_ASPECT_COLOR_BIT};VkAttachmentReference2 in{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,nullptr,1,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,VK_IMAGE_ASPECT_DEPTH_BIT};
+    for(auto& sub:second){sub.sType=VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2;sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=1;sub.pColorAttachments=&color;}second[1].inputAttachmentCount=1;second[1].pInputAttachments=&in;
+    auto rp2=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);rp2.attachmentCount=2;rp2.pAttachments=attachments.data();rp2.subpassCount=3;rp2.pSubpasses=second.data();
+    require(captureRenderPass2(&rp2,pass,why) && pass.subpass(1)->inputAspects[0]==VK_IMAGE_ASPECT_DEPTH_BIT,"RP2 used input aspect retained per selected subpass");RenderPass2View exact;
+    require(pass.view2(exact) && exact.info.pSubpasses[1].pInputAttachments[0].aspectMask==VK_IMAGE_ASPECT_DEPTH_BIT,"owned RP2 route does not invent legacy aspect authority");require(!pass.view(view),"lossy legacy fallback for used RP2 input aspects refused");
+    second[2].pNext=reinterpret_cast<const void*>(std::uintptr_t(1));require(!captureRenderPass2(&rp2,pass,why) && !pass.complete,"unknown extension in any late subpass invalidates full cohort");reason(why,Reason::Extension);second[2].pNext=nullptr;
+    attachments[0].flags=0x80000000u;require(!captureRenderPass2(&rp2,pass,why),"unknown attachment flag refuses complete cohort");attachments[0].flags=VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT;
+    rp2.subpassCount=MaxSubpasses+1;rp2.pSubpasses=reinterpret_cast<const VkSubpassDescription2*>(std::uintptr_t(1));require(!captureRenderPass2(&rp2,pass,why),"RP2 subpass count cap before source read");reason(why,Reason::Bounds);
 }
 
 std::vector<std::uint32_t> shader(const char* path,std::size_t maximum=ShaderBytes){std::ifstream file(path,std::ios::binary|std::ios::ate);require(bool(file),"explicit private module readable");auto bytes=file.tellg();require(bytes>0 && bytes<=std::streamoff(maximum) && bytes%4==0,"bounded private module bytes");std::vector<std::uint32_t> data(static_cast<std::size_t>(bytes)/4);file.seekg(0);require(bool(file.read(reinterpret_cast<char*>(data.data()),bytes)),"complete private source");return data;}
@@ -593,10 +629,11 @@ void privateComplete(const char* vsPath,const char* psPath){
 }
 }
 int main(int argc,char** argv){
+    if(argc==2 && std::strcmp(argv[1],"--renderpass-cohort-only")==0){renderPass2();renderPassCohort();unusedColor();std::cout<<"{\"scope\":\"bounded-renderpass-cohort\",\"checks\":"<<checks<<",\"native_payload_replay\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--native-device-chain-only")==0){features();nativeDeviceChain();std::cout<<"{\"scope\":\"native-device-chain-subset\",\"checks\":"<<checks<<",\"native_payload_bits_replayed\":false,\"native_authority\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--renderpass2-only")==0){renderPass2();std::cout<<"{\"scope\":\"renderpass2-subset\",\"checks\":"<<checks<<"}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--unused-color-only")==0){unusedColor();std::cout<<"{\"scope\":\"unused-color-subset\",\"checks\":"<<checks<<"}\n";return 0;}
-    require(argc==1 || argc==3 || argc==4,"optional private VS PS [count1 probe] paths only");features();nativeDeviceChain();layouts();definitions();unusedColor();renderPass2();
+    require(argc==1 || argc==3 || argc==4,"optional private VS PS [count1 probe] paths only");features();nativeDeviceChain();layouts();definitions();unusedColor();renderPass2();renderPassCohort();
     const bool privateInput=argc>=3;if(privateInput)privateComplete(argv[1],argv[2]);
     if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-clone-definition-controls-v1\",\"checks\":"<<checks<<",\"private_native_pins_tested\":"<<(privateInput?"true":"false")<<",\"recipe_bytes\":"<<sizeof(Recipe)<<",\"native_compatibility_proven\":false,\"runtime_activation_authorized\":false}\n";
