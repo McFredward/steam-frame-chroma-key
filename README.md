@@ -41,6 +41,12 @@ adds an optional, uninstalled final-draw uniform companion with bounded copies,
 an offline reader and strict resource guards. It remains off by default. A new
 native capture requires a reviewed package and fresh agreement; this does not
 authorize a replacement shader or establish the remaining spatial/video mapping.
+The [completed final-draw capture](docs/NATIVE-UNIFORM-CAPTURE-20261016.md)
+now includes GPU-copied native uniform bytes alongside both pixel paths. The
+bounded offline lookup reference is independently checked against the original
+fragment shader. Physical eye, source-ray registration and live alpha remain
+unproven; the temporary diagnostic is removed and the original Frame UI is
+confirmed usable.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
