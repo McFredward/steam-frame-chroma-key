@@ -432,7 +432,7 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
             out<<"{\"context_index\":"<<index<<",\"reason\":\""<<journal::reasonName(first.reason)<<"\",\"kind\":"<<unsigned(first.kind)<<",\"contract_reason\":\""<<frame_pixel_ssbo_clone::reasonName(first.contract.reason)<<"\",\"contract_index\":"<<first.contract.index<<",\"contract_structure_type\":"<<first.contract.type<<",\"first_object\":"<<first.value<<",\"first_generation\":"<<first.generation<<",\"last_object\":"<<last.value<<",\"last_generation\":"<<last.generation<<",\"count\":"<<context.count<<'}';
         }
         out<<"],\"inventory\":[";for(unsigned kind=0;kind<6;++kind){if(kind)out<<',';out<<"{\"kind\":"<<kind<<",\"live\":"<<facts.live[kind]<<",\"capacity\":"<<facts.capacity[kind]<<'}';}
-        out<<"],\"context_overflow\":"<<facts.contextOverflow<<",\"creation_shape_overflow\":"<<(observed.creationOverflow?"true":"false")<<",\"created\":"<<facts.created<<",\"cancelled\":"<<facts.cancelled<<",\"native_frame_association_proven\":false,\"mask_enabled\":false}\n";
+        out<<"],\"set_fact_count\":"<<facts.setFactCount<<",\"set_fact_capacity\":"<<facts.setFactCapacity<<",\"context_overflow\":"<<facts.contextOverflow<<",\"creation_shape_overflow\":"<<(observed.creationOverflow?"true":"false")<<",\"created\":"<<facts.created<<",\"cancelled\":"<<facts.cancelled<<",\"native_frame_association_proven\":false,\"mask_enabled\":false}\n";
         const auto text=out.str();if(text.size()<=8192)frame_pixel_io::writeAll(fd,text.data(),text.size());
         reportedContexts=stop;reportedReasons|=newReasons;newReasons=0;reportedOverflow=overflow;
     }
