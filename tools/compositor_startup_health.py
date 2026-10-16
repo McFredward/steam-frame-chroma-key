@@ -51,6 +51,7 @@ DIAGNOSTIC_PREFIXES = (b"GHVR_FRAME_COMPOSITOR_RAW_", b"FRAME_MASK_TRACE")
 INELIGIBLE_STATES = frozenset("TtXxZ")
 PROPERTIES = ("InvocationID", "ActiveState", "SubState", "MainPID", "ControlGroup", "NRestarts", "ExecMainStartTimestampMonotonic")
 COMPOSITOR = "/opt/steamvr/bin/linuxarm64/vrcompositor"
+SERVER = "/opt/steamvr/bin/linuxarm64/vrserver"
 WEBHELPER = "/opt/steamvr/bin/vrwebhelper/linuxarm64/vrwebhelper"
 LIBCEF = "/opt/steamvr/bin/vrwebhelper/linuxarm64/libcef.so"
 FATAL = re.compile(r"cannot allocate memory in static TLS block|error while loading shared libraries|"
@@ -222,15 +223,22 @@ def identity(process):
     return (process["pid"], process["start_ticks"])
 
 
-def require_process(process, *, main=False):
+def require_process(process, *, main=False, group=None):
     keys = {"pid", "start_ticks", "state"} if main else {"pid", "start_ticks", "state", "exe", "kind", "libcef"}
+    server = not main and isinstance(process, dict) and process.get("exe") == SERVER
+    if server: keys |= {"comm", "control_group"}
     if (not isinstance(process, dict) or set(process) not in (keys, keys | ({"ui_compositor_tasks"} if not main else set())) or
             any(type(process.get(key)) is not int or not 0 < process[key] < 2**64 for key in ("pid", "start_ticks")) or
             not isinstance(process.get("state"), str) or process["state"] not in tuple("RSDTtXxZIKPW")):
         raise RuntimeError("Invalid startup process metadata")
-    if not main and (process["exe"] not in (COMPOSITOR, WEBHELPER) or
+    if not main and (process["exe"] not in (COMPOSITOR, SERVER, WEBHELPER) or
                      not isinstance(process["kind"], str) or len(process["kind"]) > 64 or type(process["libcef"]) is not bool):
         raise RuntimeError("Invalid startup executable/mapping metadata")
+    if server and (process["kind"] != "server" or process["comm"] != "vrserver" or process["libcef"] or
+                   not reviewed_absolute_path(process["control_group"]) or not group or
+                   not (process["control_group"] == group or process["control_group"].startswith(group + "/")) or
+                   process.get("ui_compositor_tasks") is not None):
+        raise RuntimeError("Invalid startup server identity metadata")
     tasks = process.get("ui_compositor_tasks")
     if tasks is not None:
         if (not isinstance(tasks, list) or len(tasks) > 3 or
@@ -297,7 +305,7 @@ class NativeEvidenceSource:
         self.isolation_usage = {"samples": 0, "processes": 0, "metadata_bytes": 0}
         self.ui_task_usage = {key: 0 for key in UI_TASK_LIMITS}
         self.ui_task_deadline = None
-        self.native_paths = {name: os.path.realpath(name) for name in (COMPOSITOR, WEBHELPER, LIBCEF)}
+        self.native_paths = {name: os.path.realpath(name) for name in (COMPOSITOR, SERVER, WEBHELPER, LIBCEF)}
         self.logs = {name: self.home / ".local/share/Steam/logs" / (name + ".txt")
                      for name in ("vrcompositor", "vrserver")}
         self.cursor, self.offsets, self.total = None, {}, 0
@@ -381,16 +389,25 @@ class NativeEvidenceSource:
                 if not any(value == unit["ControlGroup"] or value.startswith(unit["ControlGroup"] + "/") for value in paths): continue
                 managed = True
                 comm = self.proc_read(path / "comm", 256).decode("ascii").strip()
-                if comm not in ("vrcompositor", "vrwebhelper"): continue
+                if comm not in ("vrcompositor", "vrserver", "vrwebhelper"): continue
                 start, state = self.process_identity(path)
                 mapped_exe = os.readlink(path / "exe")
-                matches = [name for name in (COMPOSITOR, WEBHELPER) if mapped_exe in (name, self.native_paths[name])]
+                matches = [name for name in (COMPOSITOR, SERVER, WEBHELPER) if mapped_exe in (name, self.native_paths[name])]
                 if len(matches) != 1: continue
                 exe = matches[0]
+                if comm == "vrserver" and exe != SERVER: continue
                 cmd = self.proc_read(path / "cmdline", 32768).decode("utf-8").split("\0")
-                kind = "compositor" if exe == COMPOSITOR else "browser"
-                for arg in cmd:
-                    if arg.startswith("--type="): kind = arg[len("--type="):]
+                kind = "compositor" if exe == COMPOSITOR else "server" if exe == SERVER else "browser"
+                server_group = None
+                if exe == SERVER:
+                    matching_groups = {value for value in paths if value == unit["ControlGroup"] or
+                                       value.startswith(unit["ControlGroup"] + "/")}
+                    if comm != "vrserver" or len(matching_groups) != 1:
+                        raise RuntimeError("Unsupported startup server identity")
+                    server_group = matching_groups.pop()
+                else:
+                    for arg in cmd:
+                        if arg.startswith("--type="): kind = arg[len("--type="):]
                 libcef = False
                 ui_tasks = None
                 if exe == WEBHELPER:
@@ -413,11 +430,13 @@ class NativeEvidenceSource:
                 if (end_start != start or path.lstat().st_uid != self.uid or
                         os.readlink(path / "exe") != mapped_exe or
                         self.proc_read(path / "cgroup", 8192).decode("ascii").splitlines() != groups or
+                        exe == SERVER and self.proc_read(path / "comm", 256).decode("ascii").strip() != comm or
                         self.proc_read(path / "cmdline", 32768).decode("utf-8").split("\0") != cmd):
                     raise RuntimeError("Startup process changed during sampling")
                 result.append({"pid": int(path.name), "start_ticks": start,
                     "state": state if state in INELIGIBLE_STATES else end_state,
                     "exe": exe, "kind": kind, "libcef": libcef, "ui_compositor_tasks": ui_tasks})
+                if exe == SERVER: result[-1].update(comm=comm, control_group=server_group)
                 if len(result) > MAX_PROCESSES: raise RuntimeError("Startup managed process bound exceeded")
             except FileNotFoundError:
                 # A required identity already seen by the gate disappearing is
@@ -849,7 +868,9 @@ class StartupGate:
         require_clock(baseline["monotonic"]); require_clock(baseline["wall_time"])
         if not isinstance(baseline["processes"], list) or len(baseline["processes"]) > MAX_PROCESSES:
             raise RuntimeError("Invalid startup baseline process count")
-        for process in baseline["processes"]: require_process(process)
+        for process in baseline["processes"]: require_process(process, group=baseline["unit"]["ControlGroup"])
+        if len({p["pid"] for p in baseline["processes"]}) != len(baseline["processes"]):
+            raise RuntimeError("Duplicate startup baseline process identity")
         require_errors(baseline.get("errors", []))
         if baseline.get("main_process") is not None: require_process(baseline["main_process"], main=True)
         self.baseline = baseline
@@ -858,6 +879,7 @@ class StartupGate:
         self.invocation, self.unit_identity = None, None
         self.markers, self.pinned = {}, {}
         self.webhelper_connections = {}
+        self.reused_old_pids = set()
         self.ready_since, self.ready = None, False
         self.last_progress, self.progress = baseline["monotonic"], 0
         self.failed = "Baseline managed process metadata unreadable" if baseline.get("errors") else None
@@ -884,7 +906,7 @@ class StartupGate:
         require_clock(now)
         if not isinstance(sample["processes"], list) or len(sample["processes"]) > MAX_PROCESSES:
             raise RuntimeError("Invalid startup process count")
-        for process in sample["processes"]: require_process(process)
+        for process in sample["processes"]: require_process(process, group=unit["ControlGroup"])
         if len({p["pid"] for p in sample["processes"]}) != len(sample["processes"]):
             raise RuntimeError("Duplicate startup process identity")
         if sample.get("main_process") is not None: require_process(sample["main_process"], main=True)
@@ -929,6 +951,11 @@ class StartupGate:
         if sample.get("main_process") and (self.baseline.get("main_process") is None or
                 identity(sample["main_process"]) != identity(self.baseline["main_process"])):
             current_pids.add(sample["main_process"]["pid"])
+        # A fresh same-number process may disappear before its delayed dump is
+        # read. Keep that observed reuse across polls/resume; it can never turn
+        # back into an old teardown PID. This set is bounded by the baseline.
+        self.reused_old_pids.update(current_pids & old_pids)
+        current_pids.update(self.reused_old_pids)
         for entry in sample["journal"]:
             if not isinstance(entry, dict):
                 raise RuntimeError("Unsupported current journal evidence")
@@ -962,7 +989,17 @@ class StartupGate:
                 if not group_matches and user_unit != UNIT: continue
                 if not group_matches or user_unit != UNIT:
                     raise RuntimeError("Startup coredump unit/control-group scope disagrees")
-                if int(crashed) in old_pids and int(crashed) not in current_pids: continue
+                if int(crashed) in old_pids and int(crashed) not in current_pids:
+                    old_servers = [p for p in self.baseline["processes"]
+                                   if p["pid"] == int(crashed) and p["exe"] == SERVER]
+                    # Keep a delayed teardown report attached to the exact old
+                    # native server, never to its logger or a filename/time guess.
+                    # A fresh same-PID start is in current_pids and remains fatal.
+                    if exe == SERVER or old_servers:
+                        if len(old_servers) == 1 and exe == SERVER and group == old_servers[0]["control_group"]:
+                            continue
+                    else:
+                        continue
                 raise RuntimeError("Fresh startup coredump: pid=" + crashed + " signal=" + signal + " exe=" + exe[:192])
             if invocation and invocation != self.invocation: continue
             message = journal_message(entry.get("MESSAGE"))
@@ -1064,14 +1101,23 @@ class StartupGate:
         return {"baseline": self.baseline, "invocation": self.invocation, "unit_identity": self.unit_identity,
                 "markers": self.markers, "pinned": self.pinned, "ready_since": self.ready_since,
                 "ready": self.ready, "last_progress": self.last_progress, "progress": self.progress,
-                "failed": self.failed, "isolation": self.isolation_result, "webhelper_connections": self.webhelper_connections}
+                "failed": self.failed, "isolation": self.isolation_result, "webhelper_connections": self.webhelper_connections,
+                "reused_old_pids": sorted(self.reused_old_pids)}
 
     @classmethod
     def resume(cls, checkpoint):
         expected = {"baseline", "invocation", "unit_identity", "markers", "pinned", "ready_since", "ready", "last_progress", "progress", "failed", "isolation", "webhelper_connections"}
-        if not isinstance(checkpoint, dict) or set(checkpoint) != expected:
+        if not isinstance(checkpoint, dict) or set(checkpoint) not in (expected, expected | {"reused_old_pids"}):
             raise RuntimeError("Invalid startup gate checkpoint shape")
         gate = cls(checkpoint["baseline"])
+        old_pids = {p["pid"] for p in gate.baseline["processes"]}
+        if gate.baseline.get("main_process"): old_pids.add(gate.baseline["main_process"]["pid"])
+        reused = checkpoint.get("reused_old_pids", [])
+        if (not isinstance(reused, list) or len(reused) > len(old_pids) or
+                any(type(pid) is not int or pid not in old_pids for pid in reused) or len(set(reused)) != len(reused) or
+                "reused_old_pids" not in checkpoint and any(p["exe"] == SERVER for p in gate.baseline["processes"])):
+            raise RuntimeError("Invalid startup PID-reuse checkpoint")
+        gate.reused_old_pids = set(reused)
         connections = checkpoint["webhelper_connections"]
         if (not isinstance(connections, dict) or len(connections) > MAX_PROCESSES or
                 any(not isinstance(pid, str) or not re.fullmatch(r"[1-9][0-9]{0,9}", pid) or int(pid) >= 2**31 or

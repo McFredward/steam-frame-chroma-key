@@ -56,6 +56,12 @@ def coredump(pid="101"):
         "COREDUMP_CGROUP": unit()["ControlGroup"]}
 
 
+def server(pid, *, start_ticks=None, group=None):
+    return {"pid": pid, "start_ticks": pid * 100 if start_ticks is None else start_ticks, "state": "S",
+        "exe": M.SERVER, "kind": "server", "libcef": False, "comm": "vrserver",
+        "control_group": unit()["ControlGroup"] if group is None else group, "ui_compositor_tasks": None}
+
+
 def forked_sample(now=2.0):
     s = sample(now)
     s["processes"] = [p for p in s["processes"] if p["kind"] != "renderer"]
@@ -487,6 +493,96 @@ class GateTests(unittest.TestCase):
             with self.subTest(message=message): self.assertEqual(M.StartupGate(baseline()).consume(s)["status"], "fault")
 
 
+class ServerBaselineGateTests(unittest.TestCase):
+    def test_exact_old_server_identity_prevents_the_observed_teardown_false_alarm(self):
+        # The captured teardown PID/executable and monotonic timestamps are real;
+        # start_ticks and positive UI roles below are synthetic fixture identities.
+        b = baseline(); b["monotonic"] = 10340.269872196
+        b["processes"].append(server(327846, start_ticks=4460000))
+        s = sample(10350.0); s["unit"]["ExecMainStartTimestampMonotonic"] = "10347501181"
+        row = coredump("327846"); row.update(COREDUMP_EXE=M.SERVER, __MONOTONIC_TIMESTAMP="10342931025")
+        s["journal"] = [row]
+        self.assertTrue(M.StartupGate(b).consume(s, stable_seconds=0)["ready"])
+        missing = copy.deepcopy(b); missing["processes"].pop()
+        result = M.StartupGate(missing).consume(s, stable_seconds=0)
+        self.assertEqual(result["status"], "fault")
+        self.assertEqual(result["reason"], "Fresh startup coredump: pid=327846 signal=11 exe=" + M.SERVER)
+
+    def test_unknown_current_and_same_pid_reused_servers_remain_fatal(self):
+        for variant in ("unknown", "current", "reused", "dead_reused", "baseline_other_exe"):
+            b = baseline(); b["processes"] = [server(10)]
+            s = sample(); row = coredump("10"); row["COREDUMP_EXE"] = M.SERVER
+            if variant == "unknown": row["COREDUMP_PID"] = "200"
+            if variant == "current": s["processes"].append(server(200)); row["COREDUMP_PID"] = "200"
+            if variant in ("reused", "dead_reused"):
+                current = server(10, start_ticks=1001)
+                if variant == "dead_reused": current["state"] = "Z"
+                s["processes"].append(current)
+            if variant == "baseline_other_exe": b["processes"] = [process(10, "compositor")]
+            s["journal"] = [row]
+            with self.subTest(variant=variant):
+                result = M.StartupGate(b).consume(s, stable_seconds=0)
+                self.assertEqual(result["status"], "fault")
+                self.assertIn("Fresh startup coredump", result["reason"])
+
+    def test_old_server_pid_never_hides_a_different_executable_or_group(self):
+        b = baseline(); b["processes"] = [server(10)]
+        for updates in ({"COREDUMP_EXE": M.COMPOSITOR}, {"COREDUMP_EXE": "/unrelated/vrserver"},
+                        {"COREDUMP_CGROUP": unit()["ControlGroup"] + "/different-child"}):
+            s = sample(); row = coredump("10"); row["COREDUMP_EXE"] = M.SERVER; row.update(updates); s["journal"] = [row]
+            with self.subTest(updates=updates):
+                self.assertEqual(M.StartupGate(b).consume(s)["status"], "fault")
+
+    def test_complete_server_identity_and_native_scope_are_required(self):
+        for updates in ({"comm": "vrwebhelper"}, {"kind": "browser"}, {"libcef": True},
+                        {"control_group": "/other/steamvr.service"}, {"control_group": "../steamvr.service"},
+                        {"start_ticks": True}, {"ui_compositor_tasks": []}):
+            b = baseline(); item = server(10); item.update(updates); b["processes"] = [item]
+            with self.subTest(updates=updates), self.assertRaises(RuntimeError): M.StartupGate(b)
+        for key in ("comm", "control_group", "start_ticks"):
+            b = baseline(); item = server(10); item.pop(key); b["processes"] = [item]
+            with self.subTest(missing=key), self.assertRaises(RuntimeError): M.StartupGate(b)
+
+    def test_descendant_server_identity_is_exact_and_checkpointed(self):
+        child = unit()["ControlGroup"] + "/native-server"
+        b = baseline(); b["processes"] = [server(10, group=child)]
+        s = sample(); row = coredump("10"); row.update(COREDUMP_EXE=M.SERVER, COREDUMP_CGROUP=child); s["journal"] = [row]
+        gate = M.StartupGate(b); gate = M.StartupGate.resume(gate.checkpoint())
+        self.assertTrue(gate.consume(s, stable_seconds=0)["ready"])
+        self.assertEqual(gate.baseline["processes"][-1]["control_group"], child)
+        fresh = copy.deepcopy(s); fresh["journal"][0]["COREDUMP_PID"] = "200"
+        self.assertEqual(gate.consume(fresh)["status"], "fault")
+
+    def test_server_is_not_a_substitute_for_required_positive_ui_roles(self):
+        s = sample(); s["processes"] = [server(200)]
+        self.assertFalse(M.StartupGate(baseline()).consume(s, stable_seconds=0)["ready"])
+
+    def test_observed_server_pid_reuse_stays_current_after_exit_and_resume(self):
+        b = baseline(); b["processes"] = [server(10)]
+        first = sample(); first["processes"].append(server(10, start_ticks=1001))
+        gate = M.StartupGate(b); self.assertTrue(gate.consume(first, stable_seconds=0)["ready"])
+        saved = gate.checkpoint(); self.assertEqual(saved["reused_old_pids"], [10])
+        gate = M.StartupGate.resume(saved)
+        later = sample(4); row = coredump("10"); row["COREDUMP_EXE"] = M.SERVER; later["journal"] = [row]
+        result = gate.consume(later)
+        self.assertEqual(result["status"], "fault"); self.assertIn("Fresh startup coredump", result["reason"])
+
+    def test_reuse_checkpoint_cannot_invent_pids_or_drop_new_server_history(self):
+        b = baseline(); b["processes"] = [server(10)]
+        saved = M.StartupGate(b).checkpoint()
+        for value in ([True], [200], [10, 10], {}, "10"):
+            bad = copy.deepcopy(saved); bad["reused_old_pids"] = value
+            with self.subTest(value=value), self.assertRaises(RuntimeError): M.StartupGate.resume(bad)
+        saved.pop("reused_old_pids")
+        with self.assertRaises(RuntimeError): M.StartupGate.resume(saved)
+        legacy = M.StartupGate(baseline()).checkpoint(); legacy.pop("reused_old_pids")
+        self.assertFalse(M.StartupGate.resume(legacy).reused_old_pids)
+
+    def test_duplicate_baseline_pid_cannot_authenticate_two_native_roles(self):
+        b = baseline(); b["processes"].append(server(10))
+        with self.assertRaisesRegex(RuntimeError, "Duplicate startup baseline process identity"): M.StartupGate(b)
+
+
 class NativeSourceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="compositor-health-fixture-"); self.root = Path(self.temp.name)
@@ -506,13 +602,13 @@ class NativeSourceTests(unittest.TestCase):
         return subprocess.CompletedProcess(args, 0, raw, "")
     def procfile(self, pid, kind="browser", *, group=None, libcef=True):
         p = self.proc / str(pid); p.mkdir()
-        exe = M.COMPOSITOR if kind == "compositor" else M.WEBHELPER
+        exe = M.COMPOSITOR if kind == "compositor" else M.SERVER if kind == "server" else M.WEBHELPER
         (p / "comm").write_text(Path(exe).name + "\n")
         (p / "cgroup").write_text("0::" + (group or unit()["ControlGroup"]) + "\n")
         cols = ["S"] + ["0"] * 18 + [str(pid * 100)]
         (p / "stat").write_text(str(pid) + " (vrwebhelper) " + " ".join(cols))
         (p / "exe").symlink_to(exe)
-        (p / "cmdline").write_bytes((exe + ("\0--type=" + kind if kind not in ("browser", "compositor") else "") + "\0").encode())
+        (p / "cmdline").write_bytes((exe + ("\0--type=" + kind if kind not in ("browser", "compositor", "server") else "") + "\0").encode())
         (p / "maps").write_text("1000-2000 r-xp 00000000 00:00 0 " + (M.LIBCEF if libcef else "/not-libcef.so") + "\n")
         return p
     def test_log_offsets_read_only_new_bytes_and_rotation_uses_current_file(self):
@@ -676,6 +772,70 @@ class NativeSourceTests(unittest.TestCase):
         processes, errors = self.source.processes(unit())
         self.assertEqual({p["pid"] for p in processes}, {101, 102, 103}); self.assertFalse(errors)
         self.assertTrue(next(p for p in processes if p["pid"] == 103)["libcef"])
+
+    def test_server_baseline_carries_exact_identity_without_reading_maps(self):
+        p = self.procfile(327846, "server")
+        original = self.source.proc_read
+        def no_maps(path, limit):
+            if path == p / "maps": raise AssertionError("Server mappings are not needed")
+            return original(path, limit)
+        with mock.patch.object(self.source, "proc_read", side_effect=no_maps):
+            processes, errors = self.source.processes(unit())
+        self.assertFalse(errors); self.assertEqual(processes, [server(327846)])
+        M.require_process(processes[0], group=unit()["ControlGroup"])
+        b = baseline(); b["processes"] += processes
+        s = sample(); row = coredump("327846"); row["COREDUMP_EXE"] = M.SERVER; s["journal"] = [row]
+        self.assertTrue(M.StartupGate(b).consume(s, stable_seconds=0)["ready"])
+
+    def test_server_exact_resolved_executable_and_descendant_group(self):
+        child = unit()["ControlGroup"] + "/native-server"
+        p = self.procfile(200, "server", group=child)
+        p.joinpath("exe").unlink(); p.joinpath("exe").symlink_to("/resolved/native/vrserver")
+        self.source.native_paths[M.SERVER] = "/resolved/native/vrserver"
+        processes, errors = self.source.processes(unit())
+        self.assertFalse(errors); self.assertEqual(processes, [server(200, group=child)])
+        p.joinpath("exe").unlink(); p.joinpath("exe").symlink_to("/unrelated/vrserver")
+        self.assertEqual(self.source.processes(unit()), ([], []))
+
+    def test_server_identity_changes_during_collection_are_explicit_gaps(self):
+        for variant in ("start", "exe", "comm", "group", "cmdline"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory(prefix="server-proc-") as tmp:
+                old_proc = self.proc; self.proc = Path(tmp); self.source.proc = self.proc
+                try:
+                    p = self.procfile(200, "server")
+                    original = self.source.proc_read; reads = {"stat": 0}
+                    def change(path, limit):
+                        if path == p / "stat":
+                            reads["stat"] += 1
+                            if reads["stat"] == 2:
+                                if variant == "start": p.joinpath("stat").write_text("200 (vrserver) S " + "0 " * 18 + "20001")
+                                if variant == "exe": p.joinpath("exe").unlink(); p.joinpath("exe").symlink_to("/foreign/vrserver")
+                                if variant == "comm": p.joinpath("comm").write_text("other\n")
+                                if variant == "group": p.joinpath("cgroup").write_text("0::/foreign/steamvr.service\n")
+                                if variant == "cmdline": p.joinpath("cmdline").write_bytes(b"changed\0")
+                        return original(path, limit)
+                    with mock.patch.object(M.NativeEvidenceSource, "proc_read", side_effect=change):
+                        processes, errors = self.source.processes(unit())
+                    self.assertFalse(processes); self.assertEqual(errors, [{"pid": 200, "reason": "RuntimeError"}])
+                finally:
+                    self.proc = old_proc; self.source.proc = old_proc
+
+    def test_server_mismatched_comm_or_unreadable_identity_cannot_enter_baseline(self):
+        p = self.procfile(200, "server"); p.joinpath("comm").write_text("vrwebhelper\n")
+        processes, errors = self.source.processes(unit())
+        self.assertFalse(processes); self.assertEqual(errors, [{"pid": 200, "reason": "RuntimeError"}])
+        p.joinpath("comm").write_text("vrserver\n")
+        original = self.source.proc_read
+        def deny(path, limit):
+            if path == p / "stat": raise PermissionError("denied")
+            return original(path, limit)
+        with mock.patch.object(M.NativeEvidenceSource, "proc_read", side_effect=deny):
+            processes, errors = self.source.processes(unit())
+        self.assertFalse(processes); self.assertEqual(errors, [{"pid": 200, "reason": "PermissionError"}])
+        for other in (M.COMPOSITOR, M.WEBHELPER):
+            p.joinpath("exe").unlink(); p.joinpath("exe").symlink_to(other)
+            with self.subTest(exe=other):
+                self.assertEqual(self.source.processes(unit()), ([], []))
     def test_exact_resolved_native_paths_are_normalized_without_filename_guessing(self):
         p = self.procfile(102, "renderer")
         p.joinpath("exe").unlink(); p.joinpath("exe").symlink_to("/resolved/steamvr/vrwebhelper")
