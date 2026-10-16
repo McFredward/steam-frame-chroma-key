@@ -9,10 +9,17 @@ native shader and the existing `native_fragment_atlas_probe.py` dependency-cone
 transformer. Both native sampled reconstructions retain their own weights and
 same-invocation metadata. Explicit caller-owned `B`, color and coverage maps
 retarget the original packed coordinate directly. The generated fragment shader
-has exactly one color output at location 0:
+has exactly one color output at location 0. The caller must explicitly declare
+one of two source conventions:
 
-- RGB = straight decoded color × native tint × linear coverage × original aperture
-- A = linear coverage × original aperture
+| Owned source RGB convention | Output RGB | Output alpha |
+| --- | --- | --- |
+| `straight` | decoded color × native tint × linear coverage × original aperture | linear coverage × original aperture |
+| `premultiplied` | decoded color × native tint × original aperture | linear coverage × original aperture |
+
+`premultiplied` does not multiply RGB by coverage a second time. Nonzero RGB
+at alpha zero is retained for additive/emissive source content. The convention
+is an explicit owned-input contract, never an inference from the sampled color.
 
 Coverage is clamped raw component-G from an **explicitly owned linear RGBA32F
 source**, independent of scene RGB; it is not inferred from a key color or decoded
@@ -36,6 +43,16 @@ source before the composed output is rendered. An opaque black source, and the
 same nonblack color at zero and partial coverage, distinguish opacity from key
 color. This is an integration proof for explicit input encoding, not a video
 transfer or native source-rendering proof.
+
+With `--rgb-convention premultiplied`, the same fixture also actually renders
+additive emission over transparent alpha zero, additive emission over overlapping
+glass, and glass over emission. The original premultiplied GPU RGB is encoded
+without dividing by alpha. Independent analytic blend equations check the
+producer and expected final output; separate unchanged-original native shader
+executions check decoded RGB, tint and original aperture. Both the ordinary
+count3 interface and the bounded owned count1 specialization exercise these
+cases. A causal mutant that incorrectly multiplies premultiplied RGB by coverage
+again must fail the RGB comparison, including cases that would erase emission.
 
 Original → enabled → original output must recover bit for bit. Disabled output
 must match unchanged original output bit for bit. Positive cases require zero
@@ -69,6 +86,11 @@ FRAME_PRIVATE_ORIGINAL_PS=/private/exact-original.spv \
   python3 -B tests/test_native_fragment_packed_output.py
 python3 -B tests/native-fragment-packed-output-gpu/run.py \
   --original /private/exact-original.spv --record /private/new-proof.json
+# New premultiplied-only integration cases; no old straight GPU suite is repeated.
+python3 -B tests/native-fragment-packed-output-gpu/run.py \
+  --original /private/exact-original.spv --record /private/premultiplied-proof.json \
+  --rgb-convention premultiplied --mode enabled --mode disabled \
+  --mode specialized_count1 --mode double_premultiply
 ```
 
 `--driver software|intel|both` selects owned host devices. Repeatable `--mode`

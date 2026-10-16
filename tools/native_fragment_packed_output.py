@@ -26,8 +26,9 @@ def mapping_contract(mapping):
     require(type(mapping) is dict and set(mapping) == {
         "schema", "scope", "source_encoding", "rgb_convention", "B", "color", "coverage"}
         and mapping["schema"] == SCHEMA and mapping["scope"] == SCOPE
-        and mapping["source_encoding"] == ENCODING and mapping["rgb_convention"] == "straight",
-        "explicit owned straight-color/linear-coverage mapping required")
+        and mapping["source_encoding"] == ENCODING
+        and mapping["rgb_convention"] in ("straight", "premultiplied"),
+        "explicit owned straight or premultiplied color/linear-coverage mapping required")
     packed = {key: mapping[key] for key in ("B", "color", "coverage")}
     packed.update(schema=atlas.PACKED_MAPPING_SCHEMA, scope=atlas.PACKED_MAPPING_SCOPE)
     atlas.packed_mapping_contract(packed)
@@ -80,7 +81,9 @@ def transform(original, mapping, enabled=True, descriptor_count=3):
         "schema": "native-fragment-packed-output-v1", "scope": SCOPE,
         "original_sha256": ssa.ORIGINAL_SHA256, "original_bytes": len(original),
         "mapping": mapping, "enabled": enabled,
-        "color_policy": "straight native decoded Pc color times tint, linear coverage and ORIGINAL-q aperture once",
+        "color_policy": ("straight native decoded Pc color times tint, linear coverage and ORIGINAL-q aperture once"
+            if mapping["rgb_convention"] == "straight" else
+            "premultiplied native decoded Pc color times tint and ORIGINAL-q aperture once; alpha0 emission retained"),
         "alpha_policy": "clamp(raw Pa sampled component-G,0,1) times ORIGINAL-q aperture once",
         "output_convention": "premultiplied RGBA", "color_attachment_count": 1,
         "owned_b9_descriptor_count": descriptor_count if enabled else 3,
@@ -116,8 +119,11 @@ def transform(original, mapping, enabled=True, descriptor_count=3):
     ids = proof["new_ssa_ids"]
     declarations = [make(43, 8, zero, 0), make(43, 8, one, 0x3f800000)]
     # GLSL.std.450 FClamp is a value-range guard, never a key-color operation.
+    # combined_color_rgb already contains the original aperture and tint. A
+    # premultiplied source must keep its RGB even at coverage0 (e.g. emission).
     composition = [make(12, 8, coverage, 1, 43, ids["raw_component_g"], zero, one),
-        make(142, 30, rgb, ids["combined_color_rgb"], coverage),
+        make(142, 30, rgb, ids["combined_color_rgb"],
+             coverage if mapping["rgb_convention"] == "straight" else one),
         make(133, 8, alpha, coverage, ids["original_aperture"]),
         make(80, 9, output, rgb, alpha)]
     result, removed_stores, replaced = [], 0, 0

@@ -15,17 +15,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
 import native_fragment_packed_output as output
 
 
-def mapping():
+def mapping(convention="straight"):
     return {'schema': output.SCHEMA, 'scope': output.SCOPE, 'source_encoding': output.ENCODING,
-        'rgb_convention': 'straight', 'B': [.9, -.22, .14, .18, .83, -.03],
+        'rgb_convention': convention, 'B': [.9, -.22, .14, .18, .83, -.03],
         'color': [.4, 0., .03, 0., .6, .2], 'coverage': [.4, 0., .56, 0., .6, .2]}
 
 
 class OwnedControls(unittest.TestCase):
-    def test_only_explicit_owned_linear_straight_source(self):
-        packed = output.mapping_contract(mapping())
-        self.assertEqual(packed['schema'], output.atlas.PACKED_MAPPING_SCHEMA)
-        for key, value in (('source_encoding', 'NATIVE_VIDEO_ALPHA'), ('rgb_convention', 'premultiplied'),
+    def test_only_explicit_owned_linear_source(self):
+        for convention in ('straight', 'premultiplied'):
+            packed = output.mapping_contract(mapping(convention))
+            self.assertEqual(packed['schema'], output.atlas.PACKED_MAPPING_SCHEMA)
+        for key, value in (('source_encoding', 'NATIVE_VIDEO_ALPHA'), ('rgb_convention', 'inferred'),
                            ('scope', 'LIVE_NATIVE_AUTHORITY'), ('B', [0.]*6), ('color', [True]*6),
                            ('coverage', [1., 0., float('nan'), 0., 1., 0.])):
             changed = mapping(); changed[key] = value
@@ -65,6 +66,26 @@ class PrivateControls(unittest.TestCase):
         for key in ('runtime_or_pipeline_activation', 'native_spatial_mapping_proven', 'native_frame_association_proven',
                     'native_draw_coherence_proven', 'physical_eye_proven', 'native_sampler_equivalence_proven',
                     'linear_game_alpha_proven', 'alpha_composition_authorized', 'passthrough_authorized'):
+            self.assertIs(record[key], False)
+
+    def test_premultiplied_does_not_multiply_coverage_or_erase_alpha0_rgb(self):
+        module, record = output.transform(self.original, mapping('premultiplied'))
+        _, instructions = output.ssa.parse_module(module)
+        ids = record['new_ssa_ids']
+        rgb = next(i for i in instructions if i.opcode == 142
+                   and i.operands[1] == ids['premultiplied_rgb'])
+        self.assertEqual(rgb.operands[:3], (30, ids['premultiplied_rgb'], ids['combined_color_rgb']))
+        self.assertIn(output.ssa.Instruction(43, (8, rgb.operands[3], 0x3f800000)), instructions)
+        self.assertNotIn(output.ssa.Instruction(142, (30, ids['premultiplied_rgb'],
+            ids['combined_color_rgb'], ids['clamped_coverage'])), instructions)
+        self.assertIn(output.ssa.Instruction(133, (8, ids['output_alpha'], ids['clamped_coverage'], 899)), instructions)
+        self.assertEqual(output.transform(self.original, mapping('premultiplied'), False)[0], self.original)
+        specialized, specialized_record = output.transform(self.original, mapping('premultiplied'), descriptor_count=1)
+        self.assertTrue(specialized_record['owned_count1_interface_specialization'])
+        self.assertFalse(specialized_record['native_descriptor_layout_modified'])
+        self.assertNotEqual(module, specialized)
+        for key in ('runtime_or_pipeline_activation', 'native_spatial_mapping_proven',
+                    'native_frame_association_proven', 'physical_eye_proven', 'passthrough_authorized'):
             self.assertIs(record[key], False)
 
     def test_disabled_exact_original_and_corrupt_profile_refused(self):
