@@ -9,8 +9,13 @@ option(FRAME_MASK_BUILD_PIXEL_SNAPSHOT
     "Build an uninstalled one-shot explicit-pattern GPU pixel diagnostic" OFF)
 option(FRAME_PIXEL_UNIFORM_COMPANION
     "Require a bounded same-command native uniform companion in the uninstalled diagnostic" OFF)
+option(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    "Observe bounded cold native creation definitions without changing pipelines" OFF)
 if(FRAME_PIXEL_UNIFORM_COMPANION AND NOT FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
     message(FATAL_ERROR "Native uniform companion requires the uninstalled pixel snapshot target")
+endif()
+if(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL AND NOT FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
+    message(FATAL_ERROR "Cold SSBO definition observation requires the uninstalled pixel snapshot target")
 endif()
 option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
@@ -211,6 +216,9 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
         target_sources(VkLayer_frame_pixel_snapshot PRIVATE layer/pixel_uniform_copy.cpp)
         target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_UNIFORM_COMPANION=1)
     endif()
+    if(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL)
+        target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_SSBO_DEFINITION_JOURNAL=1)
+    endif()
     target_include_directories(VkLayer_frame_pixel_snapshot PRIVATE ${Vulkan_INCLUDE_DIRS})
     target_compile_options(VkLayer_frame_pixel_snapshot PRIVATE
         -Wall -Wextra -Wpedantic -Werror -fvisibility=hidden)
@@ -225,6 +233,15 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
 endif()
 
 if(BUILD_TESTING AND UNIX)
+    add_executable(test_pixel_observation_boundary tests/test_pixel_observation_boundary.cpp)
+    target_compile_options(test_pixel_observation_boundary PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_observation_boundary PRIVATE Threads::Threads)
+    add_test(NAME pixel_observation_boundary COMMAND test_pixel_observation_boundary)
+    add_executable(test_pixel_ssbo_definition_journal tests/test_pixel_ssbo_definition_journal.cpp)
+    target_include_directories(test_pixel_ssbo_definition_journal PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_ssbo_definition_journal PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_ssbo_definition_journal PRIVATE Threads::Threads)
+    add_test(NAME pixel_ssbo_definition_journal COMMAND test_pixel_ssbo_definition_journal)
     # Cold-only definitions and lifecycle owners; no receiver linkage or native
     # shader input is used by these ordinary CI controls.
     add_executable(test_pixel_ssbo_clone_contract tests/test_pixel_ssbo_clone_contract.cpp)
@@ -360,6 +377,10 @@ if(BUILD_TESTING)
         add_test(NAME pixel_snapshot_session COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_snapshot_session.py)
         if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
+            set(pixel_definition_test_args)
+            if(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL)
+                set(pixel_definition_test_args --ssbo-definitions)
+            endif()
             add_executable(test_pixel_snapshot_layer tests/test_pixel_snapshot_layer.cpp)
             target_include_directories(test_pixel_snapshot_layer PRIVATE ${Vulkan_INCLUDE_DIRS})
             target_compile_options(test_pixel_snapshot_layer PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -367,12 +388,12 @@ if(BUILD_TESTING)
             add_test(NAME pixel_snapshot_real_loader COMMAND ${Python3_EXECUTABLE} -B
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_snapshot_layer.py
                 $<TARGET_FILE:test_pixel_snapshot_layer> $<TARGET_FILE:VkLayer_frame_pixel_snapshot>
-                ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json)
+                ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json ${pixel_definition_test_args})
             set_tests_properties(pixel_snapshot_real_loader PROPERTIES TIMEOUT 90)
             add_test(NAME pixel_snapshot_query_loader COMMAND ${Python3_EXECUTABLE} -B
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_snapshot_layer.py
                 $<TARGET_FILE:test_pixel_snapshot_layer> $<TARGET_FILE:VkLayer_frame_pixel_snapshot>
-                ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json --statistics-only)
+                ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json --statistics-only ${pixel_definition_test_args})
             set_tests_properties(pixel_snapshot_query_loader PROPERTIES TIMEOUT 90)
         endif()
         add_executable(test_compositor_bootstrap tests/test_compositor_bootstrap.cpp
@@ -814,6 +835,10 @@ if(BUILD_TESTING)
             add_executable(test_native_fragment_prefix_restore_gpu tests/native-fragment-prefix-restore-gpu/fixture.cpp)
             target_link_libraries(test_native_fragment_prefix_restore_gpu PRIVATE Vulkan::Vulkan)
             target_compile_options(test_native_fragment_prefix_restore_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
+            add_executable(test_native_fragment_owned_clone_gpu tests/native-fragment-owned-clone-gpu/fixture.cpp layer/pixel_ssbo_owned_clone.cpp)
+            target_include_directories(test_native_fragment_owned_clone_gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_link_libraries(test_native_fragment_owned_clone_gpu PRIVATE Vulkan::Vulkan)
+            target_compile_options(test_native_fragment_owned_clone_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
             add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/native_fragment_ssa_fixture.vert.spv
                 COMMAND ${GLSLC} --target-env=vulkan1.1
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/native-fragment-ssa-gpu/fixture.vert

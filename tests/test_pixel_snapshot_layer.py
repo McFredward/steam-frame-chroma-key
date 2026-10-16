@@ -95,6 +95,8 @@ def main():
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--retention-checkout", type=Path,
                         help="Optional checkout containing scripts/town_run_retention.py")
+    parser.add_argument("--ssbo-definitions", action="store_true",
+                        help="Expect the explicitly enabled cold definition observer; no pipeline override")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--case", action="append", choices=ORIGINAL_CASES + STATISTICS_CASES,
                            help="Run only this named case; may be repeated")
@@ -212,6 +214,23 @@ def main():
                     records = [json.loads(line) for line in (output / "status.jsonl").read_text().splitlines()]
                     result["status"] = records
                     assert records and records[0]["event"] == "prepared", (label, records)
+                    definitions = [r for r in records if r["event"].startswith("ssbo_definition_")]
+                    if args.ssbo_definitions:
+                        features = [r for r in definitions if r["event"] == "ssbo_definition_feature"]
+                        assert len(features) == 1, (label, definitions)
+                        feature = features[0]
+                        # This smoke deliberately never enables fragment stores.
+                        # It exercises refusal/forwarding, not the private pins.
+                        assert feature["initialized"] is True and feature["observed"] is statistics, (label, feature)
+                        assert feature["enabled"] is False and feature["raw"] == 0, (label, feature)
+                        assert feature["contract_reason"] == ("feature_disabled" if statistics else "feature_absent"), (label, feature)
+                        assert feature["native_compatibility_proven"] is False, (label, feature)
+                        assert all(r["event"] in ("ssbo_definition_feature", "ssbo_definition_refusals")
+                                   and r["mask_enabled"] is False for r in definitions), (label, definitions)
+                        assert len(definitions) <= 3, (label, definitions)
+                    else:
+                        assert not definitions, (label, "unexpected optional definition observer", definitions)
+                    records = [r for r in records if not r["event"].startswith("ssbo_definition_")]
                     if statistics:
                         facts, prepared = result["facts"], records[0]
                         for key in ("statistics_feature_supported", "statistics_feature_requested", "statistics_feature_enabled",

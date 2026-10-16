@@ -132,7 +132,8 @@ renderpass, modules, pipeline, record buffer/memory/map and descriptor pool cold
 through downstream PFNs. It borrows neither native object handles, pipeline cache
 nor allocator callbacks. The record is128 bytes; its actual allocation is bounded
 at8 MiB. Only ordinary host-visible memory properties are admitted. This first
-component is tested through fake dispatch, not an actual native driver creation.
+component's failure/lifetime controls use fake dispatch, separately from the
+following actual owned-driver construction check.
 
 Each coherent/noncoherent failure stage is injected, including undefined failed
 single-create/map outputs and the graphics-pipeline API's valid partial-handle
@@ -146,9 +147,44 @@ insufficient. This distinguishes the conditions in
 from a CPU handle-generation check. Private construction-control evidence is in
 `build/private-cold-clone-owner-20261016/`.
 
-The definition and construction components are compiled/tested independently;
-neither is linked into the native receiver target. Their complete/ready flags
-grant no native compatibility, original lifetime, frame/eye or activation proof.
+Intel and llvmpipe additionally pass one actual construction case/154 checks each:
+the exact private original VS/PS and their original pipeline/dependencies are
+successfully created before capturing the production recipe. All original
+objects are then destroyed and every source CI/array/module buffer overwritten.
+The real production factory still creates all owned objects and initializes its
+128 mapped bytes, then releases them without commands, submissions or queue waits.
+The initial native-VS capability rejection is retained: this owned fixture must
+enable the advertised `VK_EXT_shader_viewport_index_layer` extension alongside
+the queried Vulkan12 layer/viewport features. Original shaders are unchanged.
+These are coherent-memory runs with active validation/zero errors, not native
+receiver layout or draw evidence. Private evidence is under
+`build/private-native-owned-clone-gpu-20261016/`.
+
+The120,136-byte per-device `pixel_ssbo_definition_journal` now bridges separate
+cold creation callbacks: it synchronously owns Set0 definitions, layout snapshots,
+renderpasses and pinned shaders, then assembles independent recipes at successful
+pipeline creation. A layout retains its own Set0 definition after legal native
+SetLayout destruction. Original-handle reuse has monotonic generations plus a
+process-local journal epoch. Entry-time destruction cancels pending pipeline
+records before a driver can reuse the handle. A cold `current()` lookup is NOT a
+native lifetime lease. Focused controls pass688 public/778 private normally,
+and778 with ASan/UBSan; the last early layout-flags fix adds five targeted checks
+normally/with sanitizers and a new ARM syntax check. The journal's TSAN runtime
+fails during startup/mapping, so there is no journal TSAN pass claim.
+
+`FRAME_PIXEL_SSBO_DEFINITION_JOURNAL=ON` optionally links ONLY this creation-time
+observer into the uninstalled pixel layer. Its default is OFF. Native arguments
+and return values are unchanged; unknown RenderPass2 routes are named refusals.
+One private background feature receipt, deduplicated refusal reasons and at most
+four owned-definition receipts are emitted. Observation exceptions are contained
+at the Vulkan C ABI and permanently invalidate that device's optional history.
+The raw acquisition metadata also records its already-observed descriptor type,
+count and stages, rather than inferring them from the shader's resource array.
+
+The construction factory is still not linked into the receiver, and no clone is
+created or bound by these hooks. All draw/submit paths remain original. Complete/
+ready flags grant no native compatibility, original lifetime, frame/eye or
+activation proof. No Frame has been accessed during this offline work.
 
 ## Still required before a Frame package
 

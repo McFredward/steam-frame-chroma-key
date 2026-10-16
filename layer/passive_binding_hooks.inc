@@ -4,12 +4,18 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDescriptorSetLayout(VkDevice device, c
     const VkAllocationCallbacks* allocator, VkDescriptorSetLayout* output) {
     auto* d = deviceFor(device);
     const auto result = d->CreateDescriptorSetLayout(device, info, allocator, output);
+#ifdef FRAME_PIXEL_DEFINITION_SET_CREATED
+    if (result == VK_SUCCESS) FRAME_PIXEL_DEFINITION_SET_CREATED(d, *output, *info);
+#endif
     if (result == VK_SUCCESS) observeBindings([&](auto& b) { b.createSetLayout(d->id, *output, *info); });
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout object,
     const VkAllocationCallbacks* allocator) {
     auto* d = deviceFor(device);
+#ifdef FRAME_PIXEL_DEFINITION_SET_DESTROYED
+    FRAME_PIXEL_DEFINITION_SET_DESTROYED(d, object);
+#endif
     observeBindings([&](auto& b) { b.destroySetLayout(d->id, object); });
     d->DestroyDescriptorSetLayout(device, object, allocator);
 }
@@ -18,12 +24,18 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreatePipelineLayout(VkDevice device, const 
     const VkAllocationCallbacks* allocator, VkPipelineLayout* output) {
     auto* d = deviceFor(device);
     const auto result = d->CreatePipelineLayout(device, info, allocator, output);
+#ifdef FRAME_PIXEL_DEFINITION_LAYOUT_CREATED
+    if (result == VK_SUCCESS) FRAME_PIXEL_DEFINITION_LAYOUT_CREATED(d, *output, *info);
+#endif
     if (result == VK_SUCCESS) observeBindings([&](auto& b) { b.createPipelineLayout(d->id, *output, *info); });
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyPipelineLayout(VkDevice device, VkPipelineLayout object,
     const VkAllocationCallbacks* allocator) {
     auto* d = deviceFor(device);
+#ifdef FRAME_PIXEL_DEFINITION_LAYOUT_DESTROYED
+    FRAME_PIXEL_DEFINITION_LAYOUT_DESTROYED(d, object);
+#endif
     observeBindings([&](auto& b) { b.destroyPipelineLayout(d->id, object); });
     d->DestroyPipelineLayout(device, object, allocator);
 }

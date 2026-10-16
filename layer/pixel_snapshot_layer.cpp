@@ -12,6 +12,10 @@
 #include "pixel_sampler_admission.h"
 #include "pixel_sampler_format.h"
 #include "pixel_sampler_routes.h"
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+#include "pixel_ssbo_definition_journal.h"
+#include "pixel_observation_boundary.h"
+#endif
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
 #include "pixel_uniform_copy.h"
 #include "pixel_uniform_metadata.h"
@@ -97,6 +101,9 @@ struct Device {
 #define FIELD(name) PFN_vk##name name{};
     FIELD(DestroyDevice) FIELD(DeviceWaitIdle) FIELD(CreateShaderModule) FIELD(DestroyShaderModule)
     FIELD(CreateGraphicsPipelines) FIELD(DestroyPipeline) FIELD(CreateCommandPool)
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    FIELD(CreateRenderPass) FIELD(CreateRenderPass2) FIELD(DestroyRenderPass)
+#endif
     FIELD(AllocateCommandBuffers) FIELD(FreeCommandBuffers) FIELD(BeginCommandBuffer) FIELD(EndCommandBuffer)
     FIELD(ResetCommandBuffer) FIELD(ResetCommandPool) FIELD(DestroyCommandPool) FIELD(CmdBindPipeline)
     FIELD(CmdDraw) FIELD(CmdDrawIndexed) FIELD(CmdDrawIndirect) FIELD(CmdDrawIndexedIndirect)
@@ -125,6 +132,10 @@ struct Device {
     bool samplerRecorded = false;
     std::atomic<unsigned> queryRoutesUsed{0};
     std::atomic<SamplerRefusal> samplerRefusal{SamplerRefusal::None};
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    frame_pixel_ssbo_journal::Journal definitions;
+    frame_pixel_observation::Boundary definitionBoundary;
+#endif
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
     frame_uniform_copy::CopyRecorder uniformCopy;
     frame_uniform_copy::Dispatch uniformDispatch;
@@ -137,6 +148,11 @@ struct Device {
     std::atomic<bool> stop{false}, selected{false};
     bool ownsCapture = false;
 };
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+template<class F> void observeDefinitions(Device* d,F&& observe) noexcept {
+    d->definitionBoundary.observe([&]{observe(d->definitions);});
+}
+#endif
 bool uniformCompanionEnabled() noexcept {
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
     return true;
@@ -266,6 +282,9 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
         << ",\"generation_retired\":" << (view.generationRetired ? "true" : "false")
         << ",\"command_generation\":" << view.commandGeneration << ",\"view_generation\":"
         << b.view.identity.generation << ",\"queue_family\":" << d.candidate.queueFamily
+        << ",\"source_descriptor_type\":" << unsigned(b.type)
+        << ",\"source_descriptor_count\":" << b.descriptorCount
+        << ",\"source_descriptor_stages\":" << b.stages
         << "},\"sampler_control\":{\"schema\":\"frame-decoded-p010-sampler-control-v1\","
            "\"file\":\"sampler-components.rgba8\",\"capture_id\":\"" << config.captureId
         << "\",\"image_generation\":" << view.sourceGeneration
@@ -304,6 +323,63 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
     const bool good = frame_pixel_io::writeAll(meta,text.data(),text.size()) && !fsync(meta);
     close(meta); status(progress,good ? "complete" : "metadata_failed");
 }
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& reportedReasons,unsigned& reportedRecipes) {
+    namespace journal=frame_pixel_ssbo_journal;
+    static_assert(unsigned(journal::Reason::Count)<63,"bit63 is the sticky observer-failure receipt");
+    if(d.definitionBoundary.failed()){
+        if(!(reportedReasons&(UINT64_C(1)<<63))){
+            constexpr char message[]="{\"event\":\"ssbo_definition_observation_failed\",\"pipeline_changed\":false,\"mask_enabled\":false}\n";
+            frame_pixel_io::writeAll(fd,message,sizeof(message)-1);reportedReasons|=UINT64_C(1)<<63;
+        }
+        return;
+    }
+    const auto facts=d.definitions.inspectStats();
+    if(!featureReported){
+        char report[768]{};
+        const auto count=std::snprintf(report,sizeof(report),
+            "{\"event\":\"ssbo_definition_feature\",\"initialized\":%s,\"observed\":%s,\"enabled\":%s,\"raw\":%u,"
+            "\"source\":%u,\"contract_reason\":\"%s\",\"native_compatibility_proven\":false,\"mask_enabled\":false}\n",
+            facts.initialized?"true":"false",facts.feature.observed?"true":"false",facts.feature.enabled?"true":"false",
+            facts.feature.raw,unsigned(facts.feature.source),frame_pixel_ssbo_clone::reasonName(facts.deviceRefusal.reason));
+        if(count>0 && static_cast<std::size_t>(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,static_cast<std::size_t>(count));
+        featureReported=true;
+    }
+    const auto newReasons=facts.seenReasons&~reportedReasons;
+    if(newReasons){
+        // One bounded report per reason bit, never one report per native object.
+        char report[768]{};
+        const auto count=std::snprintf(report,sizeof(report),
+            "{\"event\":\"ssbo_definition_refusals\",\"new_reasons\":%llu,\"first_reason\":\"%s\","
+            "\"first_contract_reason\":\"%s\",\"created\":%llu,\"cancelled\":%llu,\"mask_enabled\":false}\n",
+            static_cast<unsigned long long>(newReasons),journal::reasonName(facts.firstRefusal.reason),
+            frame_pixel_ssbo_clone::reasonName(facts.firstRefusal.contract.reason),
+            static_cast<unsigned long long>(facts.created),static_cast<unsigned long long>(facts.cancelled));
+        if(count>0 && static_cast<std::size_t>(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,static_cast<std::size_t>(count));
+        reportedReasons|=newReasons;
+    }
+    // This optional phase observes complete definitions; it does NOT create or
+    // bind a clone. Four receipts are the whole process's reporting budget.
+    if(reportedRecipes>=4 || !facts.feature.complete)return;
+    journal::Ready ready;
+    if(!d.definitions.takeReady(ready))return;
+    ++reportedRecipes;
+    std::ostringstream out;
+    out<<"{\"event\":\"ssbo_definition_owned\",\"pipeline_generation\":"<<ready.pipeline.generation
+       <<",\"current_at_cold_lookup\":"<<(d.definitions.current(ready.pipeline)?"true":"false")
+       <<",\"set0_bindings\":[";
+    for(std::uint32_t i=0;i<ready.recipe.set0.count;++i){const auto& binding=ready.recipe.set0.bindings[i];
+        if(i)out<<',';
+        out<<"{\"binding\":"<<binding.binding<<",\"type\":"<<unsigned(binding.descriptorType)
+           <<",\"count\":"<<binding.descriptorCount<<",\"stages\":"<<binding.stageFlags<<'}';
+    }
+    out<<"],\"push_range_count\":"<<ready.recipe.layout.count<<",\"color_attachment_count\":"<<ready.recipe.renderPass.colorCount
+       <<",\"vertex_bytes\":"<<ready.recipe.vertex.bytes<<",\"fragment_bytes\":"<<ready.recipe.fragment.bytes
+       <<",\"native_lifetime_lease\":false,\"native_compatibility_proven\":false,\"pipeline_changed\":false,\"mask_enabled\":false}\n";
+    const auto text=out.str();
+    if(text.size()<=8192)frame_pixel_io::writeAll(fd,text.data(),text.size());
+}
+#endif
 void writer(Device* d) noexcept {
     const int progress = frame_pixel_io::create(session().config,"status.jsonl");
     if (progress < 0 || flock(progress,LOCK_EX|LOCK_NB)) { if(progress>=0)close(progress); return; }
@@ -340,7 +416,13 @@ void writer(Device* d) noexcept {
     bool uniformRefusalAnnounced = false;
 #endif
     unsigned announcedQueryRoutes=0;
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    bool definitionFeatureReported=false;std::uint64_t definitionReasons=0;unsigned definitionRecipes=0;
+#endif
     try { while (!d->stop.load(std::memory_order_acquire)) {
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+        definitionStatus(*d,progress,definitionFeatureReported,definitionReasons,definitionRecipes);
+#endif
         const auto queryRoutes=d->queryRoutesUsed.load(std::memory_order_relaxed);
         if(queryRoutes!=announcedQueryRoutes) {
             // At most two observations per device, even under continuous native
@@ -553,6 +635,11 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     link->u.pLayerInfo=link->u.pLayerInfo->pNext;
     const auto result=next(physical,info,alloc,out);if(result!=VK_SUCCESS)return result;
     d->native=*out;d->id=++nextDevice;
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    // The successful call's pointers are still readable HERE. This observes
+    // enabled state without modifying the native feature/extension request.
+    observeDefinitions(d.get(),[&](auto& definitions){definitions.createDevice(*out,*info,result);});
+#endif
     d->instanceApiVersion=i->apiVersion;
     frame_pixel_sampler::ReviewedRoutes reviewed;
     reviewed.coreComputeRoutesObserved=VK_API_VERSION_VARIANT(i->apiVersion)==0 &&
@@ -577,6 +664,9 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
 #define LOAD(name) d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,"vk" #name));
     LOAD(DestroyDevice) LOAD(DeviceWaitIdle) LOAD(CreateShaderModule) LOAD(DestroyShaderModule)
     LOAD(CreateGraphicsPipelines) LOAD(DestroyPipeline) LOAD(CreateCommandPool)
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    LOAD(CreateRenderPass) LOAD(CreateRenderPass2) LOAD(DestroyRenderPass)
+#endif
     LOAD(AllocateCommandBuffers) LOAD(FreeCommandBuffers) LOAD(BeginCommandBuffer) LOAD(EndCommandBuffer)
     LOAD(ResetCommandBuffer) LOAD(ResetCommandPool) LOAD(DestroyCommandPool) LOAD(CmdBindPipeline)
     LOAD(CmdDraw) LOAD(CmdDrawIndexed) LOAD(CmdDrawIndirect) LOAD(CmdDrawIndexedIndirect) LOAD(CmdExecuteCommands)
@@ -593,6 +683,9 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     ALIAS(CmdBeginRenderPass2,"KHR") ALIAS(CmdNextSubpass2,"KHR") ALIAS(CmdEndRenderPass2,"KHR")
     ALIAS(CmdBeginRendering,"KHR") ALIAS(CmdEndRendering,"KHR") ALIAS(QueueSubmit2,"KHR")
     ALIAS(CmdDispatchBase,"KHR")
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    ALIAS(CreateRenderPass2,"KHR")
+#endif
 #undef ALIAS
 #define BINDING_ALIAS(alias,name) if(!d->name)d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,alias));
 #include "passive_binding_aliases.inc"
@@ -673,6 +766,9 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocationCallbacks* alloc) {
     auto* d=deviceFor(device);d->stop.store(true,std::memory_order_release);if(d->writer.joinable())d->writer.join();
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    observeDefinitions(d,[&](auto& definitions){definitions.destroyDevice();});
+#endif
     // Explicit shutdown only, never a rendering/recording callback. The added
     // completion fence also belongs to this queue, so native fence waits alone
     // cannot be substituted for quiescing our own children before destruction.
@@ -687,26 +783,68 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocation
 }
 #define observeBindings(...) observeBindingsAt(__func__, __VA_ARGS__)
 #define FRAME_PIXEL_COMPUTE_BIND(d,command,point) do { if((point)!=VK_PIPELINE_BIND_POINT_GRAPHICS) session().tracker->touchComputeState((d)->id,command); } while(false)
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+#define FRAME_PIXEL_DEFINITION_SET_CREATED(d,object,info) observeDefinitions(d,[&](auto& definitions){definitions.createSet(object,info,VK_SUCCESS);})
+#define FRAME_PIXEL_DEFINITION_SET_DESTROYED(d,object) observeDefinitions(d,[&](auto& definitions){definitions.destroySet(object);})
+#define FRAME_PIXEL_DEFINITION_LAYOUT_CREATED(d,object,info) observeDefinitions(d,[&](auto& definitions){definitions.createLayout(object,info,VK_SUCCESS);})
+#define FRAME_PIXEL_DEFINITION_LAYOUT_DESTROYED(d,object) observeDefinitions(d,[&](auto& definitions){definitions.destroyLayout(object);})
+#endif
 #include "passive_binding_hooks.inc"
+#undef FRAME_PIXEL_DEFINITION_SET_CREATED
+#undef FRAME_PIXEL_DEFINITION_SET_DESTROYED
+#undef FRAME_PIXEL_DEFINITION_LAYOUT_CREATED
+#undef FRAME_PIXEL_DEFINITION_LAYOUT_DESTROYED
 #undef FRAME_PIXEL_COMPUTE_BIND
 #undef observeBindings
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateShaderModule(VkDevice device,const VkShaderModuleCreateInfo* info,const VkAllocationCallbacks* alloc,VkShaderModule* out) {
     auto* d=deviceFor(device);const auto result=d->CreateShaderModule(device,info,alloc,out);
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.createShader(*out,*info,result);});
+#endif
     if(result==VK_SUCCESS)session().tracker->createShader(d->id,*out,*info);
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyShaderModule(VkDevice device,VkShaderModule value,const VkAllocationCallbacks* alloc) {
-    auto* d=deviceFor(device);session().tracker->destroyShader(d->id,value);d->DestroyShaderModule(device,value,alloc);
+    auto* d=deviceFor(device);
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    observeDefinitions(d,[&](auto& definitions){definitions.destroyShader(value);});
+#endif
+    session().tracker->destroyShader(d->id,value);d->DestroyShaderModule(device,value,alloc);
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateGraphicsPipelines(VkDevice device,VkPipelineCache cache,std::uint32_t count,const VkGraphicsPipelineCreateInfo* info,const VkAllocationCallbacks* alloc,VkPipeline* out) {
     auto* d=deviceFor(device);const auto result=d->CreateGraphicsPipelines(device,cache,count,info,alloc,out);
     // Partial success handles are not an admitted diagnostic pipeline.
-    if(result==VK_SUCCESS && count<=256)for(std::uint32_t n=0;n<count;++n)session().tracker->createPipeline(d->id,out[n],info[n]);
+    if(result==VK_SUCCESS && count<=256)for(std::uint32_t n=0;n<count;++n){
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+        observeDefinitions(d,[&](auto& definitions){definitions.createPipeline(out[n],info[n],result);});
+#endif
+        session().tracker->createPipeline(d->id,out[n],info[n]);
+    }
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyPipeline(VkDevice device,VkPipeline pipeline,const VkAllocationCallbacks* alloc) {
-    auto* d=deviceFor(device);session().tracker->destroyPipeline(d->id,pipeline);d->DestroyPipeline(device,pipeline,alloc);
+    auto* d=deviceFor(device);
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    observeDefinitions(d,[&](auto& definitions){definitions.destroyPipeline(pipeline);});
+#endif
+    session().tracker->destroyPipeline(d->id,pipeline);d->DestroyPipeline(device,pipeline,alloc);
 }
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass(VkDevice device,const VkRenderPassCreateInfo* info,const VkAllocationCallbacks* alloc,VkRenderPass* out) {
+    auto* d=deviceFor(device);const auto result=d->CreateRenderPass(device,info,alloc,out);
+    if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.createRenderPass(*out,*info,result);});
+    return result;
+}
+VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass2(VkDevice device,const VkRenderPassCreateInfo2* info,const VkAllocationCallbacks* alloc,VkRenderPass* out) {
+    auto* d=deviceFor(device);const auto result=d->CreateRenderPass2(device,info,alloc,out);
+    if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.unsupported(frame_pixel_ssbo_journal::ObjectKind::RenderPass,
+        frame_pixel_ssbo_clone::handle(*out),VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);});
+    return result;
+}
+VKAPI_ATTR void VKAPI_CALL traceDestroyRenderPass(VkDevice device,VkRenderPass value,const VkAllocationCallbacks* alloc) {
+    auto* d=deviceFor(device);observeDefinitions(d,[&](auto& definitions){definitions.destroyRenderPass(value);});d->DestroyRenderPass(device,value,alloc);
+}
+#endif
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateCommandPool(VkDevice device,const VkCommandPoolCreateInfo* info,const VkAllocationCallbacks* alloc,VkCommandPool* out) {
     auto* d=deviceFor(device);const auto result=d->CreateCommandPool(device,info,alloc,out);
     if(result==VK_SUCCESS)session().tracker->createCommandPool(d->id,*out,*info);
@@ -883,6 +1021,10 @@ PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
     if(!native || !session().allowed)return native;
 #define HOOK(method) if(!std::strcmp(name,"vk" #method))return reinterpret_cast<PFN_vkVoidFunction>(trace##method);
     HOOK(CreateShaderModule) HOOK(DestroyShaderModule) HOOK(CreateGraphicsPipelines) HOOK(DestroyPipeline)
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    HOOK(CreateRenderPass) HOOK(CreateRenderPass2) HOOK(DestroyRenderPass)
+    if(!std::strcmp(name,"vkCreateRenderPass2KHR"))return reinterpret_cast<PFN_vkVoidFunction>(traceCreateRenderPass2);
+#endif
     HOOK(CreateCommandPool) HOOK(DestroyCommandPool) HOOK(ResetCommandPool)
     HOOK(AllocateCommandBuffers) HOOK(FreeCommandBuffers) HOOK(BeginCommandBuffer) HOOK(EndCommandBuffer) HOOK(ResetCommandBuffer)
     HOOK(CmdBindPipeline) HOOK(CmdDraw) HOOK(CmdDrawIndexed) HOOK(CmdDrawIndirect) HOOK(CmdDrawIndexedIndirect) HOOK(CmdExecuteCommands)
