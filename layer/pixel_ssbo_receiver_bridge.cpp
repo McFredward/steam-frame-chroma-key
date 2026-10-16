@@ -97,7 +97,7 @@ void Bridge::resourceRetiring(tx::Resource kind,std::uint64_t value) noexcept {
 void Bridge::descriptorMutation(VkDescriptorSet set) noexcept {
     if(retired_.load(std::memory_order_acquire)||!adopted_.load(std::memory_order_acquire))return;
     descriptorEpoch_.fetch_add(1,std::memory_order_acq_rel);
-    if(targetBound_.load(std::memory_order_acquire)&&(!set||clone::handle(set)==selectedSet_.load(std::memory_order_acquire))){refuse(Refusal::DescriptorMutation);transaction_.unknownRoute(transaction_.command());}
+    if(targetBound_.load(std::memory_order_acquire)&&(!set||clone::handle(set)==selectedSet_.load(std::memory_order_acquire))){refuse(Refusal::DescriptorMutation);CommandContext context;context.operation=Operation::DescriptorMutation;context.source=ContextSource::Internal;context.object=clone::handle(set);transaction_.unknownRoute(transaction_.command(),context);}
 }
 void Bridge::descriptorPoolRetiring(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,VkDescriptorPool pool) noexcept {
     if(retired_.load(std::memory_order_acquire)||!adopted_.load(std::memory_order_acquire))return;
@@ -133,7 +133,11 @@ void Bridge::begin(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,V
        transaction_.generation()<=learnedCommandGeneration_.load(std::memory_order_relaxed)||!transaction_.arm(c)){refuse(Refusal::Recording);return;}
     adoptedCommand_.store(clone::handle(c),std::memory_order_relaxed);adoptedPool_.store(clone::handle(transaction_.pool()),std::memory_order_relaxed);commandGeneration_.store(transaction_.generation());poolGeneration_.store(transaction_.poolGeneration());adopted_.store(true,std::memory_order_release);
 }
-void Bridge::pipeline(VkCommandBuffer c,VkPipeline p) noexcept {if(matches(c))transaction_.pipelineBound(c,p);}
+void Bridge::pipeline(VkCommandBuffer c,VkPipeline p) noexcept {if(matches(c)){
+    observedPipeline_.store(clone::handle(p),std::memory_order_relaxed);
+    CommandContext context;context.operation=Operation::CmdBindPipeline;context.source=ContextSource::Internal;context.object=clone::handle(p);context.targetPipeline=context.object==originalPipeline_.load(std::memory_order_relaxed);
+    transaction_.observe(c,context);transaction_.pipelineBound(c,p);
+}}
 void Bridge::beginPass(VkCommandBuffer c,VkRenderPass p,VkSubpassContents contents) noexcept {if(matches(c))transaction_.beginRenderPass(c,p,contents);}
 void Bridge::nextPass(VkCommandBuffer c,VkSubpassContents contents) noexcept {if(matches(c))transaction_.nextSubpass(c,contents);}
 void Bridge::endPass(VkCommandBuffer c) noexcept {if(matches(c))transaction_.endRenderPass(c);}
@@ -141,6 +145,9 @@ void Bridge::endCommand(VkCommandBuffer c,VkResult r) noexcept {if(matches(c))tr
 bool Bridge::draw(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,VkCommandBuffer c,
         std::uint32_t n,std::uint32_t instances,std::uint32_t first,std::uint32_t firstInstance,std::int32_t offset,bool indexed) noexcept {
     if(!matches(c))return false;
+    CommandContext observation;observation.operation=indexed?Operation::CmdDrawIndexed:Operation::CmdDraw;observation.source=ContextSource::Internal;
+    observation.object=observedPipeline_.load(std::memory_order_relaxed);observation.targetPipeline=observation.object&&observation.object==originalPipeline_.load(std::memory_order_relaxed);
+    transaction_.observe(c,observation); // evidence survives refusal; no ticket is minted by this observation
     tx::Transaction::TargetTicket ticket;
     const auto descriptorEpoch=descriptorEpoch_.load(std::memory_order_acquire),resourceEpoch=resourceEpoch_.load(std::memory_order_acquire);
     if(usable()&&tracker.ssboTargetTicket(tag,c,*clone_.preparedRecipe(),ticket)){
@@ -148,7 +155,7 @@ bool Bridge::draw(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,Vk
         else {selectedSet_.store(clone::handle(transaction_.descriptorSet()),std::memory_order_relaxed);targetBound_.store(true,std::memory_order_release);
             if(descriptorEpoch!=descriptorEpoch_.load(std::memory_order_acquire))refuse(Refusal::DescriptorMutation);}
     }
-    if(!usable()){transaction_.unknownRoute(c);return false;}
+    if(!usable()){observation.detailReason=reason_.load(std::memory_order_acquire);transaction_.unknownRoute(c,observation);return false;}
     const auto result=indexed?transaction_.drawIndexed(c,n,instances,first,offset,firstInstance):transaction_.draw(c,n,instances,first,firstInstance);
     if(result==tx::DrawResult::ReplacedOriginal){
         const auto source=transaction_.selectedSource();const std::array<tx::Id,3> identities{{source.image,source.view,source.memory}};
@@ -158,7 +165,11 @@ bool Bridge::draw(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,Vk
         drawKind_.store(indexed?2u:1u);drawArgs_[0].store(n);drawArgs_[1].store(instances);drawArgs_[2].store(first);drawArgs_[3].store(firstInstance);drawArgs_[4].store(static_cast<std::uint32_t>(offset));
         drawOrdinal_.store(transaction_.selectedOrdinal());replaced_.store(true,std::memory_order_release);return true;}return false;
 }
-void Bridge::unknown(VkCommandBuffer c) noexcept {if(matches(c)){transaction_.unknownRoute(c);refuse(Refusal::UnknownRoute);}}
+void Bridge::observe(VkCommandBuffer c,const CommandContext& context) noexcept {if(matches(c))transaction_.observe(c,context);}
+void Bridge::unknown(VkCommandBuffer c,const CommandContext& context) noexcept {if(matches(c)){
+    if(context.operation==Operation::Unspecified||context.operation==Operation::CmdBindShadersEXT||context.operation==Operation::CmdExecuteCommands)observedPipeline_.store(0,std::memory_order_relaxed);
+    transaction_.unknownRoute(c,context);refuse(Refusal::UnknownRoute);
+}}
 bool Bridge::deferCopy(const frame_pixel_capture::Candidate& c) noexcept {
     learn(c);
     // A refused bridge leaves the established raw diagnostic available, but it
@@ -197,10 +208,10 @@ void Bridge::afterSubmit(const tx::Transaction::SubmitTicket& ticket,VkQueue,std
     if(!transaction_.afterSubmit(ticket,result)||transaction_.execution()!=previous+1){refuse(Refusal::Execution);return;}
     pairedExecution_.store(previous+1,std::memory_order_release);
 }
-void Bridge::unsupportedSubmit(VkQueue,std::uint32_t count,const VkSubmitInfo2* info) noexcept {
+void Bridge::unsupportedSubmit(VkQueue,std::uint32_t count,const VkSubmitInfo2* info,const CommandContext& context) noexcept {
     if(!adopted_.load(std::memory_order_acquire)||!info||count>32)return;
-    for(std::uint32_t i=0;i<count;++i){if(info[i].commandBufferInfoCount>64){refuse(Refusal::SubmitShape);return;}
-        for(std::uint32_t j=0;j<info[i].commandBufferInfoCount;++j)if(matches(info[i].pCommandBufferInfos[j].commandBuffer)){submitRoute_.store(2);submitBatches_.store(count);submitBatch_.store(i);submitCommands_.store(info[i].commandBufferInfoCount);submitNext_.store(info[i].pNext?static_cast<std::uint32_t>(static_cast<const VkBaseInStructure*>(info[i].pNext)->sType):UINT32_MAX);submitOccurrences_.store(1);refuse(Refusal::SubmitShape);transaction_.unknownRoute(transaction_.command());return;}}
+    for(std::uint32_t i=0;i<count;++i){if(info[i].sType!=VK_STRUCTURE_TYPE_SUBMIT_INFO_2||info[i].commandBufferInfoCount>64||(info[i].commandBufferInfoCount&&!info[i].pCommandBufferInfos)){refuse(Refusal::SubmitShape);return;}
+        for(std::uint32_t j=0;j<info[i].commandBufferInfoCount;++j)if(matches(info[i].pCommandBufferInfos[j].commandBuffer)){submitRoute_.store(2);submitBatches_.store(count);submitBatch_.store(i);submitCommands_.store(info[i].commandBufferInfoCount);submitNext_.store(info[i].pNext?static_cast<std::uint32_t>(static_cast<const VkBaseInStructure*>(info[i].pNext)->sType):UINT32_MAX);submitOccurrences_.store(1);refuse(Refusal::SubmitShape);transaction_.unknownRoute(info[i].pCommandBufferInfos[j].commandBuffer,context);return;}}
 }
 Bridge::RetirementTicket Bridge::beforeRetirement(tx::Retirement r,VkCommandBuffer c,VkCommandPool p) noexcept {
     if(r==tx::Retirement::DestroyPool)forget(VK_NULL_HANDLE,p);
@@ -244,6 +255,6 @@ Snapshot Bridge::snapshot() const noexcept {
     s.drawKind=drawKind_.load();s.submitRoute=submitRoute_.load();for(unsigned i=0;i<5;++i)s.drawArgs[i]=drawArgs_[i].load();
     s.submit={submitBatches_.load(),submitBatch_.load(),submitCommands_.load(),submitNext_.load(),submitOccurrences_.load()};
     s.commandGeneration=commandGeneration_.load();s.poolGeneration=poolGeneration_.load();s.drawOrdinal=drawOrdinal_.load();
-    s.sourceExecutions=sourceExecutions_.load();s.pairedExecution=pairedExecution_.load();s.cancellationEpoch=cancellationEpoch_.load();return s;
+    s.sourceExecutions=sourceExecutions_.load();s.pairedExecution=pairedExecution_.load();s.cancellationEpoch=cancellationEpoch_.load();s.recordingContexts=transaction_.recordingContexts();return s;
 }
 } // namespace frame_pixel_ssbo_receiver

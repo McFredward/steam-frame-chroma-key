@@ -20,6 +20,110 @@ const char* reasonName(Reason value) noexcept {
 #undef NAME
     }return "unknown_transaction_refusal";
 }
+const char* operationName(Operation operation) noexcept {
+    switch(operation){
+#define OP(name) case Operation::name:return #name;
+    OP(Unspecified) OP(BeginCommandBuffer) OP(EndCommandBuffer) OP(CmdBindPipeline) OP(CmdBindDescriptorSets) OP(CmdPushConstants)
+    OP(CmdBeginRenderPass) OP(CmdBeginRenderPass2) OP(CmdBeginRenderPass2KHR) OP(CmdNextSubpass) OP(CmdNextSubpass2) OP(CmdNextSubpass2KHR)
+    OP(CmdEndRenderPass) OP(CmdEndRenderPass2) OP(CmdEndRenderPass2KHR) OP(CmdDraw) OP(CmdDrawIndexed) OP(CmdDrawIndirect) OP(CmdDrawIndexedIndirect)
+    OP(CmdDrawIndirectCount) OP(CmdDrawIndirectCountKHR) OP(CmdDrawIndirectCountAMD) OP(CmdDrawIndexedIndirectCount) OP(CmdDrawIndexedIndirectCountKHR) OP(CmdDrawIndexedIndirectCountAMD)
+    OP(CmdExecuteCommands) OP(CmdBindShadersEXT) OP(CmdDispatch) OP(CmdDispatchIndirect) OP(CmdDispatchBase) OP(CmdDispatchBaseKHR)
+    OP(CmdBeginQuery) OP(CmdBeginQueryIndexedEXT) OP(CmdBeginRendering) OP(CmdBeginRenderingKHR) OP(CmdEndRendering) OP(CmdEndRenderingKHR)
+    OP(QueueSubmit) OP(QueueSubmit2) OP(QueueSubmit2KHR) OP(DescriptorMutation) OP(DescriptorPoolRetiring) OP(ResourceRetiring) OP(DefinitionRetiring)
+    OP(ResetCommandBuffer) OP(FreeCommandBuffers) OP(ResetCommandPool) OP(DestroyCommandPool) OP(DeviceDestroying) OP(CopyRecorded) OP(TargetTicket) OP(Count)
+#undef OP
+    }return "InvalidOperation";
+}
+const char* phaseName(RecordingPhase phase) noexcept {
+    switch(phase){
+#define P(name) case RecordingPhase::name:return #name;
+    P(Unavailable) P(RecordingOutsidePass) P(OtherPass) P(BeforeTargetSubpass) P(TargetSubpassBeforeDraw) P(TargetSubpassAfterDraw) P(AfterTargetSubpass) P(AfterPass) P(Executable) P(Retired)
+#undef P
+    }return "InvalidPhase";
+}
+namespace {
+void normalizeContext(RecordingContext& context) noexcept {
+    if(static_cast<unsigned>(context.input.operation)>=static_cast<unsigned>(Operation::Count)){context.input.operation=Operation::Unspecified;context.metadataTruncated=true;}
+    if(static_cast<unsigned>(context.input.source)>static_cast<unsigned>(ContextSource::Internal)){context.input.source=ContextSource::Unspecified;context.metadataTruncated=true;}
+    for(auto& chain:context.input.chains)if(chain.count>chain.types.size()){chain.count=chain.types.size();context.metadataTruncated=true;}
+}
+}
+RecordingPhase Transaction::contextPhase() const noexcept {
+    if(retired_)return RecordingPhase::Retired;
+    if(!recording_)return executable_?RecordingPhase::Executable:RecordingPhase::Unavailable;
+    if(!inPass_)return scopeEnded_?RecordingPhase::AfterPass:RecordingPhase::RecordingOutsidePass;
+    if(!targetPass_)return RecordingPhase::OtherPass;
+    if(currentSubpass_<targetSubpass_)return RecordingPhase::BeforeTargetSubpass;
+    if(currentSubpass_>targetSubpass_)return RecordingPhase::AfterTargetSubpass;
+    return selected_?RecordingPhase::TargetSubpassAfterDraw:RecordingPhase::TargetSubpassBeforeDraw;
+}
+Transaction::ContextScope::ContextScope(Transaction& owner,VkCommandBuffer command,const CommandContextInput& input,Operation fallback,bool rejected) noexcept:owner_(owner) {
+    if(!owner.matches(command)||owner.retired_)return;
+    enabled_=true;context_.input=input;
+    if(context_.input.operation==Operation::Unspecified){context_.input.operation=fallback;context_.input.source=ContextSource::Internal;}
+    normalizeContext(context_);
+    context_.phase=owner.contextPhase();context_.before=owner.refusal();context_.rejected=rejected;
+    context_.transactionEpoch=owner.epoch_;context_.device=frame_pixel_ssbo_clone::handle(owner.device_);
+    context_.command=frame_pixel_ssbo_clone::handle(command);context_.pool=frame_pixel_ssbo_clone::handle(owner.pool_);
+    context_.commandGeneration=owner.generation_;context_.poolGeneration=owner.poolGeneration_;context_.drawOrdinal=owner.drawOrdinal_;
+    context_.currentSubpass=owner.currentSubpass_;context_.targetSubpass=owner.targetSubpass_;context_.subpassCount=owner.subpassCount_;
+}
+Transaction::ContextScope::~ContextScope(){
+    if(!enabled_)return;
+    context_.after=owner_.refusal();context_.rejected|=context_.before==Reason::None&&context_.after!=Reason::None;
+    owner_.retainContext(context_);
+}
+void Transaction::firstContext(const RecordingContext& context) noexcept {
+    // A later event that merely observes an earlier sticky reason is not its
+    // cause. Leave the first-context slot explicitly unavailable in that case.
+    if(!context.rejected||context.before!=Reason::None||context.after==Reason::None)return;
+    unsigned empty=0;if(!firstContextState_.compare_exchange_strong(empty,1,std::memory_order_acq_rel))return;
+    firstContext_=context;firstContextState_.store(2,std::memory_order_release);
+}
+void Transaction::contextContention(VkCommandBuffer command,const CommandContextInput& input,bool firstRefusal) noexcept {
+    contextContended_.store(true,std::memory_order_release);
+    RecordingContext context;context.input=input;context.command=frame_pixel_ssbo_clone::handle(command);context.transactionEpoch=epoch_;
+    // No plain mutable transaction state is read without Guard. Incomplete
+    // generation/phase is explicit, never assembled from unrelated atomics.
+    context.after=Reason::Contention;context.rejected=true;context.metadataTruncated=true;normalizeContext(context);
+    if(firstRefusal&&refusal()==Reason::Contention)firstContext(context);
+}
+namespace {
+bool sameContext(const RecordingContext& a,const RecordingContext& b) noexcept {
+    const auto& x=a.input;const auto& y=b.input;
+    if(a.transactionEpoch!=b.transactionEpoch||a.command!=b.command||a.pool!=b.pool||a.commandGeneration!=b.commandGeneration||a.poolGeneration!=b.poolGeneration||
+       a.phase!=b.phase||a.currentSubpass!=b.currentSubpass||a.targetSubpass!=b.targetSubpass||a.subpassCount!=b.subpassCount||a.before!=b.before||a.after!=b.after||a.rejected!=b.rejected||a.metadataTruncated!=b.metadataTruncated||
+       x.operation!=y.operation||x.source!=y.source||x.detailReason!=y.detailReason||x.structureType!=y.structureType||x.index!=y.index||x.chain!=y.chain||x.contents!=y.contents||x.flags!=y.flags||x.targetPipeline!=y.targetPipeline)return false;
+    // Object values and draw ordinals are first-observation payload, not a key:
+    // ordinary binds/draws must not starve the independent first refusal.
+    for(unsigned i=0;i<x.chains.size();++i){const auto& p=x.chains[i];const auto& q=y.chains[i];if(p.rootType!=q.rootType||p.count!=q.count||p.termination!=q.termination)return false;for(unsigned n=0;n<p.count;++n)if(p.types[n]!=q.types[n])return false;}
+    return true;
+}
+}
+void Transaction::retainContext(RecordingContext context) noexcept {
+    const auto old=contextAttempts_.load(std::memory_order_relaxed);
+    if(old==UINT64_MAX){contextOverflow_.store(UINT64_MAX,std::memory_order_relaxed);firstContext(context);return;}
+    context.sequence=old+1;contextAttempts_.store(context.sequence,std::memory_order_release);firstContext(context);
+    const auto count=contextCount_.load(std::memory_order_relaxed);
+    for(unsigned i=0;i<count;++i)if(sameContext(contexts_[i].first,context)){
+        const auto repeats=contexts_[i].count.load(std::memory_order_relaxed);if(repeats!=UINT64_MAX)contexts_[i].count.store(repeats+1,std::memory_order_release);
+        contexts_[i].lastSequence.store(context.sequence,std::memory_order_release);return;
+    }
+    if(count==contexts_.size()){const auto overflow=contextOverflow_.load(std::memory_order_relaxed);if(overflow!=UINT64_MAX)contextOverflow_.store(overflow+1,std::memory_order_release);return;}
+    auto& slot=contexts_[count];slot.first=context;slot.count.store(1,std::memory_order_relaxed);slot.lastSequence.store(context.sequence,std::memory_order_relaxed);
+    contextCount_.store(count+1,std::memory_order_release); // immutable payload publication
+}
+RecordingContexts Transaction::recordingContexts() const noexcept {
+    RecordingContexts out;out.count=contextCount_.load(std::memory_order_acquire);
+    for(unsigned i=0;i<out.count;++i){out.entries[i].first=contexts_[i].first;out.entries[i].count=contexts_[i].count.load(std::memory_order_acquire);out.entries[i].lastSequence=contexts_[i].lastSequence.load(std::memory_order_acquire);}
+    out.attempts=contextAttempts_.load(std::memory_order_acquire);out.overflow=contextOverflow_.load(std::memory_order_acquire);out.contended=contextContended_.load(std::memory_order_acquire);
+    out.firstRefusalAvailable=firstContextState_.load(std::memory_order_acquire)==2;if(out.firstRefusalAvailable)out.firstRefusal=firstContext_;
+    return out;
+}
+void Transaction::observe(VkCommandBuffer command,const CommandContextInput& input) noexcept {
+    Guard guard(*this);if(!guard){contextContention(command,input,guard.firstRefusal());return;}
+    ContextScope context(*this,command,input,Operation::Unspecified);
+}
 std::uint64_t Transaction::reserveEpoch() noexcept {
     auto value=epochs_.load(std::memory_order_relaxed);
     while(value && value!=UINT64_MAX){if(epochs_.compare_exchange_weak(value,value+1,std::memory_order_relaxed))return value;}
@@ -27,7 +131,7 @@ std::uint64_t Transaction::reserveEpoch() noexcept {
 }
 Transaction::Transaction() noexcept:epoch_(reserveEpoch()) {if(!epoch_)refuse(Reason::GenerationWrap);}
 Transaction::Guard::Guard(Transaction& owner) noexcept:owner_(owner),acquired_(!owner.lock_.test_and_set(std::memory_order_acquire)) {
-    if(!acquired_)owner_.refuse(Reason::Contention);
+    if(!acquired_){auto expected=Reason::None;firstRefusal_=owner_.reason_.compare_exchange_strong(expected,Reason::Contention,std::memory_order_acq_rel);owner_.contextContended_.store(true,std::memory_order_release);}
 }
 Transaction::Guard::~Guard(){if(acquired_)owner_.lock_.clear(std::memory_order_release);}
 bool Transaction::refuse(Reason value) noexcept {
@@ -130,6 +234,7 @@ bool Transaction::adoptRecording(const RecordingTicket& ticket) noexcept {
 }
 bool Transaction::adoptTargetState(const TargetTicket& ticket) noexcept {
     Guard guard(*this);if(!guard)return false;
+    ContextScope context(*this,ticket.command_,{},Operation::TargetTicket);
     if(!configured_ || !armed_ || !active(ticket.command_) || !inPass_ || !matchingPass_ || selected_ ||
        !adoptedTracker_ || ticket.tracker_!=adoptedTracker_ || ticket.device_!=frame_pixel_ssbo_clone::handle(device_) ||
        ticket.commandGeneration_!=generation_ || ticket.pool_!=pool_ || ticket.poolGeneration_!=poolGeneration_ ||
@@ -143,6 +248,7 @@ bool Transaction::adoptTargetState(const TargetTicket& ticket) noexcept {
 }
 bool Transaction::arm(VkCommandBuffer command) noexcept {
     Guard guard(*this);if(!guard)return false;
+    ContextScope context(*this,command,{},Operation::BeginCommandBuffer);
     if(armed_)return refuse(Reason::AlreadyArmed);
     if(!configured_ || !active(command) || inPass_ || scopeEnded_ || drawOrdinal_ || !cleanHistory_ || selected_ || !generation_)return refuse(Reason::NotArmed);
     if(!clone_->ready() || clone_->referenced() || !clone_->markReferenced())return refuse(Reason::InvalidConfiguration);
@@ -163,6 +269,7 @@ bool Transaction::arm(VkCommandBuffer command) noexcept {
 }
 bool Transaction::beginRenderPass(VkCommandBuffer command,VkRenderPass pass,VkSubpassContents contents) noexcept {
     Guard guard(*this);if(!guard)return false;
+    ContextScope context(*this,command,{},Operation::CmdBeginRenderPass);
     if(!active(command))return false;
     if(inPass_){if(armed_)return refuse(Reason::Scope);cleanHistory_=false;return false;}
     inPass_=true;
@@ -212,7 +319,9 @@ DrawResult Transaction::drawIndexed(VkCommandBuffer command,std::uint32_t indice
 }
 DrawResult Transaction::replace(VkCommandBuffer command,std::uint32_t vertices,std::uint32_t instances,
                                std::uint32_t firstVertex,std::uint32_t firstInstance,std::int32_t vertexOffset,bool indexed) noexcept {
-    Guard guard(*this);if(!guard || !active(command))return DrawResult::ForwardOriginal;
+    Guard guard(*this);if(!guard)return DrawResult::ForwardOriginal;
+    ContextScope context(*this,command,{},indexed?Operation::CmdDrawIndexed:Operation::CmdDraw);
+    if(!active(command))return DrawResult::ForwardOriginal;
     if(!advance(drawOrdinal_))return DrawResult::ForwardOriginal;
     if(selected_){refuse(Reason::LaterDraw);return DrawResult::ForwardOriginal;}
     if(!armed_)return DrawResult::ForwardOriginal;
@@ -238,7 +347,9 @@ DrawResult Transaction::replace(VkCommandBuffer command,std::uint32_t vertices,s
     return DrawResult::ReplacedOriginal;
 }
 void Transaction::endRenderPass(VkCommandBuffer command) noexcept {
-    Guard guard(*this);if(!guard || !active(command))return;
+    Guard guard(*this);if(!guard)return;
+    ContextScope context(*this,command,{},Operation::CmdEndRenderPass);
+    if(!active(command))return;
     if(!armed_){inPass_=false;scopeEnded_=true;return;}
     if(!inPass_){refuse(Reason::Scope);return;}
     if(targetPass_ && currentSubpass_+1!=subpassCount_){refuse(Reason::Subpass);return;}
@@ -256,19 +367,24 @@ void Transaction::endRenderPass(VkCommandBuffer command) noexcept {
 }
 void Transaction::endCommand(VkCommandBuffer command,VkResult result) noexcept {
     Guard guard(*this);if(!guard || !matches(command))return;
+    ContextScope context(*this,command,{},Operation::EndCommandBuffer);
     if(!armed_){recording_=false;inPass_=false;return;}
     if(result!=VK_SUCCESS || !recording_ || inPass_ || !scopeEnded_ || !selected_){refuse(Reason::CommandEnd);return;}
     recording_=false;executable_=true;
 }
-void Transaction::unknown(VkCommandBuffer command,Reason why) noexcept {
-    Guard guard(*this);if(guard && matches(command) && !retired_){cleanHistory_=false;if(armed_)refuse(why);}
+void Transaction::unknown(VkCommandBuffer command,Reason why,const CommandContextInput& input) noexcept {
+    Guard guard(*this);if(!guard){contextContention(command,input,guard.firstRefusal());return;}
+    ContextScope context(*this,command,input,Operation::Unspecified,true);
+    if(matches(command) && !retired_){cleanHistory_=false;if(armed_)refuse(why);}
 }
 void Transaction::laterDraw(VkCommandBuffer command) noexcept {
     Guard guard(*this);if(!guard || !matches(command) || retired_)return;
     if(advance(drawOrdinal_) && selected_)refuse(Reason::LaterDraw);
 }
 bool Transaction::nextSubpass(VkCommandBuffer c,VkSubpassContents contents) noexcept {
-    Guard guard(*this);if(!guard || !active(c))return false;
+    Guard guard(*this);if(!guard)return false;
+    ContextScope context(*this,c,{},Operation::CmdNextSubpass);
+    if(!active(c))return false;
     if(!inPass_)return refuse(Reason::Scope);
     if(contents!=VK_SUBPASS_CONTENTS_INLINE)return refuse(Reason::Secondary);
     // An unrelated preceding pass has no captured shape and grants no target
@@ -278,8 +394,8 @@ bool Transaction::nextSubpass(VkCommandBuffer c,VkSubpassContents contents) noex
     ++currentSubpass_;matchingPass_=targetPass_ && currentSubpass_==targetSubpass_;
     return true;
 }
-void Transaction::executeSecondary(VkCommandBuffer c) noexcept{unknown(c,Reason::Secondary);}
-void Transaction::unknownRoute(VkCommandBuffer c) noexcept{unknown(c,Reason::UnknownRoute);}
+void Transaction::executeSecondary(VkCommandBuffer c) noexcept{CommandContextInput context;context.operation=Operation::CmdExecuteCommands;context.source=ContextSource::Internal;unknown(c,Reason::Secondary,context);}
+void Transaction::unknownRoute(VkCommandBuffer c,const CommandContextInput& context) noexcept{unknown(c,Reason::UnknownRoute,context);}
 void Transaction::resourceRetiring(Resource kind,Id id) noexcept {
     Guard guard(*this);if(!guard || !device_)return;
     for(const auto& source:{currentSource_,selectedSource_}){

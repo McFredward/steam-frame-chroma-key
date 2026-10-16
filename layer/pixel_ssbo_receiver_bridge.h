@@ -66,7 +66,7 @@ public:
     void copyRecorded(const frame_pixel_capture::Candidate&) noexcept;
     tx::Transaction::SubmitTicket beforeSubmit(VkQueue,std::uint32_t,const VkSubmitInfo*) noexcept;
     void afterSubmit(const tx::Transaction::SubmitTicket&,VkQueue,std::uint32_t,const VkSubmitInfo*,VkResult) noexcept;
-    void unsupportedSubmit(VkQueue,std::uint32_t,const VkSubmitInfo2*) noexcept;
+    void unsupportedSubmit(VkQueue,std::uint32_t,const VkSubmitInfo2*,const CommandContext& = {}) noexcept;
     struct RetirementTicket {tx::Transaction::RetirementTicket native{};bool selected=false;};
     RetirementTicket beforeRetirement(tx::Retirement,VkCommandBuffer,VkCommandPool=VK_NULL_HANDLE) noexcept;
     void afterRetirement(const RetirementTicket&,VkResult) noexcept;
@@ -91,6 +91,7 @@ private:
     std::atomic<bool> unmappedCandidate_{false};
     std::atomic<std::uint64_t> learnedCommand_{0},learnedPool_{0},adoptedCommand_{0},adoptedPool_{0};
     std::atomic<std::uint64_t> originalPipeline_{0},originalLayout_{0},originalPass_{0};
+    std::atomic<std::uint64_t> observedPipeline_{0}; // evidence only; never a replacement ticket
     std::atomic<std::uint64_t> cancellationEpoch_{0},sourceExecutions_{0},pairedExecution_{0},selectedSet_{0},descriptorEpoch_{0},resourceEpoch_{0};
     std::array<std::atomic<std::uint64_t>,3> selectedSourceValues_{},selectedSourceGenerations_{};
     std::atomic<unsigned> drawKind_{0},submitRoute_{0};std::array<std::atomic<std::uint32_t>,5> drawArgs_{};

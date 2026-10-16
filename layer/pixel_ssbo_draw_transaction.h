@@ -52,6 +52,7 @@ struct CommandContextInput {
     Operation operation=Operation::Unspecified;ContextSource source=ContextSource::Unspecified;
     std::uint32_t detailReason=0,structureType=UINT32_MAX,index=UINT32_MAX,chain=UINT32_MAX,contents=UINT32_MAX,flags=0;
     std::uint64_t object=0;
+    bool targetPipeline=false;
     std::array<CommandContextChain,CommandContextChains> chains{};
 };
 struct RecordingContext {
@@ -213,15 +214,26 @@ public:
 private:
     inline static std::atomic<std::uint64_t> epochs_{1};
     static std::uint64_t reserveEpoch() noexcept;
-    class Guard {Transaction& owner_; bool acquired_; public:
-        explicit Guard(Transaction&) noexcept; ~Guard(); explicit operator bool() const noexcept{return acquired_;}};
+    class Guard {Transaction& owner_; bool acquired_,firstRefusal_=false; public:
+        explicit Guard(Transaction&) noexcept; ~Guard(); explicit operator bool() const noexcept{return acquired_;}
+        bool firstRefusal() const noexcept{return firstRefusal_;}};
+    class ContextScope {
+        Transaction& owner_;RecordingContext context_{};bool enabled_=false;
+    public:
+        ContextScope(Transaction&,VkCommandBuffer,const CommandContextInput&,Operation,bool rejected=false) noexcept;
+        ~ContextScope();
+    };
+    void retainContext(RecordingContext) noexcept;
+    void firstContext(const RecordingContext&) noexcept;
+    void contextContention(VkCommandBuffer,const CommandContextInput&,bool firstRefusal) noexcept;
+    RecordingPhase contextPhase() const noexcept;
     DrawResult replace(VkCommandBuffer,std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t,std::int32_t,bool) noexcept;
     bool refuse(Reason) noexcept;
     bool matches(VkCommandBuffer) const noexcept;
     bool active(VkCommandBuffer) noexcept;
     bool advance(std::uint64_t&) noexcept;
     bool fenceComplete() noexcept;
-    void unknown(VkCommandBuffer,Reason) noexcept;
+    void unknown(VkCommandBuffer,Reason,const CommandContextInput& = {}) noexcept;
     static bool same(Id,Id) noexcept;
     static bool same(const Cohort&,const Cohort&) noexcept;
     Configuration config_{};
@@ -248,5 +260,13 @@ private:
     bool submitted_=false,pending_=false,complete_=false,quiescent_=false,deviceLost_=false;
     std::atomic_flag lock_=ATOMIC_FLAG_INIT;
     std::atomic<Reason> reason_{Reason::None};
+    struct ContextSlot {RecordingContext first{};std::atomic<std::uint64_t> count{0},lastSequence{0};};
+    // One producer holds Guard; consumers only read immutable published slots.
+    // No consumer takes Guard, and no callback spins waiting for a reader.
+    std::array<ContextSlot,RecordingContextCapacity> contexts_{};
+    std::atomic<std::uint32_t> contextCount_{0};
+    std::atomic<std::uint64_t> contextAttempts_{0},contextOverflow_{0};
+    std::atomic<bool> contextContended_{false};
+    RecordingContext firstContext_{};std::atomic<unsigned> firstContextState_{0};
 };
 } // namespace frame_pixel_ssbo_transaction
