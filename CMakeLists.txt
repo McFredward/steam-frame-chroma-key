@@ -225,6 +225,16 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
 endif()
 
 if(BUILD_TESTING AND UNIX)
+    # Cold-only definitions and lifecycle owners; no receiver linkage or native
+    # shader input is used by these ordinary CI controls.
+    add_executable(test_pixel_ssbo_clone_contract tests/test_pixel_ssbo_clone_contract.cpp)
+    target_include_directories(test_pixel_ssbo_clone_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_ssbo_clone_contract PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME pixel_ssbo_clone_contract COMMAND test_pixel_ssbo_clone_contract)
+    add_executable(test_pixel_ssbo_owned_clone tests/test_pixel_ssbo_owned_clone.cpp layer/pixel_ssbo_owned_clone.cpp)
+    target_include_directories(test_pixel_ssbo_owned_clone PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_ssbo_owned_clone PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME pixel_ssbo_owned_clone COMMAND test_pixel_ssbo_owned_clone)
     # The native companion is an explicit, uninstalled diagnostic build option.
     # Its contracts remain independently testable without a headset or capture.
     add_executable(test_pixel_uniform_resources tests/test_pixel_uniform_resources.cpp)
@@ -798,6 +808,12 @@ if(BUILD_TESTING)
             add_executable(test_native_fragment_ssbo_gpu tests/native-fragment-ssbo-gpu/fixture.cpp)
             target_link_libraries(test_native_fragment_ssbo_gpu PRIVATE Vulkan::Vulkan)
             target_compile_options(test_native_fragment_ssbo_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
+            add_executable(test_native_fragment_ssbo_cohort_gpu tests/native-fragment-ssbo-cohort-gpu/fixture.cpp)
+            target_link_libraries(test_native_fragment_ssbo_cohort_gpu PRIVATE Vulkan::Vulkan)
+            target_compile_options(test_native_fragment_ssbo_cohort_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
+            add_executable(test_native_fragment_prefix_restore_gpu tests/native-fragment-prefix-restore-gpu/fixture.cpp)
+            target_link_libraries(test_native_fragment_prefix_restore_gpu PRIVATE Vulkan::Vulkan)
+            target_compile_options(test_native_fragment_prefix_restore_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
             add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/native_fragment_ssa_fixture.vert.spv
                 COMMAND ${GLSLC} --target-env=vulkan1.1
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/native-fragment-ssa-gpu/fixture.vert
