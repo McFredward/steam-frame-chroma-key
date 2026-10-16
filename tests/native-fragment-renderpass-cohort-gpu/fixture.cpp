@@ -13,13 +13,38 @@
 #include <vector>
 #include "../../layer/pixel_ssbo_clone_contract.h"
 namespace previous {
+bool dynamicCullEnabled=false;
+VkResult createDynamicDevice(VkPhysicalDevice physical,const VkDeviceCreateInfo* input,const VkAllocationCallbacks* alloc,VkDevice* out){
+    std::uint32_t count=0;if(::vkEnumerateDeviceExtensionProperties(physical,nullptr,&count,nullptr)!=VK_SUCCESS)return VK_ERROR_EXTENSION_NOT_PRESENT;
+    std::vector<VkExtensionProperties> supported(count);if(::vkEnumerateDeviceExtensionProperties(physical,nullptr,&count,supported.data())!=VK_SUCCESS)return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if(std::none_of(supported.begin(),supported.end(),[](const auto& e){return !std::strcmp(e.extensionName,VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);}))return VK_ERROR_EXTENSION_NOT_PRESENT;
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+    VkPhysicalDeviceFeatures2 features{};features.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;features.pNext=&dynamic;::vkGetPhysicalDeviceFeatures2(physical,&features);
+    if(!dynamic.extendedDynamicState)return VK_ERROR_FEATURE_NOT_PRESENT;
+    std::vector<const char*> names;if(input->enabledExtensionCount)names.assign(input->ppEnabledExtensionNames,input->ppEnabledExtensionNames+input->enabledExtensionCount);
+    if(std::none_of(names.begin(),names.end(),[](const char* name){return !std::strcmp(name,VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);}))names.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    auto ci=*input;ci.enabledExtensionCount=names.size();ci.ppEnabledExtensionNames=names.data();dynamic.pNext=const_cast<void*>(ci.pNext);ci.pNext=&dynamic;
+    const auto result=::vkCreateDevice(physical,&ci,alloc,out);dynamicCullEnabled=result==VK_SUCCESS;return result;
+}
+constexpr PFN_vkCreateDevice vkCreateDevice=createDynamicDevice; // Pointer lookup suppresses global-handle ADL.
 #include "../native-fragment-renderpass2-gpu/fixture.cpp"
 }
 namespace {
 namespace borrowed=previous::borrowed;namespace contract=frame_pixel_ssbo_clone;
 using previous::RenderPass2Gpu;using previous::Result;using borrowed::check;using borrowed::require;using borrowed::bits;
 struct CohortGpu:RenderPass2Gpu {
-    unsigned cohortCount=0,nexts=0;bool originalRoute2=false;
+    unsigned cohortCount=0,nexts=0,cullWrites=0,graphicsCaptures=0;bool originalRoute2=false;
+    contract::RenderPassDefinition retained{};PFN_vkCmdSetCullModeEXT setCull{};
+    static std::vector<std::uint32_t> vertexEntry(std::vector<std::uint32_t> words){
+        // Rename only the tracked, fixture-owned vertex entry. No Valve shader
+        // is parsed or changed here; the original fragment remains a private pin.
+        for(std::size_t at=5;at<words.size();){const auto length=words[at]>>16,op=words[at]&65535u;require(length&&length<=words.size()-at,"owned vertex instruction bounds");
+            if(op==15 && words[at+1]==0){require(length>=5 && words[at+3]==0x6e69616du && words[at+4]==0,"canonical owned vertex main entry");
+                words.insert(words.begin()+static_cast<std::ptrdiff_t>(at+5),0);words[at]=((length+1)<<16)|op;
+                std::memset(words.data()+at+3,0,12);std::memcpy(words.data()+at+3,"VS_DISTORT",11);return words;}
+            at+=length;
+        }throw std::runtime_error("owned vertex entry missing");
+    }
     std::size_t extra(VkFormat format,VkSampleCountFlagBits samples,VkImageUsageFlags usage,VkImageAspectFlags aspect){
         VkImageFormatProperties supported{};check(vkGetPhysicalDeviceImageFormatProperties(physical,format,VK_IMAGE_TYPE_2D,VK_IMAGE_TILING_OPTIMAL,usage,0,&supported));
         require((supported.sampleCounts&samples)!=0,"actual attachment format/sample support");const auto index=images.size();images.emplace_back();auto& out=images.back();
@@ -29,7 +54,7 @@ struct CohortGpu:RenderPass2Gpu {
     }
     VkPipeline cohortPipeline(VkShaderModule vertex,VkShaderModule fragment,VkPipelineLayout layout,VkRenderPass pass){
         VkPipelineShaderStageCreateInfo stages[2]{};for(auto& stage:stages)stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT;stages[0].module=vertex;stages[0].pName="main";
+        stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT;stages[0].module=vertex;stages[0].pName="VS_DISTORT";
         stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT;stages[1].module=fragment;stages[1].pName="PS_DISTORT";
         VkPipelineVertexInputStateCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         VkPipelineInputAssemblyStateCreateInfo ia{};ia.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;ia.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -38,15 +63,19 @@ struct CohortGpu:RenderPass2Gpu {
         VkPipelineMultisampleStateCreateInfo ms{};ms.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
         VkPipelineColorBlendAttachmentState blend{};blend.colorWriteMask=15;
         VkPipelineColorBlendStateCreateInfo cb{};cb.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;cb.attachmentCount=1;cb.pAttachments=&blend;
-        const VkDynamicState states[2]{VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
-        VkPipelineDynamicStateCreateInfo dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;dynamic.dynamicStateCount=2;dynamic.pDynamicStates=states;
+        const VkDynamicState states[3]{VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_CULL_MODE_EXT};
+        VkPipelineDynamicStateCreateInfo dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;dynamic.dynamicStateCount=3;dynamic.pDynamicStates=states;
         VkGraphicsPipelineCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;ci.stageCount=2;ci.pStages=stages;
         ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&raster;ci.pMultisampleState=&ms;ci.pColorBlendState=&cb;ci.pDynamicState=&dynamic;ci.layout=layout;ci.renderPass=pass;ci.subpass=1;
         VkPipelineDepthStencilStateCreateInfo depth{};depth.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;depth.depthCompareOp=VK_COMPARE_OP_ALWAYS;ci.pDepthStencilState=&depth;
-        VkPipeline result{};check(vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&ci,nullptr,&result));return result;
+        contract::GraphicsDefinition definition;contract::GraphicsView owned;contract::Refusal why;
+        require(contract::captureGraphics(ci,layout,pass,vertex,fragment,retained,definition,why),"production graphics captures selected1 and enabled EDS1 cull state");
+        require(definition.view({vertex,fragment,layout,pass,true},owned,why) && owned.info.subpass==1 && owned.dynamic.dynamicStateCount==3,"production owned graphics preserves exact selected subpass and EDS1 declaration");++graphicsCaptures;
+        VkPipeline result{};check(vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&owned.info,nullptr,&result));return result;
     }
     void cohort(const char* vertexPath,const char* originalPath,const char* probePath,unsigned count,bool route2){
-        RenderPass2Gpu::prepare(vertexPath,originalPath,probePath);cohortCount=count;originalRoute2=route2;
+        RenderPass2Gpu::prepare(vertexPath,originalPath,probePath);require(previous::dynamicCullEnabled,"EDS1 feature advertised and enabled on this actual device");
+        setCull=reinterpret_cast<PFN_vkCmdSetCullModeEXT>(vkGetDeviceProcAddr(device,"vkCmdSetCullModeEXT"));require(setCull!=nullptr,"actual enabled native dynamic cull setter");cohortCount=count;originalRoute2=route2;
         for(auto* pipeline:{&original,&probe}){vkDestroyPipeline(device,*pipeline,nullptr);*pipeline={};}
         vkDestroyFramebuffer(device,framebuffer,nullptr);framebuffer={};vkDestroyRenderPass(device,renderPass,nullptr);renderPass={};vkDestroyRenderPass(device,legacyPass,nullptr);legacyPass={};
         const auto ms=extra(VK_FORMAT_R32G32B32A32_SFLOAT,VK_SAMPLE_COUNT_4_BIT,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,VK_IMAGE_ASPECT_COLOR_BIT);
@@ -77,10 +106,11 @@ struct CohortGpu:RenderPass2Gpu {
             std::array<VkSubpassDependency,5> dependencies{};for(unsigned i=0;i<dependencies.size();++i){const auto& v=deps[i];dependencies[i]={v.srcSubpass,v.dstSubpass,v.srcStageMask,v.dstStageMask,v.srcAccessMask,v.dstAccessMask,v.dependencyFlags};}
             VkRenderPassCreateInfo legacy{};legacy.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;legacy.attachmentCount=a.size();legacy.pAttachments=a.data();legacy.subpassCount=count;legacy.pSubpasses=s.data();legacy.dependencyCount=ci.dependencyCount;legacy.pDependencies=dependencies.data();check(vkCreateRenderPass(device,&legacy,nullptr,&renderPass));require(contract::captureRenderPass(&legacy,captured,why),"production whole legacy cohort capture");contract::RenderPassView own;require(captured.view(own),"production same-route owned legacy view");check(vkCreateRenderPass(device,&own.info,nullptr,&legacyPass));
         }
+        retained=captured;
         require(captured.subpassCount==count&&captured.subpass(1)->hasDepth&&captured.subpass(0)->hasResolves&&captured.subpass(1)->inputCount==1,"complete cohort and exact target1 roles retained");
         const VkImageView views[]{images[targets[0]].view,images[ms].view,images[resolved].view,images[depth].view};VkFramebufferCreateInfo fb{};fb.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fb.renderPass=renderPass;fb.attachmentCount=4;fb.pAttachments=views;fb.width=fb.height=fb.layers=1;check(vkCreateFramebuffer(device,&fb,nullptr,&framebuffer));
         VkShaderModule vertex{},stock{},instrumented{};const auto release=[&]{for(auto m:{vertex,stock,instrumented})if(m)vkDestroyShaderModule(device,m,nullptr);};
-        try{vertex=module(borrowed::shader(vertexPath));stock=module(borrowed::shader(originalPath));instrumented=module(borrowed::shader(probePath));original=cohortPipeline(vertex,stock,originalLayout,renderPass);probe=cohortPipeline(vertex,instrumented,pipelineLayout,legacyPass);}catch(...){release();throw;}release();
+        try{vertex=module(vertexEntry(borrowed::shader(vertexPath)));stock=module(borrowed::shader(originalPath));instrumented=module(borrowed::shader(probePath));original=cohortPipeline(vertex,stock,originalLayout,renderPass);probe=cohortPipeline(vertex,instrumented,pipelineLayout,legacyPass);}catch(...){release();throw;}release();
     }
     Result execute(const borrowed::Case& c){
         std::memset(buffers[b4].mapped,0,272);std::memset(buffers[b6].mapped,0,2800);
@@ -108,6 +138,7 @@ struct CohortGpu:RenderPass2Gpu {
         vkCmdPushConstants(command,originalLayout,VK_SHADER_STAGE_VERTEX_BIT,0,16,c.u.data());++pushWrites;
         const VkViewport viewport{0,0,1,1,0,1};const VkRect2D scissor{{0,0},{1,1}};
         vkCmdSetViewport(command,0,1,&viewport);++viewportWrites;vkCmdSetScissor(command,0,1,&scissor);++scissorWrites;
+        setCull(command,VK_CULL_MODE_NONE);++cullWrites;
         vkCmdBindIndexBuffer(command,buffers[indexBuffer].value,0,VK_INDEX_TYPE_UINT16);++indexBinds;
         for(unsigned stage=0;stage<3;++stage){
             // Independent owned render-pass executions reuse all four images.
@@ -160,7 +191,8 @@ int main(int argc,char** argv){try{
             for(unsigned i=0;i<4;++i){require(out.record[28+i]==out.observed[i],"same target1 invocation exact RGBA record");require(out.record[6+i]==bits(c.r1[i])&&out.record[10+i]==bits(c.r0[i]),"unchanged original UBO access");}
             require(out.record[16]==c.flags,"unchanged consumed flags");for(unsigned i=0;i<2;++i)require(out.record[4+i]==bits(c.u[i])&&out.record[14+i]==bits(c.patch[i]),"unchanged push input and patch");++cases;
         }
+        require(gpu.graphicsCaptures==2&&gpu.cullWrites==2,"enabled native EDS1 setter and production graphics decoder executed");
         require(gpu.nexts==6*(count-1)&&gpu.begins2==6&&gpu.ends2==6&&gpu.indexedDraws==6&&gpu.restores==2,"only target1 observer replacement; remaining empty subpasses complete before HOST export");++cohorts;
     }
-    require(borrowed::validationErrors.load()==0,"validation/synchronization clean including teardown");std::cout<<"{\"schema\":\"owned-renderpass-cohort-gpu-v1\",\"cohorts\":"<<cohorts<<",\"cases\":"<<cases<<",\"checks\":"<<borrowed::checks<<",\"device_name\":\""<<name<<"\",\"selected_subpass\":1,\"legacy_and_rp2\":true,\"depth_resolve_input_preserve\":true,\"bit_exact_original_observer_restore\":true,\"record_bytes\":128,\"validation_enabled\":true,\"validation_errors\":0,\"native_admission_proven\":false,\"passthrough_authorized\":false}\n";return 0;
+    require(borrowed::validationErrors.load()==0,"validation/synchronization clean including teardown");std::cout<<"{\"schema\":\"owned-renderpass-cohort-gpu-v1\",\"cohorts\":"<<cohorts<<",\"cases\":"<<cases<<",\"checks\":"<<borrowed::checks<<",\"device_name\":\""<<name<<"\",\"selected_subpass\":1,\"eds1_cull_advertised_enabled_set_and_captured\":true,\"legacy_and_rp2\":true,\"depth_resolve_input_preserve\":true,\"bit_exact_original_observer_restore\":true,\"record_bytes\":128,\"validation_enabled\":true,\"validation_errors\":0,\"native_admission_proven\":false,\"passthrough_authorized\":false}\n";return 0;
 }catch(const std::exception& e){std::cerr<<"cohort GPU: "<<e.what()<<"; checks="<<borrowed::checks<<'\n';return 1;}}

@@ -10,6 +10,12 @@ produce bit-identical color and a128-byte record with intact canaries.
 
 Run `python3 tests/native-fragment-renderpass-cohort-gpu/run.py --original <private-original.spv> --record <new-private-receipt.json>` with a current Vulkan validation layer available.
 Both Intel and Lavapipe are required by default, with synchronization validation.
+The device explicitly queries and enables advertised EDS1 dynamic culling; its
+native setter executes, and production graphics capture/view retain that state
+and selected subpass1 for both original and observer pipelines. The tracked
+fixture-owned vertex entry is renamed to match the production entry contract.
+The private original fragment is not changed.
+
 This is host offscreen evidence, not a replay of uncaptured native payloads,
 full pinned native-vertex Clone factory, Frame execution, physical-eye/video-frame
 association or passthrough authorization. Existing unrelated GPU cases are not run.

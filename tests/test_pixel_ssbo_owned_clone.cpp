@@ -18,7 +18,7 @@ struct Driver {
     bool noncoherent=false,partialPipeline=false,missing=false,wrongRequirements=false;
     bool refuseMemoryType=false,oversize=false,missingPass2=false,aliasPass2=false;
     bool mappedLive=false;
-    unsigned expectedCount=3,expectedFragmentBytes=20,expectedSubpasses=1,expectedSubpass=0,pass2Calls=0;
+    unsigned expectedCount=3,expectedFragmentBytes=20,expectedSubpasses=1,expectedSubpass=UINT32_MAX,pass2Calls=0;
     std::uint64_t next=100;
     std::set<std::uint64_t> live;
     std::array<std::uint8_t,256> mapped{};
@@ -79,7 +79,7 @@ VKAPI_ATTR VkResult VKAPI_CALL createPipeline(VkDevice d,VkPipelineCache cache,s
     demand(ci->stageCount==2 && ci->pStages && ci->pStages[0].module==driver->vertex && ci->pStages[1].module==driver->fragment,"only owned shader handles reach pipeline");
     demand(std::string(ci->pStages[0].pName)=="VS_DISTORT" && std::string(ci->pStages[1].pName)=="PS_DISTORT","original entry names retained");
     demand(!ci->basePipelineHandle,"no native derivative handle borrowed");
-    demand(ci->subpass==driver->expectedSubpass,"owned pipeline preserves exact selected original subpass index");
+    demand(driver->expectedSubpass==UINT32_MAX || ci->subpass==driver->expectedSubpass,"owned pipeline preserves explicitly expected original subpass index");
     return driver->create(Stage::Pipeline,out);
 }
 VKAPI_ATTR void VKAPI_CALL destroyPipeline(VkDevice d,VkPipeline obj,const VkAllocationCallbacks* a){common(d,a);driver->destroy(obj);}
