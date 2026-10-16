@@ -361,7 +361,7 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
 }
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& reportedReasons,unsigned& reportedRecipes,
-                      unsigned& reportedSets,std::uint32_t& reportedSetSkips) {
+                      unsigned& reportedSets,std::uint32_t& reportedSetSkips,unsigned& reportedContexts,unsigned& reportedCreations,bool& reportedOverflow) {
     namespace journal=frame_pixel_ssbo_journal;
     static_assert(unsigned(journal::Reason::Count)<63,"bit63 is the sticky observer-failure receipt");
     if(d.definitionBoundary.failed()){
@@ -412,20 +412,29 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
         if(count>0 && static_cast<std::size_t>(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,static_cast<std::size_t>(count));
         reportedSetSkips|=newSkips;
     }
-    const auto newReasons=facts.seenReasons&~reportedReasons;
-    if(newReasons){
-        // One bounded report per reason bit, never one report per native object.
-        char report[768]{};
-        const auto count=std::snprintf(report,sizeof(report),
-            "{\"event\":\"ssbo_definition_refusals\",\"new_reasons\":%llu,\"first_reason\":\"%s\","
-            "\"first_contract_reason\":\"%s\",\"first_kind\":%u,\"first_contract_index\":%u,\"first_contract_type\":%u,"
-            "\"created\":%llu,\"cancelled\":%llu,\"mask_enabled\":false}\n",
-            static_cast<unsigned long long>(newReasons),journal::reasonName(facts.firstRefusal.reason),
-            frame_pixel_ssbo_clone::reasonName(facts.firstRefusal.contract.reason),
-            unsigned(facts.firstRefusal.kind),facts.firstRefusal.contract.index,facts.firstRefusal.contract.type,
-            static_cast<unsigned long long>(facts.created),static_cast<unsigned long long>(facts.cancelled));
-        if(count>0 && static_cast<std::size_t>(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,static_cast<std::size_t>(count));
-        reportedReasons|=newReasons;
+    while(reportedCreations<observed.creationCount){
+        const auto index=reportedCreations++;const auto& item=observed.creations[index];const auto& shape=item.shape;std::ostringstream out;
+        out<<"{\"event\":\"ssbo_definition_creation_shape\",\"shape_index\":"<<index<<",\"kind\":"<<unsigned(shape.kind)<<",\"route\":"<<shape.route<<",\"flags\":"<<shape.flags<<",\"counts\":["<<shape.counts[0]<<','<<shape.counts[1]<<','<<shape.counts[2]<<','<<shape.counts[3]<<"],\"base_index\":"<<shape.baseIndex<<",\"base_handle_present\":"<<(shape.baseHandle?"true":"false")
+           <<",\"first_object\":"<<item.firstObject<<",\"last_object\":"<<item.lastObject<<",\"first_layout\":"<<item.firstLayout<<",\"last_layout\":"<<item.lastLayout<<",\"first_pass\":"<<item.firstPass<<",\"last_pass\":"<<item.lastPass<<",\"count\":"<<item.count<<",\"chain_end\":\""<<frame_pixel_definition_facts::chainEndName(shape.chainEnd)<<"\",\"chain_types\":[";
+        for(std::uint32_t n=0;n<shape.chainCount;++n){if(n)out<<',';out<<shape.chainTypes[n];}
+        out<<"],\"admission_proven\":false,\"native_frame_association_proven\":false,\"mask_enabled\":false}\n";
+        const auto text=out.str();if(text.size()<=2048)frame_pixel_io::writeAll(fd,text.data(),text.size());
+    }
+    auto newReasons=facts.seenReasons&~reportedReasons;
+    const bool overflow=observed.creationOverflow||facts.contextOverflow;
+    // New keyed contexts are grouped, never one report per native create or
+    // repeated failure. NoReady cannot hide later Contract/Layout evidence.
+    while(newReasons||reportedContexts<facts.contextCount||(overflow&&!reportedOverflow)){
+        const auto stop=std::min<unsigned>(facts.contextCount,reportedContexts+8);std::ostringstream out;
+        out<<"{\"event\":\"ssbo_definition_refusals\",\"new_reasons\":"<<newReasons<<",\"first_reason\":\""<<journal::reasonName(facts.firstRefusal.reason)<<"\",\"first_contract_reason\":\""<<frame_pixel_ssbo_clone::reasonName(facts.firstRefusal.contract.reason)<<"\",\"contexts\":[";
+        for(unsigned index=reportedContexts;index<stop;++index){const auto& context=facts.contexts[index];const auto& first=context.first;const auto& last=context.last;
+            if(index!=reportedContexts)out<<',';
+            out<<"{\"context_index\":"<<index<<",\"reason\":\""<<journal::reasonName(first.reason)<<"\",\"kind\":"<<unsigned(first.kind)<<",\"contract_reason\":\""<<frame_pixel_ssbo_clone::reasonName(first.contract.reason)<<"\",\"contract_index\":"<<first.contract.index<<",\"contract_structure_type\":"<<first.contract.type<<",\"first_object\":"<<first.value<<",\"first_generation\":"<<first.generation<<",\"last_object\":"<<last.value<<",\"last_generation\":"<<last.generation<<",\"count\":"<<context.count<<'}';
+        }
+        out<<"],\"inventory\":[";for(unsigned kind=0;kind<6;++kind){if(kind)out<<',';out<<"{\"kind\":"<<kind<<",\"live\":"<<facts.live[kind]<<",\"capacity\":"<<facts.capacity[kind]<<'}';}
+        out<<"],\"context_overflow\":"<<facts.contextOverflow<<",\"creation_shape_overflow\":"<<(observed.creationOverflow?"true":"false")<<",\"created\":"<<facts.created<<",\"cancelled\":"<<facts.cancelled<<",\"native_frame_association_proven\":false,\"mask_enabled\":false}\n";
+        const auto text=out.str();if(text.size()<=8192)frame_pixel_io::writeAll(fd,text.data(),text.size());
+        reportedContexts=stop;reportedReasons|=newReasons;newReasons=0;reportedOverflow=overflow;
     }
     // This optional phase observes complete definitions; it does NOT create or
     // bind a clone. Four receipts are the whole process's reporting budget.
@@ -513,11 +522,11 @@ void writer(Device* d) noexcept {
 #endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     bool definitionFeatureReported=false;std::uint64_t definitionReasons=0;unsigned definitionRecipes=0,definitionSets=0;
-    std::uint32_t definitionSetSkips=0;
+    std::uint32_t definitionSetSkips=0;unsigned definitionContexts=0,definitionCreations=0;bool definitionOverflow=false;
 #endif
     try { while (!d->stop.load(std::memory_order_acquire)) {
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-        definitionStatus(*d,progress,definitionFeatureReported,definitionReasons,definitionRecipes,definitionSets,definitionSetSkips);
+        definitionStatus(*d,progress,definitionFeatureReported,definitionReasons,definitionRecipes,definitionSets,definitionSetSkips,definitionContexts,definitionCreations,definitionOverflow);
 #endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
         d->bridge.tick(d->definitions);
@@ -1001,8 +1010,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass(VkDevice device,const VkRen
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass2(VkDevice device,const VkRenderPassCreateInfo2* info,const VkAllocationCallbacks* alloc,VkRenderPass* out) {
     auto* d=deviceFor(device);const auto result=d->CreateRenderPass2(device,info,alloc,out);
-    if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.unsupported(frame_pixel_ssbo_journal::ObjectKind::RenderPass,
-        frame_pixel_ssbo_clone::handle(*out),VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);});
+    if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.createRenderPass2(*out,*info,result);});
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyRenderPass(VkDevice device,VkRenderPass value,const VkAllocationCallbacks* alloc) {
@@ -1242,7 +1250,9 @@ VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass(VkCommandBuffer command) {
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2(VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
     auto* d=deviceFor(command);session().tracker->beginRenderPass(d->id,command,begin->contents);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    if(info->sType==VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO&&!info->pNext&&begin->sType==VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO&&!begin->pNext&&begin->contents==VK_SUBPASS_CONTENTS_INLINE)
+        d->bridge.beginPass(command,info->renderPass,begin->contents);
+    else d->bridge.unknown(command);
 #endif
     d->CmdBeginRenderPass2(command,info,begin);
 }
@@ -1254,11 +1264,11 @@ VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass2(VkCommandBuffer command,const Vk
     d->CmdNextSubpass2(command,begin,end);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass2(VkCommandBuffer command,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);
+    auto* d=deviceFor(command);d->CmdEndRenderPass2(command,end);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    if(end->sType==VK_STRUCTURE_TYPE_SUBPASS_END_INFO&&!end->pNext)d->bridge.endPass(command);else d->bridge.unknown(command);
 #endif
-    d->CmdEndRenderPass2(command,end);afterRenderPass(d,command,false);
+    afterRenderPass(d,command,false);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRendering(VkCommandBuffer command,const VkRenderingInfo* info) {
     auto* d=deviceFor(command);session().tracker->beginRendering(d->id,command,*info);
