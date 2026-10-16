@@ -26,6 +26,48 @@ const char* reasonName(Reason) noexcept;
 enum class DrawResult : std::uint8_t { ForwardOriginal, ReplacedOriginal };
 enum class Resource : std::uint8_t { Image, View, Memory, DescriptorSet, Pipeline, RenderPass };
 enum class Retirement : std::uint8_t { ResetCommand, BeginCommand, FreeCommand, ResetPool, DestroyPool };
+// Copied callback provenance only. No member grants command, object lifetime,
+// source-frame or eye authority. Numeric refusal/token enums above stay stable.
+enum class Operation : std::uint16_t {
+    Unspecified,BeginCommandBuffer,EndCommandBuffer,CmdBindPipeline,CmdBindDescriptorSets,CmdPushConstants,
+    CmdBeginRenderPass,CmdBeginRenderPass2,CmdBeginRenderPass2KHR,CmdNextSubpass,CmdNextSubpass2,CmdNextSubpass2KHR,
+    CmdEndRenderPass,CmdEndRenderPass2,CmdEndRenderPass2KHR,CmdDraw,CmdDrawIndexed,CmdDrawIndirect,CmdDrawIndexedIndirect,
+    CmdDrawIndirectCount,CmdDrawIndirectCountKHR,CmdDrawIndirectCountAMD,CmdDrawIndexedIndirectCount,CmdDrawIndexedIndirectCountKHR,CmdDrawIndexedIndirectCountAMD,
+    CmdExecuteCommands,CmdBindShadersEXT,CmdDispatch,CmdDispatchIndirect,CmdDispatchBase,CmdDispatchBaseKHR,
+    CmdBeginQuery,CmdBeginQueryIndexedEXT,CmdBeginRendering,CmdBeginRenderingKHR,CmdEndRendering,CmdEndRenderingKHR,
+    QueueSubmit,QueueSubmit2,QueueSubmit2KHR,DescriptorMutation,DescriptorPoolRetiring,ResourceRetiring,DefinitionRetiring,
+    ResetCommandBuffer,FreeCommandBuffers,ResetCommandPool,DestroyCommandPool,DeviceDestroying,CopyRecorded,TargetTicket,Count
+};
+const char* operationName(Operation) noexcept;
+enum class ContextSource : std::uint8_t {Unspecified,Wrapper,RenderPassDecoder,Internal};
+enum class RecordingPhase : std::uint8_t {Unavailable,RecordingOutsidePass,OtherPass,BeforeTargetSubpass,TargetSubpassBeforeDraw,TargetSubpassAfterDraw,AfterTargetSubpass,AfterPass,Executable,Retired};
+const char* phaseName(RecordingPhase) noexcept;
+constexpr std::size_t RecordingContextCapacity=64,CommandContextChains=3,CommandContextHeaders=16;
+struct CommandContextChain {
+    std::uint32_t rootType=UINT32_MAX;
+    std::array<std::uint32_t,CommandContextHeaders> types{};
+    std::uint32_t count=0,termination=0;
+};
+struct CommandContextInput {
+    Operation operation=Operation::Unspecified;ContextSource source=ContextSource::Unspecified;
+    std::uint32_t detailReason=0,structureType=UINT32_MAX,index=UINT32_MAX,chain=UINT32_MAX,contents=UINT32_MAX,flags=0;
+    std::uint64_t object=0;
+    std::array<CommandContextChain,CommandContextChains> chains{};
+};
+struct RecordingContext {
+    CommandContextInput input{};RecordingPhase phase=RecordingPhase::Unavailable;
+    Reason before=Reason::None,after=Reason::None;
+    std::uint64_t sequence=0,transactionEpoch=0,device=0,command=0,pool=0,commandGeneration=0,poolGeneration=0,drawOrdinal=0;
+    std::uint32_t currentSubpass=0,targetSubpass=0,subpassCount=0;
+    bool rejected=false,metadataTruncated=false;
+};
+struct RecordingContextEntry {RecordingContext first{};std::uint64_t count=0,lastSequence=0;};
+struct RecordingContexts {
+    std::array<RecordingContextEntry,RecordingContextCapacity> entries{};std::uint32_t count=0;
+    std::uint64_t attempts=0,overflow=0;
+    bool contended=false,firstRefusalAvailable=false;
+    RecordingContext firstRefusal{};
+};
 
 struct Dispatch {
     PFN_vkCmdPipelineBarrier barrier=nullptr;
@@ -131,7 +173,9 @@ public:
     // inline transitions inside the complete captured pass are admitted.
     bool nextSubpass(VkCommandBuffer,VkSubpassContents=VK_SUBPASS_CONTENTS_INLINE) noexcept;
     void executeSecondary(VkCommandBuffer) noexcept;
-    void unknownRoute(VkCommandBuffer) noexcept;
+    void observe(VkCommandBuffer,const CommandContextInput&) noexcept;
+    void unknownRoute(VkCommandBuffer,const CommandContextInput& = {}) noexcept;
+    RecordingContexts recordingContexts() const noexcept;
     // Exact identity retirement notification at entry, before native destruction.
     void resourceRetiring(Resource,Id) noexcept;
     SubmitTicket beforeSubmit(VkQueue,std::uint32_t,const VkSubmitInfo*) noexcept;

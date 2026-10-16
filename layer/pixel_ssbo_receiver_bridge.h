@@ -11,6 +11,9 @@
 namespace frame_pixel_capture { class LiveTracker; struct Candidate; }
 namespace frame_pixel_ssbo_receiver {
 namespace tx=frame_pixel_ssbo_transaction;
+using Operation=tx::Operation;
+using ContextSource=tx::ContextSource;
+using CommandContext=tx::CommandContextInput;
 enum class Refusal : unsigned {None,Device,Queue,Shader,Clone,Configure,ColdCancelled,
     Recording,Target,CopyCohort,SubmitShape,Execution,DescriptorMutation,UnknownRoute,Release,Record,Selection,DefinitionHistory};
 const char* refusalName(Refusal) noexcept;
@@ -25,6 +28,7 @@ struct Snapshot {
     std::uint64_t sourceExecutions=0,pairedExecution=0,cancellationEpoch=0;
     frame_pixel_ssbo_clone::Identity selectedPipeline{};std::uint64_t learnedCommandGeneration=0,learnedPoolGeneration=0;
     bool unmappedCandidate=false;
+    tx::RecordingContexts recordingContexts{};
 };
 class Bridge {
 public:
@@ -56,7 +60,8 @@ public:
     void endCommand(VkCommandBuffer,VkResult) noexcept;
     bool draw(frame_pixel_capture::LiveTracker&,std::uint64_t,VkCommandBuffer,
               std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t,std::int32_t,bool) noexcept;
-    void unknown(VkCommandBuffer) noexcept;
+    void observe(VkCommandBuffer,const CommandContext&) noexcept;
+    void unknown(VkCommandBuffer,const CommandContext& = {}) noexcept;
     bool deferCopy(const frame_pixel_capture::Candidate&) noexcept;
     void copyRecorded(const frame_pixel_capture::Candidate&) noexcept;
     tx::Transaction::SubmitTicket beforeSubmit(VkQueue,std::uint32_t,const VkSubmitInfo*) noexcept;
