@@ -1,6 +1,7 @@
 #include "../layer/pixel_ssbo_owned_clone.h"
 #include <array>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <set>
 #include <string>
@@ -17,6 +18,7 @@ struct Driver {
     bool noncoherent=false,partialPipeline=false,missing=false,wrongRequirements=false;
     bool refuseMemoryType=false,oversize=false;
     bool mappedLive=false;
+    unsigned expectedCount=3,expectedFragmentBytes=20;
     std::uint64_t next=100;
     std::set<std::uint64_t> live;
     std::array<std::uint8_t,256> mapped{};
@@ -41,7 +43,7 @@ void common(VkDevice d,const VkAllocationCallbacks* a){demand(d==driver->device 
 VKAPI_ATTR VkResult VKAPI_CALL createSet(VkDevice d,const VkDescriptorSetLayoutCreateInfo* ci,const VkAllocationCallbacks* a,VkDescriptorSetLayout* out){
     common(d,a);demand(ci && ci->sType==VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO && !ci->pNext && !ci->flags,"ordinary owned set layout");
     const bool first=!driver->set0;
-    if(first)demand(ci->bindingCount==3 && ci->pBindings[2].binding==9 && ci->pBindings[2].descriptorCount==3,"original Set0 array count retained");
+    if(first)demand(ci->bindingCount==3 && ci->pBindings[2].binding==9 && ci->pBindings[2].descriptorCount==driver->expectedCount,"original Set0 descriptor count retained without native expansion");
     else demand(ci->bindingCount==1 && ci->pBindings[0].binding==0 && ci->pBindings[0].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,"owned Set1 record binding");
     auto result=driver->create(first?Stage::Set0:Stage::Set1,out);
     if(result==VK_SUCCESS)(first?driver->set0:driver->set1)=*out;
@@ -61,7 +63,7 @@ VKAPI_ATTR VkResult VKAPI_CALL createPass(VkDevice d,const VkRenderPassCreateInf
 VKAPI_ATTR void VKAPI_CALL destroyPass(VkDevice d,VkRenderPass obj,const VkAllocationCallbacks* a){common(d,a);driver->destroy(obj);}
 VKAPI_ATTR VkResult VKAPI_CALL createShader(VkDevice d,const VkShaderModuleCreateInfo* ci,const VkAllocationCallbacks* a,VkShaderModule* out){
     common(d,a);const bool first=!driver->vertex;
-    demand(ci->pCode && ci->pCode[0]==0x07230203u && ci->codeSize==(first?9460u:20u),"only explicitly owned original VS/probe PS bytes");
+    demand(ci->pCode && ci->pCode[0]==0x07230203u && ci->codeSize==(first?9460u:driver->expectedFragmentBytes),"only explicitly owned original VS/probe PS bytes");
     auto result=driver->create(first?Stage::Vertex:Stage::Fragment,out);
     if(result==VK_SUCCESS)(first?driver->vertex:driver->fragment)=*out;
     return result;
@@ -190,7 +192,7 @@ void failures(bool noncoherent){
     }
 }
 void refusals(){
-    for(unsigned mode=0;mode<11;++mode){Driver state;driver=&state;Fixture f;Clone clone;
+    for(unsigned mode=0;mode<12;++mode){Driver state;driver=&state;Fixture f;Clone clone;
         if(mode==0)f.p.fragmentSha256[0]^=1;
         if(mode==1)f.recipe.runtimeActivationAuthorized=true;
         if(mode==2)f.p.limits.maxBoundDescriptorSets=1;
@@ -203,6 +205,7 @@ void refusals(){
         if(mode==8)f.p.limits.maxDescriptorSetStorageBuffers=1;
         if(mode==9)f.p.limits.maxPerStageDescriptorStorageBuffers=0;
         if(mode==10)f.p.limits.maxPerStageResources=2;
+        if(mode==11)f.recipe.set0.bindings[2].descriptorCount=1;
         demand(clone.prepare(f.p).status!=Status::Ok && !state.calls && state.live.empty(),"invalid input/missing PFN/budget refuses before driver creation");
     }
     for(unsigned mode=0;mode<4;++mode){Driver state;driver=&state;Fixture f;Clone clone;
@@ -215,5 +218,29 @@ void refusals(){
         demand(clone.prepare(f.p).status==Status::Ok,"unreferenced cold allocation created");
         demand(clone.release().status==Status::Ok && state.live.empty(),"never-recorded allocation needs no invented queue wait");}
 }
+std::vector<std::uint32_t> readShader(const char* path){
+    std::ifstream input(path,std::ios::binary|std::ios::ate);demand(bool(input),"explicit private shader readable");const auto bytes=input.tellg();
+    demand(bytes>=20 && bytes<=std::streamoff(MaximumProbeBytes) && bytes%4==0,"bounded explicit shader extent");
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(bytes)/4);input.seekg(0);
+    demand(bool(input.read(reinterpret_cast<char*>(words.data()),bytes)),"complete explicit shader read");return words;
 }
-int main(){happy(false);happy(true);failures(false);failures(true);refusals();std::cout<<"owned cold-clone lifecycle: "<<checks<<" checks\n";}
+void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
+    const auto vs=readShader(vsPath),ps=readShader(psPath),probe=readShader(probePath);
+    for(unsigned mode=0;mode<5;++mode){Driver state;driver=&state;state.expectedCount=1;state.expectedFragmentBytes=static_cast<unsigned>(probe.size()*4);Fixture f;Clone clone;
+        frame_pixel_ssbo_clone::Refusal why;frame_pixel_ssbo_clone::ProbeInterface profile;
+        demand(frame_pixel_ssbo_clone::ProbeInterface::count1(probe.data(),probe.size()*4,profile,why),"count1 independently pinned interface proof");
+        f.recipe.set0.probeInterface=profile;f.recipe.set0.bindings[2].descriptorCount=1;
+        std::copy(vs.begin(),vs.end(),f.recipe.vertex.words.begin());std::copy(ps.begin(),ps.end(),f.recipe.fragment.words.begin());
+        f.p.fragment=probe.data();f.p.fragmentBytes=probe.size()*4;
+        if(mode==1){f.p.fragment=f.fragment.data();f.p.fragmentBytes=sizeof(f.fragment);} // Self-consistent caller hash, wrong interface.
+        if(mode==2)f.recipe.set0.probeInterface={};
+        if(mode==3)f.recipe.fragment.words[7]^=1;
+        if(mode==4)f.recipe.set0.bindings[2].descriptorCount=3;
+        frame_receiver::Sha256 hash;hash.update(f.p.fragment,f.p.fragmentBytes);f.p.fragmentSha256=hash.finish();
+        const auto result=clone.prepare(f.p);
+        if(mode==0){demand(result.status==Status::Ok && clone.ready(),"count1 original-source plus exact probe cold construction succeeds");demand(clone.release().status==Status::Ok && state.live.empty(),"specialized clone frees complete cold resources");}
+        else demand(result.status==Status::InvalidInput && !state.calls && !clone.ready(),"source/interface/descriptor mismatch refuses before every driver call");
+    }
+}
+}
+int main(int argc,char** argv){demand(argc==1 || argc==4,"optional private VS PS count1-probe paths");happy(false);happy(true);failures(false);failures(true);refusals();if(argc==4)count1Profile(argv[1],argv[2],argv[3]);std::cout<<"owned cold-clone lifecycle: "<<checks<<" checks\n";}

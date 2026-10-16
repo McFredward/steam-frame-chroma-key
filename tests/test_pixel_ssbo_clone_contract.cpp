@@ -167,7 +167,25 @@ void unusedColor(){
     require(!captureRenderPass(&unused.pass,rp,why),"all-unused color refused before dependent resolve pointer");reason(why,Reason::RenderPassShape);
 }
 
-std::vector<std::uint32_t> shader(const char* path){std::ifstream file(path,std::ios::binary|std::ios::ate);require(bool(file),"explicit private module readable");auto bytes=file.tellg();require(bytes>0 && bytes<=std::streamoff(ShaderBytes) && bytes%4==0,"bounded private module bytes");std::vector<std::uint32_t> data(static_cast<std::size_t>(bytes)/4);file.seekg(0);require(bool(file.read(reinterpret_cast<char*>(data.data()),bytes)),"complete private source");return data;}
+std::vector<std::uint32_t> shader(const char* path,std::size_t maximum=ShaderBytes){std::ifstream file(path,std::ios::binary|std::ios::ate);require(bool(file),"explicit private module readable");auto bytes=file.tellg();require(bytes>0 && bytes<=std::streamoff(maximum) && bytes%4==0,"bounded private module bytes");std::vector<std::uint32_t> data(static_cast<std::size_t>(bytes)/4);file.seekg(0);require(bool(file.read(reinterpret_cast<char*>(data.data()),bytes)),"complete private source");return data;}
+void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
+    auto vs=shader(vsPath),ps=shader(psPath),probe=shader(probePath,32768);ProbeInterface profile;Refusal why;
+    require(ProbeInterface::count1(probe.data(),probe.size()*4,profile,why) && profile.specializedCount1(),"actual independently pinned specialized SSBO interface");
+    auto corrupted=probe;corrupted.back()^=1;ProbeInterface absent;
+    require(!ProbeInterface::count1(corrupted.data(),corrupted.size()*4,absent,why) && !absent.specializedCount1(),"caller-provided artifact hash cannot bless wrong executable");reason(why,Reason::ShaderPin);
+    require(!ProbeInterface::count1(nullptr,ProbeInterface::Count1Bytes,absent,why),"null profile refused before hash");
+    require(!ProbeInterface::count1(probe.data(),probe.size()*4-4,absent,why),"bounded exact profile extent");
+    auto vertex=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO),fragment=vertex;
+    vertex.codeSize=vs.size()*4;vertex.pCode=vs.data();fragment.codeSize=ps.size()*4;fragment.pCode=ps.data();
+    Fixture f;f.bindings[5].descriptorCount=1;auto in=f.inputs(vertex,fragment);Recipe recipe;
+    require(!capture(in,recipe,why),"default original array3 still refuses native count1");reason(why,Reason::Image9Extent);
+    in.probeInterface=profile;require(capture(in,recipe,why) && recipe.set0.bindings[5].descriptorCount==1,"explicit verified probe admits owned count1 without expanding native layout");
+    require(recipe.set0.probeInterface.specializedCount1() && recipe.set0.probeInterface.matches(probe.data(),probe.size()*4),"recipe transports only verified profile identity");
+    require(!recipe.set0.probeInterface.matches(ps.data(),ps.size()*4),"original array3 module is not specialized SSBO");
+    require(!recipe.nativeCompatibilityProven && !recipe.nativeLifetimeProven && !recipe.runtimeActivationAuthorized,"count1 recipe never grants native execution authority");
+    f.bindings[5].descriptorCount=3;require(!capture(in,recipe,why),"specialized count1 profile cannot silently accept array3 layout");
+    f.bindings[5].descriptorCount=1;ps[7]^=1;require(!capture(in,recipe,why),"profile token cannot bypass original PS pin");reason(why,Reason::ShaderPin);
+}
 void privateComplete(const char* vsPath,const char* psPath){
     auto vs=shader(vsPath),ps=shader(psPath);auto vertex=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO),fragment=vertex;
     vertex.codeSize=vs.size()*4;vertex.pCode=vs.data();fragment.codeSize=ps.size()*4;fragment.pCode=ps.data();
@@ -189,7 +207,8 @@ void privateComplete(const char* vsPath,const char* psPath){
 }
 int main(int argc,char** argv){
     if(argc==2 && std::strcmp(argv[1],"--unused-color-only")==0){unusedColor();std::cout<<"{\"scope\":\"unused-color-subset\",\"checks\":"<<checks<<"}\n";return 0;}
-    require(argc==1 || argc==3,"optional private VS PS paths only");features();layouts();definitions();unusedColor();
-    const bool privateInput=argc==3;if(privateInput)privateComplete(argv[1],argv[2]);
+    require(argc==1 || argc==3 || argc==4,"optional private VS PS [count1 probe] paths only");features();layouts();definitions();unusedColor();
+    const bool privateInput=argc>=3;if(privateInput)privateComplete(argv[1],argv[2]);
+    if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-clone-definition-controls-v1\",\"checks\":"<<checks<<",\"private_native_pins_tested\":"<<(privateInput?"true":"false")<<",\"recipe_bytes\":"<<sizeof(Recipe)<<",\"native_compatibility_proven\":false,\"runtime_activation_authorized\":false}\n";
 }

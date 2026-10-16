@@ -51,6 +51,43 @@ inline bool boolean(VkBool32 value) noexcept{return value==VK_FALSE || value==VK
 inline bool stages(VkShaderStageFlags value) noexcept {
     return value && (value==VK_SHADER_STAGE_ALL || !(value&~VkShaderStageFlags(0x3f)));
 }
+inline bool digestMatches(const std::array<std::uint8_t,32>& digest,const char* hex) noexcept {
+    constexpr char alphabet[]="0123456789abcdef";
+    for(std::size_t i=0;i<digest.size();++i)if(alphabet[digest[i]>>4]!=hex[i*2] || alphabet[digest[i]&15]!=hex[i*2+1])return false;
+    return true;
+}
+// Default preserves the exact original array3 interface. The only separate
+// count1 profiles are deterministic original-invocation SSBO artifacts built
+// by native_fragment_ssbo_profile.py: Set1, pixel(0,0) or first-covered, exact original PS pin,
+// two exhaustive B9 constant0 accesses and fresh owned interface types. A caller
+// boolean/hash cannot attest that interface; admission hashes the actual bytes
+// against this independently pinned transformer result. No native authority.
+class ProbeInterface {
+public:
+    constexpr ProbeInterface() noexcept=default;
+    bool specializedCount1() const noexcept{return kind_!=0;}
+    bool firstCoveredInvocation() const noexcept{return kind_==2;}
+    static constexpr std::size_t Count1Bytes=9864;
+    static constexpr const char* Count1Sha256="6d666c261114f93436e48c1f52793fe18afbce9552e07b53d4212654c4560020";
+    static constexpr std::size_t FirstCoveredBytes=9616;
+    static constexpr const char* FirstCoveredSha256="e76f8832c87229138e4c6b21bcab7b11e63d98bc016d42f5afb8dd7098c01bcd";
+    static bool count1(const std::uint32_t* words,std::size_t bytes,ProbeInterface& out,Refusal& why) noexcept {
+        out={};why={};
+        if(!words || (bytes!=Count1Bytes && bytes!=FirstCoveredBytes))return refuse(why,Reason::ShaderProfile);
+        frame_receiver::Sha256 digest;digest.update(words,bytes);
+        const auto hash=digest.finish();
+        if(bytes==Count1Bytes && digestMatches(hash,Count1Sha256))out.kind_=1;
+        else if(bytes==FirstCoveredBytes && digestMatches(hash,FirstCoveredSha256))out.kind_=2;
+        else return refuse(why,Reason::ShaderPin);
+        return true;
+    }
+    bool matches(const std::uint32_t* words,std::size_t bytes) const noexcept {
+        if(!kind_)return true; // Historical array3 artifact transport contract.
+        ProbeInterface verified;Refusal why;return count1(words,bytes,verified,why) && verified.kind_==kind_;
+    }
+private:
+    std::uint8_t kind_=0;
+};
 template<class T> std::uint64_t handle(T value) noexcept {
     static_assert(sizeof(value)<=sizeof(std::uint64_t),"bounded public handle representation");
     std::uint64_t result=0;std::memcpy(&result,&value,sizeof(value));return result;
@@ -128,13 +165,15 @@ inline bool enabledFeature(const VkDeviceCreateInfo& in,bool successfulCreate,
 
 struct Set0Definition {
     std::uint32_t count=0;std::array<VkDescriptorSetLayoutBinding,MaxBindings> bindings{};bool complete=false;
+    ProbeInterface probeInterface{};
     bool view(VkDescriptorSetLayoutCreateInfo& out) const noexcept {
         out={};if(!complete)return false;
         out.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         out.bindingCount=count;out.pBindings=bindings.data();return true;
     }
 };
-inline bool captureSet0(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition& out,Refusal& why) noexcept {
+inline bool captureSet0(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition& out,Refusal& why,
+                        ProbeInterface profile={}) noexcept {
     out={};why={};if(!ordinary(in,VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,why))return false;
     if(in.flags || in.bindingCount>MaxBindings)return refuse(why,Reason::Bounds);
     if(in.bindingCount && !in.pBindings)return refuse(why,Reason::NullArray);
@@ -154,12 +193,13 @@ inline bool captureSet0(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition
             // validation requires that full extent even for its constant0
             // accesses. A separately validated specialized module needs its
             // own profile; native count1 must not silently pass this contract.
-            if(binding.descriptorCount<3)return refuse(why,Reason::Image9Extent,i);
+            if(profile.specializedCount1()?binding.descriptorCount!=1:binding.descriptorCount<3)
+                return refuse(why,Reason::Image9Extent,i);
         }
         out.bindings[i]=binding; // Immutable pointers were rejected, never retained.
     }
     if(!found9)return refuse(why,Reason::MissingImage9);
-    out.count=in.bindingCount;out.complete=true;return true;
+    out.count=in.bindingCount;out.probeInterface=profile;out.complete=true;return true;
 }
 struct LayoutDefinition {
     std::uint32_t count=0;std::array<VkPushConstantRange,MaxPushRanges> ranges{};bool complete=false;
@@ -240,11 +280,6 @@ struct ShaderDefinition {
     std::uint32_t bytes=0;std::array<std::uint32_t,ShaderBytes/4> words{};
     std::array<std::uint8_t,32> sha256{};bool complete=false;
 };
-inline bool digestMatches(const std::array<std::uint8_t,32>& digest,const char* hex) noexcept {
-    constexpr char alphabet[]="0123456789abcdef";
-    for(std::size_t i=0;i<digest.size();++i)if(alphabet[digest[i]>>4]!=hex[i*2] || alphabet[digest[i]&15]!=hex[i*2+1])return false;
-    return true;
-}
 inline bool captureShader(const VkShaderModuleCreateInfo& in,ShaderRole role,ShaderDefinition& out,Refusal& why) noexcept {
     out={};why={};if(!ordinary(in,VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,why))return false;
     if(role!=ShaderRole::Vertex && role!=ShaderRole::Fragment)return refuse(why,Reason::ShaderProfile);
@@ -414,6 +449,7 @@ struct Inputs {
     const VkShaderModuleCreateInfo* vertex=nullptr;const VkShaderModuleCreateInfo* fragment=nullptr;
     const VkGraphicsPipelineCreateInfo* graphics=nullptr;
     Identity set0Identity{},layoutIdentity{},renderPassIdentity{},vertexIdentity{},fragmentIdentity{},pipelineIdentity{};
+    ProbeInterface probeInterface{};
 };
 // Call-duration view with a self-pointer; recreate after copying/moving it.
 struct LayoutView {VkPipelineLayoutCreateInfo info{};std::array<VkDescriptorSetLayout,2> sets{};};
@@ -444,7 +480,7 @@ inline bool capture(const Inputs& in,Recipe& out,Refusal& why) noexcept {
     std::memcpy(&set0,&in.set0Identity.value,sizeof(set0));std::memcpy(&layout,&in.layoutIdentity.value,sizeof(layout));
     std::memcpy(&pass,&in.renderPassIdentity.value,sizeof(pass));std::memcpy(&vs,&in.vertexIdentity.value,sizeof(vs));std::memcpy(&ps,&in.fragmentIdentity.value,sizeof(ps));
     if(!enabledFeature(*in.deviceCreate,in.deviceCreateSucceeded,out.feature,why) ||
-       !captureSet0(*in.set0,out.set0,why) || !captureLayout(*in.layout,set0,out.layout,why) ||
+       !captureSet0(*in.set0,out.set0,why,in.probeInterface) || !captureLayout(*in.layout,set0,out.layout,why) ||
        !captureRenderPass(in.renderPass,out.renderPass,why) || !captureShader(*in.vertex,ShaderRole::Vertex,out.vertex,why) ||
        !captureShader(*in.fragment,ShaderRole::Fragment,out.fragment,why) ||
        !captureGraphics(*in.graphics,layout,pass,vs,ps,out.renderPass,out.graphics,why))return false;

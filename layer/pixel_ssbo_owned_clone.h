@@ -19,6 +19,9 @@ struct Preparation {
     const frame_pixel_ssbo_clone::Recipe* recipe=nullptr;
     // Explicit private transformer artifact and its independently pinned digest.
     // This validates artifact transport, not native pipeline compatibility.
+    // For count1 the recipe's separately verified interface additionally pins
+    // this exact canonical original-invocation SSBO artifact, not an arbitrary
+    // caller-supplied digest. Original array3 API behavior remains unchanged.
     const std::uint32_t* fragment=nullptr;
     std::size_t fragmentBytes=0;
     std::array<std::uint8_t,32> fragmentSha256{};
@@ -47,6 +50,9 @@ public:
     bool hostCoherent() const noexcept{return ready_ && coherent_;}
     VkDeviceMemory recordMemory() const noexcept{return ready_?memory_:VK_NULL_HANDLE;}
     VkDeviceSize allocationBytes() const noexcept{return ready_?allocationBytes_:0;}
+    // Immutable facts actually used to construct these owned objects, not a
+    // second caller recipe or a native lifetime/compatibility lease.
+    const frame_pixel_ssbo_clone::Recipe* preparedRecipe() const noexcept{return ready_?&recipe_:nullptr;}
 private:
     struct Procs {
 #define PROC(name) PFN_vk##name name=nullptr;
@@ -62,6 +68,7 @@ private:
         PROC(AllocateDescriptorSets) PROC(UpdateDescriptorSets)
 #undef PROC
     } procs_{};
+    frame_pixel_ssbo_clone::Recipe recipe_{};
     void destroyUnreferenced() noexcept;
     VkDevice device_=VK_NULL_HANDLE;
     VkDescriptorSetLayout set0_=VK_NULL_HANDLE,set1_=VK_NULL_HANDLE;

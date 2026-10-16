@@ -26,10 +26,31 @@ bool validRecipe(const frame_pixel_ssbo_clone::Recipe& r) noexcept {
         r.vertex.bytes==9460 && r.fragment.bytes==6620 && !r.nativeCompatibilityProven &&
         !r.nativeLifetimeProven && !r.runtimeActivationAuthorized;
 }
+bool profileMatches(const Preparation& p) noexcept {
+    namespace clone=frame_pixel_ssbo_clone;
+    const auto& r=*p.recipe;
+    if(!r.set0.probeInterface.matches(p.fragment,p.fragmentBytes))return false;
+    VkDescriptorSetLayoutCreateInfo info{};clone::Set0Definition checked;clone::Refusal why;
+    if(!r.set0.view(info) || !clone::captureSet0(info,checked,why,r.set0.probeInterface))return false;
+    if(!r.set0.probeInterface.specializedCount1())return true;
+    // Specialized bytes prove the probe interface, never the source identity or
+    // native compatibility. Independently rehash both owned original modules.
+    VkShaderModuleCreateInfo module{};module.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    clone::ShaderDefinition original;
+    module.codeSize=r.vertex.bytes;module.pCode=r.vertex.words.data();
+    if(!clone::captureShader(module,clone::ShaderRole::Vertex,original,why))return false;
+    module.codeSize=r.fragment.bytes;module.pCode=r.fragment.words.data();
+    return clone::captureShader(module,clone::ShaderRole::Fragment,original,why);
+}
 }
 
-Result Clone::prepare(const Preparation& p) noexcept {
+Result Clone::prepare(const Preparation& input) noexcept {
     if(device_ || ready_)return {Status::AlreadyPrepared,Stage::None,VK_SUCCESS};
+    if(!input.recipe)return {Status::InvalidInput,Stage::None,VK_SUCCESS};
+    // One cold snapshot is the sole source for all validation and construction.
+    // It remains owned by the prepared clone after caller storage is reused.
+    const frame_pixel_ssbo_clone::Recipe snapshot=*input.recipe;
+    Preparation p=input;p.recipe=&snapshot;
     if(!p.device || !p.downstream || !p.recipe || !validRecipe(*p.recipe) || !p.fragment ||
        p.fragmentBytes<20 || p.fragmentBytes>MaximumProbeBytes || p.fragmentBytes%4 || p.fragment[0]!=0x07230203u ||
        p.memory.memoryTypeCount==0 || p.memory.memoryTypeCount>VK_MAX_MEMORY_TYPES ||
@@ -37,6 +58,7 @@ Result Clone::prepare(const Preparation& p) noexcept {
         return {Status::InvalidInput,Stage::None,VK_SUCCESS};
     frame_receiver::Sha256 digest;digest.update(p.fragment,p.fragmentBytes);
     if(digest.finish()!=p.fragmentSha256)return {Status::InvalidInput,Stage::Fragment,VK_SUCCESS};
+    if(!profileMatches(p))return {Status::InvalidInput,Stage::Fragment,VK_SUCCESS};
     if(!limitsPermit(*p.recipe,p.limits))return {Status::Limits,Stage::None,VK_SUCCESS};
     Procs functions{};
 #define LOAD(name) functions.name=reinterpret_cast<PFN_vk##name>(p.downstream(p.device,"vk" #name));if(!functions.name)return {Status::MissingProc,Stage::None,VK_SUCCESS};
@@ -47,14 +69,14 @@ Result Clone::prepare(const Preparation& p) noexcept {
     LOAD(BindBufferMemory) LOAD(MapMemory) LOAD(UnmapMemory) LOAD(FlushMappedMemoryRanges)
     LOAD(CreateDescriptorPool) LOAD(DestroyDescriptorPool) LOAD(AllocateDescriptorSets) LOAD(UpdateDescriptorSets)
 #undef LOAD
-    device_=p.device;procs_=functions;
+    recipe_=snapshot;device_=p.device;procs_=functions;
     const auto failure=[&](Stage stage,VkResult result) noexcept {
         destroyUnreferenced();return Result{Status::VulkanFailure,stage,result};
     };
     const auto invalid=[&](Stage stage) noexcept {
         destroyUnreferenced();return Result{Status::InvalidInput,stage,VK_SUCCESS};
     };
-    const auto& r=*p.recipe;
+    const auto& r=recipe_;
     VkDescriptorSetLayoutCreateInfo set0Info{};
     if(!r.set0.view(set0Info))return invalid(Stage::Set0);
     auto result=procs_.CreateDescriptorSetLayout(device_,&set0Info,nullptr,&set0_);
@@ -157,7 +179,7 @@ void Clone::destroyUnreferenced() noexcept {
     device_=VK_NULL_HANDLE;set0_=set1_=VK_NULL_HANDLE;layout_=VK_NULL_HANDLE;renderPass_=VK_NULL_HANDLE;
     vertex_=fragment_=VK_NULL_HANDLE;pipeline_=VK_NULL_HANDLE;pool_=VK_NULL_HANDLE;set_=VK_NULL_HANDLE;
     buffer_=VK_NULL_HANDLE;memory_=VK_NULL_HANDLE;mapped_=nullptr;allocationBytes_=0;
-    ready_=referenced_=coherent_=false;procs_={};
+    ready_=referenced_=coherent_=false;procs_={};recipe_={};
 }
 Result Clone::release(ReleaseProof proof) noexcept {
     if(referenced_ && !(proof.allRecordingsRetired && proof.deviceQuiescentOrLost))

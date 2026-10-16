@@ -255,15 +255,32 @@ void privateConcurrency(const std::vector<std::uint32_t>& vs,const std::vector<s
     for(const auto& token:tokens)require(!j.current(token),"every consumed token stale after joined destroy");
     require(j.inspectStats().taken==4 && j.inspectStats().created==9,"bounded inventory retains every successful causal event");
 }
+void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
+    const auto vs=readShader(vsPath),ps=readShader(psPath);
+    std::ifstream input(probePath,std::ios::binary|std::ios::ate);require(bool(input),"private canonical probe readable");const auto bytes=input.tellg();
+    require(bytes==std::streamoff(clone::ProbeInterface::Count1Bytes),"canonical count1 probe extent");std::vector<std::uint32_t> probe(static_cast<std::size_t>(bytes)/4);input.seekg(0);
+    require(bool(input.read(reinterpret_cast<char*>(probe.data()),bytes)),"complete canonical count1 probe");
+    clone::ProbeInterface profile;clone::Refusal why;require(clone::ProbeInterface::count1(probe.data(),probe.size()*4,profile,why),"actual-byte verified cold count1 interface");
+    Fixture f;f.binding.descriptorCount=1;journal::Journal original;f.initialize(original);journal::Event event;
+    require(!original.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.contract.reason==clone::Reason::Image9Extent,"existing journal API rejects unchanged original array3 against count1");
+    journal::Journal specialized(1,profile);f.initialize(specialized);f.definitions(specialized);
+    auto module=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);module.codeSize=vs.size()*4;module.pCode=vs.data();
+    require(specialized.createShader(f.stages[0].module,module,VK_SUCCESS),"count1 still requires exact original vertex");
+    module.codeSize=ps.size()*4;module.pCode=ps.data();require(specialized.createShader(f.stages[1].module,module,VK_SUCCESS),"count1 still requires exact original fragment");
+    require(specialized.createPipeline(object<VkPipeline>(0x80),f.graphics,VK_SUCCESS),"count1 recipe assembled with separately verified original-invocation probe profile");
+    journal::Ready ready;require(specialized.takeReady(ready) && ready.recipe.set0.bindings[0].descriptorCount==1 && ready.recipe.set0.probeInterface.specializedCount1(),"journal retains exact count1 definition and verified profile");
+    require(!ready.nativeAuthority && !ready.recipe.nativeCompatibilityProven && !ready.recipe.runtimeActivationAuthorized,"cold profile grants no native lease or activation");
+}
 }
 int main(int argc,char** argv){
     if(argc==2 && std::strcmp(argv[1],"--layout-flags-only")==0){layoutFlags();std::cout<<"{\"scope\":\"layout-flags-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--metadata-facts-only")==0){metadataDespiteRefusal();std::cout<<"{\"scope\":\"metadata-facts-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
-    require(argc==1 || argc==3,"optional private VS/PS arguments only");
+    require(argc==1 || argc==3 || argc==4,"optional private VS/PS [count1 probe] arguments only");
     deviceControls();publicInventory();publicConcurrency();layoutFlags();metadataDespiteRefusal();
-    if(argc==3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);}
+    if(argc>=3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);}
+    if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-definition-journal-controls-v1\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)
-             <<",\"event_bytes\":"<<sizeof(journal::Event)<<",\"private_native_pins_tested\":"<<(argc==3?"true":"false")
+             <<",\"event_bytes\":"<<sizeof(journal::Event)<<",\"private_native_pins_tested\":"<<(argc>=3?"true":"false")
              <<",\"native_authority\":false,\"runtime_activation_authorized\":false}\n";
     return 0;
 }

@@ -63,7 +63,8 @@ class Journal {
 public:
     // An explicit nonzero seed supports deterministic wrap-boundary controls.
     // It is NOT a source-provided generation or a native authority assertion.
-    explicit Journal(std::uint64_t firstGeneration=1):nextGeneration_(firstGeneration){stats_.journalEpoch=acquireEpoch();}
+    explicit Journal(std::uint64_t firstGeneration=1,clone::ProbeInterface profile={}):
+        nextGeneration_(firstGeneration),probeInterface_(profile){stats_.journalEpoch=acquireEpoch();}
     Journal(const Journal&)=delete;
     Journal& operator=(const Journal&)=delete;
 
@@ -88,7 +89,7 @@ public:
         if(!retired_)frame_pixel_definition_facts::set(facts_,ci,result);
         if(!beginCreate(sets_,value,result,ObjectKind::Set,out))return false;
         clone::Set0Definition definition;clone::Refusal why;
-        if(!clone::captureSet0(ci,definition,why))return fail(out,Reason::Contract,ObjectKind::Set,value,0,why);
+        if(!clone::captureSet0(ci,definition,why,probeInterface_))return fail(out,Reason::Contract,ObjectKind::Set,value,0,why);
         return insert(sets_,value,definition,ObjectKind::Set,out);
     }
     bool createLayout(VkPipelineLayout object,const VkPipelineLayoutCreateInfo& ci,VkResult result,Event* out=nullptr) {
@@ -216,6 +217,7 @@ private:
     template<class T> struct Slot {clone::Identity identity{};T definition{};bool live=false,ready=false;};
     mutable std::mutex mutex_;
     std::uint64_t nextGeneration_=1;
+    clone::ProbeInterface probeInterface_{};
     bool retired_=false;
     Stats stats_{};
     frame_pixel_definition_facts::Facts facts_{};
