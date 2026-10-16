@@ -180,7 +180,7 @@ inline void graphicsDetails(Facts& out,const VkGraphicsPipelineCreateInfo& ci,Vk
     if(out.graphicsCount==MaxGraphics){out.graphicsOverflow=true;return;}
     auto& captured=out.graphics[out.graphicsCount++];captured.sequence=out.graphicsSequence;
     captured.pipeline=object;captured.layout=rawHandle(ci.layout);captured.renderPass=rawHandle(ci.renderPass);captured.subpass=ci.subpass;captured.scope=scope;
-    const auto stage=[&](GraphicsState which,const VkPipelineShaderStageCreateInfo& in){auto& state=captured.states[static_cast<unsigned>(which)];state.present=true;state.type=in.sType;state.flags=in.flags;state.read=GraphicsRead::Complete;graphicsState(state,in.pNext);};
+    const auto stage=[&](GraphicsState which,const VkPipelineShaderStageCreateInfo& in){auto& state=captured.states[static_cast<unsigned>(which)];state.present=true;state.type=in.sType;state.flags=in.flags;state.counts={in.pSpecializationInfo!=nullptr,in.module!=VK_NULL_HANDLE};state.read=GraphicsRead::Complete;graphicsState(state,in.pNext);};
     stage(GraphicsState::VertexStage,*vertex);stage(GraphicsState::FragmentStage,*fragment);
     auto& pipeline=captured.states[static_cast<unsigned>(GraphicsState::Pipeline)];pipeline.present=true;pipeline.type=ci.sType;pipeline.flags=ci.flags;pipeline.counts={ci.stageCount,ci.subpass};pipeline.read=GraphicsRead::Complete;pipeline.chainEnd=ChainEnd::Complete;
     if(ci.pDynamicState){const auto& in=*ci.pDynamicState;auto& state=captured.states[static_cast<unsigned>(GraphicsState::Dynamic)];state.present=true;state.type=in.sType;

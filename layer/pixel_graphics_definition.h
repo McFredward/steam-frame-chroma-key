@@ -8,7 +8,7 @@ namespace frame_pixel_ssbo_clone {
 // Exact finite graphics state, rebuilt only on the cold owner thread. Dynamic
 // values are not replaced or replayed: the original command stream still owns
 // them when the temporary compatible pipeline is bound.
-constexpr std::size_t GraphicsDynamicCapacity=64,GraphicsExtensionCapacity=16,GraphicsSampleCapacity=128;
+constexpr std::size_t GraphicsDynamicCapacity=MaxDynamics,GraphicsExtensionCapacity=16,GraphicsSampleCapacity=128;
 enum class GraphicsParent : unsigned {Vertex,Assembly,Viewport,Raster,Multisample,Depth,Blend,Dynamic,Count};
 #define GHVR_GRAPHICS_EXTENSIONS(X) \
     X(Divisor,VkPipelineVertexInputDivisorStateCreateInfoEXT,divisor,VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT) \
@@ -152,6 +152,11 @@ inline bool captureGraphicsExtensions(GraphicsParent parent,const void* input,Gr
         for(unsigned i=0;i<count;++i)if(seen[i]==node)return refuse(why,Reason::ChainCycle,count,static_cast<std::uint32_t>(node->sType));
         if(count==seen.size())return refuse(why,Reason::Bounds,count,static_cast<std::uint32_t>(node->sType));
         seen[count++]=node;GraphicsExtension slot=GraphicsExtension::Count;
+#define ITEM(kind,type,member,tag) case tag:slot=GraphicsExtension::kind;break;
+        switch(node->sType){GHVR_GRAPHICS_EXTENSIONS(ITEM) default:return refuse(why,Reason::Extension,count-1,static_cast<std::uint32_t>(node->sType));}
+#undef ITEM
+        const auto mask=UINT64_C(1)<<unsigned(slot);
+        if(out.extensionMask&mask)return refuse(why,Reason::DuplicateNode,count-1,static_cast<std::uint32_t>(node->sType));
 #define COPY(tag,expected,member,kind) case tag: { \
             if(parent!=GraphicsParent::expected)return refuse(why,Reason::Extension,count-1,static_cast<std::uint32_t>(node->sType)); \
             slot=GraphicsExtension::kind;out.extensions.member=*reinterpret_cast<const decltype(out.extensions.member)*>(node);out.extensions.member.pNext=nullptr;auto& value=out.extensions.member;
@@ -235,7 +240,6 @@ inline bool captureGraphicsExtensions(GraphicsParent parent,const void* input,Gr
         }
 #undef COPY
 #undef DONE
-        const auto mask=UINT64_C(1)<<unsigned(slot);if(out.extensionMask&mask)return refuse(why,Reason::DuplicateNode,count-1,static_cast<std::uint32_t>(node->sType));
         out.extensionMask|=mask;out.extensionOrder[unsigned(parent)][out.extensionCounts[unsigned(parent)]++]=slot;
     }
     return true;
@@ -246,12 +250,13 @@ inline bool exactEntry(const char* source,const char* expected) noexcept {
 }
 inline bool captureGraphics(const VkGraphicsPipelineCreateInfo& in,VkPipelineLayout resolvedLayout,
         VkRenderPass resolvedRenderPass,VkShaderModule vertexModule,VkShaderModule fragmentModule,
-        const RenderPassDefinition& pass,GraphicsDefinition& out,Refusal& why) noexcept {
+        const RenderPassDefinition& pass,GraphicsDefinition& out,Refusal& why,
+        const FeatureFacts* admittedDevice=nullptr) noexcept {
     out={};why={};if(in.sType!=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)return refuse(why,Reason::Type);
     if(in.pNext)return refuse(why,Reason::PipelineExtension);
     // basePipelineIndex is ignored when DERIVATIVE is absent; preserve its
     // scalar value (including zero-initialized native CIs), never invent flags.
-    if(in.flags || in.basePipelineHandle)return refuse(why,Reason::PipelineFlags);
+    if(in.flags)return refuse(why,Reason::PipelineFlags);
     if(!resolvedLayout || !resolvedRenderPass || in.layout!=resolvedLayout || in.renderPass!=resolvedRenderPass)
         return refuse(why,Reason::Identity);
     const auto* selected=pass.subpass(in.subpass);
@@ -349,12 +354,21 @@ inline bool captureGraphics(const VkGraphicsPipelineCreateInfo& in,VkPipelineLay
            (!dynamic(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE)&&!boolean(out.depth.stencilTestEnable))||
            (!dynamic(VK_DYNAMIC_STATE_DEPTH_BOUNDS)&&(dynamic(VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE)||out.depth.depthBoundsTestEnable)&&(!std::isfinite(out.depth.minDepthBounds)||!std::isfinite(out.depth.maxDepthBounds))))return refuse(why,Reason::Scalar);
     }
-    const bool blendDynamic=all({VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT,VK_DYNAMIC_STATE_LOGIC_OP_EXT,VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,VK_DYNAMIC_STATE_BLEND_CONSTANTS});
+    // enabledFeature currently rejects BLEND_OPERATION_ADVANCED_FEATURES_EXT;
+    // complete checked device facts therefore establish its coherent-operation
+    // feature absent (it is not folded into Vulkan11/12/13). If that whitelist
+    // ever admits the feature, replace this absence proof with its actual bit.
+    // A standalone graphics definition has no such checked device knowledge.
+    // This is cold semantic policy, never native runtime authorization.
+    const bool advancedDisabled=admittedDevice&&admittedDevice->complete;
+    const bool dynamicBlendArrays=all({VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT})&&
+        (dynamic(VK_DYNAMIC_STATE_COLOR_BLEND_ADVANCED_EXT)||advancedDisabled);
+    const bool blendDynamic=dynamicBlendArrays&&all({VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT,VK_DYNAMIC_STATE_LOGIC_OP_EXT,VK_DYNAMIC_STATE_BLEND_CONSTANTS});
     out.hasBlend=!discard&&selected->colorCount&&in.pColorBlendState;
     if(!discard&&selected->colorCount&&!out.hasBlend&&!blendDynamic)return refuse(why,Reason::NullArray);
     if(out.hasBlend){
         STATE(pColorBlendState,VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,blend,Blend)
-        out.blend.pAttachments=nullptr;out.hasColors=!all({VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT});
+        out.blend.pAttachments=nullptr;out.hasColors=!dynamicBlendArrays;
         if(out.blend.flags||(!dynamic(VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT)&&!boolean(out.blend.logicOpEnable))||
            (out.hasColors&&(out.blend.attachmentCount!=selected->colorCount||!copyArray(in.pColorBlendState->pAttachments,out.blend.attachmentCount,out.colors,why))))return refuse(why,Reason::Bounds);
         if(out.hasColors&&!dynamic(VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT))for(unsigned i=0;i<out.blend.attachmentCount;++i)if(!boolean(out.colors[i].blendEnable))return refuse(why,Reason::Scalar,i);
@@ -364,8 +378,9 @@ inline bool captureGraphics(const VkGraphicsPipelineCreateInfo& in,VkPipelineLay
     out.info=in;out.info.pNext=nullptr;out.info.pStages=nullptr;out.info.pVertexInputState=nullptr;out.info.pInputAssemblyState=nullptr;
     out.info.pTessellationState=nullptr;out.info.pViewportState=nullptr;out.info.pRasterizationState=nullptr;
     out.info.pMultisampleState=nullptr;out.info.pDepthStencilState=nullptr;out.info.pColorBlendState=nullptr;out.info.pDynamicState=nullptr;
-    out.info.layout=VK_NULL_HANDLE;out.info.renderPass=VK_NULL_HANDLE;out.complete=true;return true;
+    out.info.layout=VK_NULL_HANDLE;out.info.renderPass=VK_NULL_HANDLE;out.info.basePipelineHandle=VK_NULL_HANDLE;out.complete=true;return true;
 }
 
 } // namespace frame_pixel_ssbo_clone
+#undef GHVR_GRAPHICS_EXTENSIONS
 #endif

@@ -128,6 +128,13 @@ void graphicsDetails(){
     facts::graphicsDetails(vertex,ci,VK_SUCCESS,102);require(vertex.graphics[0].states[static_cast<unsigned>(facts::GraphicsState::VertexInput)].read==facts::GraphicsRead::Ignored,"fully dynamic vertex input skips entire ignored pointer");
     facts::Facts unsupported;facts::device(unsupported,device,VK_SUCCESS);ci.flags=VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;ci.pStages=reinterpret_cast<const VkPipelineShaderStageCreateInfo*>(std::uintptr_t(1));facts::graphicsDetails(unsupported,ci,VK_SUCCESS,103);
     require(!unsupported.graphicsCount,"library/unknown top-level semantics remain top-level observations only");
+    facts::Facts arrays;facts::device(arrays,device,VK_SUCCESS);ci.flags=0;ci.pStages=stages.data();ci.pVertexInputState=nullptr;raster.rasterizerDiscardEnable=VK_FALSE;
+    std::array<VkDynamicState,6> blendDynamic{{VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT,VK_DYNAMIC_STATE_LOGIC_OP_EXT,VK_DYNAMIC_STATE_BLEND_CONSTANTS}};dynamic.dynamicStateCount=blendDynamic.size();dynamic.pDynamicStates=blendDynamic.data();
+    auto viewport=info<VkPipelineViewportStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO);viewport.pViewports=reinterpret_cast<const VkViewport*>(std::uintptr_t(1));viewport.pScissors=reinterpret_cast<const VkRect2D*>(std::uintptr_t(1));ci.pViewportState=&viewport;
+    multisample.pNext=nullptr;multisample.pSampleMask=reinterpret_cast<const VkSampleMask*>(std::uintptr_t(1));ci.pMultisampleState=&multisample;
+    auto blend=info<VkPipelineColorBlendStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO);blend.attachmentCount=UINT32_MAX;blend.pAttachments=reinterpret_cast<const VkPipelineColorBlendAttachmentState*>(std::uintptr_t(1));ci.pColorBlendState=&blend;
+    facts::graphicsDetails(arrays,ci,VK_SUCCESS,104,{true,1,false});require(arrays.graphicsCount==1&&arrays.graphics[0].states[static_cast<unsigned>(facts::GraphicsState::ColorBlend)].counts[0]==UINT32_MAX,"EDS3 ignored attachment arrays remain untouched while valid parent flags/headers/count scalars are observed");
+    ci.pColorBlendState=nullptr;ci.pViewportState=nullptr;ci.pMultisampleState=nullptr;facts::graphicsDetails(arrays,ci,VK_SUCCESS,105,{true,1,false});require(arrays.graphicsCount==2&&!arrays.graphics[1].states[static_cast<unsigned>(facts::GraphicsState::ColorBlend)].present,"optional null fully dynamic parent does not become a fabricated state definition");
 }
 
 }
