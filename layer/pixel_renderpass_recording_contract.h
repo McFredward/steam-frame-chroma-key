@@ -12,6 +12,10 @@
 
 namespace frame_pixel_renderpass_recording {
 constexpr std::size_t MaxChain=16,MaxAttachments=8,MaxLocationEntries=32;
+// Public registry extension 606, offset 4. Older supported Vulkan headers do
+// not name it yet. Header-only recognition refuses its memory-write/query
+// semantics; no private declaration or payload interpretation is introduced.
+constexpr std::uint32_t PerformanceCountersBeginType=1000605004;
 enum class Reason : std::uint8_t {None,NullInfo,Type,Contents,UnknownExtension,UnsupportedExtension,
     WrongParent,DuplicateType,ChainCycle,ChainBounds,ArrayBounds,NullArray,DeviceMask,RenderArea,Identity};
 enum class Chain : std::uint8_t {RenderPassBegin,SubpassBegin,SubpassEnd,Count};
@@ -57,7 +61,8 @@ inline bool knownBeginType(std::uint32_t type) noexcept {
     case VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT:
     case VK_STRUCTURE_TYPE_RENDER_PASS_TRANSFORM_BEGIN_INFO_QCOM:
     case VK_STRUCTURE_TYPE_MULTIVIEW_PER_VIEW_RENDER_AREAS_RENDER_PASS_BEGIN_INFO_QCOM:
-    case VK_STRUCTURE_TYPE_RENDER_PASS_STRIPE_BEGIN_INFO_ARM:return true;
+    case VK_STRUCTURE_TYPE_RENDER_PASS_STRIPE_BEGIN_INFO_ARM:
+    case PerformanceCountersBeginType:return true;
     default:return false;}
 }
 inline bool knownEndType(std::uint32_t type) noexcept {
@@ -96,9 +101,16 @@ inline void chainPolicy(const Nodes& nodes,Chain chain,Shape& out) noexcept {
         }
         if(knownEndType(type)){refuse(out,Reason::WrongParent,chain,i,type);continue;}
         if(!knownBeginType(type)){refuse(out,Reason::UnknownExtension,chain,i,type);continue;}
-        // Do not inspect any extension payload after structural/earlier failure.
-        // All public headers have already survived the independent census.
-        if(out.refusal.reason!=Reason::None)continue;
+        if(type!=VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO&&
+           type!=VK_STRUCTURE_TYPE_DEVICE_GROUP_RENDER_PASS_BEGIN_INFO&&
+           type!=VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT)
+            refuse(out,Reason::UnsupportedExtension,chain,i,type);
+    }
+    // Validate the WHOLE chain before any payload. An unknown later header
+    // cannot cause us to inspect an array governed by unsupported semantics.
+    if(out.refusal.reason!=Reason::None)return;
+    for(std::uint32_t i=0;i<facts.count;++i){const auto type=facts.types[i];
+        if(out.refusal.reason!=Reason::None)break;
         switch(type){
         case VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO:{
             const auto& in=*reinterpret_cast<const VkRenderPassAttachmentBeginInfo*>(nodes.values[i]);

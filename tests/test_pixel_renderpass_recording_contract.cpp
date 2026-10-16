@@ -32,7 +32,7 @@ void ordinary(){
         require(chain(shape,r::Chain::SubpassEnd).rootType==VK_STRUCTURE_TYPE_SUBPASS_END_INFO,"Next2 both roots observed");
         require(r::end2(&end,shape)&&shape.operation==r::Operation::End&&shape.renderPass2,"ordinary Core/KHR End2 admitted");
     }
-    for(auto contents:{VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS,static_cast<VkSubpassContents>(2),static_cast<VkSubpassContents>(-1)}){
+    for(auto contents:{VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS,static_cast<VkSubpassContents>(2),static_cast<VkSubpassContents>(3)}){
         require(!r::begin(&begin,contents,shape)&&shape.refusal.reason==r::Reason::Contents,"non-inline legacy Begin refused");
         sub.contents=contents;require(!r::begin2(&begin,&sub,shape)&&shape.refusal.chain==r::Chain::SubpassBegin,"non-inline Begin2 refused in exact root");
         require(!r::next(contents,shape)&&shape.refusal.reason==r::Reason::Contents,"non-inline legacy Next refused");
@@ -121,6 +121,10 @@ void censusAndParents(){
     require(!r::begin2(&begin,&sub,shape)&&shape.refusal.reason==r::Reason::UnknownExtension,"unknown extension never silently admitted");
     require(chain(shape,r::Chain::RenderPassBegin).count==3&&chain(shape,r::Chain::RenderPassBegin).types[2]==group.sType,"unknown payload not read and later full header chain retained");
     require(shape.refusal.index==0&&shape.refusal.type==static_cast<std::uint32_t>(unknown.sType),"unknown exact type/index retained");
+    auto realAttach=info<VkRenderPassAttachmentBeginInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO);
+    realAttach.attachmentCount=1;realAttach.pAttachments=poison<VkImageView>();realAttach.pNext=&unknown;unknown.pNext=nullptr;begin.pNext=&realAttach;
+    require(!r::begin(&begin,VK_SUBPASS_CONTENTS_INLINE,shape)&&shape.refusal.reason==r::Reason::UnknownExtension&&shape.refusal.index==1,"later unknown header refuses before preceding governed array access");
+    begin.pNext=&unknown;
     unknown.pNext=&unknown;require(!r::begin(&begin,VK_SUBPASS_CONTENTS_INLINE,shape)&&shape.refusal.reason==r::Reason::ChainCycle&&chain(shape,r::Chain::RenderPassBegin).termination==r::Termination::Cycle,"self-cycle finite refusal");
     unknown.pNext=&attach;attach.pNext=&unknown;require(!r::begin(&begin,VK_SUBPASS_CONTENTS_INLINE,shape)&&chain(shape,r::Chain::RenderPassBegin).count==2,"multi-node cycle finite");
     attach.pNext=&group;group.pNext=nullptr;group.sType=attach.sType;begin.pNext=&attach;
@@ -139,7 +143,7 @@ void censusAndParents(){
         sub.pNext=nullptr;end.pNext=&node;
         require(!r::next2(&sub,&end,shape)&&shape.refusal.reason==r::Reason::WrongParent&&shape.refusal.chain==r::Chain::SubpassEnd,"known Begin extension cannot migrate to SubpassEnd");
     }
-    for(const auto type:{VK_STRUCTURE_TYPE_RENDER_PASS_TRANSFORM_BEGIN_INFO_QCOM,VK_STRUCTURE_TYPE_MULTIVIEW_PER_VIEW_RENDER_AREAS_RENDER_PASS_BEGIN_INFO_QCOM,VK_STRUCTURE_TYPE_RENDER_PASS_STRIPE_BEGIN_INFO_ARM}){
+    for(const auto type:{VK_STRUCTURE_TYPE_RENDER_PASS_TRANSFORM_BEGIN_INFO_QCOM,VK_STRUCTURE_TYPE_MULTIVIEW_PER_VIEW_RENDER_AREAS_RENDER_PASS_BEGIN_INFO_QCOM,VK_STRUCTURE_TYPE_RENDER_PASS_STRIPE_BEGIN_INFO_ARM,static_cast<VkStructureType>(r::PerformanceCountersBeginType)}){
         auto node=info<VkBaseInStructure>(type);begin.pNext=&node;sub.pNext=nullptr;
         require(!r::begin2(&begin,&sub,shape)&&shape.refusal.reason==r::Reason::UnsupportedExtension&&shape.refusal.type==static_cast<std::uint32_t>(type),"known vendor Begin semantics explicitly refused without reading payload");
     }
