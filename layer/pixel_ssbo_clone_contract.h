@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <type_traits>
 
 namespace frame_pixel_ssbo_clone {
@@ -116,18 +117,137 @@ struct FeatureFacts {
     VkBool32 raw=VK_FALSE;
     bool nativeAuthority=false;
 };
+// Public named scalar validation only; never scan struct padding or rewrite
+// the original request. Non-storage feature declarations may be enabled or
+// disabled independently. Their presence is not native route/lifetime proof.
+inline bool featureValues(std::initializer_list<VkBool32> values,std::uint32_t index,
+                          VkStructureType type,Refusal& why) noexcept {
+    for(const auto value:values)if(!boolean(value))return refuse(why,Reason::FeatureValue,index,static_cast<std::uint32_t>(type));
+    return true;
+}
+inline bool coreFeatureValues(const VkPhysicalDeviceFeatures& f,std::uint32_t index,
+                              VkStructureType type,Refusal& why) noexcept {
+    return featureValues({f.robustBufferAccess,f.fullDrawIndexUint32,f.imageCubeArray,f.independentBlend,f.geometryShader,
+            f.tessellationShader,f.sampleRateShading,f.dualSrcBlend,f.logicOp,f.multiDrawIndirect,
+            f.drawIndirectFirstInstance,f.depthClamp,f.depthBiasClamp,f.fillModeNonSolid,f.depthBounds,
+            f.wideLines,f.largePoints,f.alphaToOne,f.multiViewport,f.samplerAnisotropy,f.textureCompressionETC2,
+            f.textureCompressionASTC_LDR,f.textureCompressionBC,f.occlusionQueryPrecise,
+            f.pipelineStatisticsQuery,f.vertexPipelineStoresAndAtomics,f.fragmentStoresAndAtomics,
+            f.shaderTessellationAndGeometryPointSize,f.shaderImageGatherExtended,
+            f.shaderStorageImageExtendedFormats,f.shaderStorageImageMultisample,
+            f.shaderStorageImageReadWithoutFormat,f.shaderStorageImageWriteWithoutFormat,
+            f.shaderUniformBufferArrayDynamicIndexing,f.shaderSampledImageArrayDynamicIndexing,
+            f.shaderStorageBufferArrayDynamicIndexing,f.shaderStorageImageArrayDynamicIndexing,
+            f.shaderClipDistance,f.shaderCullDistance,f.shaderFloat64,f.shaderInt64,f.shaderInt16,
+            f.shaderResourceResidency,f.shaderResourceMinLod,f.sparseBinding,f.sparseResidencyBuffer,
+            f.sparseResidencyImage2D,f.sparseResidencyImage3D,f.sparseResidency2Samples,
+            f.sparseResidency4Samples,f.sparseResidency8Samples,f.sparseResidency16Samples,
+            f.sparseResidencyAliased,f.variableMultisampleRate,f.inheritedQueries},index,type,why);
+}
+inline bool knownFeaturePayload(const VkBaseInStructure* node,std::uint32_t index,Refusal& why) noexcept {
+    switch(node->sType){
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceVulkan11Features*>(node);
+        return featureValues({f.storageBuffer16BitAccess,f.uniformAndStorageBuffer16BitAccess,f.storagePushConstant16,
+            f.storageInputOutput16,f.multiview,f.multiviewGeometryShader,f.multiviewTessellationShader,
+            f.variablePointersStorageBuffer,f.variablePointers,f.protectedMemory,f.samplerYcbcrConversion,
+            f.shaderDrawParameters},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(node);
+        return featureValues({f.samplerMirrorClampToEdge,f.drawIndirectCount,f.storageBuffer8BitAccess,
+            f.uniformAndStorageBuffer8BitAccess,f.storagePushConstant8,f.shaderBufferInt64Atomics,
+            f.shaderSharedInt64Atomics,f.shaderFloat16,f.shaderInt8,f.descriptorIndexing,
+            f.shaderInputAttachmentArrayDynamicIndexing,f.shaderUniformTexelBufferArrayDynamicIndexing,
+            f.shaderStorageTexelBufferArrayDynamicIndexing,f.shaderUniformBufferArrayNonUniformIndexing,
+            f.shaderSampledImageArrayNonUniformIndexing,f.shaderStorageBufferArrayNonUniformIndexing,
+            f.shaderStorageImageArrayNonUniformIndexing,f.shaderInputAttachmentArrayNonUniformIndexing,
+            f.shaderUniformTexelBufferArrayNonUniformIndexing,f.shaderStorageTexelBufferArrayNonUniformIndexing,
+            f.descriptorBindingUniformBufferUpdateAfterBind,f.descriptorBindingSampledImageUpdateAfterBind,
+            f.descriptorBindingStorageImageUpdateAfterBind,f.descriptorBindingStorageBufferUpdateAfterBind,
+            f.descriptorBindingUniformTexelBufferUpdateAfterBind,
+            f.descriptorBindingStorageTexelBufferUpdateAfterBind,f.descriptorBindingUpdateUnusedWhilePending,
+            f.descriptorBindingPartiallyBound,f.descriptorBindingVariableDescriptorCount,
+            f.runtimeDescriptorArray,f.samplerFilterMinmax,f.scalarBlockLayout,f.imagelessFramebuffer,
+            f.uniformBufferStandardLayout,f.shaderSubgroupExtendedTypes,f.separateDepthStencilLayouts,
+            f.hostQueryReset,f.timelineSemaphore,f.bufferDeviceAddress,f.bufferDeviceAddressCaptureReplay,
+            f.bufferDeviceAddressMultiDevice,f.vulkanMemoryModel,f.vulkanMemoryModelDeviceScope,
+            f.vulkanMemoryModelAvailabilityVisibilityChains,f.shaderOutputViewportIndex,f.shaderOutputLayer,
+            f.subgroupBroadcastDynamicId},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceVulkan13Features*>(node);
+        return featureValues({f.robustImageAccess,f.inlineUniformBlock,f.descriptorBindingInlineUniformBlockUpdateAfterBind,
+            f.pipelineCreationCacheControl,f.privateData,f.shaderDemoteToHelperInvocation,
+            f.shaderTerminateInvocation,f.subgroupSizeControl,f.computeFullSubgroups,f.synchronization2,
+            f.textureCompressionASTC_HDR,f.shaderZeroInitializeWorkgroupMemory,f.dynamicRendering,
+            f.shaderIntegerDotProduct,f.maintenance4},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures*>(node);
+        return featureValues({f.timelineSemaphore},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceHostQueryResetFeatures*>(node);
+        return featureValues({f.hostQueryReset},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceCustomBorderColorFeaturesEXT*>(node);
+        return featureValues({f.customBorderColors,f.customBorderColorWithoutFormat},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceExtendedDynamicStateFeaturesEXT*>(node);
+        return featureValues({f.extendedDynamicState},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceExtendedDynamicState3FeaturesEXT*>(node);
+        return featureValues({f.extendedDynamicState3TessellationDomainOrigin,f.extendedDynamicState3DepthClampEnable,
+            f.extendedDynamicState3PolygonMode,f.extendedDynamicState3RasterizationSamples,
+            f.extendedDynamicState3SampleMask,f.extendedDynamicState3AlphaToCoverageEnable,
+            f.extendedDynamicState3AlphaToOneEnable,f.extendedDynamicState3LogicOpEnable,
+            f.extendedDynamicState3ColorBlendEnable,f.extendedDynamicState3ColorBlendEquation,
+            f.extendedDynamicState3ColorWriteMask,f.extendedDynamicState3RasterizationStream,
+            f.extendedDynamicState3ConservativeRasterizationMode,
+            f.extendedDynamicState3ExtraPrimitiveOverestimationSize,f.extendedDynamicState3DepthClipEnable,
+            f.extendedDynamicState3SampleLocationsEnable,f.extendedDynamicState3ColorBlendAdvanced,
+            f.extendedDynamicState3ProvokingVertexMode,f.extendedDynamicState3LineRasterizationMode,
+            f.extendedDynamicState3LineStippleEnable,f.extendedDynamicState3DepthClipNegativeOneToOne,
+            f.extendedDynamicState3ViewportWScalingEnable,f.extendedDynamicState3ViewportSwizzle,
+            f.extendedDynamicState3CoverageToColorEnable,f.extendedDynamicState3CoverageToColorLocation,
+            f.extendedDynamicState3CoverageModulationMode,f.extendedDynamicState3CoverageModulationTableEnable,
+            f.extendedDynamicState3CoverageModulationTable,f.extendedDynamicState3CoverageReductionMode,
+            f.extendedDynamicState3RepresentativeFragmentTestEnable,
+            f.extendedDynamicState3ShadingRateImageEnable},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDeviceSamplerYcbcrConversionFeatures*>(node);
+        return featureValues({f.samplerYcbcrConversion},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDevicePresentIdFeaturesKHR*>(node);
+        return featureValues({f.presentId},index,node->sType,why);
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR: {
+        const auto& f=*reinterpret_cast<const VkPhysicalDevicePresentWaitFeaturesKHR*>(node);
+        return featureValues({f.presentWait},index,node->sType,why);
+    }
+    default:return refuse(why,Reason::Extension,index,static_cast<std::uint32_t>(node->sType));
+    }
+}
 inline bool enabledFeature(const VkDeviceCreateInfo& in,bool successfulCreate,
                            FeatureFacts& out,Refusal& why) noexcept {
     out={};why={};
     if(!successfulCreate)return refuse(why,Reason::NativeCreationFailed);
     if(in.sType!=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO || in.flags)
         return refuse(why,Reason::Type,UINT32_MAX,static_cast<std::uint32_t>(in.sType));
-    const auto observe=[&](VkBool32 value,FeatureSource source) noexcept {
+    const auto observe=[&](VkBool32 value,FeatureSource source,std::uint32_t index=UINT32_MAX,
+                           VkStructureType type=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO) noexcept {
         out.observed=true;out.raw=value;out.source=source;
-        if(!boolean(value))return refuse(why,Reason::FeatureValue);
+        if(!boolean(value))return refuse(why,Reason::FeatureValue,index,static_cast<std::uint32_t>(type));
         out.enabled=value==VK_TRUE;return true;
     };
-    if(in.pEnabledFeatures && !observe(in.pEnabledFeatures->fragmentStoresAndAtomics,FeatureSource::Legacy))return false;
+    if(in.pEnabledFeatures && (!observe(in.pEnabledFeatures->fragmentStoresAndAtomics,FeatureSource::Legacy) ||
+       !coreFeatureValues(*in.pEnabledFeatures,UINT32_MAX,VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,why)))return false;
     std::array<const VkBaseInStructure*,MaxChain> seen{};std::uint32_t count=0,loaderFunctions=0;
     for(auto* node=static_cast<const VkBaseInStructure*>(in.pNext);node;node=node->pNext){
         if(count==seen.size())return refuse(why,Reason::Bounds,count);
@@ -151,19 +271,10 @@ inline bool enabledFeature(const VkDeviceCreateInfo& in,bool successfulCreate,
         }
         if(node->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2){
             if(in.pEnabledFeatures)return refuse(why,Reason::FeatureConflict,index,static_cast<std::uint32_t>(node->sType));
-            if(!observe(reinterpret_cast<const VkPhysicalDeviceFeatures2*>(node)->features.fragmentStoresAndAtomics,
-                        FeatureSource::Features2))return false;
-        }else if(node->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES){
-            // This independent synchronization feature neither supplies nor
-            // disables fragment storage. Inspect the public scalar, preserving
-            // the original chain and the separately observed core feature.
-            if(!boolean(reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures*>(node)->timelineSemaphore))
-                return refuse(why,Reason::FeatureValue,index,static_cast<std::uint32_t>(node->sType));
-        }else if(node->sType!=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES &&
-                 node->sType!=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES &&
-                 node->sType!=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES &&
-                 node->sType!=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES)
-            return refuse(why,Reason::Extension,index,static_cast<std::uint32_t>(node->sType));
+            const auto& features=reinterpret_cast<const VkPhysicalDeviceFeatures2*>(node)->features;
+            if(!observe(features.fragmentStoresAndAtomics,FeatureSource::Features2,index,node->sType) ||
+               !coreFeatureValues(features,index,node->sType,why))return false;
+        }else if(!knownFeaturePayload(node,index,why))return false;
     }
     if(!out.observed)return refuse(why,Reason::FeatureAbsent);
     if(!out.enabled)return refuse(why,Reason::FeatureDisabled);

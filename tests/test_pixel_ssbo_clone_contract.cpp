@@ -105,6 +105,356 @@ void features(){
     f.device.pNext=longChain.data();require(!enabledFeature(f.device,true,result,why),"long malformed chain finite");reason(why,Reason::DuplicateNode);
 }
 
+// Exact12header order from the retained native device-shape receipt. Its
+// payload bits were not captured: the canonical/mixed payloads below are owned
+// adversarial fixtures, never a claim to replay unseen SteamVR feature values.
+struct NativeDeviceChain {
+    VkDeviceCreateInfo device=info<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+    VkLayerDeviceCreateInfo link{},callback{};
+    VkPhysicalDeviceFeatures2 core=info<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+    VkPhysicalDeviceVulkan12Features vulkan12=info<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline=info<VkPhysicalDeviceTimelineSemaphoreFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
+    VkPhysicalDeviceHostQueryResetFeatures host=info<VkPhysicalDeviceHostQueryResetFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES);
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT border=info<VkPhysicalDeviceCustomBorderColorFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT);
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamic=info<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT);
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic3=info<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT);
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr=info<VkPhysicalDeviceSamplerYcbcrConversionFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES);
+    VkPhysicalDevicePresentIdFeaturesKHR presentId=info<VkPhysicalDevicePresentIdFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+    VkPhysicalDevicePresentWaitFeaturesKHR presentWait=info<VkPhysicalDevicePresentWaitFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
+    NativeDeviceChain(){
+        link.sType=callback.sType=VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO;
+        link.function=VK_LAYER_LINK_INFO;callback.function=VK_LOADER_DATA_CALLBACK;
+        link.pNext=&callback;callback.pNext=&core;device.pNext=&link;
+        // Callback/union storage is deliberately not callable authority.
+        link.u.pLayerInfo=reinterpret_cast<VkLayerDeviceLink*>(std::uintptr_t(1));
+        core.features.fragmentStoresAndAtomics=VK_TRUE;
+        core.pNext=&vulkan12;
+        vulkan12.pNext=&timeline;
+        timeline.pNext=&host;
+        host.pNext=&border;
+        border.pNext=&dynamic;
+        dynamic.pNext=&dynamic3;
+        dynamic3.pNext=&ycbcr;
+        ycbcr.pNext=&presentId;
+        presentId.pNext=&presentWait;
+        presentWait.pNext=nullptr;
+    }
+    std::array<const VkBaseInStructure*,12> headers() const noexcept {
+        return {reinterpret_cast<const VkBaseInStructure*>(&link),reinterpret_cast<const VkBaseInStructure*>(&callback),
+            reinterpret_cast<const VkBaseInStructure*>(&core),
+            reinterpret_cast<const VkBaseInStructure*>(&vulkan12),
+            reinterpret_cast<const VkBaseInStructure*>(&timeline),
+            reinterpret_cast<const VkBaseInStructure*>(&host),
+            reinterpret_cast<const VkBaseInStructure*>(&border),
+            reinterpret_cast<const VkBaseInStructure*>(&dynamic),
+            reinterpret_cast<const VkBaseInStructure*>(&dynamic3),
+            reinterpret_cast<const VkBaseInStructure*>(&ycbcr),
+            reinterpret_cast<const VkBaseInStructure*>(&presentId),
+            reinterpret_cast<const VkBaseInStructure*>(&presentWait)};
+    }
+    std::vector<unsigned char> bytes() const {
+        std::vector<unsigned char> result;
+        const auto append=[&](const auto& value){const auto* begin=reinterpret_cast<const unsigned char*>(&value);result.insert(result.end(),begin,begin+sizeof(value));};
+        append(device);append(link);append(callback);
+        append(core);append(vulkan12);append(timeline);append(host);append(border);append(dynamic);append(dynamic3);append(ycbcr);append(presentId);append(presentWait);return result;
+    }
+};
+void nativeDeviceChain(){
+    NativeDeviceChain f;FeatureFacts result;Refusal why;
+    constexpr std::array<std::uint32_t,12> actualHeaders{{48,48,1000059000,51,1000207000,1000261000,
+        1000287002,1000267000,1000455000,1000156004,1000294001,1000248000}};
+    const auto headers=f.headers();for(std::size_t i=0;i<headers.size();++i)require(static_cast<std::uint32_t>(headers[i]->sType)==actualHeaders[i],"entire retained actual12header order is covered");
+    const auto before=f.bytes();
+    require(enabledFeature(f.device,true,result,why) && result.complete && result.enabled && result.source==FeatureSource::Features2,"full actual header chain with owned canonical payloads is observable");
+    require(f.bytes()==before && !result.nativeAuthority,"full chain inspection does not rewrite original request or grant authority");
+    struct Field {VkBool32* value;std::uint32_t index;VkStructureType type;};
+    std::vector<Field> fields;
+    fields.push_back({&f.core.features.robustBufferAccess,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.fullDrawIndexUint32,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.imageCubeArray,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.independentBlend,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.geometryShader,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.tessellationShader,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sampleRateShading,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.dualSrcBlend,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.logicOp,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.multiDrawIndirect,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.drawIndirectFirstInstance,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.depthClamp,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.depthBiasClamp,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.fillModeNonSolid,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.depthBounds,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.wideLines,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.largePoints,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.alphaToOne,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.multiViewport,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.samplerAnisotropy,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.textureCompressionETC2,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.textureCompressionASTC_LDR,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.textureCompressionBC,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.occlusionQueryPrecise,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.pipelineStatisticsQuery,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.vertexPipelineStoresAndAtomics,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.fragmentStoresAndAtomics,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderTessellationAndGeometryPointSize,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderImageGatherExtended,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderStorageImageExtendedFormats,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderStorageImageMultisample,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderStorageImageReadWithoutFormat,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderStorageImageWriteWithoutFormat,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderUniformBufferArrayDynamicIndexing,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderSampledImageArrayDynamicIndexing,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderStorageBufferArrayDynamicIndexing,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderStorageImageArrayDynamicIndexing,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderClipDistance,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderCullDistance,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderFloat64,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderInt64,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderInt16,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderResourceResidency,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.shaderResourceMinLod,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseBinding,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseResidencyBuffer,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseResidencyImage2D,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseResidencyImage3D,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseResidency2Samples,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseResidency4Samples,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseResidency8Samples,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseResidency16Samples,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.sparseResidencyAliased,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.variableMultisampleRate,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.core.features.inheritedQueries,2,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2});
+    fields.push_back({&f.vulkan12.samplerMirrorClampToEdge,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.drawIndirectCount,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.storageBuffer8BitAccess,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.uniformAndStorageBuffer8BitAccess,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.storagePushConstant8,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderBufferInt64Atomics,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderSharedInt64Atomics,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderFloat16,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderInt8,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderInputAttachmentArrayDynamicIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderUniformTexelBufferArrayDynamicIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderStorageTexelBufferArrayDynamicIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderUniformBufferArrayNonUniformIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderSampledImageArrayNonUniformIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderStorageBufferArrayNonUniformIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderStorageImageArrayNonUniformIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderInputAttachmentArrayNonUniformIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderUniformTexelBufferArrayNonUniformIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderStorageTexelBufferArrayNonUniformIndexing,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingUniformBufferUpdateAfterBind,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingSampledImageUpdateAfterBind,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingStorageImageUpdateAfterBind,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingStorageBufferUpdateAfterBind,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingUniformTexelBufferUpdateAfterBind,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingStorageTexelBufferUpdateAfterBind,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingUpdateUnusedWhilePending,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingPartiallyBound,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.descriptorBindingVariableDescriptorCount,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.runtimeDescriptorArray,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.samplerFilterMinmax,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.scalarBlockLayout,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.imagelessFramebuffer,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.uniformBufferStandardLayout,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderSubgroupExtendedTypes,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.separateDepthStencilLayouts,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.hostQueryReset,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.timelineSemaphore,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.bufferDeviceAddress,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.bufferDeviceAddressCaptureReplay,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.bufferDeviceAddressMultiDevice,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.vulkanMemoryModel,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.vulkanMemoryModelDeviceScope,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.vulkanMemoryModelAvailabilityVisibilityChains,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderOutputViewportIndex,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.shaderOutputLayer,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.vulkan12.subgroupBroadcastDynamicId,3,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES});
+    fields.push_back({&f.timeline.timelineSemaphore,4,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES});
+    fields.push_back({&f.host.hostQueryReset,5,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES});
+    fields.push_back({&f.border.customBorderColors,6,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT});
+    fields.push_back({&f.border.customBorderColorWithoutFormat,6,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT});
+    fields.push_back({&f.dynamic.extendedDynamicState,7,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3TessellationDomainOrigin,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3DepthClampEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3PolygonMode,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3RasterizationSamples,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3SampleMask,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3AlphaToCoverageEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3AlphaToOneEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3LogicOpEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ColorBlendEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ColorBlendEquation,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ColorWriteMask,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3RasterizationStream,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ConservativeRasterizationMode,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ExtraPrimitiveOverestimationSize,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3DepthClipEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3SampleLocationsEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ColorBlendAdvanced,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ProvokingVertexMode,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3LineRasterizationMode,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3LineStippleEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3DepthClipNegativeOneToOne,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ViewportWScalingEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ViewportSwizzle,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3CoverageToColorEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3CoverageToColorLocation,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3CoverageModulationMode,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3CoverageModulationTableEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3CoverageModulationTable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3CoverageReductionMode,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3RepresentativeFragmentTestEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.dynamic3.extendedDynamicState3ShadingRateImageEnable,8,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT});
+    fields.push_back({&f.ycbcr.samplerYcbcrConversion,9,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES});
+    fields.push_back({&f.presentId.presentId,10,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR});
+    fields.push_back({&f.presentWait.presentWait,11,VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR});
+    for(auto& field:fields){
+        const auto saved=*field.value;
+        for(VkBool32 value:{VkBool32(VK_FALSE),VkBool32(VK_TRUE)}){
+            *field.value=value;const bool required=field.value==&f.core.features.fragmentStoresAndAtomics;
+            const auto unchanged=f.bytes();const bool accepted=enabledFeature(f.device,true,result,why);
+            require(accepted==(!required || value==VK_TRUE),"each known public boolean accepts either canonical scalar independently of required storage");
+            require(f.bytes()==unchanged,"known true/false inspection leaves payloads/pointers unchanged");
+        }
+        *field.value=2;const auto unchanged=f.bytes();
+        require(!enabledFeature(f.device,true,result,why) && !result.complete,"every named known payload field rejects noncanonical VkBool32");
+        require(why.reason==Reason::FeatureValue && why.index==field.index && why.type==static_cast<std::uint32_t>(field.type),"full chain scalar refusal identifies exact node, including late known features");
+        require(f.bytes()==unchanged,"malformed feature refusal never edits native payload");*field.value=saved;
+    }
+    require(fields.size()==141,"all141public boolean fields in actual full chain are exercised");
+    for(std::size_t i=0;i<fields.size();++i)*fields[i].value=static_cast<VkBool32>(i%2);
+    f.core.features.fragmentStoresAndAtomics=VK_TRUE;
+    f.vulkan12.timelineSemaphore=VK_FALSE;f.timeline.timelineSemaphore=VK_TRUE;
+    f.vulkan12.hostQueryReset=VK_TRUE;f.host.hostQueryReset=VK_FALSE;
+    const auto mixed=f.bytes();
+    require(enabledFeature(f.device,true,result,why) && result.enabled && !result.nativeAuthority,"mixed independent flags and promoted native aliases are observation only, not merged authority");
+    require(f.bytes()==mixed,"mixed alias declarations are passed unchanged, not normalized into a new request");
+    f.core.features.fragmentStoresAndAtomics=VK_FALSE;
+    require(!enabledFeature(f.device,true,result,why) && result.observed && !result.enabled,"all other enabled features cannot substitute for actually enabled fragment stores");reason(why,Reason::FeatureDisabled);
+    f.callback.pNext=&f.vulkan12;
+    require(!enabledFeature(f.device,true,result,why) && !result.observed,"complete optional-feature chain without core storage observation stays ineligible");reason(why,Reason::FeatureAbsent);
+    f.callback.pNext=&f.core;f.core.features.fragmentStoresAndAtomics=VK_TRUE;
+    VkPhysicalDeviceFeatures legacy{};legacy.fragmentStoresAndAtomics=VK_TRUE;f.device.pEnabledFeatures=&legacy;
+    require(!enabledFeature(f.device,true,result,why),"legacy core plus Features2 is still refused");reason(why,Reason::FeatureConflict);f.device.pEnabledFeatures=nullptr;
+    for(std::size_t i=2;i<headers.size();++i){
+        VkBaseInStructure duplicate{headers[i]->sType,reinterpret_cast<const VkBaseInStructure*>(std::uintptr_t(1))};f.presentWait.pNext=&duplicate;
+        require(!enabledFeature(f.device,true,result,why) && why.reason==Reason::DuplicateNode && why.index==12,"all known repeated typed nodes refuse before reading missing duplicate payload or next pointer");
+    }
+    VkLayerDeviceCreateInfo repeated=f.link;f.presentWait.pNext=&repeated;
+    require(!enabledFeature(f.device,true,result,why) && why.reason==Reason::DuplicateNode,"repeated loader function remains invalid");
+    for(const auto* node:headers){f.presentWait.pNext=const_cast<VkBaseInStructure*>(node);
+        require(!enabledFeature(f.device,true,result,why) && why.reason==Reason::ChainCycle,"all full-chain pointer-cycle positions are finite refusals");}
+    VkBaseInStructure unknown{static_cast<VkStructureType>(0x7ffffffe),reinterpret_cast<const VkBaseInStructure*>(std::uintptr_t(1))};f.presentWait.pNext=&unknown;
+    require(!enabledFeature(f.device,true,result,why) && why.reason==Reason::Extension && why.index==12 && why.type==0x7ffffffe,"unknown headers stay closed before unknown payload or next pointer");
+    f.presentWait.pNext=nullptr;
+    // Already admitted Vulkan11/13 feature payloads also require every named
+    // public scalar, rather than the former header-only acceptance.
+    auto v11=info<VkPhysicalDeviceVulkan11Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);f.presentWait.pNext=&v11;
+    for(auto member:std::initializer_list<VkBool32 VkPhysicalDeviceVulkan11Features::*>{
+        &VkPhysicalDeviceVulkan11Features::storageBuffer16BitAccess,
+        &VkPhysicalDeviceVulkan11Features::uniformAndStorageBuffer16BitAccess,
+        &VkPhysicalDeviceVulkan11Features::storagePushConstant16,
+        &VkPhysicalDeviceVulkan11Features::storageInputOutput16,
+        &VkPhysicalDeviceVulkan11Features::multiview,
+        &VkPhysicalDeviceVulkan11Features::multiviewGeometryShader,
+        &VkPhysicalDeviceVulkan11Features::multiviewTessellationShader,
+        &VkPhysicalDeviceVulkan11Features::variablePointersStorageBuffer,
+        &VkPhysicalDeviceVulkan11Features::variablePointers,
+        &VkPhysicalDeviceVulkan11Features::protectedMemory,
+        &VkPhysicalDeviceVulkan11Features::samplerYcbcrConversion,
+        &VkPhysicalDeviceVulkan11Features::shaderDrawParameters}){
+        v11.*member=VK_TRUE;require(enabledFeature(f.device,true,result,why),"known core-version scalar canonical true accepted");
+        v11.*member=2;require(!enabledFeature(f.device,true,result,why) && why.reason==Reason::FeatureValue && why.index==12 && why.type==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,"already known core-version malformed scalar refused");
+        v11.*member=VK_FALSE;
+    }
+    auto v13=info<VkPhysicalDeviceVulkan13Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);f.presentWait.pNext=&v13;
+    for(auto member:std::initializer_list<VkBool32 VkPhysicalDeviceVulkan13Features::*>{
+        &VkPhysicalDeviceVulkan13Features::robustImageAccess,
+        &VkPhysicalDeviceVulkan13Features::inlineUniformBlock,
+        &VkPhysicalDeviceVulkan13Features::descriptorBindingInlineUniformBlockUpdateAfterBind,
+        &VkPhysicalDeviceVulkan13Features::pipelineCreationCacheControl,
+        &VkPhysicalDeviceVulkan13Features::privateData,
+        &VkPhysicalDeviceVulkan13Features::shaderDemoteToHelperInvocation,
+        &VkPhysicalDeviceVulkan13Features::shaderTerminateInvocation,
+        &VkPhysicalDeviceVulkan13Features::subgroupSizeControl,
+        &VkPhysicalDeviceVulkan13Features::computeFullSubgroups,
+        &VkPhysicalDeviceVulkan13Features::synchronization2,
+        &VkPhysicalDeviceVulkan13Features::textureCompressionASTC_HDR,
+        &VkPhysicalDeviceVulkan13Features::shaderZeroInitializeWorkgroupMemory,
+        &VkPhysicalDeviceVulkan13Features::dynamicRendering,
+        &VkPhysicalDeviceVulkan13Features::shaderIntegerDotProduct,
+        &VkPhysicalDeviceVulkan13Features::maintenance4}){
+        v13.*member=VK_TRUE;require(enabledFeature(f.device,true,result,why),"known core-version scalar canonical true accepted");
+        v13.*member=2;require(!enabledFeature(f.device,true,result,why) && why.reason==Reason::FeatureValue && why.index==12 && why.type==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,"already known core-version malformed scalar refused");
+        v13.*member=VK_FALSE;
+    }
+    f.device.pNext=nullptr;f.device.pEnabledFeatures=&legacy;
+    for(auto member:std::initializer_list<VkBool32 VkPhysicalDeviceFeatures::*>{
+        &VkPhysicalDeviceFeatures::robustBufferAccess,
+        &VkPhysicalDeviceFeatures::fullDrawIndexUint32,
+        &VkPhysicalDeviceFeatures::imageCubeArray,
+        &VkPhysicalDeviceFeatures::independentBlend,
+        &VkPhysicalDeviceFeatures::geometryShader,
+        &VkPhysicalDeviceFeatures::tessellationShader,
+        &VkPhysicalDeviceFeatures::sampleRateShading,
+        &VkPhysicalDeviceFeatures::dualSrcBlend,
+        &VkPhysicalDeviceFeatures::logicOp,
+        &VkPhysicalDeviceFeatures::multiDrawIndirect,
+        &VkPhysicalDeviceFeatures::drawIndirectFirstInstance,
+        &VkPhysicalDeviceFeatures::depthClamp,
+        &VkPhysicalDeviceFeatures::depthBiasClamp,
+        &VkPhysicalDeviceFeatures::fillModeNonSolid,
+        &VkPhysicalDeviceFeatures::depthBounds,
+        &VkPhysicalDeviceFeatures::wideLines,
+        &VkPhysicalDeviceFeatures::largePoints,
+        &VkPhysicalDeviceFeatures::alphaToOne,
+        &VkPhysicalDeviceFeatures::multiViewport,
+        &VkPhysicalDeviceFeatures::samplerAnisotropy,
+        &VkPhysicalDeviceFeatures::textureCompressionETC2,
+        &VkPhysicalDeviceFeatures::textureCompressionASTC_LDR,
+        &VkPhysicalDeviceFeatures::textureCompressionBC,
+        &VkPhysicalDeviceFeatures::occlusionQueryPrecise,
+        &VkPhysicalDeviceFeatures::pipelineStatisticsQuery,
+        &VkPhysicalDeviceFeatures::vertexPipelineStoresAndAtomics,
+        &VkPhysicalDeviceFeatures::fragmentStoresAndAtomics,
+        &VkPhysicalDeviceFeatures::shaderTessellationAndGeometryPointSize,
+        &VkPhysicalDeviceFeatures::shaderImageGatherExtended,
+        &VkPhysicalDeviceFeatures::shaderStorageImageExtendedFormats,
+        &VkPhysicalDeviceFeatures::shaderStorageImageMultisample,
+        &VkPhysicalDeviceFeatures::shaderStorageImageReadWithoutFormat,
+        &VkPhysicalDeviceFeatures::shaderStorageImageWriteWithoutFormat,
+        &VkPhysicalDeviceFeatures::shaderUniformBufferArrayDynamicIndexing,
+        &VkPhysicalDeviceFeatures::shaderSampledImageArrayDynamicIndexing,
+        &VkPhysicalDeviceFeatures::shaderStorageBufferArrayDynamicIndexing,
+        &VkPhysicalDeviceFeatures::shaderStorageImageArrayDynamicIndexing,
+        &VkPhysicalDeviceFeatures::shaderClipDistance,
+        &VkPhysicalDeviceFeatures::shaderCullDistance,
+        &VkPhysicalDeviceFeatures::shaderFloat64,
+        &VkPhysicalDeviceFeatures::shaderInt64,
+        &VkPhysicalDeviceFeatures::shaderInt16,
+        &VkPhysicalDeviceFeatures::shaderResourceResidency,
+        &VkPhysicalDeviceFeatures::shaderResourceMinLod,
+        &VkPhysicalDeviceFeatures::sparseBinding,
+        &VkPhysicalDeviceFeatures::sparseResidencyBuffer,
+        &VkPhysicalDeviceFeatures::sparseResidencyImage2D,
+        &VkPhysicalDeviceFeatures::sparseResidencyImage3D,
+        &VkPhysicalDeviceFeatures::sparseResidency2Samples,
+        &VkPhysicalDeviceFeatures::sparseResidency4Samples,
+        &VkPhysicalDeviceFeatures::sparseResidency8Samples,
+        &VkPhysicalDeviceFeatures::sparseResidency16Samples,
+        &VkPhysicalDeviceFeatures::sparseResidencyAliased,
+        &VkPhysicalDeviceFeatures::variableMultisampleRate,
+        &VkPhysicalDeviceFeatures::inheritedQueries}){
+        legacy.*member=2;require(!enabledFeature(f.device,true,result,why) && why.reason==Reason::FeatureValue,"every legacy core payload scalar also canonical");
+        legacy.*member=VK_FALSE;legacy.fragmentStoresAndAtomics=VK_TRUE;
+    }
+    // Failed original creation must not dereference any native pointers.
+    f.device.pNext=reinterpret_cast<const void*>(std::uintptr_t(1));f.device.pEnabledFeatures=reinterpret_cast<const VkPhysicalDeviceFeatures*>(std::uintptr_t(1));
+    require(!enabledFeature(f.device,false,result,why) && why.reason==Reason::NativeCreationFailed,"failed original create never samples full feature chain");
+}
+
 void layouts(){
     Fixture f;Set0Definition set;LayoutDefinition layout;Refusal why;
     require(captureSet0(f.set0,set,why) && set.bindings[5].descriptorCount==3,"full array[3] retained");
@@ -211,8 +561,9 @@ void privateComplete(const char* vsPath,const char* psPath){
 }
 }
 int main(int argc,char** argv){
+    if(argc==2 && std::strcmp(argv[1],"--native-device-chain-only")==0){features();nativeDeviceChain();std::cout<<"{\"scope\":\"native-device-chain-subset\",\"checks\":"<<checks<<",\"native_payload_bits_replayed\":false,\"native_authority\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--unused-color-only")==0){unusedColor();std::cout<<"{\"scope\":\"unused-color-subset\",\"checks\":"<<checks<<"}\n";return 0;}
-    require(argc==1 || argc==3 || argc==4,"optional private VS PS [count1 probe] paths only");features();layouts();definitions();unusedColor();
+    require(argc==1 || argc==3 || argc==4,"optional private VS PS [count1 probe] paths only");features();nativeDeviceChain();layouts();definitions();unusedColor();
     const bool privateInput=argc>=3;if(privateInput)privateComplete(argv[1],argv[2]);
     if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-clone-definition-controls-v1\",\"checks\":"<<checks<<",\"private_native_pins_tested\":"<<(privateInput?"true":"false")<<",\"recipe_bytes\":"<<sizeof(Recipe)<<",\"native_compatibility_proven\":false,\"runtime_activation_authorized\":false}\n";
