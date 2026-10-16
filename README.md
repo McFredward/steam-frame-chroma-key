@@ -36,6 +36,9 @@ now recovers all six original static source headers and measured fractional
 coverage codes through native GPU sampling. The diagnostic was fully removed.
 Native spatial/temporal association and live alpha composition remain open;
 this does not enable streamed passthrough.
+The [next receiver-parameter proof](docs/NATIVE-UNIFORM-PROOF-PLAN-20261016.md)
+has inert metadata/copy foundations; these are not linked into the installed
+diagnostic and do not authorize another native read or a replacement shader.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
