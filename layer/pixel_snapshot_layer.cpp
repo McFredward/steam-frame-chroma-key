@@ -1174,6 +1174,8 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDraw(VkCommandBuffer command,std::uint32_t ve
     const auto* limits=session().armed.load(std::memory_order_acquire) && !d->selected.load(std::memory_order_acquire)
         ?&d->uniformLimits:nullptr;
     session().tracker->draw(d->id,command,limits,vertices && instances);
+#elif defined(FRAME_PIXEL_SSBO_TRANSACTION)
+    session().tracker->draw(d->id,command,nullptr,vertices && instances);
 #else
     if(vertices && instances)session().tracker->draw(d->id,command);
 #endif
@@ -1188,6 +1190,8 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexed(VkCommandBuffer command,std::uint
     const auto* limits=session().armed.load(std::memory_order_acquire) && !d->selected.load(std::memory_order_acquire)
         ?&d->uniformLimits:nullptr;
     session().tracker->draw(d->id,command,limits,indices && instances);
+#elif defined(FRAME_PIXEL_SSBO_TRANSACTION)
+    session().tracker->draw(d->id,command,nullptr,indices && instances);
 #else
     if(indices && instances)session().tracker->draw(d->id,command);
 #endif

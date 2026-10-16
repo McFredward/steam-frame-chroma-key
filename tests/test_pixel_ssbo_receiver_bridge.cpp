@@ -71,7 +71,7 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     calls={};owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;
     driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
     owned_fixture::Fixture limits;
-    auto native=uniformFixture();
+    auto native=std::make_unique<Fixture>(true,0,VK_COMMAND_BUFFER_LEVEL_PRIMARY,0,true);
     Bridge b;frame_pixel_ssbo_journal::Journal journal{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
     journal_fixture::Fixture shape;shape.nativeSet=sl;shape.graphics.layout=pl;shape.graphics.renderPass=h<VkRenderPass>(30);
     shape.stages[0].module=vs;shape.stages[1].module=fs;shape.push={VK_SHADER_STAGE_VERTEX_BIT,0,16};
@@ -97,7 +97,7 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     frame_pixel_ssbo_journal::Ready ready;require(journal.takeReady(ready),"one cold ready recipe");
     b.prepare(ready);b.tick(journal);require(!b.snapshot().ready&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None,"queue retrieval may legally arrive later without dropping recipe");
     b.queueRetrieved(3,0,h<VkQueue>(2));b.tick(journal);if(!b.snapshot().ready){auto s=b.snapshot();std::cerr<<"cold failure reason="<<unsigned(s.refusal)<<" clone="<<s.cloneStatus<<" stage="<<s.cloneStage<<" tx="<<s.transaction<<" driver="<<s.cloneDriver<<"\n";}require(b.snapshot().ready&&driver.calls&&calls.fences==1,"late actual queue retrieval completes the retained cold recipe");
-    const auto learned=native->finishPass();b.learn(learned);require(!calls.resets,"learning an unarmed live candidate never injects into its already-ended scope");
+    const auto learned=native->finishPass();require(!learned.oneTimeSubmit&&learned.retirementRequired,"serial replay control uses flags0 reusable native command recording");b.learn(learned);require(!calls.resets,"learning an unarmed live candidate never injects into its already-ended scope");
     require(native->tracker.beginCommand(device,cb,native->beginInfo,true),"next original successful native Begin");
     b.begin(native->tracker,device,cb,false);require(!calls.resets,"explicit manual arm required");
     b.begin(native->tracker,device,cb,true);require(calls.resets==1&&b.tracks(cb),"opaque live next-Begin ticket admits only one bounded GPU reset");
@@ -107,6 +107,8 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     b.afterRetirement(unrelated,VK_SUCCESS);b.afterRetirement(unrelatedPool,VK_SUCCESS);
     native->bind(uiDs,uiPipeline,uiPl);b.pipeline(cb,uiPipeline);
     require(native->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"original mock render scope starts");b.beginPass(cb,shape.graphics.renderPass,VK_SUBPASS_CONTENTS_INLINE);
+    native->tracker.draw(device,cb,nullptr,false);require(!b.draw(native->tracker,device,cb,0,1,0,0,0,false),"zero-count preceding direct draw preserves matching observed ordinals");
+    native->tracker.draw(device,cb,nullptr,false);require(!b.draw(native->tracker,device,cb,0,1,0,0,0,true),"zero-count preceding indexed draw preserves matching observed ordinals");
     native->tracker.draw(device,cb);require(!b.draw(native->tracker,device,cb,3,1,0,0,0,false),"preceding UI draw remains native and uninstrumented");
     native->bind();b.pipeline(cb,pipeline);native->tracker.draw(device,cb);
     require(b.draw(native->tracker,device,cb,6,1,0,0,-3,true)&&calls.indexed==1&&!calls.draws,"one exact indexed target replaced once with original args, never duplicated");
@@ -115,6 +117,7 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     require(b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None&&!b.snapshot().transaction,"unrelated descriptor pools, sets and image destruction preserve selected generation");
     if(mode==3)b.resourceRetiring(tx::Resource::Image,frame_bindings::handle(image));
     if(mode==4)b.descriptorPoolRetiring(native->tracker,device,dp);
+    require(b.snapshot().drawOrdinal==4,"selected original ordinal includes both empty direct/indexed calls plus prior UI draw");
     Candidate candidate;require(native->tracker.endRenderPass(device,cb,candidate),"matching source candidate from production tracker");b.endPass(cb);
     if(mode!=1)b.copyRecorded(candidate);
     b.endCommand(cb,VK_SUCCESS);

@@ -27,7 +27,7 @@ buffer. The bridge waits for that command buffer's **next actual successful
 Begin**. The production tracker mints opaque recording and target tickets from
 its observed generations; the bridge cannot construct those tickets. Reset is
 recorded before any render pass. Prior ordinary direct/indexed draws are
-preserved. Only the exact final original target draw is replaced once with the
+preserved; zero-count calls still advance both observers' matching ordinals. Only the exact final original target draw is replaced once with the
 owned original-output observer, and the original pipeline is immediately restored.
 Unknown routes and later draws invalidate publication. No allocation, shader
 compilation, file output or wait occurs in draw callbacks.
@@ -79,7 +79,7 @@ finite fake dispatch: these controls prove callback/state integration, **not**
 actual GPU execution or a headset picture.
 
 The private controls cover late queue lookup, prior UI draw plus indexed target,
-serial replay pairing, missing raw-copy rejection, malformed SSBO header, exact
+legal flags0 serial replay pairing, zero-count preceding direct/indexed calls, missing raw-copy rejection, malformed SSBO header, exact
 source/pool cancellation, unrelated lifecycle filtering, the publication
 retirement boundary, replacement-generation reuse and explicit terminal cleanup.
 Actual Sparse32 shader color/record and cost evidence comes from the separate
