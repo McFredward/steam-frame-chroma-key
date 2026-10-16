@@ -20,6 +20,7 @@
 #include "pixel_observation_boundary.h"
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
 #include "pixel_ssbo_receiver_bridge.h"
+#include "pixel_renderpass_recording_contract.h"
 #endif
 #endif
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
@@ -32,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <locale>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -110,19 +112,19 @@ struct Device {
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     FIELD(CreateRenderPass) FIELD(CreateRenderPass2) FIELD(CreateRenderPass2KHR) FIELD(DestroyRenderPass)
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    FIELD(GetDeviceQueue) FIELD(GetDeviceQueue2) FIELD(CmdDrawIndirectCount) FIELD(CmdDrawIndexedIndirectCount)
+    FIELD(GetDeviceQueue) FIELD(GetDeviceQueue2) FIELD(CmdDrawIndirectCount) FIELD(CmdDrawIndexedIndirectCount) FIELD(CmdDrawIndirectCountKHR) FIELD(CmdDrawIndexedIndirectCountKHR)
 #endif
 #endif
     FIELD(AllocateCommandBuffers) FIELD(FreeCommandBuffers) FIELD(BeginCommandBuffer) FIELD(EndCommandBuffer)
     FIELD(ResetCommandBuffer) FIELD(ResetCommandPool) FIELD(DestroyCommandPool) FIELD(CmdBindPipeline)
     FIELD(CmdDraw) FIELD(CmdDrawIndexed) FIELD(CmdDrawIndirect) FIELD(CmdDrawIndexedIndirect)
     FIELD(CmdBindShadersEXT)
-    FIELD(CmdDispatch) FIELD(CmdDispatchIndirect) FIELD(CmdDispatchBase)
+    FIELD(CmdDispatch) FIELD(CmdDispatchIndirect) FIELD(CmdDispatchBase) FIELD(CmdDispatchBaseKHR)
     FIELD(CmdBeginQuery) FIELD(CmdBeginQueryIndexedEXT)
     FIELD(CmdExecuteCommands) FIELD(CmdBeginRenderPass) FIELD(CmdNextSubpass) FIELD(CmdEndRenderPass)
     FIELD(CmdBeginRenderPass2) FIELD(CmdNextSubpass2) FIELD(CmdEndRenderPass2)
     FIELD(CmdBeginRenderPass2KHR) FIELD(CmdNextSubpass2KHR) FIELD(CmdEndRenderPass2KHR)
-    FIELD(CmdBeginRendering) FIELD(CmdEndRendering) FIELD(QueueSubmit) FIELD(QueueSubmit2)
+    FIELD(CmdBeginRendering) FIELD(CmdEndRendering) FIELD(CmdBeginRenderingKHR) FIELD(CmdEndRenderingKHR) FIELD(QueueSubmit) FIELD(QueueSubmit2) FIELD(QueueSubmit2KHR)
 #define BINDING_FIELD(name) FIELD(name)
 #include "passive_binding_commands.inc"
 #undef BINDING_FIELD
@@ -228,6 +230,52 @@ void status(int fd, const char* name, int result = 0) {
         "{\"event\":\"%s\",\"vk_result\":%d,\"mask_enabled\":false,\"native_frame_association_proven\":false}\n",name,result);
     if(count>0 && static_cast<std::size_t>(count)<sizeof(bytes))frame_pixel_io::writeAll(fd,bytes,static_cast<std::size_t>(count));
 }
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+// Cold serialization only. Callback code owns finite numeric facts; formatting
+// and I/O occur exclusively on this background writer or in offline fixtures.
+constexpr std::size_t RecordingContextLineBytes=2048;
+void recordingContextJson(std::ostream& out,const frame_pixel_ssbo_transaction::RecordingContext& context) {
+    namespace tx=frame_pixel_ssbo_transaction;const auto& in=context.input;
+    out<<"{\"operation\":\""<<tx::operationName(in.operation)<<"\",\"source\":"<<unsigned(in.source)
+       <<",\"phase\":\""<<tx::phaseName(context.phase)<<"\",\"before_reason\":"<<unsigned(context.before)<<",\"after_reason\":"<<unsigned(context.after)
+       <<",\"sequence\":"<<context.sequence<<",\"transaction_epoch\":"<<context.transactionEpoch<<",\"device\":"<<context.device
+       <<",\"command\":"<<context.command<<",\"pool\":"<<context.pool<<",\"command_generation\":"<<context.commandGeneration<<",\"pool_generation\":"<<context.poolGeneration
+       <<",\"draw_ordinal\":"<<context.drawOrdinal<<",\"current_subpass\":"<<context.currentSubpass<<",\"target_subpass\":"<<context.targetSubpass<<",\"subpass_count\":"<<context.subpassCount
+       <<",\"rejected\":"<<(context.rejected?"true":"false")<<",\"metadata_truncated\":"<<(context.metadataTruncated?"true":"false")
+       <<",\"detail_reason\":"<<in.detailReason<<",\"structure_type\":"<<in.structureType<<",\"index\":"<<in.index<<",\"chain\":"<<in.chain<<",\"contents\":"<<in.contents
+       <<",\"object\":"<<in.object<<",\"flags\":"<<in.flags<<",\"target_pipeline\":"<<(in.targetPipeline?"true":"false")<<",\"chains\":[";
+    for(unsigned i=0;i<in.chains.size();++i){if(i)out<<',';const auto& chain=in.chains[i];
+        out<<"{\"root_type\":"<<chain.rootType<<",\"termination\":"<<chain.termination<<",\"types\":[";
+        for(unsigned n=0;n<std::min<std::size_t>(chain.count,chain.types.size());++n){if(n)out<<',';out<<chain.types[n];}
+        out<<"]}";}
+    out<<"]}";
+}
+bool recordingContextLine(const frame_pixel_ssbo_transaction::RecordingContext& context,unsigned index,std::uint64_t count,std::uint64_t last,bool first,std::string& text) {
+    std::ostringstream out;out.imbue(std::locale::classic());
+    out<<"{\"event\":\""<<(first?"ssbo_recording_first_refusal":"ssbo_recording_context")<<"\",\"context_index\":"<<index<<",\"observed_count\":"<<count<<",\"last_sequence\":"<<last<<",\"context\":";
+    recordingContextJson(out,context);out<<",\"native_frame_association_proven\":false,\"mask_enabled\":false}\n";
+    text=out.str();if(text.size()>RecordingContextLineBytes){text.clear();return false;}return true;
+}
+void recordingMetadataJson(std::ostream& out,const frame_pixel_ssbo_transaction::RecordingContexts& contexts) {
+    out<<",\"recording_context_count\":"<<contexts.count<<",\"recording_context_attempts\":"<<contexts.attempts<<",\"recording_context_overflow\":"<<contexts.overflow<<",\"recording_context_contended\":"<<(contexts.contended?"true":"false")<<",\"first_recording_refusal\":";
+    if(contexts.firstRefusalAvailable)recordingContextJson(out,contexts.firstRefusal);else out<<"null";
+    out<<",\"recording_context_repeats\":[";
+    for(unsigned i=0;i<std::min<std::size_t>(contexts.count,contexts.entries.size());++i){if(i)out<<',';const auto& entry=contexts.entries[i];out<<'['<<i<<','<<entry.count<<','<<entry.lastSequence<<']';}out<<']';
+}
+struct RecordingReportProgress {unsigned contexts=0;bool firstRefusal=false,overflow=false;};
+void recordingStatus(const frame_pixel_ssbo_transaction::RecordingContexts& contexts,int fd,RecordingReportProgress& reported) {
+    const auto emit=[&](const auto& context,unsigned index,std::uint64_t count,std::uint64_t last,bool first){
+        std::string text;if(recordingContextLine(context,index,count,last,first,text))frame_pixel_io::writeAll(fd,text.data(),text.size());
+        else {constexpr char failure[]="{\"event\":\"ssbo_recording_context_reporting_failed\",\"mask_enabled\":false}\n";frame_pixel_io::writeAll(fd,failure,sizeof(failure)-1);}};
+    while(reported.contexts<std::min<std::size_t>(contexts.count,contexts.entries.size())){const auto index=reported.contexts++;const auto& entry=contexts.entries[index];emit(entry.first,index,entry.count,entry.lastSequence,false);}
+    // The independently reserved first failure survives a saturated accepted
+    // bank. New distinct contexts are emitted even if refusal bits stay equal.
+    if(contexts.firstRefusalAvailable&&!reported.firstRefusal){reported.firstRefusal=true;emit(contexts.firstRefusal,UINT32_MAX,1,contexts.firstRefusal.sequence,true);}
+    if((contexts.overflow||contexts.contended)&&!reported.overflow){reported.overflow=true;char report[256]{};
+        const auto n=std::snprintf(report,sizeof(report),"{\"event\":\"ssbo_recording_context_overflow\",\"attempts\":%llu,\"overflow\":%llu,\"contended\":%s,\"mask_enabled\":false}\n",static_cast<unsigned long long>(contexts.attempts),static_cast<unsigned long long>(contexts.overflow),contexts.contended?"true":"false");
+        if(n>0&&std::size_t(n)<sizeof(report))frame_pixel_io::writeAll(fd,report,std::size_t(n));}
+}
+#endif
 void save(Device& d, const frame_pixels::View& view, int progress) {
     const auto& config = session().config;
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
@@ -352,6 +400,7 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
           <<",\"submit_next_type\":"<<ssbo.submit.nextType<<",\"submit_occurrences\":"<<ssbo.submit.selectedOccurrences<<",\"pool_generation\":"<<ssbo.poolGeneration
           <<",\"source_executions\":"<<ssbo.sourceExecutions<<",\"paired_execution\":"<<ssbo.pairedExecution
           <<",\"original_color_expression_preserved\":true,\"native_visual_result_verified\":false,\"sparse_grid32_invocation\":true";
+    recordingMetadataJson(record,ssbo.recordingContexts);
     if(ssboReady)record<<",\"file\":\"ssbo-original-invocation.bin\",\"bytes\":128,\"sha256\":\""
           <<frame_pixel_io::digest(static_cast<const std::uint8_t*>(invocation.record),128)<<"\",\"command_generation\":"<<invocation.commandGeneration
           <<",\"execution\":"<<invocation.execution<<",\"source_cohort\":{\"device\":"<<invocation.source.image.device<<",\"layout\":"<<unsigned(invocation.source.layout)<<",\"extent\":["<<invocation.source.extent.width<<','<<invocation.source.extent.height<<"],\"image\":"<<invocation.source.image.value<<",\"image_generation\":"<<invocation.source.image.generation
@@ -480,8 +529,8 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
 }
 #endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-void bridgeStatus(Device& d,int fd,std::uint64_t& seen) {
-    const auto s=d.bridge.snapshot();
+void bridgeStatus(Device& d,int fd,std::uint64_t& seen,RecordingReportProgress& recordingReported) {
+    const auto s=d.bridge.snapshot();recordingStatus(s.recordingContexts,fd,recordingReported);
     const std::uint64_t state=1u|std::uint64_t(s.profile)<<1|std::uint64_t(s.ready)<<2|std::uint64_t(s.learned)<<3|
         std::uint64_t(s.adopted)<<4|std::uint64_t(s.replaced)<<5|std::uint64_t(s.copy)<<6|std::uint64_t(s.queueKnown)<<7|std::uint64_t(s.refusal)<<8|
         std::uint64_t(s.transaction)<<16|std::uint64_t(s.cloneStatus)<<24|std::uint64_t(s.unmappedCandidate)<<32;
@@ -539,7 +588,7 @@ void writer(Device* d) noexcept {
 #endif
     unsigned announcedQueryRoutes=0;
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    std::uint64_t bridgeState=0;
+    std::uint64_t bridgeState=0;RecordingReportProgress recordingReported;
 #endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     bool definitionFeatureReported=false;std::uint64_t definitionReasons=0;unsigned definitionRecipes=0,definitionSets=0;
@@ -551,7 +600,7 @@ void writer(Device* d) noexcept {
 #endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
         d->bridge.tick(d->definitions);
-        bridgeStatus(*d,progress,bridgeState);
+        bridgeStatus(*d,progress,bridgeState,recordingReported);
 #endif
         const auto queryRoutes=d->queryRoutesUsed.load(std::memory_order_relaxed);
         if(queryRoutes!=announcedQueryRoutes) {
@@ -783,6 +832,16 @@ void loadRenderPass2Dispatch(Device& d,VkDevice device) {
     LOAD_RP2(CmdEndRenderPass2) LOAD_RP2(CmdEndRenderPass2KHR)
 #undef LOAD_RP2
 }
+void loadRecordingAliasDispatch(Device& d,VkDevice device) {
+#define LOAD_RECORDING(name) d.name=reinterpret_cast<PFN_vk##name>(d.gdpa(device,"vk" #name));
+    LOAD_RECORDING(CmdDispatchBase) LOAD_RECORDING(CmdDispatchBaseKHR)
+    LOAD_RECORDING(CmdBeginRendering) LOAD_RECORDING(CmdBeginRenderingKHR) LOAD_RECORDING(CmdEndRendering) LOAD_RECORDING(CmdEndRenderingKHR)
+    LOAD_RECORDING(QueueSubmit2) LOAD_RECORDING(QueueSubmit2KHR)
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    LOAD_RECORDING(CmdDrawIndirectCount) LOAD_RECORDING(CmdDrawIndirectCountKHR) LOAD_RECORDING(CmdDrawIndexedIndirectCount) LOAD_RECORDING(CmdDrawIndexedIndirectCountKHR)
+#endif
+#undef LOAD_RECORDING
+}
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const VkDeviceCreateInfo* info,const VkAllocationCallbacks* alloc,VkDevice* out) {
     auto* i=instanceFor(physical);auto* link=static_cast<VkLayerDeviceCreateInfo*>(const_cast<void*>(info->pNext));
     while(link && (link->sType!=VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO || link->function!=VK_LAYER_LINK_INFO))
@@ -836,29 +895,23 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     LOAD(CreateRenderPass) LOAD(DestroyRenderPass)
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    LOAD(GetDeviceQueue) LOAD(GetDeviceQueue2) LOAD(CmdDrawIndirectCount) LOAD(CmdDrawIndexedIndirectCount)
+    LOAD(GetDeviceQueue) LOAD(GetDeviceQueue2)
 #endif
 #endif
     LOAD(AllocateCommandBuffers) LOAD(FreeCommandBuffers) LOAD(BeginCommandBuffer) LOAD(EndCommandBuffer)
     LOAD(ResetCommandBuffer) LOAD(ResetCommandPool) LOAD(DestroyCommandPool) LOAD(CmdBindPipeline)
     LOAD(CmdDraw) LOAD(CmdDrawIndexed) LOAD(CmdDrawIndirect) LOAD(CmdDrawIndexedIndirect) LOAD(CmdExecuteCommands)
     LOAD(CmdBindShadersEXT)
-    LOAD(CmdDispatch) LOAD(CmdDispatchIndirect) LOAD(CmdDispatchBase)
+    LOAD(CmdDispatch) LOAD(CmdDispatchIndirect)
     LOAD(CmdBeginQuery) LOAD(CmdBeginQueryIndexedEXT)
     LOAD(CmdBeginRenderPass) LOAD(CmdNextSubpass) LOAD(CmdEndRenderPass)
-    LOAD(CmdBeginRendering) LOAD(CmdEndRendering) LOAD(QueueSubmit) LOAD(QueueSubmit2)
+    LOAD(QueueSubmit)
 #define BINDING_FIELD(name) LOAD(name)
 #include "passive_binding_commands.inc"
 #undef BINDING_FIELD
 #undef LOAD
-    loadRenderPass2Dispatch(*d,*out);
-#define ALIAS(name,suffix) if(!d->name)d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,"vk" #name suffix));
-    ALIAS(CmdBeginRendering,"KHR") ALIAS(CmdEndRendering,"KHR") ALIAS(QueueSubmit2,"KHR")
-    ALIAS(CmdDispatchBase,"KHR")
-#ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    ALIAS(CmdDrawIndirectCount,"KHR") ALIAS(CmdDrawIndexedIndirectCount,"KHR")
-#endif
-#undef ALIAS
+    loadRenderPass2Dispatch(*d,*out);loadRecordingAliasDispatch(*d,*out);
+
 #define BINDING_ALIAS(alias,name) if(!d->name)d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,alias));
 #include "passive_binding_aliases.inc"
 #undef BINDING_ALIAS
@@ -965,9 +1018,36 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocation
     const auto key=dispatchKey(device);d->DestroyDevice(device,alloc);
     auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.devices.erase(key);
 }
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+using RecordingOperation=frame_pixel_ssbo_receiver::Operation;
+using CommandContext=frame_pixel_ssbo_receiver::CommandContext;
+namespace recording=frame_pixel_renderpass_recording;
+CommandContext commandContext(RecordingOperation operation,std::uint64_t object=0,std::uint32_t flags=0) noexcept {
+    CommandContext out;out.operation=operation;out.source=frame_pixel_ssbo_receiver::ContextSource::Wrapper;
+    out.object=object;out.flags=flags;return out;
+}
+CommandContext passContext(RecordingOperation operation,const recording::Shape& shape) noexcept {
+    auto out=commandContext(operation,frame_pixel_ssbo_clone::handle(shape.renderPass));
+    out.source=frame_pixel_ssbo_receiver::ContextSource::RenderPassDecoder;
+    out.detailReason=unsigned(shape.refusal.reason);out.structureType=shape.refusal.type;
+    out.index=shape.refusal.index;out.chain=unsigned(shape.refusal.chain);out.contents=unsigned(shape.contents);
+    static_assert(recording::MaxChain==frame_pixel_ssbo_transaction::CommandContextHeaders,"lossless bounded public header census");
+    static_assert(unsigned(recording::Chain::Count)==frame_pixel_ssbo_transaction::CommandContextChains,"all public Begin/Next/End roots retained");
+    for(unsigned i=0;i<out.chains.size();++i){const auto& source=shape.chains[i];auto& target=out.chains[i];
+        target.rootType=source.rootType;target.types=source.types;target.count=source.count;target.termination=unsigned(source.termination);}
+    return out;
+}
+void recordPassContext(Device* d,VkCommandBuffer command,RecordingOperation operation,const recording::Shape& shape) noexcept {
+    const auto context=passContext(operation,shape);
+    if(shape.supported)d->bridge.observe(command,context);else d->bridge.unknown(command,context);
+}
+void unknownCommand(Device* d,VkCommandBuffer command,RecordingOperation operation,std::uint64_t object=0,std::uint32_t flags=0) noexcept {
+    d->bridge.unknown(command,commandContext(operation,object,flags));
+}
+#endif
 #define observeBindings(...) observeBindingsAt(__func__, __VA_ARGS__)
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-#define FRAME_PIXEL_COMPUTE_BIND(d,command,point) do { if((point)!=VK_PIPELINE_BIND_POINT_GRAPHICS) { session().tracker->touchComputeState((d)->id,command); (d)->bridge.unknown(command); } } while(false)
+#define FRAME_PIXEL_COMPUTE_BIND(d,command,point) do { const auto context=commandContext(RecordingOperation::CmdBindDescriptorSets,frame_pixel_ssbo_clone::handle(layout),unsigned(point)); if((point)!=VK_PIPELINE_BIND_POINT_GRAPHICS) { session().tracker->touchComputeState((d)->id,command); (d)->bridge.unknown(command,context); } else (d)->bridge.observe(command,context); } while(false)
 #else
 #define FRAME_PIXEL_COMPUTE_BIND(d,command,point) do { if((point)!=VK_PIPELINE_BIND_POINT_GRAPHICS) session().tracker->touchComputeState((d)->id,command); } while(false)
 #endif
@@ -1127,7 +1207,8 @@ VKAPI_ATTR VkResult VKAPI_CALL traceBeginCommandBuffer(VkCommandBuffer command,c
     retired(d,before,result==VK_SUCCESS);
     session().tracker->beginCommand(d->id,command,*info,result==VK_SUCCESS);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    if(result==VK_SUCCESS)d->bridge.begin(*session().tracker,d->id,command,session().armed.load(std::memory_order_acquire));
+    if(result==VK_SUCCESS){d->bridge.begin(*session().tracker,d->id,command,session().armed.load(std::memory_order_acquire));
+        auto context=commandContext(RecordingOperation::BeginCommandBuffer,0,info->flags);context.chains[0].rootType=unsigned(info->sType);d->bridge.observe(command,context);}
 #endif
     return result;
 }
@@ -1135,7 +1216,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceEndCommandBuffer(VkCommandBuffer command) {
     auto* d=deviceFor(command);const auto result=d->EndCommandBuffer(command);
     session().tracker->endCommand(d->id,command,result==VK_SUCCESS);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.endCommand(command,result);
+    d->bridge.observe(command,commandContext(RecordingOperation::EndCommandBuffer));d->bridge.endCommand(command,result);
 #endif
     return result;
 }
@@ -1156,37 +1237,44 @@ VKAPI_ATTR VkResult VKAPI_CALL traceResetCommandBuffer(VkCommandBuffer command,V
 VKAPI_ATTR void VKAPI_CALL traceCmdBindPipeline(VkCommandBuffer command,VkPipelineBindPoint point,VkPipeline pipeline) {
     auto* d=deviceFor(command);session().tracker->bindPipeline(d->id,command,point,pipeline);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    if(point==VK_PIPELINE_BIND_POINT_GRAPHICS)d->bridge.pipeline(command,pipeline);else d->bridge.unknown(command);
+    if(point==VK_PIPELINE_BIND_POINT_GRAPHICS){d->bridge.observe(command,commandContext(RecordingOperation::CmdBindPipeline,frame_pixel_ssbo_clone::handle(pipeline),unsigned(point)));d->bridge.pipeline(command,pipeline);}
+    else unknownCommand(d,command,RecordingOperation::CmdBindPipeline,frame_pixel_ssbo_clone::handle(pipeline),unsigned(point));
 #endif
     d->CmdBindPipeline(command,point,pipeline);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBindShadersEXT(VkCommandBuffer command,std::uint32_t count,const VkShaderStageFlagBits* stages,const VkShaderEXT* shaders) {
     auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,RecordingOperation::CmdBindShadersEXT,0,count);
 #endif
     d->CmdBindShadersEXT(command,count,stages,shaders);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDispatch(VkCommandBuffer command,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
     auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,RecordingOperation::CmdDispatch);
 #endif
     d->CmdDispatch(command,x,y,z);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDispatchIndirect(VkCommandBuffer command,VkBuffer buffer,VkDeviceSize offset) {
     auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,RecordingOperation::CmdDispatchIndirect,frame_pixel_ssbo_clone::handle(buffer));
 #endif
     d->CmdDispatchIndirect(command,buffer,offset);
 }
-VKAPI_ATTR void VKAPI_CALL traceCmdDispatchBase(VkCommandBuffer command,std::uint32_t bx,std::uint32_t by,std::uint32_t bz,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
-    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);
+void dispatchBase(Device* d,PFN_vkCmdDispatchBase original,bool khr,VkCommandBuffer command,std::uint32_t bx,std::uint32_t by,std::uint32_t bz,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
+    session().tracker->touchComputeState(d->id,command);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,khr?RecordingOperation::CmdDispatchBaseKHR:RecordingOperation::CmdDispatchBase);
 #endif
-    d->CmdDispatchBase(command,bx,by,bz,x,y,z);
+    (void)khr;original(command,bx,by,bz,x,y,z);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdDispatchBase(VkCommandBuffer command,std::uint32_t bx,std::uint32_t by,std::uint32_t bz,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
+    auto* d=deviceFor(command);dispatchBase(d,d->CmdDispatchBase,false,command,bx,by,bz,x,y,z);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdDispatchBaseKHR(VkCommandBuffer command,std::uint32_t bx,std::uint32_t by,std::uint32_t bz,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
+    auto* d=deviceFor(command);dispatchBase(d,d->CmdDispatchBaseKHR,true,command,bx,by,bz,x,y,z);
 }
 // Queries must begin/end in their own command buffer; accepted primaries cannot
 // inherit them and never execute secondary recordings. Refuse every recording
@@ -1197,7 +1285,7 @@ VKAPI_ATTR void VKAPI_CALL traceCmdBeginQuery(VkCommandBuffer command,VkQueryPoo
     auto* d=deviceFor(command);
     if(session().tracker->touchComputeState(d->id,command))d->queryRoutesUsed.fetch_or(1u,std::memory_order_relaxed);
     #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,RecordingOperation::CmdBeginQuery,frame_pixel_ssbo_clone::handle(pool),flags);
 #endif
     d->CmdBeginQuery(command,pool,query,flags);
 }
@@ -1205,7 +1293,7 @@ VKAPI_ATTR void VKAPI_CALL traceCmdBeginQueryIndexedEXT(VkCommandBuffer command,
     auto* d=deviceFor(command);
     if(session().tracker->touchComputeState(d->id,command))d->queryRoutesUsed.fetch_or(2u,std::memory_order_relaxed);
     #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,RecordingOperation::CmdBeginQueryIndexedEXT,frame_pixel_ssbo_clone::handle(pool),flags);
 #endif
     d->CmdBeginQueryIndexedEXT(command,pool,query,flags,index);
 }
@@ -1221,6 +1309,7 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDraw(VkCommandBuffer command,std::uint32_t ve
     if(vertices && instances)session().tracker->draw(d->id,command);
 #endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.observe(command,commandContext(RecordingOperation::CmdDraw));
     if(d->bridge.draw(*session().tracker,d->id,command,vertices,instances,firstVertex,firstInstance,0,false))return;
 #endif
     d->CmdDraw(command,vertices,instances,firstVertex,firstInstance);
@@ -1237,6 +1326,7 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexed(VkCommandBuffer command,std::uint
     if(indices && instances)session().tracker->draw(d->id,command);
 #endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.observe(command,commandContext(RecordingOperation::CmdDrawIndexed));
     if(d->bridge.draw(*session().tracker,d->id,command,indices,instances,firstIndex,firstInstance,vertexOffset,true))return;
 #endif
     d->CmdDrawIndexed(command,indices,instances,firstIndex,vertexOffset,firstInstance);
@@ -1244,29 +1334,29 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexed(VkCommandBuffer command,std::uint
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirect(VkCommandBuffer command,VkBuffer buffer,VkDeviceSize offset,std::uint32_t count,std::uint32_t stride) {
     auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,RecordingOperation::CmdDrawIndirect,frame_pixel_ssbo_clone::handle(buffer),count);
 #endif
     d->CmdDrawIndirect(command,buffer,offset,count,stride);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirect(VkCommandBuffer command,VkBuffer buffer,VkDeviceSize offset,std::uint32_t count,std::uint32_t stride) {
     auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,RecordingOperation::CmdDrawIndexedIndirect,frame_pixel_ssbo_clone::handle(buffer),count);
 #endif
     d->CmdDrawIndexedIndirect(command,buffer,offset,count,stride);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdExecuteCommands(VkCommandBuffer command,std::uint32_t count,const VkCommandBuffer* children) {
     auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,RecordingOperation::CmdExecuteCommands,0,count);
 #endif
     d->CmdExecuteCommands(command,count,children);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass(VkCommandBuffer command,const VkRenderPassBeginInfo* info,VkSubpassContents contents) {
     auto* d=deviceFor(command);session().tracker->beginRenderPass(d->id,command,contents);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    if(info->sType==VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO&&!info->pNext)d->bridge.beginPass(command,info->renderPass,contents);
-    else d->bridge.unknown(command);
+    recording::Shape shape;recording::begin(info,contents,shape);recordPassContext(d,command,RecordingOperation::CmdBeginRenderPass,shape);
+    if(shape.supported)d->bridge.beginPass(command,info->renderPass,contents);
 #endif
     d->CmdBeginRenderPass(command,info,contents);
 }
@@ -1274,73 +1364,81 @@ VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass(VkCommandBuffer command,VkSubpass
     auto* d=deviceFor(command);session().tracker->nextSubpass(d->id,command,contents);
     d->CmdNextSubpass(command,contents);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.nextPass(command,contents);
+    recording::Shape shape;recording::next(contents,shape);recordPassContext(d,command,RecordingOperation::CmdNextSubpass,shape);
+    if(shape.supported)d->bridge.nextPass(command,contents);
 #endif
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass(VkCommandBuffer command) {
     auto* d=deviceFor(command);d->CmdEndRenderPass(command);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.endPass(command);
+    recording::Shape shape;recording::end(shape);recordPassContext(d,command,RecordingOperation::CmdEndRenderPass,shape);d->bridge.endPass(command);
 #endif
     afterRenderPass(d,command,false);
 }
-void beginRenderPass2(Device* d,PFN_vkCmdBeginRenderPass2 original,VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
+void beginRenderPass2(Device* d,PFN_vkCmdBeginRenderPass2 original,bool khr,VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
     session().tracker->beginRenderPass(d->id,command,begin->contents);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    if(info->sType==VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO&&!info->pNext&&begin->sType==VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO&&!begin->pNext&&begin->contents==VK_SUBPASS_CONTENTS_INLINE)
-        d->bridge.beginPass(command,info->renderPass,begin->contents);
-    else d->bridge.unknown(command);
+    const auto operation=khr?RecordingOperation::CmdBeginRenderPass2KHR:RecordingOperation::CmdBeginRenderPass2;
+    recording::Shape shape;recording::begin2(info,begin,shape);recordPassContext(d,command,operation,shape);
+    if(shape.supported)d->bridge.beginPass(command,info->renderPass,begin->contents);
 #endif
-    original(command,info,begin);
+    (void)khr;original(command,info,begin);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2(VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
-    auto* d=deviceFor(command);beginRenderPass2(d,d->CmdBeginRenderPass2,command,info,begin);
+    auto* d=deviceFor(command);beginRenderPass2(d,d->CmdBeginRenderPass2,false,command,info,begin);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2KHR(VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
-    auto* d=deviceFor(command);beginRenderPass2(d,d->CmdBeginRenderPass2KHR,command,info,begin);
+    auto* d=deviceFor(command);beginRenderPass2(d,d->CmdBeginRenderPass2KHR,true,command,info,begin);
 }
-void nextSubpass2(Device* d,PFN_vkCmdNextSubpass2 original,VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
+void nextSubpass2(Device* d,PFN_vkCmdNextSubpass2 original,bool khr,VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
     session().tracker->nextSubpass(d->id,command,begin->contents);
-    original(command,begin,end);
+    (void)khr;original(command,begin,end);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    if(begin->sType==VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO&&!begin->pNext&&end->sType==VK_STRUCTURE_TYPE_SUBPASS_END_INFO&&!end->pNext)
-        d->bridge.nextPass(command,begin->contents);
-    else d->bridge.unknown(command);
+    const auto operation=khr?RecordingOperation::CmdNextSubpass2KHR:RecordingOperation::CmdNextSubpass2;
+    recording::Shape shape;recording::next2(begin,end,shape);recordPassContext(d,command,operation,shape);
+    if(shape.supported)d->bridge.nextPass(command,begin->contents);
 #endif
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass2(VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);nextSubpass2(d,d->CmdNextSubpass2,command,begin,end);
+    auto* d=deviceFor(command);nextSubpass2(d,d->CmdNextSubpass2,false,command,begin,end);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass2KHR(VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);nextSubpass2(d,d->CmdNextSubpass2KHR,command,begin,end);
+    auto* d=deviceFor(command);nextSubpass2(d,d->CmdNextSubpass2KHR,true,command,begin,end);
 }
-void endRenderPass2(Device* d,PFN_vkCmdEndRenderPass2 original,VkCommandBuffer command,const VkSubpassEndInfo* end) {
-    original(command,end);
+void endRenderPass2(Device* d,PFN_vkCmdEndRenderPass2 original,bool khr,VkCommandBuffer command,const VkSubpassEndInfo* end) {
+    (void)khr;original(command,end);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    if(end->sType==VK_STRUCTURE_TYPE_SUBPASS_END_INFO&&!end->pNext)d->bridge.endPass(command);else d->bridge.unknown(command);
+    const auto operation=khr?RecordingOperation::CmdEndRenderPass2KHR:RecordingOperation::CmdEndRenderPass2;
+    recording::Shape shape;recording::end2(end,shape);recordPassContext(d,command,operation,shape);
+    if(shape.supported)d->bridge.endPass(command);
 #endif
     afterRenderPass(d,command,false);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass2(VkCommandBuffer command,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);endRenderPass2(d,d->CmdEndRenderPass2,command,end);
+    auto* d=deviceFor(command);endRenderPass2(d,d->CmdEndRenderPass2,false,command,end);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass2KHR(VkCommandBuffer command,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);endRenderPass2(d,d->CmdEndRenderPass2KHR,command,end);
+    auto* d=deviceFor(command);endRenderPass2(d,d->CmdEndRenderPass2KHR,true,command,end);
 }
-VKAPI_ATTR void VKAPI_CALL traceCmdBeginRendering(VkCommandBuffer command,const VkRenderingInfo* info) {
-    auto* d=deviceFor(command);session().tracker->beginRendering(d->id,command,*info);
+void beginRendering(Device* d,PFN_vkCmdBeginRendering original,bool khr,VkCommandBuffer command,const VkRenderingInfo* info) {
+    session().tracker->beginRendering(d->id,command,*info);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    recording::Shape shape;recording::headerCensus(unsigned(info->sType),info->pNext,recording::Chain::RenderPassBegin,shape);
+    auto context=passContext(khr?RecordingOperation::CmdBeginRenderingKHR:RecordingOperation::CmdBeginRendering,shape);context.source=frame_pixel_ssbo_receiver::ContextSource::Wrapper;context.flags=info->flags;
+    d->bridge.unknown(command,context);
 #endif
-    d->CmdBeginRendering(command,info);
+    (void)khr;original(command,info);
 }
-VKAPI_ATTR void VKAPI_CALL traceCmdEndRendering(VkCommandBuffer command) {
-    auto* d=deviceFor(command);
+VKAPI_ATTR void VKAPI_CALL traceCmdBeginRendering(VkCommandBuffer command,const VkRenderingInfo* info) {auto* d=deviceFor(command);beginRendering(d,d->CmdBeginRendering,false,command,info);}
+VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderingKHR(VkCommandBuffer command,const VkRenderingInfo* info) {auto* d=deviceFor(command);beginRendering(d,d->CmdBeginRenderingKHR,true,command,info);}
+void endRendering(Device* d,PFN_vkCmdEndRendering original,bool khr,VkCommandBuffer command) {
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
+    unknownCommand(d,command,khr?RecordingOperation::CmdEndRenderingKHR:RecordingOperation::CmdEndRendering);
 #endif
-    d->CmdEndRendering(command);afterRenderPass(d,command,true);
+    (void)khr;original(command);afterRenderPass(d,command,true);
 }
+VKAPI_ATTR void VKAPI_CALL traceCmdEndRendering(VkCommandBuffer command) {auto* d=deviceFor(command);endRendering(d,d->CmdEndRendering,false,command);}
+VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderingKHR(VkCommandBuffer command) {auto* d=deviceFor(command);endRendering(d,d->CmdEndRenderingKHR,true,command);}
 template<class Info,class Count,class Command> SubmitTicket ticket(Device* d,std::uint32_t count,const Info* info,Count commandCount,Command command) {
     if(!d->ownsCapture || !d->selected.load(std::memory_order_acquire) || d->readback.state()!=frame_pixels::State::Recorded || count>32)return {};
     for(std::uint32_t i=0;i<count;++i) {
@@ -1374,13 +1472,15 @@ VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit(VkQueue queue,std::uint32_t coun
 #endif
     return result;
 }
-VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit2(VkQueue queue,std::uint32_t count,const VkSubmitInfo2* info,VkFence fence) {
-    auto* d=deviceFor(queue);const auto before=ticket(d,count,info,[](const auto& i){return i.commandBufferInfoCount;},[](const auto& i,std::uint32_t n){return i.pCommandBufferInfos[n].commandBuffer;});
+VkResult queueSubmit2(Device* d,PFN_vkQueueSubmit2 original,bool khr,VkQueue queue,std::uint32_t count,const VkSubmitInfo2* info,VkFence fence) {
+    const auto before=ticket(d,count,info,[](const auto& i){return i.commandBufferInfoCount;},[](const auto& i,std::uint32_t n){return i.pCommandBufferInfos[n].commandBuffer;});
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unsupportedSubmit(queue,count,info);
+    d->bridge.unsupportedSubmit(queue,count,info,commandContext(khr?RecordingOperation::QueueSubmit2KHR:RecordingOperation::QueueSubmit2));
 #endif
-    const auto result=d->QueueSubmit2(queue,count,info,fence);submitted(d,queue,before,result);return result;
+    (void)khr;const auto result=original(queue,count,info,fence);submitted(d,queue,before,result);return result;
 }
+VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit2(VkQueue queue,std::uint32_t count,const VkSubmitInfo2* info,VkFence fence) {auto* d=deviceFor(queue);return queueSubmit2(d,d->QueueSubmit2,false,queue,count,info,fence);}
+VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit2KHR(VkQueue queue,std::uint32_t count,const VkSubmitInfo2* info,VkFence fence) {auto* d=deviceFor(queue);return queueSubmit2(d,d->QueueSubmit2KHR,true,queue,count,info,fence);}
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
 VKAPI_ATTR void VKAPI_CALL traceGetDeviceQueue(VkDevice device,std::uint32_t family,std::uint32_t index,VkQueue* out){
     auto* d=deviceFor(device);d->GetDeviceQueue(device,family,index,out);d->bridge.queueRetrieved(family,index,*out);
@@ -1389,12 +1489,16 @@ VKAPI_ATTR void VKAPI_CALL traceGetDeviceQueue2(VkDevice device,const VkDeviceQu
     auto* d=deviceFor(device);d->GetDeviceQueue2(device,info,out);
     d->bridge.queueRetrieved(info->queueFamilyIndex,info->queueIndex,*out,info->sType==VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2&&!info->pNext&&!info->flags);
 }
-VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirectCount(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){
-    auto* d=deviceFor(c);session().tracker->unknownCommand(d->id,c);d->bridge.unknown(c);d->CmdDrawIndirectCount(c,buffer,offset,counts,countOffset,count,stride);
+void sharedCmdDrawIndirectCount(Device* d,PFN_vkCmdDrawIndirectCount original,bool khr,VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){
+    session().tracker->unknownCommand(d->id,c);unknownCommand(d,c,khr?RecordingOperation::CmdDrawIndirectCountKHR:RecordingOperation::CmdDrawIndirectCount);original(c,buffer,offset,counts,countOffset,count,stride);
 }
-VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirectCount(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){
-    auto* d=deviceFor(c);session().tracker->unknownCommand(d->id,c);d->bridge.unknown(c);d->CmdDrawIndexedIndirectCount(c,buffer,offset,counts,countOffset,count,stride);
+VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirectCount(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){auto* d=deviceFor(c);sharedCmdDrawIndirectCount(d,d->CmdDrawIndirectCount,false,c,buffer,offset,counts,countOffset,count,stride);}
+VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirectCountKHR(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){auto* d=deviceFor(c);sharedCmdDrawIndirectCount(d,d->CmdDrawIndirectCountKHR,true,c,buffer,offset,counts,countOffset,count,stride);}
+void sharedCmdDrawIndexedIndirectCount(Device* d,PFN_vkCmdDrawIndexedIndirectCount original,bool khr,VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){
+    session().tracker->unknownCommand(d->id,c);unknownCommand(d,c,khr?RecordingOperation::CmdDrawIndexedIndirectCountKHR:RecordingOperation::CmdDrawIndexedIndirectCount);original(c,buffer,offset,counts,countOffset,count,stride);
 }
+VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirectCount(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){auto* d=deviceFor(c);sharedCmdDrawIndexedIndirectCount(d,d->CmdDrawIndexedIndirectCount,false,c,buffer,offset,counts,countOffset,count,stride);}
+VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirectCountKHR(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){auto* d=deviceFor(c);sharedCmdDrawIndexedIndirectCount(d,d->CmdDrawIndexedIndirectCountKHR,true,c,buffer,offset,counts,countOffset,count,stride);}
 VKAPI_ATTR void VKAPI_CALL bridgeDestroyImage(VkDevice device,VkImage value,const VkAllocationCallbacks* alloc){
     auto* d=deviceFor(device);d->bridge.resourceRetiring(frame_pixel_ssbo_transaction::Resource::Image,frame_pixel_ssbo_clone::handle(value));traceDestroyImage(device,value,alloc);
 }
@@ -1463,10 +1567,10 @@ PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
 #include "passive_binding_aliases.inc"
 #undef BINDING_ALIAS
     ALIAS("vkCmdBeginRenderPass2KHR",CmdBeginRenderPass2KHR) ALIAS("vkCmdNextSubpass2KHR",CmdNextSubpass2KHR) ALIAS("vkCmdEndRenderPass2KHR",CmdEndRenderPass2KHR)
-    ALIAS("vkCmdBeginRenderingKHR",CmdBeginRendering) ALIAS("vkCmdEndRenderingKHR",CmdEndRendering) ALIAS("vkQueueSubmit2KHR",QueueSubmit2)
-    ALIAS("vkCmdDispatchBaseKHR",CmdDispatchBase)
+    ALIAS("vkCmdBeginRenderingKHR",CmdBeginRenderingKHR) ALIAS("vkCmdEndRenderingKHR",CmdEndRenderingKHR) ALIAS("vkQueueSubmit2KHR",QueueSubmit2KHR)
+    ALIAS("vkCmdDispatchBaseKHR",CmdDispatchBaseKHR)
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    ALIAS("vkCmdDrawIndirectCountKHR",CmdDrawIndirectCount) ALIAS("vkCmdDrawIndexedIndirectCountKHR",CmdDrawIndexedIndirectCount)
+    ALIAS("vkCmdDrawIndirectCountKHR",CmdDrawIndirectCountKHR) ALIAS("vkCmdDrawIndexedIndirectCountKHR",CmdDrawIndexedIndirectCountKHR)
 #endif
 #undef ALIAS
     return native;
