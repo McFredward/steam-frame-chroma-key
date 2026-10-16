@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -117,8 +118,11 @@ void publicInventory(){
     require(j.createLayout(f.graphics.layout,f.layout,VK_SUCCESS),"current Set0 joins correctly after reuse");
     require(j.destroySet(f.nativeSet),"native may destroy set after layout creation");
     require(j.createRenderPass(f.graphics.renderPass,f.pass,VK_SUCCESS),"full render pass retained");
-    auto pass=f.pass;pass.pNext=reinterpret_cast<const void*>(std::uintptr_t(1));
-    require(!j.createRenderPass(object<VkRenderPass>(0x31),pass,VK_SUCCESS,&event),"RP extension named without reading pNext");require(event.contract.reason==clone::Reason::Extension,"RP extension cause");
+    // Successful original inputs have readable chain headers; admission still
+    // refuses extensions without interpreting their payload.
+    VkBaseInStructure extension{static_cast<VkStructureType>(0x6fffffff),nullptr};
+    auto pass=f.pass;pass.pNext=&extension;
+    require(!j.createRenderPass(object<VkRenderPass>(0x31),pass,VK_SUCCESS,&event),"RP extension refused without interpreting unknown payload");require(event.contract.reason==clone::Reason::Extension,"RP extension cause");
     require(!j.unsupported(journal::ObjectKind::RenderPass,0x99,VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,&event),"explicit caller unsupported route remains a refusal");reason(event,journal::Reason::UnsupportedRoute);
     require(event.contract.type==VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,"unsupported public route type retained");
     auto shader=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);shader.codeSize=4;shader.pCode=reinterpret_cast<const std::uint32_t*>(std::uintptr_t(1));
@@ -130,7 +134,7 @@ void publicInventory(){
     graphics=f.graphics;graphics.renderPass=object<VkRenderPass>(0x99);require(!j.createPipeline(object<VkPipeline>(0x60),graphics,VK_SUCCESS,&event),"unknown pass");reason(event,journal::Reason::UnknownRenderPass);
     graphics=f.graphics;graphics.stageCount=3;graphics.pStages=reinterpret_cast<const VkPipelineShaderStageCreateInfo*>(std::uintptr_t(1));
     require(!j.createPipeline(object<VkPipeline>(0x60),graphics,VK_SUCCESS,&event),"stage bound before array read");require(event.contract.reason==clone::Reason::Stage,"stage refusal exact");
-    graphics.pNext=reinterpret_cast<const void*>(std::uintptr_t(1));require(!j.createPipeline(object<VkPipeline>(0x60),graphics,VK_SUCCESS,&event),"unsupported pipeline route rejected before ignored stage data");require(event.contract.reason==clone::Reason::PipelineExtension,"pipeline extension exact");
+    graphics.pNext=&extension;require(!j.createPipeline(object<VkPipeline>(0x60),graphics,VK_SUCCESS,&event),"unsupported pipeline route rejected before ignored stage data");require(event.contract.reason==clone::Reason::PipelineExtension,"pipeline extension exact");
     const auto stats=j.inspectStats();require(stats.firstRefusal.reason==first.reason && stats.firstRefusal.contract.reason==first.contract.reason,"later failures never overwrite first refusal");
     require(stats.refusals[static_cast<std::size_t>(journal::Reason::Contract)]>=4 && (stats.seenReasons&(1ull<<static_cast<unsigned>(journal::Reason::Capacity))),"fixed counters and deduplicated reason mask");
     journal::Ready ready;require(!j.takeReady(ready,&event) && !ready.recipe.definitionComplete,"no invented ready recipe");reason(event,journal::Reason::NoReady);
@@ -305,6 +309,68 @@ void privateVariants(const std::vector<std::uint32_t>& vs,const std::vector<std:
     require(!j.lookupPipeline(identities[5],out)&&!out.recipe.definitionComplete,"stale original selection cannot alias reused live pipeline");
     require(j.lookupPipeline(identities[4],out)&&out.pipeline.value==identities[4].value,"independent current actual variant remains selectable after another variant retires");
 }
+// Pressure model based on retained public startup counts/order, NOT replay of
+// uncaptured native payloads or proof that all archived layouts qualify.
+void privateStartup(const std::vector<std::uint32_t>& vs,const std::vector<std::uint32_t>& ps){
+    Fixture f;auto owned=std::make_unique<journal::Journal>(1,clone::ProbeInterface{},journal::PendingCount1::RetainFacts);auto& j=*owned;f.initialize(j);journal::Event event;
+    journal::Ready absent;require(!j.takeReady(absent),"NoReady before startup must not hide later refusal contexts");
+    std::array<VkDescriptorSetLayoutBinding,29> bindings{};
+    for(unsigned i=0;i<bindings.size();++i)bindings[i]={i,i<8?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:i==8?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i<25?VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_ALL,nullptr};
+    f.set.bindingCount=bindings.size();f.set.pBindings=bindings.data();require(j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"actual observed29binding shape retained as pending");const auto originalSet=event.generation;
+    auto attachment=info<VkAttachmentDescription2>(VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2);attachment.format=f.attachment.format;attachment.samples=f.attachment.samples;attachment.loadOp=f.attachment.loadOp;attachment.storeOp=f.attachment.storeOp;attachment.initialLayout=f.attachment.initialLayout;attachment.finalLayout=f.attachment.finalLayout;
+    VkAttachmentReference2 color{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,nullptr,0,f.color.layout,VK_IMAGE_ASPECT_COLOR_BIT};auto sub=info<VkSubpassDescription2>(VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2);sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=1;sub.pColorAttachments=&color;
+    auto ci=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);ci.attachmentCount=1;ci.pAttachments=&attachment;ci.subpassCount=1;ci.pSubpasses=&sub;
+    std::array<clone::Identity,107> layouts{},passes{};
+    for(unsigned i=0;i<107;++i){
+        f.push.offset=i*4;f.graphics.layout=object<VkPipelineLayout>(0x10000+i);f.graphics.renderPass=object<VkRenderPass>(0x20000+i);
+        require(j.createLayout(f.graphics.layout,f.layout,VK_SUCCESS,&event),"107 qualifying unrelated native layouts cannot starve late target");layouts[i]={1,event.value,event.generation};
+        require(j.createRenderPass2(f.graphics.renderPass,ci,VK_SUCCESS,&event),"107 ordinary RP2 definitions cannot starve late target");passes[i]={1,event.value,event.generation};
+        require(!j.createPipeline(object<VkPipeline>(0x30000+i),f.graphics,VK_SUCCESS,&event),"pending probe never authorizes unrelated pipeline");
+    }
+    require(j.inspectStats().setFactCount==1 && j.inspectStats().live[2]==107 && j.inspectStats().live[3]==107,"all107 layout identities share one immutable semantic Set0 fact");
+    require(j.destroySet(f.nativeSet),"native source Set0 can die before late pinned shader callback");bindings[0].descriptorCount=2;
+    require(j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.generation!=originalSet,"source Set0 handle reused with new facts and identity");
+    auto shader=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);shader.codeSize=ps.size()*4;shader.pCode=ps.data();clone::ShaderDefinition source;clone::Refusal why;
+    require(clone::captureShader(shader,clone::ShaderRole::Fragment,source,why),"exact actual PS required before promotion");frame_pixel_ssbo_profile::Artifact artifact;
+    require(frame_pixel_ssbo_profile::transform(source,frame_pixel_ssbo_profile::Election::Sparse32,artifact,why) && j.authorizeProbeInterface(artifact.profile),"all referenced pending facts promote once after exact artifact verification");
+    require(j.inspectStats().setFactCount==2,"old layout facts survive distinct reused Set0");
+    constexpr unsigned targets[6]{56,67,78,90,106,107};std::array<clone::Identity,6> identities{};
+    for(unsigned i=0;i<108;++i){
+        const auto index=std::min(i,106u);f.graphics.layout=object<VkPipelineLayout>(layouts[index].value);f.graphics.renderPass=object<VkRenderPass>(passes[index].value);
+        const auto target=std::find(std::begin(targets),std::end(targets),i);
+        if(target==std::end(targets)){f.stages[0].module=object<VkShaderModule>(0x900000+i);f.stages[1].module=object<VkShaderModule>(0x910000+i);require(!j.createPipeline(object<VkPipeline>(0x40000+i),f.graphics,VK_SUCCESS,&event) && event.reason==journal::Reason::UnknownShader,"unrelated shader pipelines consume no recipe slots");continue;}
+        const auto n=static_cast<unsigned>(target-std::begin(targets));f.stages[0].module=object<VkShaderModule>(0x50000+n*2);f.stages[1].module=object<VkShaderModule>(0x50001+n*2);
+        shader.codeSize=vs.size()*4;shader.pCode=vs.data();require(j.createShader(f.stages[0].module,shader,VK_SUCCESS),"late exact source VS retained");shader.codeSize=ps.size()*4;shader.pCode=ps.data();require(j.createShader(f.stages[1].module,shader,VK_SUCCESS),"late exact source PS retained");
+        require(j.createPipeline(object<VkPipeline>(0x40000+i),f.graphics,VK_SUCCESS,&event),"all6 late pinned target recipes admitted after107decoys");identities[n]={1,event.value,event.generation};
+    }
+    for(unsigned n=0;n<6;++n){journal::Ready ready;require(j.lookupPipeline(identities[n],ready),"exact late target generation lookup succeeds");const auto i=std::min(targets[n],106u);
+        require(ready.recipe.provenance[0].generation==originalSet && ready.recipe.set0.bindings[0].descriptorCount==1 && ready.recipe.provenance[1].generation==layouts[i].generation && ready.recipe.provenance[2].generation==passes[i].generation,"original association cannot alias destroyed/reused Set0");
+        require(ready.recipe.layout.ranges[0].offset==i*4 && ready.recipe.set0.probeInterface.sameProfile(artifact.profile) && !ready.nativeAuthority,"own exact layout bytes and probe without native authority");}
+    const auto stats=j.inspectStats();require(stats.live[2]==107 && stats.live[3]==107 && stats.live[4]==12 && stats.live[5]==6,"complete bounded startup inventory exact");
+    require(stats.refusals[static_cast<unsigned>(journal::Reason::Capacity)]==0 && !stats.contextOverflow,"modeled full startup has neither capacity starvation nor context saturation");
+    require(stats.firstRefusal.reason==journal::Reason::NoReady && stats.contextCount>=3,"later useful target-stage context visible despite first NoReady");
+    require(j.destroyLayout(object<VkPipelineLayout>(layouts[56].value)),"destroy original exact layout entry");f.graphics.layout=object<VkPipelineLayout>(layouts[56].value);f.push.offset=999*4;
+    require(j.createLayout(f.graphics.layout,f.layout,VK_SUCCESS,&event) && event.generation!=layouts[56].generation,"layout handle reuse obtains fresh generation");journal::Ready old;
+    require(j.lookupPipeline(identities[0],old) && old.recipe.layout.ranges[0].offset==56*4 && old.recipe.set0.bindings[0].descriptorCount==1,"completed target recipe unaffected by intermediate source reuse");
+    require(j.destroyPipeline(object<VkPipeline>(identities[0].value)) && !j.lookupPipeline(identities[0],old),"exact pipeline destroy cancels retained target lookup");
+}
+void semanticFactPressure(){
+    Fixture f;auto owned=std::make_unique<journal::Journal>();auto& j=*owned;f.initialize(j);journal::Event event;
+    std::array<VkDescriptorSetLayoutBinding,2> bindings{{f.binding,{1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr}}};f.set.bindingCount=2;f.set.pBindings=bindings.data();
+    for(unsigned i=0;i<journal::LayoutCapacity;++i){bindings[1].binding=100+i;require(j.createSet(f.nativeSet,f.set,VK_SUCCESS),"unique semantic set temporary source");require(j.createLayout(object<VkPipelineLayout>(0x1000+i),f.layout,VK_SUCCESS),"unique immutable fact retained by layout");require(j.destroySet(f.nativeSet),"fact ref survives native source retirement");}
+    for(unsigned i=0;i<journal::SetCapacity;++i){bindings[1].binding=10000+i;require(j.createSet(object<VkDescriptorSetLayout>(0x2000+i),f.set,VK_SUCCESS),"remaining live source set facts fill mathematical bound");}
+    auto stats=j.inspectStats();require(stats.setFactCount==journal::SetFactCapacity && stats.live[2]==journal::LayoutCapacity && stats.live[1]==journal::SetCapacity,"all distinct semantic facts reach exact reference-derived bound");
+    require(!j.createLayout(object<VkPipelineLayout>(0x5000),f.layout,VK_SUCCESS,&event) && event.reason==journal::Reason::Capacity && event.kind==journal::ObjectKind::Layout,"bounded instance overflow refuses without eviction");
+    require(j.destroyLayout(object<VkPipelineLayout>(0x1000)),"retiring final fact reference releases bank entry");require(j.inspectStats().setFactCount==journal::SetFactCapacity-1,"no semantic bank leak");
+    require(j.destroySet(object<VkDescriptorSetLayout>(0x2000)),"retiring live source releases its unique fact");bindings[1].binding=50000;require(j.createSet(f.nativeSet,f.set,VK_SUCCESS) && j.createLayout(object<VkPipelineLayout>(0x5000),f.layout,VK_SUCCESS),"released exact slots reusable without aliasing older snapshots");
+    for(unsigned i=0;i<journal::PassCapacity;++i)require(j.createRenderPass(object<VkRenderPass>(0x6000+i),f.pass,VK_SUCCESS),"full independent pass instance budget");
+    require(!j.createRenderPass(object<VkRenderPass>(0x7000),f.pass,VK_SUCCESS,&event) && event.reason==journal::Reason::Capacity && event.kind==journal::ObjectKind::RenderPass,"pass overflow kind distinct from layout overflow");
+    stats=j.inspectStats();bool layout=false,pass=false;for(unsigned i=0;i<stats.contextCount;++i)if(stats.contexts[i].first.reason==journal::Reason::Capacity){layout|=stats.contexts[i].first.kind==journal::ObjectKind::Layout;pass|=stats.contexts[i].first.kind==journal::ObjectKind::RenderPass;}
+    require(layout && pass,"same Capacity bit retains both actual exhausted object kinds");
+    const auto facts=j.inspectFacts();bool capacityFact=false;
+    for(unsigned i=0;i<facts.creationCount;++i)capacityFact|=facts.creations[i].shape.kind==frame_pixel_definition_facts::CreationKind::RenderPass && facts.creations[i].count==journal::PassCapacity+1;
+    require(capacityFact,"original successful RP shape remains observable after optional inventory refusal");j.destroyDevice();stats=j.inspectStats();require(!stats.setFactCount && !stats.live[1] && !stats.live[2] && !stats.live[3],"device retirement releases all owned bank references");
+}
 void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
     const auto vs=readShader(vsPath),ps=readShader(psPath);
     std::ifstream input(probePath,std::ios::binary|std::ios::ate);require(bool(input),"private canonical probe readable");const auto bytes=input.tellg();
@@ -338,13 +404,14 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
 }
 }
 int main(int argc,char** argv){
+    if(argc==4 && std::strcmp(argv[1],"--startup-only")==0){semanticFactPressure();privateStartup(readShader(argv[2]),readShader(argv[3]));std::cout<<"{\"scope\":\"startup-pressure-model-subset\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)<<",\"exact_native_payload_replay\":false,\"native_authority\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--refusal-contexts-only")==0){refusalContexts();std::cout<<"{\"scope\":\"journal-context-rp2-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     if(argc==4 && std::strcmp(argv[1],"--variants-only")==0){privateVariants(readShader(argv[2]),readShader(argv[3]));std::cout<<"{\"scope\":\"private-pipeline-variants-subset\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)<<",\"native_authority\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--layout-flags-only")==0){layoutFlags();std::cout<<"{\"scope\":\"layout-flags-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--metadata-facts-only")==0){metadataDespiteRefusal();std::cout<<"{\"scope\":\"metadata-facts-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     require(argc==1 || argc==3 || argc==4,"optional private VS/PS [count1 probe] arguments only");
-    deviceControls();publicInventory();publicConcurrency();refusalContexts();layoutFlags();metadataDespiteRefusal();
-    if(argc>=3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);privateVariants(vs,ps);}
+    deviceControls();publicInventory();publicConcurrency();refusalContexts();layoutFlags();metadataDespiteRefusal();semanticFactPressure();
+    if(argc>=3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);privateVariants(vs,ps);privateStartup(vs,ps);}
     if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-definition-journal-controls-v1\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)
              <<",\"event_bytes\":"<<sizeof(journal::Event)<<",\"private_native_pins_tested\":"<<(argc>=3?"true":"false")

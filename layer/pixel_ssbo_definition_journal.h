@@ -12,10 +12,17 @@
 
 namespace frame_pixel_ssbo_journal {
 namespace clone=frame_pixel_ssbo_clone;
-// The retained native sequence has six created distortion variants; their
-// overlapping lifetimes are unknown, so all six may need retention. Definition
-// retention is independent of the smaller progress-report budget.
-constexpr std::size_t SetCapacity=16, LayoutCapacity=16, PassCapacity=16;
+// The retained startup archive has 107 distinct pipeline-layout handles before
+// all six pinned target variants appear. It does not retain destruction or prove
+// all 107 qualify. Reserve 2x that instance count, rounded to 256, for layouts
+// and passes. Set handles use the same archived count rounded to 128. These
+// are explicit finite instance budgets, not claimed native lifetime maxima.
+// Unrelated layouts share facts rather than each copying full Set0 definitions.
+// Unknown future pressure remains an explicit finite refusal, never eviction.
+constexpr std::size_t SetCapacity=128, LayoutCapacity=256, PassCapacity=256;
+// Each retained Set or Layout owns one reference. Therefore this many immutable
+// semantic definitions cannot fill before the corresponding instance budgets.
+constexpr std::size_t SetFactCapacity=SetCapacity+LayoutCapacity;
 constexpr std::size_t ShaderCapacity=16, PipelineCapacity=16;
 enum class PendingCount1 : std::uint8_t {Refuse,RetainFacts};
 enum class ObjectKind : std::uint8_t {Device,Set,Layout,RenderPass,Shader,Pipeline};
@@ -63,6 +70,7 @@ struct Stats {
     std::uint32_t contextCount=0;
     std::uint64_t contextOverflow=0;
     std::array<std::uint32_t,6> live{},capacity{};
+    std::uint32_t setFactCount=0,setFactCapacity=SetFactCapacity;
     clone::FeatureFacts feature{};
     clone::Refusal deviceRefusal{};
     bool initialized=false;
@@ -107,7 +115,10 @@ public:
             }else if(pendingCount1_!=PendingCount1::RetainFacts || !clone::capturePendingCount1Set0(ci,definition,why))
                 return fail(out,Reason::Contract,ObjectKind::Set,value,0,why);
         }
-        return insert(sets_,value,definition,ObjectKind::Set,out);
+        const auto index=retainSetFact(definition);
+        if(index==SetFactCapacity)return fail(out,Reason::Capacity,ObjectKind::Set,value);
+        if(insert(sets_,value,SetSnapshot{index},ObjectKind::Set,out))return true;
+        releaseSetFact(index);return false;
     }
     // Successful native Set0/layout callbacks may precede the original PS
     // callback. Promote only bounded owned facts after the cold transformer
@@ -119,13 +130,20 @@ public:
         if(!profile.specializedCount1())return fail(out,Reason::Contract,ObjectKind::Shader,0,0,{clone::Reason::ShaderProfile});
         if(probeInterface_.specializedCount1())return probeInterface_.sameProfile(profile) ||
             fail(out,Reason::Contract,ObjectKind::Shader,0,0,{clone::Reason::ShaderProfile});
-        // Validate into local copies first so any refusal is all-or-nothing.
-        auto sets=sets_;auto layouts=layouts_;clone::Refusal why;
-        for(auto& slot:sets)if(slot.live && slot.definition.pendingCount1 && !clone::promotePendingCount1Set0(slot.definition,profile,why))
-            return fail(out,Reason::Contract,ObjectKind::Set,slot.identity.value,slot.identity.generation,why);
-        for(auto& slot:layouts)if(slot.live && slot.definition.set0.pendingCount1 && !clone::promotePendingCount1Set0(slot.definition.set0,profile,why))
-            return fail(out,Reason::Contract,ObjectKind::Layout,slot.identity.value,slot.identity.generation,why);
-        sets_=sets;layouts_=layouts;probeInterface_=profile;return true;
+        // Validate every owned pending semantic definition before changing any.
+        // Temporary per-fact copies keep stack use independent of inventory size.
+        clone::Refusal why;
+        for(const auto& fact:setFacts_)if(fact.references && fact.definition.pendingCount1){
+            auto verified=fact.definition;
+            if(!clone::promotePendingCount1Set0(verified,profile,why))
+                return fail(out,Reason::Contract,ObjectKind::Set,0,0,why);
+        }
+        for(auto& fact:setFacts_)if(fact.references && fact.definition.pendingCount1){
+            // Same immutable input, same verified profile, no callbacks between
+            // validation and promotion under this mutex: this cannot newly fail.
+            clone::promotePendingCount1Set0(fact.definition,profile,why);
+        }
+        probeInterface_=profile;return true;
     }
     bool createLayout(VkPipelineLayout object,const VkPipelineLayoutCreateInfo& ci,VkResult result,Event* out=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
@@ -145,11 +163,13 @@ public:
         LayoutSnapshot definition;clone::Refusal why;
         if(!clone::captureLayout(ci,ci.pSetLayouts[0],definition.layout,why))
             return fail(out,Reason::Contract,ObjectKind::Layout,value,0,why);
-        definition.set0=set->definition;definition.setIdentity=set->identity;
-        return insert(layouts_,value,definition,ObjectKind::Layout,out);
+        definition.setFact=set->definition.setFact;definition.setIdentity=set->identity;
+        if(!insert(layouts_,value,definition,ObjectKind::Layout,out))return false;
+        ++setFacts_[definition.setFact].references;return true;
     }
     bool createRenderPass(VkRenderPass object,const VkRenderPassCreateInfo& ci,VkResult result,Event* out=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
+        if(!retired_)frame_pixel_definition_facts::renderPass(facts_,ci,result,value);
         if(!beginCreate(passes_,value,result,ObjectKind::RenderPass,out))return false;
         clone::RenderPassDefinition definition;clone::Refusal why;
         if(!clone::captureRenderPass(&ci,definition,why))return fail(out,Reason::Contract,ObjectKind::RenderPass,value,0,why);
@@ -157,6 +177,7 @@ public:
     }
     bool createRenderPass2(VkRenderPass object,const VkRenderPassCreateInfo2& ci,VkResult result,Event* out=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
+        if(!retired_)frame_pixel_definition_facts::renderPass2(facts_,ci,result,value);
         if(!beginCreate(passes_,value,result,ObjectKind::RenderPass,out))return false;
         clone::RenderPassDefinition definition;clone::Refusal why;
         if(!clone::captureRenderPass2(&ci,definition,why))return fail(out,Reason::Contract,ObjectKind::RenderPass,value,0,why);
@@ -174,6 +195,7 @@ public:
     }
     bool createPipeline(VkPipeline object,const VkGraphicsPipelineCreateInfo& ci,VkResult result,Event* out=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
+        if(!retired_)frame_pixel_definition_facts::graphics(facts_,ci,result,value);
         if(!beginCreate(pipelines_,value,result,ObjectKind::Pipeline,out))return false;
         if(ci.sType!=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
             return fail(out,Reason::Contract,ObjectKind::Pipeline,value,0,{clone::Reason::Type});
@@ -182,7 +204,8 @@ public:
             return fail(out,Reason::Contract,ObjectKind::Pipeline,value,0,{clone::Reason::PipelineFlags});
         const auto* layout=find(layouts_,clone::handle(ci.layout));
         if(!layout)return fail(out,Reason::UnknownLayout,ObjectKind::Pipeline,value);
-        if(!layout->definition.set0.complete || layout->definition.set0.pendingCount1)
+        const auto& set0=setFacts_[layout->definition.setFact].definition;
+        if(!set0.complete || set0.pendingCount1)
             return fail(out,Reason::Contract,ObjectKind::Pipeline,value,0,{clone::Reason::Image9Extent});
         const auto* pass=find(passes_,clone::handle(ci.renderPass));
         if(!pass)return fail(out,Reason::UnknownRenderPass,ObjectKind::Pipeline,value);
@@ -202,7 +225,7 @@ public:
                                   ci.pStages[ci.pStages[0].stage==VK_SHADER_STAGE_FRAGMENT_BIT?0:1].module,
                                   pass->definition,recipe.graphics,why))
             return fail(out,Reason::Contract,ObjectKind::Pipeline,value,0,why);
-        recipe.feature=stats_.feature;recipe.set0=layout->definition.set0;recipe.layout=layout->definition.layout;
+        recipe.feature=stats_.feature;recipe.set0=set0;recipe.layout=layout->definition.layout;
         recipe.renderPass=pass->definition;recipe.vertex=vertex->definition.shader;recipe.fragment=fragment->definition.shader;
         recipe.provenance={layout->definition.setIdentity,layout->identity,pass->identity,vertex->identity,fragment->identity,{}};
         auto* slot=empty(pipelines_); // beginCreate already checked the bounded inventory.
@@ -224,7 +247,7 @@ public:
     void destroyDevice() {
         std::lock_guard<std::mutex> lock(mutex_);
         for(auto& slot:pipelines_)if(slot.live && slot.ready)increment(stats_.cancelled);
-        sets_={};layouts_={};passes_={};shaders_={};pipelines_={};retired_=true;
+        sets_={};layouts_={};setFacts_={};passes_={};shaders_={};pipelines_={};retired_=true;
     }
     bool takeReady(Ready& out,Event* why=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);out={};clear(why,ObjectKind::Pipeline,0);
@@ -270,12 +293,15 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);auto out=stats_;
         out.capacity={1,SetCapacity,LayoutCapacity,PassCapacity,ShaderCapacity,PipelineCapacity};
         out.live={stats_.initialized&&!retired_?1u:0u,liveCount(sets_),liveCount(layouts_),liveCount(passes_),liveCount(shaders_),liveCount(pipelines_)};
+        for(const auto& fact:setFacts_)out.setFactCount+=fact.references?1u:0u;
         return out;
     }
     frame_pixel_definition_facts::Facts inspectFacts() const {std::lock_guard<std::mutex> lock(mutex_);return facts_;}
 
 private:
-    struct LayoutSnapshot {clone::Set0Definition set0{};clone::LayoutDefinition layout{};clone::Identity setIdentity{};};
+    struct SetSnapshot {std::size_t setFact=SetFactCapacity;};
+    struct SetFact {clone::Set0Definition definition{};std::uint32_t references=0;};
+    struct LayoutSnapshot {std::size_t setFact=SetFactCapacity;clone::LayoutDefinition layout{};clone::Identity setIdentity{};};
     struct ShaderSnapshot {clone::ShaderDefinition shader{};clone::ShaderRole role=clone::ShaderRole::Vertex;};
     template<class T> struct Slot {clone::Identity identity{};T definition{};bool live=false,ready=false;};
     mutable std::mutex mutex_;
@@ -285,11 +311,31 @@ private:
     bool retired_=false;
     Stats stats_{};
     frame_pixel_definition_facts::Facts facts_{};
-    std::array<Slot<clone::Set0Definition>,SetCapacity> sets_{};
+    std::array<Slot<SetSnapshot>,SetCapacity> sets_{};
+    std::array<SetFact,SetFactCapacity> setFacts_{};
     std::array<Slot<LayoutSnapshot>,LayoutCapacity> layouts_{};
     std::array<Slot<clone::RenderPassDefinition>,PassCapacity> passes_{};
     std::array<Slot<ShaderSnapshot>,ShaderCapacity> shaders_{};
     std::array<Slot<clone::Recipe>,PipelineCapacity> pipelines_{};
+    static bool sameSet(const clone::Set0Definition& a,const clone::Set0Definition& b) noexcept {
+        if(a.count!=b.count || a.complete!=b.complete || a.pendingCount1!=b.pendingCount1 || !a.probeInterface.sameProfile(b.probeInterface))return false;
+        for(std::uint32_t i=0;i<a.count;++i){const auto& x=a.bindings[i];const auto& y=b.bindings[i];
+            if(x.binding!=y.binding || x.descriptorType!=y.descriptorType || x.descriptorCount!=y.descriptorCount || x.stageFlags!=y.stageFlags)return false;
+        }
+        return true; // Immutable sampler pointers are rejected by capture.
+    }
+    std::size_t retainSetFact(const clone::Set0Definition& definition) noexcept {
+        std::size_t unused=SetFactCapacity;
+        for(std::size_t i=0;i<setFacts_.size();++i){auto& fact=setFacts_[i];
+            if(fact.references && sameSet(fact.definition,definition)){++fact.references;return i;}
+            if(!fact.references && unused==SetFactCapacity)unused=i;
+        }
+        if(unused!=SetFactCapacity)setFacts_[unused]={definition,1};
+        return unused;
+    }
+    void releaseSetFact(std::size_t index) noexcept {
+        if(index<setFacts_.size() && setFacts_[index].references && !--setFacts_[index].references)setFacts_[index]={};
+    }
     static std::uint64_t acquireEpoch() {
         // Process-local diagnostic token namespace, not a native device epoch.
         // Constructor-only serialization never nests the instance mutex. On
@@ -361,6 +407,7 @@ private:
         if(!slot)return fail(out,Reason::UnknownObject,kind,value);
         const auto generation=slot->identity.generation;
         if(slot->ready)increment(stats_.cancelled);
+        if constexpr(std::is_same_v<T,SetSnapshot> || std::is_same_v<T,LayoutSnapshot>)releaseSetFact(slot->definition.setFact);
         *slot={};increment(stats_.destroyed);clear(out,kind,value,generation);return true;
     }
 };
