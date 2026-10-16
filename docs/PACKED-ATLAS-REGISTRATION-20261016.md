@@ -52,9 +52,9 @@ their specific RGB/raw-G checks on both drivers, without validation errors.
 
 Ten Python structure/schema/CLI methods pass with the explicit private original.
 Four before/after old-q binary and record comparisons agree byte-for-byte.
-No unchanged whole mod gate is rerun. Original modules/generated derivatives
-remain private and are deleted with owned compiler/package caches after use;
-small source pins, positive/negative results and reviews are retained in
+No unchanged whole mod gate is rerun. Original inputs remain private and are
+preserved; generated derivatives and owned compiler/package caches are deleted
+after use. Small source pins, positive/negative results and reviews are retained in
 `build/private-packed-atlas-20261016/`.
 
 ## What a registration result must mean
