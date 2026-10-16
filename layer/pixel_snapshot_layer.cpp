@@ -106,7 +106,7 @@ struct Device {
     FIELD(DestroyDevice) FIELD(DeviceWaitIdle) FIELD(CreateShaderModule) FIELD(DestroyShaderModule)
     FIELD(CreateGraphicsPipelines) FIELD(DestroyPipeline) FIELD(CreateCommandPool)
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-    FIELD(CreateRenderPass) FIELD(CreateRenderPass2) FIELD(DestroyRenderPass)
+    FIELD(CreateRenderPass) FIELD(CreateRenderPass2) FIELD(CreateRenderPass2KHR) FIELD(DestroyRenderPass)
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     FIELD(GetDeviceQueue) FIELD(GetDeviceQueue2) FIELD(CmdDrawIndirectCount) FIELD(CmdDrawIndexedIndirectCount)
 #endif
@@ -119,6 +119,7 @@ struct Device {
     FIELD(CmdBeginQuery) FIELD(CmdBeginQueryIndexedEXT)
     FIELD(CmdExecuteCommands) FIELD(CmdBeginRenderPass) FIELD(CmdNextSubpass) FIELD(CmdEndRenderPass)
     FIELD(CmdBeginRenderPass2) FIELD(CmdNextSubpass2) FIELD(CmdEndRenderPass2)
+    FIELD(CmdBeginRenderPass2KHR) FIELD(CmdNextSubpass2KHR) FIELD(CmdEndRenderPass2KHR)
     FIELD(CmdBeginRendering) FIELD(CmdEndRendering) FIELD(QueueSubmit) FIELD(QueueSubmit2)
 #define BINDING_FIELD(name) FIELD(name)
 #include "passive_binding_commands.inc"
@@ -768,6 +769,18 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyInstance(VkInstance instance,const VkAllo
     auto* i=instanceFor(instance);auto next=reinterpret_cast<PFN_vkDestroyInstance>(i->gipa(instance,"vkDestroyInstance"));
     const auto key=dispatchKey(instance);next(instance,alloc);auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.instances.erase(key);
 }
+// A non-null core pointer does not authorize substituting it for an enabled
+// extension command (or the reverse). Preserve the exact queried API name.
+void loadRenderPass2Dispatch(Device& d,VkDevice device) {
+#define LOAD_RP2(name) d.name=reinterpret_cast<PFN_vk##name>(d.gdpa(device,"vk" #name));
+#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+    LOAD_RP2(CreateRenderPass2) LOAD_RP2(CreateRenderPass2KHR)
+#endif
+    LOAD_RP2(CmdBeginRenderPass2) LOAD_RP2(CmdBeginRenderPass2KHR)
+    LOAD_RP2(CmdNextSubpass2) LOAD_RP2(CmdNextSubpass2KHR)
+    LOAD_RP2(CmdEndRenderPass2) LOAD_RP2(CmdEndRenderPass2KHR)
+#undef LOAD_RP2
+}
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const VkDeviceCreateInfo* info,const VkAllocationCallbacks* alloc,VkDevice* out) {
     auto* i=instanceFor(physical);auto* link=static_cast<VkLayerDeviceCreateInfo*>(const_cast<void*>(info->pNext));
     while(link && (link->sType!=VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO || link->function!=VK_LAYER_LINK_INFO))
@@ -819,7 +832,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     LOAD(DestroyDevice) LOAD(DeviceWaitIdle) LOAD(CreateShaderModule) LOAD(DestroyShaderModule)
     LOAD(CreateGraphicsPipelines) LOAD(DestroyPipeline) LOAD(CreateCommandPool)
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-    LOAD(CreateRenderPass) LOAD(CreateRenderPass2) LOAD(DestroyRenderPass)
+    LOAD(CreateRenderPass) LOAD(DestroyRenderPass)
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     LOAD(GetDeviceQueue) LOAD(GetDeviceQueue2) LOAD(CmdDrawIndirectCount) LOAD(CmdDrawIndexedIndirectCount)
 #endif
@@ -830,21 +843,18 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     LOAD(CmdBindShadersEXT)
     LOAD(CmdDispatch) LOAD(CmdDispatchIndirect) LOAD(CmdDispatchBase)
     LOAD(CmdBeginQuery) LOAD(CmdBeginQueryIndexedEXT)
-    LOAD(CmdBeginRenderPass) LOAD(CmdNextSubpass) LOAD(CmdEndRenderPass) LOAD(CmdBeginRenderPass2) LOAD(CmdNextSubpass2) LOAD(CmdEndRenderPass2)
+    LOAD(CmdBeginRenderPass) LOAD(CmdNextSubpass) LOAD(CmdEndRenderPass)
     LOAD(CmdBeginRendering) LOAD(CmdEndRendering) LOAD(QueueSubmit) LOAD(QueueSubmit2)
 #define BINDING_FIELD(name) LOAD(name)
 #include "passive_binding_commands.inc"
 #undef BINDING_FIELD
 #undef LOAD
+    loadRenderPass2Dispatch(*d,*out);
 #define ALIAS(name,suffix) if(!d->name)d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,"vk" #name suffix));
-    ALIAS(CmdBeginRenderPass2,"KHR") ALIAS(CmdNextSubpass2,"KHR") ALIAS(CmdEndRenderPass2,"KHR")
     ALIAS(CmdBeginRendering,"KHR") ALIAS(CmdEndRendering,"KHR") ALIAS(QueueSubmit2,"KHR")
     ALIAS(CmdDispatchBase,"KHR")
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     ALIAS(CmdDrawIndirectCount,"KHR") ALIAS(CmdDrawIndexedIndirectCount,"KHR")
-#endif
-#ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-    ALIAS(CreateRenderPass2,"KHR")
 #endif
 #undef ALIAS
 #define BINDING_ALIAS(alias,name) if(!d->name)d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,alias));
@@ -1026,10 +1036,16 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass(VkDevice device,const VkRen
     if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.createRenderPass(*out,*info,result);});
     return result;
 }
-VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass2(VkDevice device,const VkRenderPassCreateInfo2* info,const VkAllocationCallbacks* alloc,VkRenderPass* out) {
-    auto* d=deviceFor(device);const auto result=d->CreateRenderPass2(device,info,alloc,out);
-    if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.createRenderPass2(*out,*info,result);});
+VkResult createRenderPass2(Device* d,PFN_vkCreateRenderPass2 original,bool khr,VkDevice device,const VkRenderPassCreateInfo2* info,const VkAllocationCallbacks* alloc,VkRenderPass* out) {
+    const auto result=original(device,info,alloc,out);
+    if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.createRenderPass2(*out,*info,result,nullptr,khr);});
     return result;
+}
+VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass2(VkDevice device,const VkRenderPassCreateInfo2* info,const VkAllocationCallbacks* alloc,VkRenderPass* out) {
+    auto* d=deviceFor(device);return createRenderPass2(d,d->CreateRenderPass2,false,device,info,alloc,out);
+}
+VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass2KHR(VkDevice device,const VkRenderPassCreateInfo2* info,const VkAllocationCallbacks* alloc,VkRenderPass* out) {
+    auto* d=deviceFor(device);return createRenderPass2(d,d->CreateRenderPass2KHR,true,device,info,alloc,out);
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyRenderPass(VkDevice device,VkRenderPass value,const VkAllocationCallbacks* alloc) {
     auto* d=deviceFor(device);
@@ -1266,30 +1282,48 @@ VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass(VkCommandBuffer command) {
 #endif
     afterRenderPass(d,command,false);
 }
-VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2(VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
-    auto* d=deviceFor(command);session().tracker->beginRenderPass(d->id,command,begin->contents);
+void beginRenderPass2(Device* d,PFN_vkCmdBeginRenderPass2 original,VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
+    session().tracker->beginRenderPass(d->id,command,begin->contents);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     if(info->sType==VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO&&!info->pNext&&begin->sType==VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO&&!begin->pNext&&begin->contents==VK_SUBPASS_CONTENTS_INLINE)
         d->bridge.beginPass(command,info->renderPass,begin->contents);
     else d->bridge.unknown(command);
 #endif
-    d->CmdBeginRenderPass2(command,info,begin);
+    original(command,info,begin);
 }
-VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass2(VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);session().tracker->nextSubpass(d->id,command,begin->contents);
-    d->CmdNextSubpass2(command,begin,end);
+VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2(VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
+    auto* d=deviceFor(command);beginRenderPass2(d,d->CmdBeginRenderPass2,command,info,begin);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2KHR(VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
+    auto* d=deviceFor(command);beginRenderPass2(d,d->CmdBeginRenderPass2KHR,command,info,begin);
+}
+void nextSubpass2(Device* d,PFN_vkCmdNextSubpass2 original,VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
+    session().tracker->nextSubpass(d->id,command,begin->contents);
+    original(command,begin,end);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     if(begin->sType==VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO&&!begin->pNext&&end->sType==VK_STRUCTURE_TYPE_SUBPASS_END_INFO&&!end->pNext)
         d->bridge.nextPass(command,begin->contents);
     else d->bridge.unknown(command);
 #endif
 }
-VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass2(VkCommandBuffer command,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);d->CmdEndRenderPass2(command,end);
+VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass2(VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
+    auto* d=deviceFor(command);nextSubpass2(d,d->CmdNextSubpass2,command,begin,end);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass2KHR(VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
+    auto* d=deviceFor(command);nextSubpass2(d,d->CmdNextSubpass2KHR,command,begin,end);
+}
+void endRenderPass2(Device* d,PFN_vkCmdEndRenderPass2 original,VkCommandBuffer command,const VkSubpassEndInfo* end) {
+    original(command,end);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     if(end->sType==VK_STRUCTURE_TYPE_SUBPASS_END_INFO&&!end->pNext)d->bridge.endPass(command);else d->bridge.unknown(command);
 #endif
     afterRenderPass(d,command,false);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass2(VkCommandBuffer command,const VkSubpassEndInfo* end) {
+    auto* d=deviceFor(command);endRenderPass2(d,d->CmdEndRenderPass2,command,end);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass2KHR(VkCommandBuffer command,const VkSubpassEndInfo* end) {
+    auto* d=deviceFor(command);endRenderPass2(d,d->CmdEndRenderPass2KHR,command,end);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRendering(VkCommandBuffer command,const VkRenderingInfo* info) {
     auto* d=deviceFor(command);session().tracker->beginRendering(d->id,command,*info);
@@ -1407,7 +1441,7 @@ PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     HOOK(GetDeviceQueue) HOOK(GetDeviceQueue2) HOOK(CmdDrawIndirectCount) HOOK(CmdDrawIndexedIndirectCount)
 #endif
-    if(!std::strcmp(name,"vkCreateRenderPass2KHR"))return reinterpret_cast<PFN_vkVoidFunction>(traceCreateRenderPass2);
+    HOOK(CreateRenderPass2KHR)
 #endif
     HOOK(CreateCommandPool) HOOK(DestroyCommandPool) HOOK(ResetCommandPool)
     HOOK(AllocateCommandBuffers) HOOK(FreeCommandBuffers) HOOK(BeginCommandBuffer) HOOK(EndCommandBuffer) HOOK(ResetCommandBuffer)
@@ -1426,7 +1460,7 @@ PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
 #define BINDING_ALIAS(alias,method) ALIAS(alias,method)
 #include "passive_binding_aliases.inc"
 #undef BINDING_ALIAS
-    ALIAS("vkCmdBeginRenderPass2KHR",CmdBeginRenderPass2) ALIAS("vkCmdNextSubpass2KHR",CmdNextSubpass2) ALIAS("vkCmdEndRenderPass2KHR",CmdEndRenderPass2)
+    ALIAS("vkCmdBeginRenderPass2KHR",CmdBeginRenderPass2KHR) ALIAS("vkCmdNextSubpass2KHR",CmdNextSubpass2KHR) ALIAS("vkCmdEndRenderPass2KHR",CmdEndRenderPass2KHR)
     ALIAS("vkCmdBeginRenderingKHR",CmdBeginRendering) ALIAS("vkCmdEndRenderingKHR",CmdEndRendering) ALIAS("vkQueueSubmit2KHR",QueueSubmit2)
     ALIAS("vkCmdDispatchBaseKHR",CmdDispatchBase)
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION

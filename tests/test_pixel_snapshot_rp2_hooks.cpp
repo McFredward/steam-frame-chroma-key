@@ -26,6 +26,7 @@ namespace {
 enum class HookEvent {Begin,Next,End,NativeIndexed,OwnedIndexed,OriginalPipeline,OwnedPipeline,HostBarrier};
 struct HookCalls {
     unsigned creates=0,begins=0,nexts=0,ends=0,nativeIndexed=0,ownedIndexed=0,commandBegins=0,commandEnds=0,idles=0,destroys=0;
+    std::array<unsigned,4> coreRoute{},khrRoute{};
     VkResult createResult=VK_SUCCESS;
     const VkRenderPassCreateInfo2* createInfo=nullptr;
     const VkRenderPassBeginInfo* beginInfo=nullptr;
@@ -35,8 +36,8 @@ struct HookCalls {
     VkDevice dispatchDevice{};
     std::vector<HookEvent> events;
 } hookCalls;
-unsigned ownedResets=0,ownedFences=0;
-unsigned ownedPassCount=1,ownedTargetSubpass=0,ownedLegacyPasses=0,ownedPasses2=0;
+unsigned ownedResets=0,ownedFences=0,availableRP2Routes=3;
+unsigned ownedPassCount=1,ownedTargetSubpass=0,ownedLegacyPasses=0,ownedPasses2=0,ownedPasses2Core=0,ownedPasses2KHR=0;
 void emulateShader(){const std::array<std::uint32_t,4> header{{1,0x5353424f,1,32}};std::memcpy(owned_fixture::driver->mapped.data(),header.data(),16);}
 VKAPI_ATTR void VKAPI_CALL hookFill(VkCommandBuffer,VkBuffer,VkDeviceSize,VkDeviceSize,std::uint32_t){++ownedResets;}
 VKAPI_ATTR void VKAPI_CALL hookSets(VkCommandBuffer,VkPipelineBindPoint,VkPipelineLayout,std::uint32_t,std::uint32_t,const VkDescriptorSet*,std::uint32_t,const std::uint32_t*){}
@@ -62,27 +63,40 @@ template<class Info>VkResult hookOwnedPass(VkDevice d,const Info* ci,const VkAll
     return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL hookOwnedPass1(VkDevice d,const VkRenderPassCreateInfo* ci,const VkAllocationCallbacks* a,VkRenderPass* out){++ownedLegacyPasses;return hookOwnedPass(d,ci,a,out);}
-VKAPI_ATTR VkResult VKAPI_CALL hookOwnedPass2(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* a,VkRenderPass* out){++ownedPasses2;return hookOwnedPass(d,ci,a,out);}
+VKAPI_ATTR VkResult VKAPI_CALL hookOwnedPass2(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* a,VkRenderPass* out){++ownedPasses2;++ownedPasses2Core;return hookOwnedPass(d,ci,a,out);}
+VKAPI_ATTR VkResult VKAPI_CALL hookOwnedPass2KHR(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* a,VkRenderPass* out){++ownedPasses2;++ownedPasses2KHR;return hookOwnedPass(d,ci,a,out);}
 VKAPI_ATTR VkResult VKAPI_CALL hookOwnedPipelineCreate(VkDevice d,VkPipelineCache cache,std::uint32_t count,const VkGraphicsPipelineCreateInfo* ci,const VkAllocationCallbacks* a,VkPipeline* out){
     require(count==1&&ci->subpass==ownedTargetSubpass,"owned graphics pipeline preserves exact original nonzero target subpass");
     return owned_fixture::createPipeline(d,cache,count,ci,a,out);
 }
-VKAPI_ATTR VkResult VKAPI_CALL hookCreatePass2(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* allocator,VkRenderPass* out){
+VkResult hookCreatePass2Route(bool khr,VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* allocator,VkRenderPass* out){
+    ++(khr?hookCalls.khrRoute:hookCalls.coreRoute)[0];
     require(d==hookCalls.dispatchDevice&&!allocator&&ci==hookCalls.createInfo,"original RP2 creation arguments forwarded unchanged");
     ++hookCalls.creates;if(hookCalls.createResult==VK_SUCCESS)*out=h<VkRenderPass>(29+hookCalls.creates);return hookCalls.createResult;
 }
-VKAPI_ATTR void VKAPI_CALL hookBegin2(VkCommandBuffer c,const VkRenderPassBeginInfo* ci,const VkSubpassBeginInfo* begin){
+void hookBegin2Route(bool khr,VkCommandBuffer c,const VkRenderPassBeginInfo* ci,const VkSubpassBeginInfo* begin){
+    ++(khr?hookCalls.khrRoute:hookCalls.coreRoute)[1];
     require(c==hookCalls.command&&ci==hookCalls.beginInfo&&begin==hookCalls.subBegin,"original Begin2 arguments forwarded unchanged");
     ++hookCalls.begins;hookCalls.events.push_back(HookEvent::Begin);
 }
-VKAPI_ATTR void VKAPI_CALL hookNext2(VkCommandBuffer c,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end){
+void hookNext2Route(bool khr,VkCommandBuffer c,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end){
+    ++(khr?hookCalls.khrRoute:hookCalls.coreRoute)[2];
     require(c==hookCalls.command&&begin==hookCalls.subBegin&&end==hookCalls.subEnd,"original Next2 arguments forwarded unchanged");
     ++hookCalls.nexts;hookCalls.events.push_back(HookEvent::Next);
 }
-VKAPI_ATTR void VKAPI_CALL hookEnd2(VkCommandBuffer c,const VkSubpassEndInfo* end){
+void hookEnd2Route(bool khr,VkCommandBuffer c,const VkSubpassEndInfo* end){
+    ++(khr?hookCalls.khrRoute:hookCalls.coreRoute)[3];
     require(c==hookCalls.command&&end==hookCalls.subEnd,"original End2 arguments forwarded unchanged");
     ++hookCalls.ends;hookCalls.events.push_back(HookEvent::End);
 }
+VKAPI_ATTR VkResult VKAPI_CALL hookCreatePass2(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* a,VkRenderPass* out){return hookCreatePass2Route(false,d,ci,a,out);}
+VKAPI_ATTR VkResult VKAPI_CALL hookCreatePass2KHR(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* a,VkRenderPass* out){return hookCreatePass2Route(true,d,ci,a,out);}
+VKAPI_ATTR void VKAPI_CALL hookBegin2(VkCommandBuffer c,const VkRenderPassBeginInfo* ci,const VkSubpassBeginInfo* begin){hookBegin2Route(false,c,ci,begin);}
+VKAPI_ATTR void VKAPI_CALL hookBegin2KHR(VkCommandBuffer c,const VkRenderPassBeginInfo* ci,const VkSubpassBeginInfo* begin){hookBegin2Route(true,c,ci,begin);}
+VKAPI_ATTR void VKAPI_CALL hookNext2(VkCommandBuffer c,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end){hookNext2Route(false,c,begin,end);}
+VKAPI_ATTR void VKAPI_CALL hookNext2KHR(VkCommandBuffer c,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end){hookNext2Route(true,c,begin,end);}
+VKAPI_ATTR void VKAPI_CALL hookEnd2(VkCommandBuffer c,const VkSubpassEndInfo* end){hookEnd2Route(false,c,end);}
+VKAPI_ATTR void VKAPI_CALL hookEnd2KHR(VkCommandBuffer c,const VkSubpassEndInfo* end){hookEnd2Route(true,c,end);}
 VKAPI_ATTR void VKAPI_CALL hookBegin1(VkCommandBuffer c,const VkRenderPassBeginInfo* ci,VkSubpassContents contents){
     require(contents==hookCalls.subBegin->contents,"original legacy contents preserved");hookBegin2(c,ci,hookCalls.subBegin);
 }
@@ -115,10 +129,12 @@ VKAPI_ATTR VkResult VKAPI_CALL hookIdle(VkDevice d){require(d==hookCalls.dispatc
 VKAPI_ATTR void VKAPI_CALL hookDestroy(VkDevice d,const VkAllocationCallbacks* a){require(d==hookCalls.dispatchDevice&&!a,"original DestroyDevice forwarded");++hookCalls.destroys;}
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hookGdpa(VkDevice,const char* name){
 #define ENTRY(n,f) if(!std::strcmp(name,"vk" #n))return reinterpret_cast<PFN_vkVoidFunction>(f);
-    ENTRY(CreateRenderPass2,hookCreatePass2) ENTRY(CreateRenderPass2KHR,hookCreatePass2)
-    ENTRY(CmdBeginRenderPass2,hookBegin2) ENTRY(CmdBeginRenderPass2KHR,hookBegin2)
-    ENTRY(CmdNextSubpass2,hookNext2) ENTRY(CmdNextSubpass2KHR,hookNext2)
-    ENTRY(CmdEndRenderPass2,hookEnd2) ENTRY(CmdEndRenderPass2KHR,hookEnd2)
+#define RP2_ENTRY(n,f,route) if(!std::strcmp(name,"vk" #n))return (availableRP2Routes&route)?reinterpret_cast<PFN_vkVoidFunction>(f):nullptr;
+    RP2_ENTRY(CreateRenderPass2,hookCreatePass2,1) RP2_ENTRY(CreateRenderPass2KHR,hookCreatePass2KHR,2)
+    RP2_ENTRY(CmdBeginRenderPass2,hookBegin2,1) RP2_ENTRY(CmdBeginRenderPass2KHR,hookBegin2KHR,2)
+    RP2_ENTRY(CmdNextSubpass2,hookNext2,1) RP2_ENTRY(CmdNextSubpass2KHR,hookNext2KHR,2)
+    RP2_ENTRY(CmdEndRenderPass2,hookEnd2,1) RP2_ENTRY(CmdEndRenderPass2KHR,hookEnd2KHR,2)
+#undef RP2_ENTRY
     ENTRY(CmdBeginRenderPass,hookBegin1) ENTRY(CmdNextSubpass,hookNext1) ENTRY(CmdEndRenderPass,hookEnd1)
     ENTRY(CmdDrawIndexed,hookIndexed) ENTRY(CmdBindPipeline,hookPipeline)
     ENTRY(BeginCommandBuffer,hookCommandBegin) ENTRY(EndCommandBuffer,hookCommandEnd)
@@ -130,7 +146,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hookOwnedProc(VkDevice d,const char* na
 #define ENTRY(n,f) if(!std::strcmp(name,"vk" #n))return reinterpret_cast<PFN_vkVoidFunction>(f);
     ENTRY(CmdDrawIndexed,hookOwnedIndexed) ENTRY(CmdBindPipeline,hookPipeline) ENTRY(CmdPipelineBarrier,hookBarrier)
     ENTRY(CreateDescriptorSetLayout,hookSetLayout) ENTRY(CmdFillBuffer,hookFill) ENTRY(CmdBindDescriptorSets,hookSets) ENTRY(CmdDraw,hookDraw)
-    ENTRY(CreateRenderPass,hookOwnedPass1) ENTRY(CreateRenderPass2,hookOwnedPass2) ENTRY(CreateRenderPass2KHR,hookOwnedPass2) ENTRY(CreateGraphicsPipelines,hookOwnedPipelineCreate)
+    ENTRY(CreateRenderPass,hookOwnedPass1) ENTRY(CreateRenderPass2,hookOwnedPass2) ENTRY(CreateRenderPass2KHR,hookOwnedPass2KHR) ENTRY(CreateGraphicsPipelines,hookOwnedPipelineCreate)
     ENTRY(CreateFence,hookFence) ENTRY(DestroyFence,hookDestroyFence) ENTRY(ResetFences,hookResetFence) ENTRY(GetFenceStatus,hookFenceStatus)
     ENTRY(QueueSubmit,hookSubmit) ENTRY(InvalidateMappedMemoryRanges,hookInvalidate)
 #undef ENTRY
@@ -157,17 +173,17 @@ struct HookFixture {
     VkRenderPassCreateInfo2 pass=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);
     std::array<VkDescriptorSetLayoutBinding,6> setDefinitions{};
     float priority=1;VkDeviceQueueCreateInfo queue=info<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
-    HookFixture(unsigned subpasses=1,unsigned selected=0){
-        hookCalls={};ownedResets=ownedFences=0;hookCalls.command=command;hookCalls.dispatchDevice=dispatchDevice;owned_fixture::driver=&driver;
+    HookFixture(unsigned subpasses=1,unsigned selected=0,unsigned routes=3){
+        hookCalls={};ownedResets=ownedFences=0;availableRP2Routes=routes;hookCalls.command=command;hookCalls.dispatchDevice=dispatchDevice;owned_fixture::driver=&driver;
         driver.expectedCount=1;driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
-        ownedPassCount=subpasses;ownedTargetSubpass=selected;ownedLegacyPasses=ownedPasses2=0;
+        ownedPassCount=subpasses;ownedTargetSubpass=selected;ownedLegacyPasses=ownedPasses2=ownedPasses2Core=ownedPasses2KHR=0;
         shape.nativeSet=sl;shape.graphics.layout=pl;shape.graphics.renderPass=h<VkRenderPass>(30);shape.stages[0].module=vs;shape.stages[1].module=fs;shape.push={VK_SHADER_STAGE_VERTEX_BIT,0,16};
         shape.graphics.subpass=selected;
         for(unsigned i=0;i<5;++i)setDefinitions[i]={frame_pixel_uniform::UniformBindings[i],i==1?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr};
         setDefinitions.back()={9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};shape.set.bindingCount=6;shape.set.pBindings=setDefinitions.data();
         queue.queueCount=1;queue.queueFamilyIndex=3;queue.pQueuePriorities=&priority;shape.device.queueCreateInfoCount=1;shape.device.pQueueCreateInfos=&queue;
         auto deviceContext=std::make_unique<Device>();context=deviceContext.get();context->native=h<VkDevice>(1);context->id=device;context->gdpa=hookGdpa;
-        context->CreateRenderPass2=hookCreatePass2;context->CmdBeginRenderPass2=hookBegin2;context->CmdNextSubpass2=hookNext2;context->CmdEndRenderPass2=hookEnd2;
+        loadRenderPass2Dispatch(*context,dispatchDevice);
         context->CmdBeginRenderPass=hookBegin1;context->CmdNextSubpass=hookNext1;context->CmdEndRenderPass=hookEnd1;
         context->BeginCommandBuffer=hookCommandBegin;context->EndCommandBuffer=hookCommandEnd;context->CmdDrawIndexed=hookIndexed;context->CmdBindPipeline=hookPipeline;
         context->DeviceWaitIdle=hookIdle;context->DestroyDevice=hookDestroy;
@@ -224,7 +240,7 @@ struct HookFixture {
         for(unsigned i=shape.graphics.subpass+1;i<pass.subpassCount;++i)require(native->tracker.nextSubpass(device,command,VK_SUBPASS_CONTENTS_INLINE),"remaining original learned subpass observed");
         require(native->tracker.endRenderPass(device,command,learned),"completed whole original metadata pass selects next recording");
         context->bridge.learn(learned);context->bridge.tick(context->definitions);require(context->bridge.snapshot().ready,"real cold bridge ready from actual original private definitions");
-        require(ownedPasses2==1&&!ownedLegacyPasses,"original RP2 creation route retained by owned cold factory");
+        require(ownedPasses2==1&&!ownedLegacyPasses&&ownedPasses2Core==unsigned(!khr)&&ownedPasses2KHR==unsigned(khr),"original exact core/KHR RP2 creation route retained by owned cold factory");
         session().armed=true;
         hookExport<PFN_vkBeginCommandBuffer>(dispatchDevice,"vkBeginCommandBuffer")(command,&native->beginInfo);
         require(context->bridge.snapshot().adopted&&ownedResets==1,"actual successful Begin hook adopts and GPU-resets exact fresh recording");bindTarget();
@@ -232,6 +248,31 @@ struct HookFixture {
         hookCalls.events.clear();
     }
 };
+void exportedExactAliasRoutes(){
+    for(unsigned available:{1u,2u,3u})for(bool khr:{false,true}){
+        if(!(available&(khr?2u:1u)))continue;
+        HookFixture fixture(1,0,available);
+        for(const char* operation:{"CreateRenderPass2","CmdBeginRenderPass2","CmdNextSubpass2","CmdEndRenderPass2"}){
+            const std::string core=std::string("vk")+operation,khrName=core+"KHR";
+            const auto c=frame_pixel_vkGetDeviceProcAddr(fixture.dispatchDevice,core.c_str());
+            const auto k=frame_pixel_vkGetDeviceProcAddr(fixture.dispatchDevice,khrName.c_str());
+            require(bool(c)==bool(available&1)&&bool(k)==bool(available&2),"missing exact original alias never fabricated from available sibling");
+            if(c&&k)require(c!=k,"core and KHR queries retain distinct production entrypoints");
+        }
+        require(bool(fixture.context->CreateRenderPass2)==bool(available&1)&&bool(fixture.context->CreateRenderPass2KHR)==bool(available&2),"production dispatch loader retains independent exact creation pointers");
+        require(bool(fixture.context->CmdBeginRenderPass2)==bool(available&1)&&bool(fixture.context->CmdBeginRenderPass2KHR)==bool(available&2)&&
+                bool(fixture.context->CmdNextSubpass2)==bool(available&1)&&bool(fixture.context->CmdNextSubpass2KHR)==bool(available&2)&&
+                bool(fixture.context->CmdEndRenderPass2)==bool(available&1)&&bool(fixture.context->CmdEndRenderPass2KHR)==bool(available&2),"production dispatch loader does not fall back between command aliases");
+        auto begin=info<VkRenderPassBeginInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);begin.renderPass=fixture.createPass(khr);
+        auto subBegin=info<VkSubpassBeginInfo>(VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO);subBegin.contents=VK_SUBPASS_CONTENTS_INLINE;
+        auto subEnd=info<VkSubpassEndInfo>(VK_STRUCTURE_TYPE_SUBPASS_END_INFO);
+        hookCalls.beginInfo=&begin;hookCalls.subBegin=&subBegin;hookCalls.subEnd=&subEnd;
+        hookExport<PFN_vkCmdBeginRenderPass2>(fixture.dispatchDevice,khr?"vkCmdBeginRenderPass2KHR":"vkCmdBeginRenderPass2")(fixture.command,&begin,&subBegin);
+        hookExport<PFN_vkCmdNextSubpass2>(fixture.dispatchDevice,khr?"vkCmdNextSubpass2KHR":"vkCmdNextSubpass2")(fixture.command,&subBegin,&subEnd);
+        hookExport<PFN_vkCmdEndRenderPass2>(fixture.dispatchDevice,khr?"vkCmdEndRenderPass2KHR":"vkCmdEndRenderPass2")(fixture.command,&subEnd);
+        for(unsigned i=0;i<4;++i)require(hookCalls.coreRoute[i]==unsigned(!khr)&&hookCalls.khrRoute[i]==unsigned(khr),"requested original core/KHR route forwarded exactly once; nonnull sibling never called");
+    }
+}
 void exportedCreation(){
     HookFixture fixture;
     require(frame_pixel_vkGetDeviceProcAddr(VK_NULL_HANDLE,"vkCreateRenderPass2")==nullptr,"null native device never fabricates dispatch");
@@ -364,13 +405,17 @@ void multipleSubpassHooks(const char* vertex,const char* fragment,unsigned count
 }
 }
 int main(int argc,char** argv){
+    if(argc==2&&!std::strcmp(argv[1],"--aliases-only")){
+        exportedExactAliasRoutes();
+        std::cout<<"{\"scope\":\"exact exported RP2 core/KHR API routes, fake downstream only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;
+    }
     if(argc==4&&!std::strcmp(argv[1],"--subpasses-only")){
         for(unsigned count:{2u,3u})for(unsigned route=0;route<3;++route)multipleSubpassHooks(argv[2],argv[3],count,route);
         for(unsigned route:{1u,2u})for(unsigned mutation:{1u,2u})multipleSubpassHooks(argv[2],argv[3],3,route,mutation);
         std::cout<<"{\"scope\":\"actual exported multi-subpass Snapshot hooks, fake downstream only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;
     }
     require(argc==1||argc==3,"optional private original VS/PS arguments");
-    exportedCreation();exportedObservationFailure();exactGraphicsReporting();
+    exportedExactAliasRoutes();exportedCreation();exportedObservationFailure();exactGraphicsReporting();
     if(argc==3)for(bool khr:{false,true})for(unsigned mutation=0;mutation<=5;++mutation)privateHooks(argv[1],argv[2],mutation,khr);
     std::cout<<"{\"scope\":\"actual SnapshotTU exported GDPA RP2/KHR hooks, fake downstream only\",\"checks\":"<<checks.load()
         <<",\"private_pins_tested\":"<<(argc==3?"true":"false")<<",\"native_admission_proven\":false,\"passthrough_authorized\":false}\n";
