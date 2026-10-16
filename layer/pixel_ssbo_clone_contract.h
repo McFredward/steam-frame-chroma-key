@@ -17,7 +17,7 @@
 namespace frame_pixel_ssbo_clone {
 constexpr std::size_t MaxBindings=32, MaxArray=16, MaxPushRanges=8, MaxVertexBindings=16;
 constexpr std::size_t MaxAttributes=32, MaxViewports=4, MaxAttachments=8, MaxDynamics=16, MaxDependencies=8;
-constexpr std::size_t MaxChain=32, ShaderBytes=9460;
+constexpr std::size_t MaxChain=32, ShaderBytes=9460, MaxSubpasses=8;
 enum class Reason : std::uint8_t {
     None, NativeCreationFailed, Type, Extension, Bounds, NullArray, Identity,
     FeatureAbsent, FeatureDisabled, FeatureValue, FeatureConflict, ChainCycle, DuplicateNode, LoaderFunction,
@@ -356,110 +356,164 @@ inline bool captureLayout(const VkPipelineLayoutCreateInfo& in,VkDescriptorSetLa
     }
     out.count=in.pushConstantRangeCount;out.complete=true;return true;
 }
-// Call-duration view: recreate after copying/moving either this view or recipe.
-struct RenderPassView {VkRenderPassCreateInfo info{};VkSubpassDescription subpass{};};
-struct RenderPassDefinition {
-    std::uint32_t attachmentCount=0,colorCount=0,preserveCount=0,dependencyCount=0;
-    bool hasResolves=false,hasDepthReference=false,hasDepth=false,complete=false;
-    std::array<VkAttachmentDescription,MaxAttachments> attachments{};
-    std::array<VkAttachmentReference,MaxAttachments> colors{},resolves{};
+// Full ordinary render-pass cohort, including subpasses which do not contain
+// the observed draw. Flat inherited fields preserve the historical subpass0 API.
+struct SubpassDefinition {
+    std::uint32_t inputCount=0,colorCount=0,preserveCount=0;
+    bool hasResolves=false,hasDepthReference=false,hasDepth=false;
+    std::array<VkAttachmentReference,MaxAttachments> inputs{},colors{},resolves{};
+    std::array<VkImageAspectFlags,MaxAttachments> inputAspects{};
     VkAttachmentReference depth{};std::array<std::uint32_t,MaxAttachments> preserves{};
+};
+// Call-duration views: recreate after copying/moving either view or definition.
+struct RenderPassView {
+    VkRenderPassCreateInfo info{};VkSubpassDescription subpass{};
+    std::array<VkSubpassDescription,MaxSubpasses> subpasses{};
+};
+struct RenderPass2View {
+    VkRenderPassCreateInfo2 info{};
+    std::array<VkAttachmentDescription2,MaxAttachments> attachments{};
+    std::array<VkSubpassDescription2,MaxSubpasses> subpasses{};
+    std::array<std::array<VkAttachmentReference2,MaxAttachments>,MaxSubpasses> inputs{},colors{},resolves{};
+    std::array<VkAttachmentReference2,MaxSubpasses> depths{};
+    std::array<VkSubpassDependency2,MaxDependencies> dependencies{};
+};
+struct RenderPassDefinition:SubpassDefinition {
+    std::uint32_t attachmentCount=0,dependencyCount=0,subpassCount=1;
+    bool complete=false,route2=false;
+    std::array<VkAttachmentDescription,MaxAttachments> attachments{};
     std::array<VkSubpassDependency,MaxDependencies> dependencies{};
+    std::array<SubpassDefinition,MaxSubpasses-1> following{};
+    const SubpassDefinition* subpass(std::uint32_t index) const noexcept {
+        return index<subpassCount && index<MaxSubpasses?(index?&following[index-1]:static_cast<const SubpassDefinition*>(this)):nullptr;
+    }
+    SubpassDefinition* subpass(std::uint32_t index) noexcept {
+        return index<subpassCount && index<MaxSubpasses?(index?&following[index-1]:static_cast<SubpassDefinition*>(this)):nullptr;
+    }
+    bool bounded() const noexcept {
+        if(!subpassCount || subpassCount>MaxSubpasses || attachmentCount>MaxAttachments || dependencyCount>MaxDependencies)return false;
+        for(std::uint32_t i=0;i<subpassCount;++i){const auto& sub=*subpass(i);
+            if(sub.inputCount>MaxAttachments || sub.colorCount>MaxAttachments || sub.preserveCount>MaxAttachments)return false;
+        }return true;
+    }
     bool view(RenderPassView& out) const noexcept {
-        out={};if(!complete)return false;
-        out.subpass.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;out.subpass.colorAttachmentCount=colorCount;
-        out.subpass.pColorAttachments=colorCount?colors.data():nullptr;out.subpass.pResolveAttachments=hasResolves?resolves.data():nullptr;
-        out.subpass.pDepthStencilAttachment=hasDepthReference?&depth:nullptr;out.subpass.preserveAttachmentCount=preserveCount;
-        out.subpass.pPreserveAttachments=preserveCount?preserves.data():nullptr;
-        out.info.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;out.info.attachmentCount=attachmentCount;
-        out.info.pAttachments=attachmentCount?attachments.data():nullptr;out.info.subpassCount=1;out.info.pSubpasses=&out.subpass;
-        out.info.dependencyCount=dependencyCount;out.info.pDependencies=dependencyCount?dependencies.data():nullptr;return true;
+        out={};if(!complete || !bounded())return false;
+        for(std::uint32_t n=0;n<subpassCount;++n){const auto& src=*subpass(n);auto& dst=out.subpasses[n];
+            // RP2 input aspect selection has no corresponding legacy field.
+            // Keep the older no-input lowering proof, never discard a used mask.
+            if(route2)for(std::uint32_t i=0;i<src.inputCount;++i)
+                if(src.inputs[i].attachment!=VK_ATTACHMENT_UNUSED && src.inputAspects[i])return false;
+            dst.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;dst.inputAttachmentCount=src.inputCount;
+            dst.pInputAttachments=src.inputCount?src.inputs.data():nullptr;dst.colorAttachmentCount=src.colorCount;
+            dst.pColorAttachments=src.colorCount?src.colors.data():nullptr;dst.pResolveAttachments=src.hasResolves?src.resolves.data():nullptr;
+            dst.pDepthStencilAttachment=src.hasDepthReference?&src.depth:nullptr;dst.preserveAttachmentCount=src.preserveCount;
+            dst.pPreserveAttachments=src.preserveCount?src.preserves.data():nullptr;
+        }
+        out.subpass=out.subpasses[0];out.info.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;out.info.attachmentCount=attachmentCount;
+        out.info.pAttachments=attachmentCount?attachments.data():nullptr;out.info.subpassCount=subpassCount;
+        out.info.pSubpasses=subpassCount==1?&out.subpass:out.subpasses.data();out.info.dependencyCount=dependencyCount;
+        out.info.pDependencies=dependencyCount?dependencies.data():nullptr;return true;
+    }
+    bool view2(RenderPass2View& out) const noexcept {
+        out={};if(!complete || !route2 || !bounded())return false;
+        for(std::uint32_t i=0;i<attachmentCount;++i){const auto& a=attachments[i];
+            out.attachments[i]={VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,nullptr,a.flags,a.format,a.samples,a.loadOp,a.storeOp,a.stencilLoadOp,a.stencilStoreOp,a.initialLayout,a.finalLayout};
+        }
+        for(std::uint32_t n=0;n<subpassCount;++n){const auto& src=*subpass(n);auto& dst=out.subpasses[n];dst.sType=VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2;
+            dst.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;dst.inputAttachmentCount=src.inputCount;dst.colorAttachmentCount=src.colorCount;
+            const auto copy=[](const VkAttachmentReference& ref,VkImageAspectFlags aspect) noexcept {return VkAttachmentReference2{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,nullptr,ref.attachment,ref.layout,aspect};};
+            for(std::uint32_t i=0;i<src.inputCount;++i)out.inputs[n][i]=copy(src.inputs[i],src.inputAspects[i]);
+            for(std::uint32_t i=0;i<src.colorCount;++i){out.colors[n][i]=copy(src.colors[i],0);if(src.hasResolves)out.resolves[n][i]=copy(src.resolves[i],0);}
+            if(src.hasDepthReference)out.depths[n]=copy(src.depth,0);
+            dst.pInputAttachments=src.inputCount?out.inputs[n].data():nullptr;dst.pColorAttachments=src.colorCount?out.colors[n].data():nullptr;
+            dst.pResolveAttachments=src.hasResolves?out.resolves[n].data():nullptr;dst.pDepthStencilAttachment=src.hasDepthReference?&out.depths[n]:nullptr;
+            dst.preserveAttachmentCount=src.preserveCount;dst.pPreserveAttachments=src.preserveCount?src.preserves.data():nullptr;
+        }
+        for(std::uint32_t i=0;i<dependencyCount;++i){const auto& d=dependencies[i];
+            out.dependencies[i]={VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,nullptr,d.srcSubpass,d.dstSubpass,d.srcStageMask,d.dstStageMask,d.srcAccessMask,d.dstAccessMask,d.dependencyFlags,0};
+        }
+        out.info.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2;out.info.attachmentCount=attachmentCount;
+        out.info.pAttachments=attachmentCount?out.attachments.data():nullptr;out.info.subpassCount=subpassCount;out.info.pSubpasses=out.subpasses.data();
+        out.info.dependencyCount=dependencyCount;out.info.pDependencies=dependencyCount?out.dependencies.data():nullptr;return true;
     }
 };
 inline bool sampleCount(VkSampleCountFlagBits value) noexcept {
     const auto v=static_cast<std::uint32_t>(value);return v && v<=64 && !(v&(v-1));
 }
+inline bool renderPassReferences(const RenderPassDefinition& pass,const SubpassDefinition& sub,Refusal& why,std::uint32_t index) noexcept {
+    const auto ref=[&](VkAttachmentReference value) noexcept {return value.attachment==VK_ATTACHMENT_UNUSED || value.attachment<pass.attachmentCount;};
+    for(std::uint32_t i=0;i<sub.inputCount;++i)if(!ref(sub.inputs[i]))return refuse(why,Reason::AttachmentIndex,index,i);
+    for(std::uint32_t i=0;i<sub.colorCount;++i)if(!ref(sub.colors[i]) || (sub.hasResolves && !ref(sub.resolves[i])))return refuse(why,Reason::AttachmentIndex,index,i);
+    if(sub.hasDepthReference && !ref(sub.depth))return refuse(why,Reason::AttachmentIndex,index);
+    for(std::uint32_t i=0;i<sub.preserveCount;++i)if(sub.preserves[i]>=pass.attachmentCount)return refuse(why,Reason::AttachmentIndex,index,i);
+    return true;
+}
+inline bool renderPassDependencies(const RenderPassDefinition& pass,Refusal& why) noexcept {
+    for(std::uint32_t i=0;i<pass.dependencyCount;++i){const auto& d=pass.dependencies[i];
+        if((d.srcSubpass!=VK_SUBPASS_EXTERNAL && d.srcSubpass>=pass.subpassCount) ||
+           (d.dstSubpass!=VK_SUBPASS_EXTERNAL && d.dstSubpass>=pass.subpassCount) || (d.dependencyFlags&VK_DEPENDENCY_VIEW_LOCAL_BIT))return refuse(why,Reason::RenderPassShape,i);
+    }return true;
+}
 inline bool captureRenderPass(const VkRenderPassCreateInfo* in,RenderPassDefinition& out,Refusal& why) noexcept {
     out={};why={};if(!in)return refuse(why,Reason::RenderPassMissing);
     if(!ordinary(*in,VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,why))return false;
-    if(in->flags || in->subpassCount!=1 || !in->pSubpasses || !in->attachmentCount)return refuse(why,Reason::RenderPassShape);
-    if(!copyArray(in->pAttachments,in->attachmentCount,out.attachments,why) ||
-       !copyArray(in->pDependencies,in->dependencyCount,out.dependencies,why))return false;
-    out.attachmentCount=in->attachmentCount;out.dependencyCount=in->dependencyCount;
-    for(std::uint32_t i=0;i<out.attachmentCount;++i)if(out.attachments[i].flags || !sampleCount(out.attachments[i].samples) || out.attachments[i].format==VK_FORMAT_UNDEFINED)
-        return refuse(why,Reason::RenderPassShape,i);
-    const auto& sub=in->pSubpasses[0];
-    if(sub.flags || sub.pipelineBindPoint!=VK_PIPELINE_BIND_POINT_GRAPHICS || sub.inputAttachmentCount || !sub.colorAttachmentCount)
-        return refuse(why,Reason::RenderPassShape);
-    if(!copyArray(sub.pColorAttachments,sub.colorAttachmentCount,out.colors,why))return false;
-    bool colorUsed=false;for(std::uint32_t i=0;i<sub.colorAttachmentCount;++i)colorUsed|=out.colors[i].attachment!=VK_ATTACHMENT_UNUSED;
-    if(!colorUsed)return refuse(why,Reason::RenderPassShape); // Refuse before ignored dependent pointers.
-    if(!copyArray(sub.pPreserveAttachments,sub.preserveAttachmentCount,out.preserves,why))return false;
-    out.colorCount=sub.colorAttachmentCount;out.preserveCount=sub.preserveAttachmentCount;
-    out.hasResolves=sub.pResolveAttachments!=nullptr;out.hasDepthReference=sub.pDepthStencilAttachment!=nullptr;
-    if(out.hasResolves && !copyArray(sub.pResolveAttachments,sub.colorAttachmentCount,out.resolves,why))return false;
-    if(out.hasDepthReference){out.depth=*sub.pDepthStencilAttachment;out.hasDepth=out.depth.attachment!=VK_ATTACHMENT_UNUSED;}
-    const auto reference=[&](const VkAttachmentReference& value) noexcept {
-        return value.attachment==VK_ATTACHMENT_UNUSED || value.attachment<out.attachmentCount;
-    };
-    for(std::uint32_t i=0;i<out.colorCount;++i)if(!reference(out.colors[i]) || (out.hasResolves && !reference(out.resolves[i])))
-        return refuse(why,Reason::AttachmentIndex,i);
-    if(out.hasDepthReference && !reference(out.depth))return refuse(why,Reason::AttachmentIndex);
-    for(std::uint32_t i=0;i<out.preserveCount;++i)if(out.preserves[i]>=out.attachmentCount)
-        return refuse(why,Reason::AttachmentIndex,i);
-    for(std::uint32_t i=0;i<out.dependencyCount;++i)if((out.dependencies[i].srcSubpass!=0 && out.dependencies[i].srcSubpass!=VK_SUBPASS_EXTERNAL) ||
-        (out.dependencies[i].dstSubpass!=0 && out.dependencies[i].dstSubpass!=VK_SUBPASS_EXTERNAL))return refuse(why,Reason::RenderPassShape,i);
+    if(in->flags || !in->subpassCount)return refuse(why,Reason::RenderPassShape);
+    if(in->subpassCount>MaxSubpasses)return refuse(why,Reason::Bounds);
+    if(!in->pSubpasses)return refuse(why,Reason::NullArray);
+    if(!copyArray(in->pAttachments,in->attachmentCount,out.attachments,why) || !copyArray(in->pDependencies,in->dependencyCount,out.dependencies,why))return false;
+    out.attachmentCount=in->attachmentCount;out.dependencyCount=in->dependencyCount;out.subpassCount=in->subpassCount;
+    for(std::uint32_t i=0;i<out.attachmentCount;++i)if(out.attachments[i].flags || !sampleCount(out.attachments[i].samples) || out.attachments[i].format==VK_FORMAT_UNDEFINED)return refuse(why,Reason::RenderPassShape,i);
+    for(std::uint32_t n=0;n<out.subpassCount;++n){const auto& sub=in->pSubpasses[n];auto& dst=*out.subpass(n);
+        if(sub.flags || sub.pipelineBindPoint!=VK_PIPELINE_BIND_POINT_GRAPHICS)return refuse(why,Reason::RenderPassShape,n);
+        if(!copyArray(sub.pInputAttachments,sub.inputAttachmentCount,dst.inputs,why) || !copyArray(sub.pColorAttachments,sub.colorAttachmentCount,dst.colors,why) || !copyArray(sub.pPreserveAttachments,sub.preserveAttachmentCount,dst.preserves,why))return false;
+        dst.inputCount=sub.inputAttachmentCount;dst.colorCount=sub.colorAttachmentCount;dst.preserveCount=sub.preserveAttachmentCount;
+        // Resolve arrays are ignored when colorAttachmentCount is zero.
+        dst.hasResolves=dst.colorCount && sub.pResolveAttachments;dst.hasDepthReference=sub.pDepthStencilAttachment!=nullptr;
+        if(dst.hasResolves && !copyArray(sub.pResolveAttachments,dst.colorCount,dst.resolves,why))return false;
+        if(dst.hasDepthReference){dst.depth=*sub.pDepthStencilAttachment;dst.hasDepth=dst.depth.attachment!=VK_ATTACHMENT_UNUSED;}
+        if(!renderPassReferences(out,dst,why,n))return false;
+    }
+    if(!renderPassDependencies(out,why))return false;
     out.complete=true;return true;
 }
 
-// Vulkan defines same-named RP2 fields to have their legacy effect. This
-// decoder admits only that lossless subset; it never rewrites the native CI.
-// Non-input reference aspectMask is explicitly ignored by the specification:
+// Preserve the original RP2 creation route, including input aspect selection.
+// Non-input aspectMask is explicitly ignored by Vulkan; the owned view uses0:
 // https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentReference2.html
 inline bool captureRenderPass2(const VkRenderPassCreateInfo2* in,RenderPassDefinition& out,Refusal& why) noexcept {
     out={};why={};if(!in)return refuse(why,Reason::RenderPassMissing);
     if(!ordinary(*in,VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,why))return false;
-    if(in->flags || in->subpassCount!=1 || !in->pSubpasses || !in->attachmentCount || in->correlatedViewMaskCount)
-        return refuse(why,Reason::RenderPassShape);
-    if(in->attachmentCount>MaxAttachments || in->dependencyCount>MaxDependencies)return refuse(why,Reason::Bounds);
-    if(!in->pAttachments || (in->dependencyCount && !in->pDependencies))return refuse(why,Reason::NullArray);
-    std::array<VkAttachmentDescription,MaxAttachments> attachments{};
-    std::array<VkSubpassDependency,MaxDependencies> dependencies{};
-    std::array<VkAttachmentReference,MaxAttachments> colors{},resolves{};VkAttachmentReference depth{};
-    for(std::uint32_t i=0;i<in->attachmentCount;++i){
-        const auto& a=in->pAttachments[i];if(!ordinary(a,VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,why))return false;
-        attachments[i]={a.flags,a.format,a.samples,a.loadOp,a.storeOp,a.stencilLoadOp,a.stencilStoreOp,a.initialLayout,a.finalLayout};
+    if(in->flags || !in->subpassCount || in->correlatedViewMaskCount)return refuse(why,Reason::RenderPassShape);
+    if(in->subpassCount>MaxSubpasses || in->attachmentCount>MaxAttachments || in->dependencyCount>MaxDependencies)return refuse(why,Reason::Bounds);
+    if(!in->pSubpasses || (in->attachmentCount && !in->pAttachments) || (in->dependencyCount && !in->pDependencies))return refuse(why,Reason::NullArray);
+    out.attachmentCount=in->attachmentCount;out.dependencyCount=in->dependencyCount;out.subpassCount=in->subpassCount;
+    for(std::uint32_t i=0;i<out.attachmentCount;++i){const auto& a=in->pAttachments[i];if(!ordinary(a,VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,why))return false;
+        if(a.flags || !sampleCount(a.samples) || a.format==VK_FORMAT_UNDEFINED)return refuse(why,Reason::RenderPassShape,i);
+        out.attachments[i]={a.flags,a.format,a.samples,a.loadOp,a.storeOp,a.stencilLoadOp,a.stencilStoreOp,a.initialLayout,a.finalLayout};
     }
-    const auto& sub=in->pSubpasses[0];
-    if(!ordinary(sub,VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,why))return false;
-    if(sub.flags || sub.viewMask || sub.pipelineBindPoint!=VK_PIPELINE_BIND_POINT_GRAPHICS || sub.inputAttachmentCount || !sub.colorAttachmentCount)
-        return refuse(why,Reason::RenderPassShape);
-    if(sub.colorAttachmentCount>MaxAttachments || sub.preserveAttachmentCount>MaxAttachments)return refuse(why,Reason::Bounds);
-    if(!sub.pColorAttachments || (sub.preserveAttachmentCount && !sub.pPreserveAttachments))return refuse(why,Reason::NullArray);
-    const auto reference=[&](const VkAttachmentReference2& src,VkAttachmentReference& dst) noexcept {
-        if(!ordinary(src,VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,why))return false;
-        dst={src.attachment,src.layout};return true;
-    };
-    bool colorUsed=false;
-    for(std::uint32_t i=0;i<sub.colorAttachmentCount;++i){
-        if(!reference(sub.pColorAttachments[i],colors[i]))return false;
-        colorUsed|=colors[i].attachment!=VK_ATTACHMENT_UNUSED;
+    for(std::uint32_t n=0;n<out.subpassCount;++n){const auto& sub=in->pSubpasses[n];auto& dst=*out.subpass(n);
+        if(!ordinary(sub,VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,why))return false;
+        if(sub.flags || sub.viewMask || sub.pipelineBindPoint!=VK_PIPELINE_BIND_POINT_GRAPHICS)return refuse(why,Reason::RenderPassShape,n);
+        if(sub.inputAttachmentCount>MaxAttachments || sub.colorAttachmentCount>MaxAttachments || sub.preserveAttachmentCount>MaxAttachments)return refuse(why,Reason::Bounds,n);
+        if((sub.inputAttachmentCount && !sub.pInputAttachments) || (sub.colorAttachmentCount && !sub.pColorAttachments) || (sub.preserveAttachmentCount && !sub.pPreserveAttachments))return refuse(why,Reason::NullArray,n);
+        dst.inputCount=sub.inputAttachmentCount;dst.colorCount=sub.colorAttachmentCount;dst.preserveCount=sub.preserveAttachmentCount;
+        const auto ref=[&](const VkAttachmentReference2& src,VkAttachmentReference& target) noexcept {
+            if(!ordinary(src,VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,why))return false;
+            target={src.attachment,src.layout};return true;
+        };
+        for(std::uint32_t i=0;i<dst.inputCount;++i){if(!ref(sub.pInputAttachments[i],dst.inputs[i]))return false;dst.inputAspects[i]=sub.pInputAttachments[i].aspectMask;}
+        dst.hasResolves=dst.colorCount && sub.pResolveAttachments;dst.hasDepthReference=sub.pDepthStencilAttachment!=nullptr;
+        for(std::uint32_t i=0;i<dst.colorCount;++i){if(!ref(sub.pColorAttachments[i],dst.colors[i]) || (dst.hasResolves && !ref(sub.pResolveAttachments[i],dst.resolves[i])))return false;}
+        if(dst.hasDepthReference){if(!ref(*sub.pDepthStencilAttachment,dst.depth))return false;dst.hasDepth=dst.depth.attachment!=VK_ATTACHMENT_UNUSED;}
+        for(std::uint32_t i=0;i<dst.preserveCount;++i)dst.preserves[i]=sub.pPreserveAttachments[i];
+        if(!renderPassReferences(out,dst,why,n))return false;
     }
-    if(!colorUsed)return refuse(why,Reason::RenderPassShape); // Before unused dependent arrays.
-    if(sub.pResolveAttachments)for(std::uint32_t i=0;i<sub.colorAttachmentCount;++i)
-        if(!reference(sub.pResolveAttachments[i],resolves[i]))return false;
-    if(sub.pDepthStencilAttachment && !reference(*sub.pDepthStencilAttachment,depth))return false;
-    for(std::uint32_t i=0;i<in->dependencyCount;++i){
-        const auto& d=in->pDependencies[i];if(!ordinary(d,VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,why))return false;
-        if(d.viewOffset || (d.dependencyFlags&VK_DEPENDENCY_VIEW_LOCAL_BIT))return refuse(why,Reason::RenderPassShape,i);
-        dependencies[i]={d.srcSubpass,d.dstSubpass,d.srcStageMask,d.dstStageMask,d.srcAccessMask,d.dstAccessMask,d.dependencyFlags};
+    for(std::uint32_t i=0;i<out.dependencyCount;++i){const auto& d=in->pDependencies[i];if(!ordinary(d,VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,why))return false;
+        if(d.viewOffset)return refuse(why,Reason::RenderPassShape,i);
+        out.dependencies[i]={d.srcSubpass,d.dstSubpass,d.srcStageMask,d.dstStageMask,d.srcAccessMask,d.dstAccessMask,d.dependencyFlags};
     }
-    VkSubpassDescription legacy{};legacy.pipelineBindPoint=sub.pipelineBindPoint;legacy.colorAttachmentCount=sub.colorAttachmentCount;
-    legacy.pColorAttachments=colors.data();legacy.pResolveAttachments=sub.pResolveAttachments?resolves.data():nullptr;
-    legacy.pDepthStencilAttachment=sub.pDepthStencilAttachment?&depth:nullptr;legacy.preserveAttachmentCount=sub.preserveAttachmentCount;legacy.pPreserveAttachments=sub.pPreserveAttachments;
-    VkRenderPassCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ci.attachmentCount=in->attachmentCount;ci.pAttachments=attachments.data();
-    ci.subpassCount=1;ci.pSubpasses=&legacy;ci.dependencyCount=in->dependencyCount;ci.pDependencies=dependencies.data();
-    return captureRenderPass(&ci,out,why);
+    if(!renderPassDependencies(out,why))return false;
+    out.route2=true;out.complete=true;return true;
 }
 
 enum class ShaderRole : std::uint8_t {Vertex,Fragment};
@@ -480,153 +534,9 @@ inline bool captureShader(const VkShaderModuleCreateInfo& in,ShaderRole role,Sha
     out.bytes=static_cast<std::uint32_t>(in.codeSize);std::memcpy(out.words.data(),in.pCode,in.codeSize);out.complete=true;return true;
 }
 
-struct GraphicsView {
-    // Call-duration view only: rebuild after moving either the recipe or view.
-    VkGraphicsPipelineCreateInfo info{};std::array<VkPipelineShaderStageCreateInfo,2> stages{};
-    VkPipelineVertexInputStateCreateInfo vertex{};VkPipelineInputAssemblyStateCreateInfo assembly{};
-    VkPipelineViewportStateCreateInfo viewport{};VkPipelineRasterizationStateCreateInfo raster{};
-    VkPipelineMultisampleStateCreateInfo multisample{};VkPipelineDepthStencilStateCreateInfo depth{};
-    VkPipelineColorBlendStateCreateInfo blend{};VkPipelineDynamicStateCreateInfo dynamic{};
-};
-struct OwnedObjects {
-    VkShaderModule vertex=VK_NULL_HANDLE,fragment=VK_NULL_HANDLE;
-    VkPipelineLayout layout=VK_NULL_HANDLE;VkRenderPass renderPass=VK_NULL_HANDLE;
-    // This is an explicit caller obligation, never inferred from handle values.
-    bool createdAndOwnedByCaller=false;
-};
-struct GraphicsDefinition {
-    VkGraphicsPipelineCreateInfo info{};std::array<VkPipelineShaderStageCreateInfo,2> stageInfo{};
-    std::array<std::array<char,16>,2> entries{};
-    VkPipelineVertexInputStateCreateInfo vertex{};VkPipelineInputAssemblyStateCreateInfo assembly{};
-    VkPipelineViewportStateCreateInfo viewport{};VkPipelineRasterizationStateCreateInfo raster{};
-    VkPipelineMultisampleStateCreateInfo multisample{};VkPipelineDepthStencilStateCreateInfo depth{};
-    VkPipelineColorBlendStateCreateInfo blend{};VkPipelineDynamicStateCreateInfo dynamic{};
-    std::array<VkVertexInputBindingDescription,MaxVertexBindings> vertexBindings{};
-    std::array<VkVertexInputAttributeDescription,MaxAttributes> attributes{};
-    std::array<VkViewport,MaxViewports> viewports{};std::array<VkRect2D,MaxViewports> scissors{};
-    std::array<VkPipelineColorBlendAttachmentState,MaxAttachments> colors{};
-    std::array<VkDynamicState,MaxDynamics> dynamics{};std::array<VkSampleMask,2> sampleMask{};
-    bool hasMask=false,hasDepth=false,hasDynamic=false,hasViewports=false,hasScissors=false,complete=false;
-    bool view(const OwnedObjects& objects,GraphicsView& out,Refusal& why) const noexcept {
-        out={};why={};
-        if(!complete || !objects.createdAndOwnedByCaller || !objects.vertex || !objects.fragment || !objects.layout || !objects.renderPass)
-            return refuse(why,Reason::OwnedObjectsMissing);
-        out.info=info;out.stages=stageInfo;
-        for(std::size_t i=0;i<2;++i){out.stages[i].pName=entries[i].data();out.stages[i].module=out.stages[i].stage==VK_SHADER_STAGE_VERTEX_BIT?objects.vertex:objects.fragment;}
-        out.vertex=vertex;out.vertex.pVertexBindingDescriptions=vertex.vertexBindingDescriptionCount?vertexBindings.data():nullptr;
-        out.vertex.pVertexAttributeDescriptions=vertex.vertexAttributeDescriptionCount?attributes.data():nullptr;
-        out.assembly=assembly;out.viewport=viewport;out.viewport.pViewports=hasViewports?viewports.data():nullptr;out.viewport.pScissors=hasScissors?scissors.data():nullptr;
-        out.raster=raster;out.multisample=multisample;out.multisample.pSampleMask=hasMask?sampleMask.data():nullptr;
-        out.depth=depth;out.blend=blend;out.blend.pAttachments=blend.attachmentCount?colors.data():nullptr;
-        out.dynamic=dynamic;out.dynamic.pDynamicStates=dynamic.dynamicStateCount?dynamics.data():nullptr;
-        out.info.pStages=out.stages.data();out.info.pVertexInputState=&out.vertex;out.info.pInputAssemblyState=&out.assembly;
-        out.info.pViewportState=&out.viewport;out.info.pRasterizationState=&out.raster;out.info.pMultisampleState=&out.multisample;
-        out.info.pDepthStencilState=hasDepth?&out.depth:nullptr;out.info.pColorBlendState=&out.blend;out.info.pDynamicState=hasDynamic?&out.dynamic:nullptr;
-        out.info.layout=objects.layout;out.info.renderPass=objects.renderPass;return true;
-    }
-};
-inline bool knownDynamic(VkDynamicState value) noexcept {
-    return value==VK_DYNAMIC_STATE_VIEWPORT || value==VK_DYNAMIC_STATE_SCISSOR || value==VK_DYNAMIC_STATE_LINE_WIDTH ||
-        value==VK_DYNAMIC_STATE_DEPTH_BIAS || value==VK_DYNAMIC_STATE_BLEND_CONSTANTS || value==VK_DYNAMIC_STATE_DEPTH_BOUNDS ||
-        value==VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK || value==VK_DYNAMIC_STATE_STENCIL_WRITE_MASK || value==VK_DYNAMIC_STATE_STENCIL_REFERENCE;
-}
-inline bool exactEntry(const char* source,const char* expected) noexcept {
-    if(!source)return false;
-    for(std::size_t i=0;i<16;++i){if(source[i]!=expected[i])return false;if(!expected[i])return true;}return false;
-}
-inline bool captureGraphics(const VkGraphicsPipelineCreateInfo& in,VkPipelineLayout resolvedLayout,
-        VkRenderPass resolvedRenderPass,VkShaderModule vertexModule,VkShaderModule fragmentModule,
-        const RenderPassDefinition& pass,GraphicsDefinition& out,Refusal& why) noexcept {
-    out={};why={};if(in.sType!=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)return refuse(why,Reason::Type);
-    if(in.pNext)return refuse(why,Reason::PipelineExtension);
-    // basePipelineIndex is ignored when DERIVATIVE is absent; preserve its
-    // scalar value (including zero-initialized native CIs), never invent flags.
-    if(in.flags || in.basePipelineHandle)return refuse(why,Reason::PipelineFlags);
-    if(!resolvedLayout || !resolvedRenderPass || in.layout!=resolvedLayout || in.renderPass!=resolvedRenderPass)
-        return refuse(why,Reason::Identity);
-    if(!pass.complete || in.subpass!=0)return refuse(why,Reason::RenderPassMissing);
-    if(in.stageCount!=2 || !in.pStages || !vertexModule || !fragmentModule)return refuse(why,Reason::Stage);
-    bool vertexFound=false,fragmentFound=false;
-    for(std::size_t i=0;i<2;++i){
-        const auto& stage=in.pStages[i];
-        if(!ordinary(stage,VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,why))return false;
-        const bool vertex=stage.stage==VK_SHADER_STAGE_VERTEX_BIT;
-        if(stage.flags || stage.pSpecializationInfo || (vertex?(vertexFound || stage.module!=vertexModule):
-                (stage.stage!=VK_SHADER_STAGE_FRAGMENT_BIT || fragmentFound || stage.module!=fragmentModule)) ||
-           !exactEntry(stage.pName,vertex?"VS_DISTORT":"PS_DISTORT"))return refuse(why,Reason::Stage,static_cast<std::uint32_t>(i));
-        vertexFound|=vertex;fragmentFound|=!vertex;
-        out.stageInfo[i]=stage;out.stageInfo[i].module=VK_NULL_HANDLE;out.stageInfo[i].pName=nullptr;
-        std::memcpy(out.entries[i].data(),vertex?"VS_DISTORT":"PS_DISTORT",11);
-    }
-#define STATE(field,type,member) if(!ordinary(*in.field,type,why))return false;out.member=*in.field;
-    // Reject unsupported dynamic routes before touching any static state that
-    // such a route could make ignored. Ignored nonnull pointers are not readable
-    // input arrays merely because an application supplied a pointer value.
-    bool dynamicViewport=false,dynamicScissor=false;
-    if(in.pDynamicState){
-        STATE(pDynamicState,VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,dynamic)
-        out.dynamic.pDynamicStates=nullptr;out.hasDynamic=true;
-        if(out.dynamic.flags || !copyArray(in.pDynamicState->pDynamicStates,out.dynamic.dynamicStateCount,out.dynamics,why))return refuse(why,Reason::Bounds);
-        for(std::uint32_t i=0;i<out.dynamic.dynamicStateCount;++i){
-            if(!knownDynamic(out.dynamics[i]))return refuse(why,Reason::DynamicState,i,static_cast<std::uint32_t>(out.dynamics[i]));
-            for(std::uint32_t j=0;j<i;++j)if(out.dynamics[i]==out.dynamics[j])return refuse(why,Reason::DynamicState,i,static_cast<std::uint32_t>(out.dynamics[i]));
-            dynamicViewport|=out.dynamics[i]==VK_DYNAMIC_STATE_VIEWPORT;dynamicScissor|=out.dynamics[i]==VK_DYNAMIC_STATE_SCISSOR;
-        }
-    }
-    if(!in.pRasterizationState)return refuse(why,Reason::NullArray);
-    STATE(pRasterizationState,VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,raster)
-    if(out.raster.flags || !boolean(out.raster.depthClampEnable) || !boolean(out.raster.rasterizerDiscardEnable) ||
-       !boolean(out.raster.depthBiasEnable) || out.raster.rasterizerDiscardEnable || !std::isfinite(out.raster.lineWidth) || out.raster.lineWidth<=0 ||
-       !std::isfinite(out.raster.depthBiasConstantFactor) || !std::isfinite(out.raster.depthBiasClamp) || !std::isfinite(out.raster.depthBiasSlopeFactor))
-        return refuse(why,Reason::Scalar);
-    if(!in.pVertexInputState || !in.pInputAssemblyState || !in.pViewportState || !in.pMultisampleState || !in.pColorBlendState)
-        return refuse(why,Reason::NullArray);
-    if(in.pTessellationState)return refuse(why,Reason::Stage);
-    STATE(pVertexInputState,VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,vertex)
-    out.vertex.pVertexBindingDescriptions=nullptr;out.vertex.pVertexAttributeDescriptions=nullptr;
-    if(out.vertex.flags || !copyArray(in.pVertexInputState->pVertexBindingDescriptions,out.vertex.vertexBindingDescriptionCount,out.vertexBindings,why) ||
-       !copyArray(in.pVertexInputState->pVertexAttributeDescriptions,out.vertex.vertexAttributeDescriptionCount,out.attributes,why))return refuse(why,Reason::Bounds);
-    STATE(pInputAssemblyState,VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,assembly)
-    if(out.assembly.flags || !boolean(out.assembly.primitiveRestartEnable))return refuse(why,Reason::Scalar);
-    STATE(pViewportState,VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,viewport)
-    out.viewport.pViewports=nullptr;out.viewport.pScissors=nullptr;
-    if(out.viewport.flags || !out.viewport.viewportCount || out.viewport.viewportCount!=out.viewport.scissorCount || out.viewport.viewportCount>MaxViewports)return refuse(why,Reason::Bounds);
-    out.hasViewports=!dynamicViewport;out.hasScissors=!dynamicScissor;
-    if(out.hasViewports && !copyArray(in.pViewportState->pViewports,out.viewport.viewportCount,out.viewports,why))return false;
-    if(out.hasScissors && !copyArray(in.pViewportState->pScissors,out.viewport.scissorCount,out.scissors,why))return false;
-    if(out.hasViewports)for(std::uint32_t i=0;i<out.viewport.viewportCount;++i){const auto& v=out.viewports[i];
-        if(!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.width) || !std::isfinite(v.height) ||
-           !std::isfinite(v.minDepth) || !std::isfinite(v.maxDepth) || v.width<=0 || v.height==0)
-            return refuse(why,Reason::Scalar,i);
-    }
-    STATE(pMultisampleState,VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,multisample)
-    out.multisample.pSampleMask=nullptr;out.hasMask=in.pMultisampleState->pSampleMask!=nullptr;
-    if(out.multisample.flags || !sampleCount(out.multisample.rasterizationSamples) || !boolean(out.multisample.sampleShadingEnable) ||
-       !boolean(out.multisample.alphaToCoverageEnable) || !boolean(out.multisample.alphaToOneEnable) ||
-       !std::isfinite(out.multisample.minSampleShading) || out.multisample.minSampleShading<0 || out.multisample.minSampleShading>1)return refuse(why,Reason::Scalar);
-    if(out.hasMask){const auto count=(static_cast<unsigned>(out.multisample.rasterizationSamples)+31)/32;
-        for(unsigned i=0;i<count;++i)out.sampleMask[i]=in.pMultisampleState->pSampleMask[i];}
-    if(pass.hasDepth && in.pDepthStencilState){
-        STATE(pDepthStencilState,VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,depth)
-        if(out.depth.flags || !boolean(out.depth.depthTestEnable) || !boolean(out.depth.depthWriteEnable) ||
-           !boolean(out.depth.depthBoundsTestEnable) || !boolean(out.depth.stencilTestEnable) ||
-           !std::isfinite(out.depth.minDepthBounds) || !std::isfinite(out.depth.maxDepthBounds))return refuse(why,Reason::Scalar);
-        out.hasDepth=true;
-    }
-    if(pass.hasDepth && !out.hasDepth)return refuse(why,Reason::NullArray);
-    STATE(pColorBlendState,VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,blend)
-    out.blend.pAttachments=nullptr;
-    if(out.blend.flags || !boolean(out.blend.logicOpEnable) || out.blend.attachmentCount!=pass.colorCount ||
-       !copyArray(in.pColorBlendState->pAttachments,out.blend.attachmentCount,out.colors,why))return refuse(why,Reason::Bounds);
-    for(std::uint32_t i=0;i<out.blend.attachmentCount;++i)if(!boolean(out.colors[i].blendEnable))return refuse(why,Reason::Scalar,i);
-    for(float value:out.blend.blendConstants)if(!std::isfinite(value))return refuse(why,Reason::Scalar);
-#undef STATE
-    if((!out.hasViewports && !dynamicViewport) || (!out.hasScissors && !dynamicScissor))return refuse(why,Reason::NullArray);
-    out.info=in;out.info.pNext=nullptr;out.info.pStages=nullptr;out.info.pVertexInputState=nullptr;out.info.pInputAssemblyState=nullptr;
-    out.info.pTessellationState=nullptr;out.info.pViewportState=nullptr;out.info.pRasterizationState=nullptr;
-    out.info.pMultisampleState=nullptr;out.info.pDepthStencilState=nullptr;out.info.pColorBlendState=nullptr;out.info.pDynamicState=nullptr;
-    out.info.layout=VK_NULL_HANDLE;out.info.renderPass=VK_NULL_HANDLE;out.complete=true;return true;
-}
+} // namespace frame_pixel_ssbo_clone
+#include "pixel_graphics_definition.h"
+namespace frame_pixel_ssbo_clone {
 
 struct Identity {std::uint64_t device=0,value=0,generation=0;};
 struct Inputs {

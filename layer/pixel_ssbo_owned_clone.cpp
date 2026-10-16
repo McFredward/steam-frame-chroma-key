@@ -63,12 +63,20 @@ Result Clone::prepare(const Preparation& input) noexcept {
     Procs functions{};
 #define LOAD(name) functions.name=reinterpret_cast<PFN_vk##name>(p.downstream(p.device,"vk" #name));if(!functions.name)return {Status::MissingProc,Stage::None,VK_SUCCESS};
     LOAD(CreateDescriptorSetLayout) LOAD(DestroyDescriptorSetLayout)
-    LOAD(CreatePipelineLayout) LOAD(DestroyPipelineLayout) LOAD(CreateRenderPass) LOAD(DestroyRenderPass)
+    LOAD(CreatePipelineLayout) LOAD(DestroyPipelineLayout) LOAD(DestroyRenderPass)
     LOAD(CreateShaderModule) LOAD(DestroyShaderModule) LOAD(CreateGraphicsPipelines) LOAD(DestroyPipeline)
     LOAD(CreateBuffer) LOAD(DestroyBuffer) LOAD(GetBufferMemoryRequirements) LOAD(AllocateMemory) LOAD(FreeMemory)
     LOAD(BindBufferMemory) LOAD(MapMemory) LOAD(UnmapMemory) LOAD(FlushMappedMemoryRanges)
     LOAD(CreateDescriptorPool) LOAD(DestroyDescriptorPool) LOAD(AllocateDescriptorSets) LOAD(UpdateDescriptorSets)
 #undef LOAD
+    if(snapshot.renderPass.route2){
+        functions.CreateRenderPass2=reinterpret_cast<PFN_vkCreateRenderPass2>(p.downstream(p.device,"vkCreateRenderPass2"));
+        if(!functions.CreateRenderPass2)functions.CreateRenderPass2=reinterpret_cast<PFN_vkCreateRenderPass2>(p.downstream(p.device,"vkCreateRenderPass2KHR"));
+        if(!functions.CreateRenderPass2)return {Status::MissingProc,Stage::RenderPass,VK_SUCCESS};
+    }else{
+        functions.CreateRenderPass=reinterpret_cast<PFN_vkCreateRenderPass>(p.downstream(p.device,"vkCreateRenderPass"));
+        if(!functions.CreateRenderPass)return {Status::MissingProc,Stage::RenderPass,VK_SUCCESS};
+    }
     recipe_=snapshot;device_=p.device;procs_=functions;
     const auto failure=[&](Stage stage,VkResult result) noexcept {
         destroyUnreferenced();return Result{Status::VulkanFailure,stage,result};
@@ -90,9 +98,15 @@ Result Clone::prepare(const Preparation& input) noexcept {
     if(!r.layoutView(set0_,set1_,layoutView))return invalid(Stage::Layout);
     result=procs_.CreatePipelineLayout(device_,&layoutView.info,nullptr,&layout_);
     if(result!=VK_SUCCESS){layout_=VK_NULL_HANDLE;return failure(Stage::Layout,result);}
-    frame_pixel_ssbo_clone::RenderPassView renderView{};
-    if(!r.renderPass.view(renderView))return invalid(Stage::RenderPass);
-    result=procs_.CreateRenderPass(device_,&renderView.info,nullptr,&renderPass_);
+    if(r.renderPass.route2){
+        frame_pixel_ssbo_clone::RenderPass2View renderView{};
+        if(!r.renderPass.view2(renderView))return invalid(Stage::RenderPass);
+        result=procs_.CreateRenderPass2(device_,&renderView.info,nullptr,&renderPass_);
+    }else{
+        frame_pixel_ssbo_clone::RenderPassView renderView{};
+        if(!r.renderPass.view(renderView))return invalid(Stage::RenderPass);
+        result=procs_.CreateRenderPass(device_,&renderView.info,nullptr,&renderPass_);
+    }
     if(result!=VK_SUCCESS){renderPass_=VK_NULL_HANDLE;return failure(Stage::RenderPass,result);}
     VkShaderModuleCreateInfo module{};module.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     module.codeSize=r.vertex.bytes;module.pCode=r.vertex.words.data();

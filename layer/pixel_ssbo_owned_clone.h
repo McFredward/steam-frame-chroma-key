@@ -58,7 +58,7 @@ private:
 #define PROC(name) PFN_vk##name name=nullptr;
         PROC(CreateDescriptorSetLayout) PROC(DestroyDescriptorSetLayout)
         PROC(CreatePipelineLayout) PROC(DestroyPipelineLayout)
-        PROC(CreateRenderPass) PROC(DestroyRenderPass)
+        PROC(CreateRenderPass) PROC(CreateRenderPass2) PROC(DestroyRenderPass)
         PROC(CreateShaderModule) PROC(DestroyShaderModule)
         PROC(CreateGraphicsPipelines) PROC(DestroyPipeline)
         PROC(CreateBuffer) PROC(DestroyBuffer) PROC(GetBufferMemoryRequirements)
