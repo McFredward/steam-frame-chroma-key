@@ -290,6 +290,14 @@ if(BUILD_TESTING AND UNIX)
     target_compile_options(test_pixel_ssbo_receiver_bridge PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_link_libraries(test_pixel_ssbo_receiver_bridge PRIVATE Threads::Threads)
     add_test(NAME pixel_ssbo_receiver_bridge COMMAND test_pixel_ssbo_receiver_bridge)
+    add_executable(test_pixel_snapshot_rp2_hooks tests/test_pixel_snapshot_rp2_hooks.cpp
+        layer/pixel_ssbo_receiver_bridge.cpp layer/pixel_ssbo_draw_transaction.cpp layer/pixel_ssbo_owned_clone.cpp
+        layer/pixel_readback.cpp layer/pixel_sampler_probe.cpp)
+    target_include_directories(test_pixel_snapshot_rp2_hooks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_definitions(test_pixel_snapshot_rp2_hooks PRIVATE FRAME_PIXEL_SSBO_TRANSACTION=1 FRAME_PIXEL_SSBO_DEFINITION_JOURNAL=1)
+    target_compile_options(test_pixel_snapshot_rp2_hooks PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_snapshot_rp2_hooks PRIVATE Threads::Threads)
+    add_test(NAME pixel_snapshot_rp2_hooks COMMAND test_pixel_snapshot_rp2_hooks)
     # The native companion is an explicit, uninstalled diagnostic build option.
     # Its contracts remain independently testable without a headset or capture.
     add_executable(test_pixel_uniform_resources tests/test_pixel_uniform_resources.cpp)
