@@ -23,13 +23,16 @@ new claim of native eye/ray/frame association or live mask output.
   and reveals no later full definition. This was an overly narrow observer
   policy, not a missing GPU capability or a native creation failure.
 - The successfully tracked acquired image's descriptor is sampled-image type2,
-  count1, stage flags2147483647. The original cold profile's minimum count3 was
-  an assumption inferred from the module's declared array length.
+  count1, stage flags2147483647. This conflicts with the original module's
+  declared array length3 and must be reconciled before a native clone.
 - Inspection of the exact private pinned fragment shows that **both** access
   chains of binding9 use constant index0. Declared extent3 alone does not prove
-  use of descriptors1/2. Changing the native count to3 would change its layout;
-  the copied definition must preserve count1. Actual owned-driver validation of
-  that corrected profile remains separate from this static evidence.
+  use of descriptors1/2. However, subsequent **actual Vulkan validation rejects
+  both original and composed modules with count1**, VUID07991: static index0
+  does not waive the declared array's interface rule. The attempted relaxation
+  is reverted before deployment. Changing the native layout to3 would break
+  compatibility. A separate exact-pin module-interface specialization, with
+  unchanged executed accesses and valid count1, is being checked offline.
 
 The approved manual rollback first removed activation/config/arm files, then
 restarted SteamVR, then removed the now-unmapped exact run library. The final
@@ -42,9 +45,9 @@ rollback timer or restart was introduced.
 
 The strict feature contract now inspects the canonical timeline boolean while
 continuing to require the separately enabled core fragment-storage feature.
-It still rejects unknown device-chain payloads. The pinned-shader Set0 contract
-preserves a nonzero binding9 count instead of expanding a native scalar binding.
-Unknown shader modules still fail their independent full pins.
+It still rejects unknown device-chain payloads. The unmodified pinned-shader
+Set0 contract retains its count3 minimum. Unknown shader modules still fail
+their independent full pins. Raw count1 observations remain diagnostic only.
 
 Small creation facts are now collected independently from recipe eligibility:
 all up-to32 public device-chain headers and at most four distinct ordinary
@@ -56,8 +59,10 @@ recipe, pipeline association, permission or compatibility. Strict admission is
 unchanged by discovery. The journal totals122,864 bytes per device.
 
 Focused evidence at `build/private-native-definitions-repair-20261016/` passes
-23 raw-fact,700 journal and154 definition controls normally and with ASan/UBSan,
-plus strict AArch64 syntax. Three affected actual-loader cases pass with the
+23 raw-fact,700 journal and154 definition controls normally and with ASan/UBSan
+before the rejected scalar relaxation is reverted. The final narrow definition
+repair passes156 definition controls normally/with sanitizers and strict ARM
+syntax; it does not replay the unchanged suites. Three affected actual-loader cases pass with the
 observer enabled; they preserve native operations and intentionally refuse
 fragment-storage admission. Unchanged previous GPU proofs and the complete main
 mod gate were not rerun. Completed CMake and sanitizer outputs are removed;

@@ -111,7 +111,7 @@ void layouts(){
     require(captureLayout(f.layout,f.nativeSet,layout,why),"complete ordered push ranges captured");
     require(layout.ranges[0].stageFlags==VK_SHADER_STAGE_FRAGMENT_BIT && layout.ranges[0].offset==64,"push order preserved");
     f.bindings[5].descriptorCount=1;require(set.bindings[5].descriptorCount==3,"owned array independent of overwrite");
-    require(captureSet0(f.set0,set,why) && set.bindings[5].descriptorCount==1,"actual native scalar binding retained without expansion");require(f.bindings[5].descriptorCount==1,"source declaration untouched");
+    require(!captureSet0(f.set0,set,why),"unmodified original array3 cannot admit observed scalar binding");reason(why,Reason::Image9Extent);require(f.bindings[5].descriptorCount==1,"source declaration untouched; no silent native expansion");
     f.bindings[5].descriptorCount=0;require(!captureSet0(f.set0,set,why),"missing statically used descriptor0 refused");reason(why,Reason::Image9Extent);
     f.bindings[5].descriptorCount=3;VkSampler immutable=object<VkSampler>(8);f.bindings[6].pImmutableSamplers=&immutable;require(!captureSet0(f.set0,set,why),"immutable handles not async authority");reason(why,Reason::ImmutableSampler);f.bindings[6].pImmutableSamplers=nullptr;
     f.bindings[5].binding=8;require(!captureSet0(f.set0,set,why),"missing image9");reason(why,Reason::MissingImage9);f.bindings[5].binding=9;
