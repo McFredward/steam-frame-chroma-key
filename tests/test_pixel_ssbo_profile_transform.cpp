@@ -17,12 +17,12 @@ std::vector<std::uint32_t> shader(const char* path){
 }
 }
 int main(int argc,char** argv){
-    require(argc==1 || argc==4,"optional private originalPS pixelSSBO firstSSBO");
+    require(argc==1 || argc==4 || argc==5,"optional private originalPS pixelSSBO firstSSBO [sparseSSBO]");
     clone::ShaderDefinition source;profile::Artifact output;clone::Refusal why;
     require(!profile::transform(source,false,output,why) && !output.bytes,"absent source cannot generate artifact");
     source.complete=true;source.bytes=6620;source.words[0]=0x07230203u;
     require(!profile::transform(source,false,output,why) && !output.bytes,"plausible header without source pin cannot generate artifact");
-    if(argc==4){
+    if(argc>=4){
         const auto original=shader(argv[1]),pixel=shader(argv[2]),first=shader(argv[3]);
         VkShaderModuleCreateInfo info{};info.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;info.codeSize=original.size()*4;info.pCode=original.data();
         require(clone::captureShader(info,clone::ShaderRole::Fragment,source,why),"successful callback's actual source exact pin");
@@ -35,7 +35,14 @@ int main(int argc,char** argv){
             const auto& other=firstCovered?pixel:first;
             require(!output.profile.matches(other.data(),other.size()*4),"pixel and first-covered profile cannot substitute for each other");
         }
+        if(argc==5){const auto expected=shader(argv[4]);
+            require(profile::transform(source,profile::Election::Sparse32,output,why),"sparse first-eligible grid32 cold transformer");
+            require(output.bytes==expected.size()*4 && std::equal(expected.begin(),expected.end(),output.words.begin()),"sparse C++ bytes exactly match independent Python canonical artifact");
+            require(output.profile.sparseGrid32() && !output.profile.firstCoveredInvocation(),"sparse profile does not claim all-fragment first coverage");
+            require(!output.profile.matches(pixel.data(),pixel.size()*4) && !output.profile.matches(first.data(),first.size()*4),"other canonical modes cannot substitute for sparse");
+            require(!profile::transform(source,static_cast<profile::Election>(255),output,why) && !output.bytes,"unknown election refuses rather than widening default");
+        }
         source.words[7]^=1;require(!profile::transform(source,true,output,why) && !output.bytes,"changed original bytes refuse and clear any previous output");
     }
-    std::cout<<"{\"schema\":\"cold-count1-ssbo-transform-v1\",\"checks\":"<<checks<<",\"private_source_tested\":"<<(argc==4?"true":"false")<<",\"runtime_activation_authorized\":false}\n";
+    std::cout<<"{\"schema\":\"cold-count1-ssbo-transform-v1\",\"checks\":"<<checks<<",\"private_source_tested\":"<<(argc>=4?"true":"false")<<",\"runtime_activation_authorized\":false}\n";
 }

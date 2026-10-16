@@ -7,6 +7,9 @@
 #include <cstring>
 namespace {
 bool count1Layout=false;
+unsigned fixtureExtent=1;
+float fixtureViewportOrigin=0;
+int fixtureCopyOffset=0;
 VkResult ownedSetLayout(VkDevice device,const VkDescriptorSetLayoutCreateInfo* ci,
         const VkAllocationCallbacks* allocator,VkDescriptorSetLayout* result){
     if(!count1Layout)return vkCreateDescriptorSetLayout(device,ci,allocator,result);
@@ -35,6 +38,8 @@ void transferSafePass(SsboGpu& gpu){
     // Explicitly cover the previous readback before another clear/write too.
     vkDestroyFramebuffer(gpu.device,gpu.framebuffer,nullptr);gpu.framebuffer={};
     vkDestroyRenderPass(gpu.device,gpu.renderPass,nullptr);gpu.renderPass={};
+    if(fixtureExtent>1)gpu.targets[0]=gpu.image(VK_FORMAT_R32G32B32A32_SFLOAT,fixtureExtent,fixtureExtent,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     VkAttachmentDescription attachment{};attachment.format=VK_FORMAT_R32G32B32A32_SFLOAT;attachment.samples=VK_SAMPLE_COUNT_1_BIT;
     attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
     attachment.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;attachment.finalLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -51,13 +56,15 @@ void transferSafePass(SsboGpu& gpu){
     pass.subpassCount=1;pass.pSubpasses=&sub;pass.dependencyCount=2;pass.pDependencies=dependencies.data();
     check(vkCreateRenderPass(gpu.device,&pass,nullptr,&gpu.renderPass));
     const auto view=gpu.images[gpu.targets[0]].view;VkFramebufferCreateInfo fb{};fb.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fb.renderPass=gpu.renderPass;fb.attachmentCount=1;fb.pAttachments=&view;fb.width=fb.height=fb.layers=1;
+    fb.renderPass=gpu.renderPass;fb.attachmentCount=1;fb.pAttachments=&view;fb.width=fb.height=fixtureExtent;fb.layers=1;
     check(vkCreateFramebuffer(gpu.device,&fb,nullptr,&gpu.framebuffer));
 }
 }
 int main(int argc,char** argv){
     try{
-        require(argc==5,"usage: count1-ssbo-fixture VERTEX ORIGINAL ARRAY3_SSBO COUNT1_SSBO");
+        require(argc==5 || (argc==6 && std::string(argv[5])=="no-grid"),"usage: count1-ssbo-fixture VERTEX ORIGINAL ARRAY3_SSBO COUNT1_SSBO [no-grid]");
+        const bool noGrid=argc==6;
+        if(noGrid){fixtureExtent=2;fixtureViewportOrigin=1;fixtureCopyOffset=1;}
         count1Layout=false;SsboGpu oracle;oracle.init();require(oracle.validationEnabled,"actual validation required");
         oracle.setup(false);transferSafePass(oracle);oracle.createPipelines(argv[1],argv[2],argv[3]);
         count1Layout=true;SsboGpu gpu;gpu.init();require(gpu.validationEnabled,"actual count1 validation required");
@@ -71,13 +78,14 @@ int main(int argc,char** argv){
             require(number(original.rgba[3])==1.f,"unchanged original3 output remains opaque");
             require(original.rgba==reference.rgba && original.rgba==observed.rgba,"specialized count1 retains bit-exact unchanged original3 color output");++bitIdentical;
             require(reference.record==observed.record,"specialized count1 exports exact original-invocation record and sampled components");
-            require(observed.record[0]==1 && observed.record[1]==0x5353424fu && observed.record[2]==1 && observed.record[3]==32,"full single-attachment128-byte actual invocation record");
+            if(noGrid)require(std::all_of(observed.record.begin(),observed.record.end(),[](auto value){return value==0;}),"rendered non-grid pixel safely leaves complete record unclaimed");
+            else require(observed.record[0]==1 && observed.record[1]==0x5353424fu && observed.record[2]==1 && observed.record[3]==32,"full single-attachment128-byte actual invocation record");
             auto next=c;next.u[0]+=.03125f;const auto retained=gpu.run(next,gpu.probe,false,2);
             require(retained.record==observed.record,"existing atomic first claim prevents later overwrite");++completed;
         }
         require(validationErrors.load()==0,"count1 shader/layout Vulkan validation errors");
         std::cout<<"{\"schema\":\"count1-original-invocation-ssbo-gpu-v1\",\"cases\":"<<completed<<",\"checks\":"<<checks
             <<",\"original3_bit_identical_cases\":"<<bitIdentical<<",\"active_color_attachments\":1,\"count1_layout_created\":true,\"logical_record_bytes\":128"
-            <<",\"validation_enabled\":true,\"validation_errors\":0,\"device_name\":\""<<gpu.properties.deviceName<<"\",\"passthrough_authorized\":false}\n";return 0;
+            <<",\"no_eligible_grid_geometry\":"<<(noGrid?"true":"false")<<",\"validation_enabled\":true,\"validation_errors\":0,\"device_name\":\""<<gpu.properties.deviceName<<"\",\"passthrough_authorized\":false}\n";return 0;
     }catch(const std::exception& error){std::cerr<<"count1 SSBO fixture failed: "<<error.what()<<"; checks="<<checks<<'\n';return 1;}
 }

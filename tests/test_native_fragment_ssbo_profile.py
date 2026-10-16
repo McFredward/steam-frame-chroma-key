@@ -24,6 +24,7 @@ class PublicControls(unittest.TestCase):
                           data[:20]+struct.pack("<I", (1 << 16)|65535)):
             with self.assertRaises(tool.ssbo.probe.ProbeError): tool.parse_ssbo_module(candidate)
         self.assertNotIn(29, tool.ssa.ALLOWED)
+        self.assertNotIn(109, tool.ssa.ALLOWED)
         for bad in (data, bytes(tool.ssa.ORIGINAL_BYTES)):
             with self.assertRaisesRegex(tool.ssbo.probe.ProbeError, "exact original"): tool.transform(bad)
 
@@ -98,6 +99,27 @@ class PrivateControls(unittest.TestCase):
         # Generated body output uses original IDs, while newly defined result
         # IDs live strictly beyond the exact original bound.
         self.assertEqual(tables["original_bound"], original_header[3])
+
+    def test_sparse32_is_first_eligible_only_and_preserves_original_stream(self):
+        active, record = tool.transform(self.original, election="sparse32")
+        self.assertEqual(record["output_sha256"], "eb242f9252a51393e0794e12afed36a90de3e1059d45310d8b4c70d543019efd")
+        self.assertEqual(len(active), 9888)
+        self.assertEqual(record["profile"], tool.SPARSE32_PROFILE)
+        self.assertTrue(record["sparse_grid32"])
+        self.assertFalse(record["first_covered_invocation"])
+        self.assertIn("safe incomplete/refusal", record["sparse_empty_claim_means"])
+        self.assertIsNone(record["selected_fragment"])
+        _, instructions = tool.parse_ssbo_module(active)
+        _, original = tool.ssa.parse_module(self.original)
+        self.assertEqual(sum(item.opcode == 109 for item in instructions), 2)
+        self.assertEqual(sum(item.opcode == 230 for item in instructions), 1)
+        self.assertEqual([item for item in instructions if item.opcode == 62 and item.operands[0] == 504],
+                         [item for item in original if item.opcode == 62 and item.operands[0] == 504])
+        self.assertEqual([item for item in instructions if item.opcode == 65 and item.operands[2] == 289],
+                         [item for item in original if item.opcode == 65 and item.operands[2] == 289])
+        for bad in (True, 32, "sparse16"):
+            with self.assertRaises(tool.ssbo.probe.ProbeError): tool.transform(self.original, election=bad)
+        with self.assertRaises(tool.ssbo.probe.ProbeError): tool.transform(self.original, True, "sparse32")
 
 
 if __name__ == "__main__": unittest.main()

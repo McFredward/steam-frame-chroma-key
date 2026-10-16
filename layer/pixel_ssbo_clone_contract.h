@@ -58,7 +58,8 @@ inline bool digestMatches(const std::array<std::uint8_t,32>& digest,const char* 
 }
 // Default preserves the exact original array3 interface. The only separate
 // count1 profiles are deterministic original-invocation SSBO artifacts built
-// by native_fragment_ssbo_profile.py: Set1, pixel(0,0) or first-covered, exact original PS pin,
+// by native_fragment_ssbo_profile.py: Set1, pixel(0,0), first-covered, or first
+// eligible32x32grid invocation, exact original PS pin,
 // two exhaustive B9 constant0 accesses and fresh owned interface types. A caller
 // boolean/hash cannot attest that interface; admission hashes the actual bytes
 // against this independently pinned transformer result. No native authority.
@@ -67,18 +68,23 @@ public:
     constexpr ProbeInterface() noexcept=default;
     bool specializedCount1() const noexcept{return kind_!=0;}
     bool firstCoveredInvocation() const noexcept{return kind_==2;}
+    bool sparseGrid32() const noexcept{return kind_==3;}
     bool sameProfile(ProbeInterface other) const noexcept{return kind_==other.kind_;}
     static constexpr std::size_t Count1Bytes=9864;
     static constexpr const char* Count1Sha256="6d666c261114f93436e48c1f52793fe18afbce9552e07b53d4212654c4560020";
     static constexpr std::size_t FirstCoveredBytes=9616;
     static constexpr const char* FirstCoveredSha256="e76f8832c87229138e4c6b21bcab7b11e63d98bc016d42f5afb8dd7098c01bcd";
+    static constexpr std::size_t Sparse32Bytes=9888;
+    static constexpr const char* Sparse32Sha256="eb242f9252a51393e0794e12afed36a90de3e1059d45310d8b4c70d543019efd";
+    static constexpr std::size_t MaximumBytes=Sparse32Bytes;
     static bool count1(const std::uint32_t* words,std::size_t bytes,ProbeInterface& out,Refusal& why) noexcept {
         out={};why={};
-        if(!words || (bytes!=Count1Bytes && bytes!=FirstCoveredBytes))return refuse(why,Reason::ShaderProfile);
+        if(!words || (bytes!=Count1Bytes && bytes!=FirstCoveredBytes && bytes!=Sparse32Bytes))return refuse(why,Reason::ShaderProfile);
         frame_receiver::Sha256 digest;digest.update(words,bytes);
         const auto hash=digest.finish();
         if(bytes==Count1Bytes && digestMatches(hash,Count1Sha256))out.kind_=1;
         else if(bytes==FirstCoveredBytes && digestMatches(hash,FirstCoveredSha256))out.kind_=2;
+        else if(bytes==Sparse32Bytes && digestMatches(hash,Sparse32Sha256))out.kind_=3;
         else return refuse(why,Reason::ShaderPin);
         return true;
     }

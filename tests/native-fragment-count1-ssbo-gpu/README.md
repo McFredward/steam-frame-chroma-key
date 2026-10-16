@@ -2,8 +2,9 @@
 
 This private, offscreen fixture keeps the unchanged, pinned original fragment
 shader on a separate count3 layout. It compares that original GPU output and its
-canonical array3 SSBO record with two explicitly specialized count1 interfaces:
-pixel `(0, 0)` and the first actually rasterized invocation. Both retain one
+canonical array3 SSBO record with three explicitly specialized count1 interfaces:
+pixel `(0, 0)`, the first actually rasterized invocation, and the first eligible
+integer pixel on a32x32grid. All retain one
 color attachment and an owned 128-byte Set1 record, including atomic first claim.
 
 The runner derives a temporary reusable helper include from the approved SSBO
@@ -12,12 +13,21 @@ and writes change to count1. The original shader never runs against that layout.
 Every original/candidate color word and all 32 SSBO words must be bit-identical;
 the existing resource/record canaries also remain active. Both Intel and lavapipe
 must finish with validation and synchronization validation enabled and no errors.
+The sparse control also renders a real opaque pixel at `(1, 1)` in a2x2target;
+its unchanged original color must remain bit-identical while its unclaimed
+record stays entirely zero. Zero means safe incomplete/refusal, not proof of a
+native physical eye or of first coverage outside the eligible grid.
 
 ```sh
 python3 -B tests/native-fragment-count1-ssbo-gpu/run.py \
   --original /private/distort_ps_achromatic_se2.spv \
   --record /private/exclusive-count1-receipt.json --driver both
 ```
+
+For a bounded sparse-only delta, add `--sparse-only`; unchanged old-mode evidence
+can be inherited instead of rerunning it. The original boolean C++ transformer
+API still produces the exact two former artifacts; `Election::Sparse32` selects
+the separately pinned third profile.
 
 Set `VK_LAYER_PATH` and `LD_LIBRARY_PATH` to the explicitly inspected private
 Khronos validation package when the host does not provide it. No system install

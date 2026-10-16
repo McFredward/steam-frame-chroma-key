@@ -19,9 +19,10 @@ import native_fragment_ssbo_probe as ssbo
 ssa, require = ssbo.ssa, ssbo.require
 PROFILE = "EXACT_ORIGINAL_CONSTANT_ZERO_B9_COUNT1_SSBO_PIXEL_0_0_SET1_V1"
 FIRST_COVERED_PROFILE = "EXACT_ORIGINAL_CONSTANT_ZERO_B9_COUNT1_SSBO_FIRST_COVERED_SET1_V1"
+SPARSE32_PROFILE = "EXACT_ORIGINAL_CONSTANT_ZERO_B9_COUNT1_SSBO_FIRST_ELIGIBLE_GRID32_SET1_V1"
 # A finite instrumentation grammar, not a change to ssa.ALLOWED. These extra
 # opcodes are required by this exact SSBO transformer and are not original code.
-SSBO_ALLOWED = ssa.ALLOWED | {29, 167, 184, 190, 230}
+SSBO_ALLOWED = ssa.ALLOWED | {29, 109, 167, 184, 190, 230}
 
 
 def parse_ssbo_module(data):
@@ -83,10 +84,18 @@ def insertion_blocks(original, instrumented):
     return native, blocks
 
 
-def canonical_ssbo(original, first_covered=False):
+def election_mode(first_covered=False, election=None):
     require(type(first_covered) is bool, "explicit SSBO selection mode required")
+    if election is None: return "first-covered" if first_covered else "pixel0"
+    require(type(election) is str and election in ("pixel0", "first-covered", "sparse32") and not first_covered,
+            "one explicit SSBO election mode required")
+    return election
+
+
+def canonical_ssbo(original, first_covered=False, election=None):
+    mode = election_mode(first_covered, election)
     binary, _ = ssbo.transform(original, canonical_admission(), (0, 0))
-    if not first_covered: return binary
+    if mode == "pixel0": return binary
     # Retain the existing atomic first claimant, removing only the coordinate
     # predicate around it. This chooses an actually rasterized invocation; no
     # guessed screen center, private eye/frame claim or extra resource read.
@@ -99,16 +108,34 @@ def canonical_ssbo(original, first_covered=False):
     claim = ssa.Instruction(248, (branch.operands[1],))
     claim_index = body.index(claim)
     require(body[-2:] == [ssa.Instruction(249, (final,)), ssa.Instruction(248, (final,))], "exact outer predicate tail")
-    blocks[body_index] = body[claim_index+1:-2]
+    if mode == "first-covered": blocks[body_index] = body[claim_index+1:-2]
+    else:
+        # Every32nd integer pixel on both axes may contend. This is the first
+        # ELIGIBLE grid invocation, not necessarily the first covered fragment.
+        # A mesh/scissor with no eligible coverage leaves claim0 and is refused.
+        # No guessed center, native UBO read, subgroup feature or shared read is
+        # introduced. Original fragment output/accesses remain intact.
+        frag = body[0];require(frag.opcode == 61 and frag.operands[0] == 9 and frag.operands[2] == 487, "exact own fragment-coordinate load")
+        components = [next(item for item in body[:merge] if item.opcode == 81 and item.operands[2:] == (frag.operands[1], axis)) for axis in (0, 1)]
+        ids = list(range(header[3], header[3]+9));zero, mask, x, y, mx, my, ex, ey, selected = ids
+        boolean = next(item.operands[0] for item in native if item.opcode == 20)
+        make = lambda op, *a: ssa.Instruction(op, tuple(a))
+        blocks[sorted(blocks)[1]] += [make(43, 6, zero, 0), make(43, 6, mask, 31)]
+        prefix = [frag, *components, make(109, 6, x, components[0].operands[1]), make(109, 6, y, components[1].operands[1]),
+                  make(199, 6, mx, x, mask), make(199, 6, my, y, mask), make(170, boolean, ex, mx, zero),
+                  make(170, boolean, ey, my, zero), make(167, boolean, selected, ex, ey)]
+        blocks[body_index] = prefix+[body[merge], make(250, selected, *branch.operands[1:])]+body[merge+2:]
+        header = (*header[:3], ids[-1]+1, header[4])
     result = []
     for index, item in enumerate(native): result.extend(blocks.get(index, [])); result.append(item)
     words = list(header)+[word for item in result for word in item.words()]
     return struct.pack("<%dI" % len(words), *words)
 
 
-def specialize(original, instrumented, first_covered=False):
+def specialize(original, instrumented, first_covered=False, election=None):
+    mode = election_mode(first_covered, election)
     variable, accesses = original_interface(original)
-    canonical = canonical_ssbo(original, first_covered)
+    canonical = canonical_ssbo(original, election=mode)
     # Do not accept caller claims that an arbitrary instrumented module preserves
     # accesses. Byte equality proves this exact original SSA export before the
     # independent interface-only rewrite (including every added SSBO operation).
@@ -127,7 +154,7 @@ def specialize(original, instrumented, first_covered=False):
     require(replacements == 1 and pointer < 65536, "single bounded owned interface specialization required")
     words = [*header[:3], pointer+1, header[4]]+[word for item in result for word in item.words()]
     binary = struct.pack("<%dI" % len(words), *words)
-    record = {"schema": "native-fragment-count1-ssbo-profile-v1", "profile": FIRST_COVERED_PROFILE if first_covered else PROFILE,
+    record = {"schema": "native-fragment-count1-ssbo-profile-v1", "profile": {"first-covered": FIRST_COVERED_PROFILE, "pixel0": PROFILE, "sparse32": SPARSE32_PROFILE}[mode],
         "original_sha256": ssa.ORIGINAL_SHA256, "original_bytes": len(original),
         "canonical_array3_ssbo_sha256": ssbo.probe.digest(canonical),
         "output_sha256": ssbo.probe.digest(binary), "output_bytes": len(binary),
@@ -135,7 +162,9 @@ def specialize(original, instrumented, first_covered=False):
         "new_interface_ids": [one, array, pointer], "shared_original_array_length_mutated": False,
         "original_executable_accesses_preserved": True, "original_output_store_preserved": True,
         "instrumentation": "original-invocation 128-byte Set1 SSBO; single color attachment",
-        "selected_fragment": None if first_covered else [0, 0], "first_covered_invocation": first_covered,
+        "selected_fragment": [0, 0] if mode == "pixel0" else None, "first_covered_invocation": mode == "first-covered",
+        "sparse_grid32": mode == "sparse32", "election": mode,
+        "sparse_empty_claim_means": "safe incomplete/refusal, no eligible covered grid fragment" if mode == "sparse32" else None,
         "own_b9_descriptor_count": 1,
         "native_descriptor_layout_modified": False, "native_creation_proven": False,
         "native_same_draw_eye_frame_binding_proven": False, "runtime_activation_authorized": False,
@@ -143,9 +172,10 @@ def specialize(original, instrumented, first_covered=False):
     return binary, record
 
 
-def transform(original, first_covered=False):
+def transform(original, first_covered=False, election=None):
     original_interface(original)
-    return specialize(original, canonical_ssbo(original, first_covered), first_covered)
+    mode = election_mode(first_covered, election)
+    return specialize(original, canonical_ssbo(original, election=mode), election=mode)
 
 
 def cpp_template_data(original):
@@ -156,29 +186,37 @@ def cpp_template_data(original):
     for item in native: offsets.append(cursor); cursor += len(item.words())
     _, blocks = insertion_blocks(original, canonical_ssbo(original))
     _, first_blocks = insertion_blocks(original, canonical_ssbo(original, True))
+    sparse_header, _ = parse_ssbo_module(canonical_ssbo(original, election="sparse32"))
+    _, sparse_blocks = insertion_blocks(original, canonical_ssbo(original, election="sparse32"))
     points = sorted(blocks)
     instrumented_header, _ = parse_ssbo_module(canonical_ssbo(original))
     one, array, pointer = range(instrumented_header[3], instrumented_header[3]+3)
     flatten = lambda items: [word for item in items for word in item.words()]
+    sparse_one, sparse_array, sparse_pointer = range(sparse_header[3], sparse_header[3]+3)
     return {"annotations": flatten(blocks[points[0]]), "globals": flatten(blocks[points[1]]),
         "pixel_body": flatten(blocks[points[2]]), "first_body": flatten(first_blocks[points[2]]),
+        "sparse_globals": flatten(sparse_blocks[points[1]]), "sparse_body": flatten(sparse_blocks[points[2]]),
         "interface_types": flatten([ssa.Instruction(43, (6, one, 1)),
             ssa.Instruction(28, (array, 286, one)), ssa.Instruction(32, (pointer, 0, array))]),
         "interface_variable": flatten([ssa.Instruction(59, (pointer, 289, 0))]),
+        "sparse_interface_types": flatten([ssa.Instruction(43, (6, sparse_one, 1)),
+            ssa.Instruction(28, (sparse_array, 286, sparse_one)), ssa.Instruction(32, (sparse_pointer, 0, sparse_array))]),
+        "sparse_interface_variable": flatten([ssa.Instruction(59, (sparse_pointer, 289, 0))]),
         "insertion_offsets": [offsets[index] for index in points],
         "variable_offset": offsets[native.index(ssa.Instruction(59, (288, 289, 0)))],
-        "output_bound": pointer+1, "original_bound": header[3]}
+        "output_bound": pointer+1, "sparse_output_bound": sparse_pointer+1, "original_bound": header[3]}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("original", "output", "record"): parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--first-covered", action="store_true")
+    parser.add_argument("--election", choices=("pixel0", "first-covered", "sparse32"))
     args = parser.parse_args(argv)
     try:
         require(args.output.absolute() != args.record.absolute(), "distinct private output paths required")
         require(not any(path.exists() or path.is_symlink() for path in (args.output, args.record)), "exclusive output paths required")
-        binary, record = transform(ssbo.recovery.read_owned(args.original, ssa.MAX_BYTES), args.first_covered)
+        binary, record = transform(ssbo.recovery.read_owned(args.original, ssa.MAX_BYTES), args.first_covered, args.election)
         with tempfile.TemporaryDirectory(prefix="owned-count1-ssbo-") as temporary:
             path = Path(temporary)/"probe.spv"; path.write_bytes(binary)
             result = subprocess.run(["spirv-val", "--target-env", "vulkan1.1", str(path)],
