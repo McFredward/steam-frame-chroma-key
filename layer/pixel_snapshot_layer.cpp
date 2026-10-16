@@ -339,9 +339,11 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
         char report[768]{};
         const auto count=std::snprintf(report,sizeof(report),
             "{\"event\":\"ssbo_definition_feature\",\"initialized\":%s,\"observed\":%s,\"enabled\":%s,\"raw\":%u,"
-            "\"source\":%u,\"contract_reason\":\"%s\",\"native_compatibility_proven\":false,\"mask_enabled\":false}\n",
+            "\"source\":%u,\"contract_reason\":\"%s\",\"contract_index\":%u,\"contract_structure_type\":%u,"
+            "\"native_compatibility_proven\":false,\"mask_enabled\":false}\n",
             facts.initialized?"true":"false",facts.feature.observed?"true":"false",facts.feature.enabled?"true":"false",
-            facts.feature.raw,unsigned(facts.feature.source),frame_pixel_ssbo_clone::reasonName(facts.deviceRefusal.reason));
+            facts.feature.raw,unsigned(facts.feature.source),frame_pixel_ssbo_clone::reasonName(facts.deviceRefusal.reason),
+            facts.deviceRefusal.index,facts.deviceRefusal.type);
         if(count>0 && static_cast<std::size_t>(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,static_cast<std::size_t>(count));
         featureReported=true;
     }
@@ -351,9 +353,11 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
         char report[768]{};
         const auto count=std::snprintf(report,sizeof(report),
             "{\"event\":\"ssbo_definition_refusals\",\"new_reasons\":%llu,\"first_reason\":\"%s\","
-            "\"first_contract_reason\":\"%s\",\"created\":%llu,\"cancelled\":%llu,\"mask_enabled\":false}\n",
+            "\"first_contract_reason\":\"%s\",\"first_kind\":%u,\"first_contract_index\":%u,\"first_contract_type\":%u,"
+            "\"created\":%llu,\"cancelled\":%llu,\"mask_enabled\":false}\n",
             static_cast<unsigned long long>(newReasons),journal::reasonName(facts.firstRefusal.reason),
             frame_pixel_ssbo_clone::reasonName(facts.firstRefusal.contract.reason),
+            unsigned(facts.firstRefusal.kind),facts.firstRefusal.contract.index,facts.firstRefusal.contract.type,
             static_cast<unsigned long long>(facts.created),static_cast<unsigned long long>(facts.cancelled));
         if(count>0 && static_cast<std::size_t>(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,static_cast<std::size_t>(count));
         reportedReasons|=newReasons;

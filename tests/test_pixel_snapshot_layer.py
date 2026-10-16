@@ -224,6 +224,8 @@ def main():
                         assert feature["initialized"] is True and feature["observed"] is statistics, (label, feature)
                         assert feature["enabled"] is False and feature["raw"] == 0, (label, feature)
                         assert feature["contract_reason"] == ("feature_disabled" if statistics else "feature_absent"), (label, feature)
+                        for key in ("contract_index", "contract_structure_type"):
+                            assert type(feature[key]) is int and 0 <= feature[key] <= 0xffffffff, (label, feature)
                         assert feature["native_compatibility_proven"] is False, (label, feature)
                         assert all(r["event"] in ("ssbo_definition_feature", "ssbo_definition_refusals")
                                    and r["mask_enabled"] is False for r in definitions), (label, definitions)
