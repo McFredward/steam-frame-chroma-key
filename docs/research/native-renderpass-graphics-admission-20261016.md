@@ -95,3 +95,33 @@ Private evidence: `build/private-native-r4-integration-20261016/`,
 receipts. Temporary compilation outputs and completed worker checkouts are
 removed once reaped and no longer borrowed. Original native captures and current
 deliverables remain protected. No new Frame action follows from this document.
+
+## Final integration and next action
+
+Runtime source b897155 has exact hosted CI38972790160 green:127 CTests in96.61s,
+both optional diagnostic builds, Windows sender and8,482 protocol sanitizer
+checks. Local focused integration reuses unchanged passing scopes after two
+obsolete test expectations were repaired; it is not reported as another full
+local gate. Final exact-name Snapshot public checks total333;200 new exact-name
+and910 complete-subpass controls pass normally and sanitized.
+
+ARM package510,752B SHA
+`dc9fa04aa9d7da4e559b00c614e73378c4243dac43e457ff7367db91ab06c494`
+retains three exports and ELF hardening. Its81 imports add two GLIBCXX3.4 locale
+functions; the existing actual-provider and isolated-load preflight must still
+check all imports before activation. Exact ARM-file local staging, byte/inode
+idempotence, unarmed state and rollback pass; three separate real host-loader
+cases pass. These do not execute the ARM file on the headset.
+
+The unique r4 plan is630,333B transferred and1,141,085B including the staged
+library copy. One paired source capture stays at most64MiB combined plus128B
+SSBO; progress is at most512KiB. There is no automatic expiry/restart, sender
+modification or live passthrough. Installation and the single loading restart
+remain pending fresh maintainer permission/readiness; later removal needs a
+manually agreed restart. No Frame contact occurred in this preparation round.
+
+All three own worker worktrees and reaped build/VVL caches are removed after
+source comparison. The final root compile-cache cleanup removed77,737,048B;
+private original inputs, failed attempts, logs, source pins and current package
+remain. The fork's remaining private build directory contains evidence/current
+deliverables, with no CMakeFiles or Python cache directories.
