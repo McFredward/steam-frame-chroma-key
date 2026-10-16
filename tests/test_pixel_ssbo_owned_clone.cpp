@@ -166,6 +166,9 @@ void happy(bool noncoherent){
     demand(clone.prepare(f.p).status==Status::Ok && clone.ready(),"cold build succeeds");
     demand(state.updates==1 && state.flushes==(noncoherent?1u:0u),"actual coherent/noncoherent initialization paths");
     demand(clone.pipeline() && clone.layout() && clone.set1() && clone.recordBuffer() && clone.recordMemory() && clone.allocationBytes()==256,"publish complete own objects only");
+    const auto* prepared=clone.preparedRecipe();demand(prepared && prepared!=&f.recipe,"prepared clone owns exact cold recipe snapshot");
+    f.recipe.set0.bindings[2].descriptorCount=99;f.recipe.graphics.entries[0][0]='?';
+    demand(prepared->set0.bindings[2].descriptorCount==3 && prepared->graphics.entries[0][0]=='V',"later caller overwrite cannot change actual constructed object facts");
     demand(!clone.hostCoherent()==noncoherent,"coherence reflects chosen memory");
     for(unsigned i=0;i<128;++i)demand(state.mapped[i]==0,"record initialized before publication");
     const auto calls=state.calls;demand(clone.prepare(f.p).status==Status::AlreadyPrepared && calls==state.calls,"no replacement over live allocation");
@@ -176,6 +179,7 @@ void happy(bool noncoherent){
     }
     demand(clone.release({true,true}).status==Status::Ok && state.live.empty() && !clone.ready(),"retired/quiescent release frees every object");
     demand(!clone.markReferenced() && !clone.pipeline() && !clone.mappedRecord(),"released handles never published");
+    demand(!clone.preparedRecipe(),"released recipe facts never published");
     demand(clone.release().status==Status::Ok && state.live.empty(),"release idempotent");
 }
 void failures(bool noncoherent){

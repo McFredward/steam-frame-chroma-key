@@ -258,7 +258,7 @@ void privateConcurrency(const std::vector<std::uint32_t>& vs,const std::vector<s
 void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
     const auto vs=readShader(vsPath),ps=readShader(psPath);
     std::ifstream input(probePath,std::ios::binary|std::ios::ate);require(bool(input),"private canonical probe readable");const auto bytes=input.tellg();
-    require(bytes==std::streamoff(clone::ProbeInterface::Count1Bytes),"canonical count1 probe extent");std::vector<std::uint32_t> probe(static_cast<std::size_t>(bytes)/4);input.seekg(0);
+    require(bytes==std::streamoff(clone::ProbeInterface::Count1Bytes) || bytes==std::streamoff(clone::ProbeInterface::FirstCoveredBytes),"canonical count1 probe extent");std::vector<std::uint32_t> probe(static_cast<std::size_t>(bytes)/4);input.seekg(0);
     require(bool(input.read(reinterpret_cast<char*>(probe.data()),bytes)),"complete canonical count1 probe");
     clone::ProbeInterface profile;clone::Refusal why;require(clone::ProbeInterface::count1(probe.data(),probe.size()*4,profile,why),"actual-byte verified cold count1 interface");
     Fixture f;f.binding.descriptorCount=1;journal::Journal original;f.initialize(original);journal::Event event;
@@ -270,6 +270,21 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
     require(specialized.createPipeline(object<VkPipeline>(0x80),f.graphics,VK_SUCCESS),"count1 recipe assembled with separately verified original-invocation probe profile");
     journal::Ready ready;require(specialized.takeReady(ready) && ready.recipe.set0.bindings[0].descriptorCount==1 && ready.recipe.set0.probeInterface.specializedCount1(),"journal retains exact count1 definition and verified profile");
     require(!ready.nativeAuthority && !ready.recipe.nativeCompatibilityProven && !ready.recipe.runtimeActivationAuthorized,"cold profile grants no native lease or activation");
+    journal::Journal pending(1,{},journal::PendingCount1::RetainFacts);f.initialize(pending);
+    require(pending.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"explicit observational mode retains early successful count1 set callback");const auto setGeneration=event.generation;
+    require(pending.createLayout(f.graphics.layout,f.layout,VK_SUCCESS,&event),"early native layout retains owned pending set shape");const auto layoutGeneration=event.generation;
+    require(pending.createRenderPass(f.graphics.renderPass,f.pass,VK_SUCCESS),"pending profile does not lose other native definitions");
+    require(!pending.createPipeline(object<VkPipeline>(0x80),f.graphics,VK_SUCCESS,&event) && event.contract.reason==clone::Reason::Image9Extent,"no pipeline recipe admitted before actual probe verification");
+    require(!pending.authorizeProbeInterface({},&event) && event.contract.reason==clone::Reason::ShaderProfile,"caller default/boolean cannot promote pending observations");
+    require(pending.destroySet(f.nativeSet),"actual set may die while native layout retains its shape");
+    const auto before=pending.inspectStats();require(pending.authorizeProbeInterface(profile),"actual-byte verified later shader profile promotes original pending layout in place");
+    require(pending.authorizeProbeInterface(profile),"identical later profile authorization idempotent");
+    const auto after=pending.inspectStats();require(before.created==after.created && before.destroyed==after.destroyed,"promotion neither invents native create callbacks nor changes generations");
+    module.codeSize=vs.size()*4;module.pCode=vs.data();require(pending.createShader(f.stages[0].module,module,VK_SUCCESS),"later actual source VS callback");
+    module.codeSize=ps.size()*4;module.pCode=ps.data();require(pending.createShader(f.stages[1].module,module,VK_SUCCESS),"later actual source PS callback");
+    require(pending.createPipeline(object<VkPipeline>(0x80),f.graphics,VK_SUCCESS),"real later pipeline callback assembles promoted definitions");
+    require(pending.takeReady(ready) && ready.recipe.set0.complete && !ready.recipe.set0.pendingCount1 && ready.recipe.set0.probeInterface.sameProfile(profile),"promoted owned recipe has verified exact count1 interface");
+    require(ready.recipe.provenance[0].generation==setGeneration && ready.recipe.provenance[1].generation==layoutGeneration,"earlier actual source generations survive promotion even after set destruction");
 }
 }
 int main(int argc,char** argv){

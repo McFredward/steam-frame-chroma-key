@@ -175,6 +175,11 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
     require(!ProbeInterface::count1(corrupted.data(),corrupted.size()*4,absent,why) && !absent.specializedCount1(),"caller-provided artifact hash cannot bless wrong executable");reason(why,Reason::ShaderPin);
     require(!ProbeInterface::count1(nullptr,ProbeInterface::Count1Bytes,absent,why),"null profile refused before hash");
     require(!ProbeInterface::count1(probe.data(),probe.size()*4-4,absent,why),"bounded exact profile extent");
+    Fixture observed;observed.bindings[5].descriptorCount=1;Set0Definition pending;VkDescriptorSetLayoutCreateInfo unusable{};
+    require(capturePendingCount1Set0(observed.set0,pending,why) && pending.pendingCount1 && !pending.complete,"pending count1 capture is observational only");
+    require(!pending.view(unusable),"pending observed count1 cannot create any Vulkan layout");
+    require(!promotePendingCount1Set0(pending,{},why) && pending.pendingCount1,"default profile never promotes observations");
+    require(promotePendingCount1Set0(pending,profile,why) && pending.complete && !pending.pendingCount1 && pending.view(unusable),"independent actual-byte probe verification promotes owned observed shape");
     auto vertex=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO),fragment=vertex;
     vertex.codeSize=vs.size()*4;vertex.pCode=vs.data();fragment.codeSize=ps.size()*4;fragment.pCode=ps.data();
     Fixture f;f.bindings[5].descriptorCount=1;auto in=f.inputs(vertex,fragment);Recipe recipe;

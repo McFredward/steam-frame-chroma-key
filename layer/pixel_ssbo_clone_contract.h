@@ -67,6 +67,7 @@ public:
     constexpr ProbeInterface() noexcept=default;
     bool specializedCount1() const noexcept{return kind_!=0;}
     bool firstCoveredInvocation() const noexcept{return kind_==2;}
+    bool sameProfile(ProbeInterface other) const noexcept{return kind_==other.kind_;}
     static constexpr std::size_t Count1Bytes=9864;
     static constexpr const char* Count1Sha256="6d666c261114f93436e48c1f52793fe18afbce9552e07b53d4212654c4560020";
     static constexpr std::size_t FirstCoveredBytes=9616;
@@ -166,14 +167,16 @@ inline bool enabledFeature(const VkDeviceCreateInfo& in,bool successfulCreate,
 struct Set0Definition {
     std::uint32_t count=0;std::array<VkDescriptorSetLayoutBinding,MaxBindings> bindings{};bool complete=false;
     ProbeInterface probeInterface{};
+    bool pendingCount1=false;
     bool view(VkDescriptorSetLayoutCreateInfo& out) const noexcept {
-        out={};if(!complete)return false;
+        out={};if(!complete || pendingCount1)return false;
         out.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         out.bindingCount=count;out.pBindings=bindings.data();return true;
     }
 };
-inline bool captureSet0(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition& out,Refusal& why,
-                        ProbeInterface profile={}) noexcept {
+namespace detail {
+inline bool captureSet0Shape(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition& out,Refusal& why,
+                            ProbeInterface profile,bool pending) noexcept {
     out={};why={};if(!ordinary(in,VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,why))return false;
     if(in.flags || in.bindingCount>MaxBindings)return refuse(why,Reason::Bounds);
     if(in.bindingCount && !in.pBindings)return refuse(why,Reason::NullArray);
@@ -193,13 +196,30 @@ inline bool captureSet0(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition
             // validation requires that full extent even for its constant0
             // accesses. A separately validated specialized module needs its
             // own profile; native count1 must not silently pass this contract.
-            if(profile.specializedCount1()?binding.descriptorCount!=1:binding.descriptorCount<3)
+            if((profile.specializedCount1() || pending)?binding.descriptorCount!=1:binding.descriptorCount<3)
                 return refuse(why,Reason::Image9Extent,i);
         }
         out.bindings[i]=binding; // Immutable pointers were rejected, never retained.
     }
     if(!found9)return refuse(why,Reason::MissingImage9);
-    out.count=in.bindingCount;out.probeInterface=profile;out.complete=true;return true;
+    out.count=in.bindingCount;out.probeInterface=profile;out.complete=!pending;out.pendingCount1=pending;return true;
+}
+} // namespace detail
+inline bool captureSet0(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition& out,Refusal& why,
+                        ProbeInterface profile={}) noexcept {
+    return detail::captureSet0Shape(in,out,why,profile,false);
+}
+// Cold observation only. No complete definition, usable Vulkan view or profile
+// is produced until independently verified probe bytes authorize promotion.
+inline bool capturePendingCount1Set0(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition& out,Refusal& why) noexcept {
+    return detail::captureSet0Shape(in,out,why,{},true);
+}
+inline bool promotePendingCount1Set0(Set0Definition& definition,ProbeInterface profile,Refusal& why) noexcept {
+    why={};if(!definition.pendingCount1 || definition.complete || !profile.specializedCount1())return refuse(why,Reason::ShaderProfile);
+    VkDescriptorSetLayoutCreateInfo info{};info.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount=definition.count;info.pBindings=definition.bindings.data();Set0Definition verified;
+    if(!captureSet0(info,verified,why,profile))return false;
+    definition=verified;return true;
 }
 struct LayoutDefinition {
     std::uint32_t count=0;std::array<VkPushConstantRange,MaxPushRanges> ranges{};bool complete=false;

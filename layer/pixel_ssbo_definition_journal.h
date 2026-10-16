@@ -14,6 +14,7 @@ namespace frame_pixel_ssbo_journal {
 namespace clone=frame_pixel_ssbo_clone;
 constexpr std::size_t SetCapacity=4, LayoutCapacity=4, PassCapacity=4;
 constexpr std::size_t ShaderCapacity=2, PipelineCapacity=4;
+enum class PendingCount1 : std::uint8_t {Refuse,RetainFacts};
 enum class ObjectKind : std::uint8_t {Device,Set,Layout,RenderPass,Shader,Pipeline};
 enum class Reason : std::uint8_t {
     None,NativeCreationFailed,NotInitialized,AlreadyInitialized,DeviceIneligible,
@@ -63,8 +64,8 @@ class Journal {
 public:
     // An explicit nonzero seed supports deterministic wrap-boundary controls.
     // It is NOT a source-provided generation or a native authority assertion.
-    explicit Journal(std::uint64_t firstGeneration=1,clone::ProbeInterface profile={}):
-        nextGeneration_(firstGeneration),probeInterface_(profile){stats_.journalEpoch=acquireEpoch();}
+    explicit Journal(std::uint64_t firstGeneration=1,clone::ProbeInterface profile={},PendingCount1 pending=PendingCount1::Refuse):
+        nextGeneration_(firstGeneration),probeInterface_(profile),pendingCount1_(pending){stats_.journalEpoch=acquireEpoch();}
     Journal(const Journal&)=delete;
     Journal& operator=(const Journal&)=delete;
 
@@ -89,8 +90,34 @@ public:
         if(!retired_)frame_pixel_definition_facts::set(facts_,ci,result);
         if(!beginCreate(sets_,value,result,ObjectKind::Set,out))return false;
         clone::Set0Definition definition;clone::Refusal why;
-        if(!clone::captureSet0(ci,definition,why,probeInterface_))return fail(out,Reason::Contract,ObjectKind::Set,value,0,why);
+        // Original3 definitions keep their original profile. Only the explicit
+        // count1 lane can use the separately verified specialized interface.
+        if(!clone::captureSet0(ci,definition,why)){
+            if(why.reason!=clone::Reason::Image9Extent)return fail(out,Reason::Contract,ObjectKind::Set,value,0,why);
+            if(probeInterface_.specializedCount1()){
+                if(!clone::captureSet0(ci,definition,why,probeInterface_))return fail(out,Reason::Contract,ObjectKind::Set,value,0,why);
+            }else if(pendingCount1_!=PendingCount1::RetainFacts || !clone::capturePendingCount1Set0(ci,definition,why))
+                return fail(out,Reason::Contract,ObjectKind::Set,value,0,why);
+        }
         return insert(sets_,value,definition,ObjectKind::Set,out);
+    }
+    // Successful native Set0/layout callbacks may precede the original PS
+    // callback. Promote only bounded owned facts after the cold transformer
+    // pins the actual probe. Identities/generations and creation totals remain
+    // untouched; no callback replay, Vulkan call or native lifetime lease.
+    bool authorizeProbeInterface(clone::ProbeInterface profile,Event* out=nullptr) {
+        std::lock_guard<std::mutex> lock(mutex_);clear(out,ObjectKind::Shader,0);
+        if(!deviceEligible(out,ObjectKind::Shader,0))return false;
+        if(!profile.specializedCount1())return fail(out,Reason::Contract,ObjectKind::Shader,0,0,{clone::Reason::ShaderProfile});
+        if(probeInterface_.specializedCount1())return probeInterface_.sameProfile(profile) ||
+            fail(out,Reason::Contract,ObjectKind::Shader,0,0,{clone::Reason::ShaderProfile});
+        // Validate into local copies first so any refusal is all-or-nothing.
+        auto sets=sets_;auto layouts=layouts_;clone::Refusal why;
+        for(auto& slot:sets)if(slot.live && slot.definition.pendingCount1 && !clone::promotePendingCount1Set0(slot.definition,profile,why))
+            return fail(out,Reason::Contract,ObjectKind::Set,slot.identity.value,slot.identity.generation,why);
+        for(auto& slot:layouts)if(slot.live && slot.definition.set0.pendingCount1 && !clone::promotePendingCount1Set0(slot.definition.set0,profile,why))
+            return fail(out,Reason::Contract,ObjectKind::Layout,slot.identity.value,slot.identity.generation,why);
+        sets_=sets;layouts_=layouts;probeInterface_=profile;return true;
     }
     bool createLayout(VkPipelineLayout object,const VkPipelineLayoutCreateInfo& ci,VkResult result,Event* out=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
@@ -140,6 +167,8 @@ public:
             return fail(out,Reason::Contract,ObjectKind::Pipeline,value,0,{clone::Reason::PipelineFlags});
         const auto* layout=find(layouts_,clone::handle(ci.layout));
         if(!layout)return fail(out,Reason::UnknownLayout,ObjectKind::Pipeline,value);
+        if(!layout->definition.set0.complete || layout->definition.set0.pendingCount1)
+            return fail(out,Reason::Contract,ObjectKind::Pipeline,value,0,{clone::Reason::Image9Extent});
         const auto* pass=find(passes_,clone::handle(ci.renderPass));
         if(!pass)return fail(out,Reason::UnknownRenderPass,ObjectKind::Pipeline,value);
         if(ci.stageCount!=2 || !ci.pStages)
@@ -218,6 +247,7 @@ private:
     mutable std::mutex mutex_;
     std::uint64_t nextGeneration_=1;
     clone::ProbeInterface probeInterface_{};
+    PendingCount1 pendingCount1_=PendingCount1::Refuse;
     bool retired_=false;
     Stats stats_{};
     frame_pixel_definition_facts::Facts facts_{};
