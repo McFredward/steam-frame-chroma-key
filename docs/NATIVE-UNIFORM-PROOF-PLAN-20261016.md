@@ -1,5 +1,13 @@
 # Next receiver mapping proof, 2026-10-16
 
+Final-review boundary: the implemented post-draw companion does not establish
+native host-visible/map/write lifetime or a native CPU-writer completion
+contract. Its private fence proves completion/publication of its copies, not
+that the original shader read those same bytes. Treat resulting matrix facts
+as captured-content analysis, with native draw coherence false. Before using
+them for live mapping, independently exclude host writes across the relevant
+read/copy interval or adopt a separately reviewed consumption-proof design.
+
 The [successful sampler capture](PIXEL-SAMPLER-CAPTURE-20261016.md) establishes
 static source identity and measured grayscale coverage carriage. It does not
 establish the native eye/atlas/reprojection/foveation mapping. The next evidence

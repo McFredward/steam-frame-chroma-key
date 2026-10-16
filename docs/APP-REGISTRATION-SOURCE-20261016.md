@@ -6,6 +6,11 @@ a changing color frame and coverage plane still belong together. GloomhavenVR677
 adds the next synthetic source in the existing mod's opt-in test, without
 modifying the native PC Steam sender or enabling passthrough.
 
+The copied native uniforms also retain an unresolved host-write lifetime:
+post-draw contents have not independently been proved identical to shader-read
+values. GPU publication fences alone do not supply that native CPU-writer
+contract. The new source/GPU tests do not close or silently waive this gap.
+
 ## Source contract
 
 Each explicit run has a fresh nonzero128-bit app session. Monotonic64-bit pair

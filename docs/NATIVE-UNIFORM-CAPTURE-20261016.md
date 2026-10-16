@@ -6,6 +6,16 @@ The approved optional diagnostic from source
 unchanged embedded static source pattern. The maintainer confirmed the pattern
 in both eyes. No native shader, PC Steam sender or live alpha output changed.
 
+**Evidence limitation found in the final review:** these are uniform contents
+copied after the native draw, not independently established shader-consumed
+values. The manifest lacks native host-visible/mapping/write histories and a
+proved native CPU-writer completion contract. The owned fence and command
+retirement protect publication of our copies; they do not independently exclude
+a host write between the shader read and the later copy. Matrix relationships
+below therefore describe captured bytes only. Keep
+`native_draw_coherence_proven=false`; do not use this artifact alone to admit
+live sampling or label current native pose/frame semantics as proven.
+
 ## Recorded evidence
 
 The exact winning native direct draw is ordinal4, command generation48660,
