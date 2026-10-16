@@ -68,5 +68,35 @@ void setShapes(){
     binding.binding=8;ci.bindingCount=1;ci.pBindings=&binding;facts::set(absent,ci,VK_SUCCESS);
     require(absent.setCount==0 && absent.setSkipReasons==0,"unrelated layouts do not consume target-shape budget");
 }
+void creationShapes(){
+    facts::Facts out;auto device=info<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+    auto ci=info<VkGraphicsPipelineCreateInfo>(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
+    ci.stageCount=UINT32_MAX;ci.pStages=reinterpret_cast<const VkPipelineShaderStageCreateInfo*>(std::uintptr_t(1));ci.pDynamicState=reinterpret_cast<const VkPipelineDynamicStateCreateInfo*>(std::uintptr_t(1));
+    facts::graphics(out,ci,VK_SUCCESS,10);require(!out.creationCount,"unobserved device cannot contribute creation evidence");
+    facts::device(out,device,VK_SUCCESS);facts::graphics(out,ci,VK_ERROR_INITIALIZATION_FAILED,10);require(!out.creationCount,"failed original create never inspects ignored subordinate arrays");
+    auto extension=info<VkBaseInStructure>(static_cast<VkStructureType>(0x6fffffff));ci.pNext=&extension;ci.flags=VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;ci.subpass=3;ci.basePipelineIndex=-1;
+    ci.layout=reinterpret_cast<VkPipelineLayout>(std::uintptr_t(20));ci.renderPass=reinterpret_cast<VkRenderPass>(std::uintptr_t(30));
+    facts::graphics(out,ci,VK_SUCCESS,10);
+    require(out.creationCount==1&&out.creations[0].shape.counts[0]==UINT32_MAX&&out.creations[0].shape.flags==ci.flags,"only safe top-level successful graphics words copied");
+    require(out.creations[0].shape.chainCount==1&&out.creations[0].shape.chainTypes[0]==0x6fffffff&&out.creations[0].shape.chainEnd==facts::ChainEnd::Complete,"actual unsupported pNext header retained without payload interpretation");
+    ci.layout=reinterpret_cast<VkPipelineLayout>(std::uintptr_t(21));facts::graphics(out,ci,VK_SUCCESS,11);
+    require(out.creationCount==1&&out.creations[0].count==2&&out.creations[0].firstObject==10&&out.creations[0].lastObject==11&&out.creations[0].lastLayout==21,"same finite shape deduplicates changing native handles without losing bounded endpoints");
+    extension.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;ci.stageCount=2;
+    require(out.creations[0].shape.chainTypes[0]==0x6fffffff&&out.creations[0].shape.counts[0]==UINT32_MAX,"later native input overwrite cannot rewrite creation facts");
+    auto rp2=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);rp2.attachmentCount=3;rp2.subpassCount=1;rp2.dependencyCount=5;rp2.correlatedViewMaskCount=7;rp2.pAttachments=reinterpret_cast<const VkAttachmentDescription2*>(std::uintptr_t(1));
+    facts::renderPass2(out,rp2,VK_SUCCESS,50);
+    require(out.creationCount==2&&out.creations[1].shape.kind==facts::CreationKind::RenderPass2&&out.creations[1].shape.route==VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2&&out.creations[1].shape.counts==std::array<std::uint32_t,4>{{3,1,5,7}},"original RP2 route and finite counts observed without guessing attachment payloads");
+    auto rp=info<VkRenderPassCreateInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO);rp.subpassCount=1;facts::renderPass(out,rp,VK_SUCCESS,51);
+    require(out.creationCount==3&&out.creations[2].shape.kind==facts::CreationKind::RenderPass,"legacy creation route remains distinguishable");
+    facts::Facts capacity;facts::device(capacity,device,VK_SUCCESS);ci.pNext=nullptr;
+    for(unsigned i=0;i<facts::MaxCreations;++i){ci.subpass=i;facts::graphics(capacity,ci,VK_SUCCESS,i+1);}
+    ci.subpass=facts::MaxCreations;facts::graphics(capacity,ci,VK_SUCCESS,99);
+    require(capacity.creationCount==facts::MaxCreations&&capacity.creationOverflow&&capacity.creations[0].firstObject==1,"creation evidence capacity is explicit and never evicts earlier shapes");
+    facts::Creation cycle;extension.pNext=&extension;facts::creationChain(cycle,&extension);
+    require(cycle.chainCount==1&&cycle.chainEnd==facts::ChainEnd::Cycle,"creation-chain cycle is bounded independently of native admission");
+    std::array<VkBaseInStructure,33> nodes{};for(unsigned i=0;i<nodes.size();++i){nodes[i].sType=static_cast<VkStructureType>(i+1);nodes[i].pNext=i+1<nodes.size()?&nodes[i+1]:nullptr;}
+    facts::Creation bounded;facts::creationChain(bounded,nodes.data());require(bounded.chainCount==32&&bounded.chainEnd==facts::ChainEnd::Bounds,"creation pNext census has exact finite bound");
 }
-int main(){deviceChain();setShapes();std::cout<<"{\"checks\":"<<checks<<",\"facts_bytes\":"<<sizeof(facts::Facts)<<",\"runtime_authority\":false}\n";}
+
+}
+int main(){deviceChain();setShapes();creationShapes();std::cout<<"{\"checks\":"<<checks<<",\"facts_bytes\":"<<sizeof(facts::Facts)<<",\"runtime_authority\":false}\n";}
