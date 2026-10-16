@@ -61,6 +61,60 @@ class StreamPreflightTests(unittest.TestCase):
         self.assertIn("no_complete_pipeline_definition_observed", result["reasons"])
         self.assertNotIn("original_output_clone_not_ready", result["reasons"])
 
+    def test_prestream_missing_target_is_observation_only_not_a_causal_deadlock(self):
+        self.events = [event for event in self.events if event["event"] != "ssbo_definition_owned"]
+        before = self.assess()
+        self.assertTrue(before["ready"])
+        self.assertEqual(before["readiness_phase"], "pre_stream_observation")
+        self.assertTrue(before["awaiting_original_pipeline"])
+        self.assertFalse(before["receiver_pipeline_admitted"])
+        self.assertFalse(self.assess(require_profile=True)["ready"])
+
+    def test_r2_healthy_profile_without_recipes_explains_actual_legacy_masks(self):
+        self.events[-1]["profile"] = True
+        self.events = [event for event in self.events if event["event"] != "ssbo_definition_owned"]
+        # The real r2 receipt kept global first_reason=no_ready for all masks.
+        for mask in (16384, 139264, 32768, 1152):
+            self.events.append({"event": "ssbo_definition_refusals", "new_reasons": mask, "first_reason": "no_ready", "first_contract_reason": "none"})
+        result = self.assess(require_profile=True)
+        self.assertFalse(result["ready"])
+        self.assertIn("no_complete_pipeline_definition_observed", result["reasons"])
+        self.assertIn("definition_retention_refused", result["reasons"])
+        details = result["definition_diagnostics"]
+        self.assertTrue({"capacity", "unknown_layout", "contract", "unsupported_route"}.issubset(details["reasons"]))
+        self.assertFalse(details["context_available"])
+        self.assertEqual(details["contexts"], [])  # Legacy receipt does not prove a nested RP2 payload.
+        self.assertFalse(self.assess()["ready"])
+
+    def test_keyed_cause_and_inventory_survive_global_first_no_ready(self):
+        context = {"context_index": 2, "reason": "contract", "kind": 2, "contract_reason": "bounds", "contract_index": 3, "contract_structure_type": 1000109004,
+                   "first_object": 21, "last_object": 92, "first_generation": 0, "last_generation": 0, "count": 12}
+        inventory = [{"kind": i, "live": i, "capacity": i + 1} for i in range(6)]
+        self.events.append({"event": "ssbo_definition_refusals", "new_reasons": 8192, "first_reason": "no_ready", "contexts": [context], "inventory": inventory, "set_fact_count": 12, "set_fact_capacity": 384})
+        details = self.assess()["definition_diagnostics"]
+        self.assertEqual(details["contexts"], [context])
+        self.assertEqual(details["inventory"], inventory)
+        self.assertEqual(details["set_facts"], {"count": 12, "capacity": 384})
+        self.assertEqual(details["reasons"], ["contract"])
+        self.assertTrue(self.assess()["ready"])  # Another complete recipe still establishes the separate admission condition.
+
+    def test_context_overflow_and_malformed_nested_data_fail_closed(self):
+        self.events = [event for event in self.events if event["event"] != "ssbo_definition_owned"]
+        self.events.append({"event": "ssbo_definition_refusals", "new_reasons": 0, "context_overflow": 1})
+        self.assertIn("definition_evidence_truncated", self.assess()["reasons"])
+        self.events[-1] = {"event": "ssbo_definition_refusals", "contexts": [{"reason": "contract"}]}
+        self.assertIn("invalid_definition_context", self.assess()["reasons"])
+        self.events[-1] = {"event": "ssbo_definition_refusals", "new_reasons": 1 << 63}
+        self.assertIn("invalid_definition_context", self.assess()["reasons"])
+        self.events[-1] = {"event": "ssbo_definition_refusals", "set_fact_count": 385, "set_fact_capacity": 384}
+        self.assertIn("invalid_definition_context", self.assess()["reasons"])
+
+    def test_context_reports_can_cross_old_event_bound_but_not_the_new_fixed_bound(self):
+        self.events += [{"event": "bounded_cold_metadata"}] * (gate.MAX_EVENTS - len(self.events))
+        self.assertTrue(self.assess()["ready"])
+        self.events.append({"event": "bounded_cold_metadata"})
+        self.assertEqual(self.assess()["reasons"], ["invalid_events"])
+
     def test_real_failure_domains_remain_independent(self):
         original = copy.deepcopy((self.status, self.health, self.events))
         for domain in ("health", "mapping", "sampler", "feature", "transaction", "failure"):
@@ -75,7 +129,7 @@ class StreamPreflightTests(unittest.TestCase):
                 self.assertFalse(self.assess()["ready"])
 
     def test_missing_malformed_and_oversized_receipts_never_allow_a_test(self):
-        for events in (None, [], [None], [{"event": 1}], self.events * 44):
+        for events in (None, [], [None], [{"event": 1}], self.events * gate.MAX_EVENTS):
             with self.subTest(events=str(events)[:40]):
                 self.assertFalse(gate.assess(self.status, self.health, events, definitions=True, transaction=True)["ready"])
         self.assertFalse(gate.assess(None, self.health, self.events)["ready"])

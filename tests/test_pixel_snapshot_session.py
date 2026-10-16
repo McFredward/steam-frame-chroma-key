@@ -255,9 +255,21 @@ class SessionTests(unittest.TestCase):
         with self.assertRaises(mod.SafetyError):
             self.session.arm()
 
+    def test_grouped_progress_has_a_separate_bound_from_small_json_documents(self):
+        self.prepare()
+        payload = b'{"event":"bounded_cold_context"}\n' * 900
+        self.assertGreater(len(payload), mod.MAX_JSON)
+        self.assertLess(len(payload), mod.MAX_PROGRESS)
+        self.write(self.run / "status.jsonl", payload)
+        self.assertEqual(self.session.status()["progress"], payload.decode())
+        ordinary = self.root / "oversized-small-document.json"
+        self.write(ordinary, b" " * mod.MAX_JSON + b"{}")
+        with self.assertRaises(mod.SafetyError):
+            mod.load_json(ordinary)
+
     def test_status_is_bounded_and_does_not_read_raw_capture(self):
         self.prepare()
-        self.write(self.run / "status.jsonl", b"x" * (mod.MAX_JSON + 1))
+        self.write(self.run / "status.jsonl", b"x" * (mod.MAX_PROGRESS + 1))
         raw = self.run / "snapshot.p010"
         raw.symlink_to(self.source)
         result = self.session.status()

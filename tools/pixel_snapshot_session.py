@@ -16,6 +16,9 @@ import time
 
 MAX_LIBRARY = 8 * 1024 * 1024
 MAX_JSON = 16 * 1024
+# Bounded cold diagnostic groups can exceed one small JSON document. Ordinary
+# configuration/audit JSON keeps its independent strict16KiB limit.
+MAX_PROGRESS = 256 * 1024
 MAX_MAP = 1024 * 1024
 MAX_MAP_TOTAL = 64 * MAX_MAP
 MAX_PROCESSES = 4096
@@ -440,7 +443,7 @@ class Session:
         progress = None
         if exists(self.run / "status.jsonl"):
             try:
-                progress = read_file(self.run / "status.jsonl", MAX_JSON, mode=0o600).decode("utf-8")
+                progress = read_file(self.run / "status.jsonl", MAX_PROGRESS, mode=0o600).decode("utf-8")
             except (OSError, SafetyError, UnicodeError):
                 progress = "unreadable_or_excessive_preserved"
         return {"schema": "frame-pixel-snapshot-session-status-v1", "capture_id": receipt["capture_id"],
