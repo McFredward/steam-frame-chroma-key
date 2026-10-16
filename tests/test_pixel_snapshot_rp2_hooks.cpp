@@ -244,10 +244,10 @@ void exportedCreation(){
     require(stats.live[3]==2&&stats.firstRefusal.contract.reason==frame_pixel_ssbo_clone::Reason::Extension,"successful unsupported RP2 still forwards native success but refuses only observer definition");
     for(unsigned i=0;i<9;++i)fixture.context->definitions.unsupported(frame_pixel_ssbo_journal::ObjectKind::Layout,0x1000+i,1000+i);
     FILE* output=std::tmpfile();require(output!=nullptr,"private bounded status fixture output");
-    bool feature=false,overflow=false;std::uint64_t reasons=0;unsigned recipes=0,sets=0,contextsCount=0,creations=0;std::uint32_t skips=0;
-    for(unsigned i=0;i<2;++i)definitionStatus(*fixture.context,fileno(output),feature,reasons,recipes,sets,skips,contextsCount,creations,overflow);
+    bool feature=false,overflow=false;std::uint64_t reasons=0;unsigned recipes=0,sets=0,contextsCount=0,creations=0,graphics=0;std::uint32_t skips=0;
+    for(unsigned i=0;i<2;++i)definitionStatus(*fixture.context,fileno(output),feature,reasons,recipes,sets,skips,contextsCount,creations,graphics,overflow);
     const auto before=std::ftell(output);require(before>0&&before<65536,"bounded grouped production status output");
-    definitionStatus(*fixture.context,fileno(output),feature,reasons,recipes,sets,skips,contextsCount,creations,overflow);
+    definitionStatus(*fixture.context,fileno(output),feature,reasons,recipes,sets,skips,contextsCount,creations,graphics,overflow);
     require(std::ftell(output)==before,"unchanged repeated status poll produces no recurring diagnostic output");
     require(!std::fseek(output,0,SEEK_SET),"read retained production status from start");
     std::string text(static_cast<std::size_t>(before),'\0');require(std::fread(text.data(),1,text.size(),output)==text.size(),"complete actual production JSON status read");std::fclose(output);
@@ -263,6 +263,25 @@ void exportedCreation(){
         position=end+1;
     }
     require(reports==3&&contextsCount==11,"ten creation contexts plus next-poll NoReady retained without historical refusal masking");
+}
+void exactGraphicsReporting(){
+    HookFixture fixture;
+    for(unsigned i=0;i<9;++i)
+        fixture.context->definitions.createPipeline(h<VkPipeline>(0x700+i),fixture.shape.graphics,VK_SUCCESS);
+    FILE* output=std::tmpfile();require(output!=nullptr,"private exact-target status output");
+    bool feature=false,overflow=false;std::uint64_t reasons=0;unsigned recipes=0,sets=0,contextsCount=0,creations=0,graphics=0;std::uint32_t skips=0;
+    for(unsigned i=0;i<2;++i)definitionStatus(*fixture.context,fileno(output),feature,reasons,recipes,sets,skips,contextsCount,creations,graphics,overflow);
+    const auto before=std::ftell(output);
+    require(graphics==8&&overflow&&before>0,"complete exact target bank and explicit overflow reported by actual cold writer");
+    definitionStatus(*fixture.context,fileno(output),feature,reasons,recipes,sets,skips,contextsCount,creations,graphics,overflow);
+    require(std::ftell(output)==before,"complete target observations are emitted once across repeated cold polls");
+    require(!std::fseek(output,0,SEEK_SET),"read exact target reports from start");
+    std::string text(static_cast<std::size_t>(before),'\0');
+    require(std::fread(text.data(),1,text.size(),output)==text.size(),"complete exact target JSON status read");std::fclose(output);
+    unsigned amount=0;std::size_t cursor=0;
+    while((cursor=text.find("\"event\":\"ssbo_definition_graphics_state\"",cursor))!=std::string::npos){++amount;++cursor;}
+    require(amount==8&&text.find("\"graphics_index\":7")!=std::string::npos,"same-shaped native creates keep all eight separately identified receipts");
+    require(text.find("\"graphics_observation_overflow\":true")!=std::string::npos,"exact-target overflow cannot silently disappear in grouped refusal reports");
 }
 void exportedObservationFailure(){
     HookFixture fixture;fixture.createPass(false);const auto live=fixture.context->definitions.inspectStats().live[3];
@@ -351,7 +370,7 @@ int main(int argc,char** argv){
         std::cout<<"{\"scope\":\"actual exported multi-subpass Snapshot hooks, fake downstream only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;
     }
     require(argc==1||argc==3,"optional private original VS/PS arguments");
-    exportedCreation();exportedObservationFailure();
+    exportedCreation();exportedObservationFailure();exactGraphicsReporting();
     if(argc==3)for(bool khr:{false,true})for(unsigned mutation=0;mutation<=5;++mutation)privateHooks(argv[1],argv[2],mutation,khr);
     std::cout<<"{\"scope\":\"actual SnapshotTU exported GDPA RP2/KHR hooks, fake downstream only\",\"checks\":"<<checks.load()
         <<",\"private_pins_tested\":"<<(argc==3?"true":"false")<<",\"native_admission_proven\":false,\"passthrough_authorized\":false}\n";
