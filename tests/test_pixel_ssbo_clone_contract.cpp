@@ -501,7 +501,7 @@ void definitions(){
     bad.sub.pDepthStencilAttachment=&bad.depthRef;bad.depthRef.attachment=VK_ATTACHMENT_UNUSED;
     require(bad.copyGraphics(g,why) && !g.hasDepth,"unused depth reference also ignores depth state pointer");
     bad.raster.rasterizerDiscardEnable=VK_TRUE;bad.graphics.pViewportState=reinterpret_cast<const VkPipelineViewportStateCreateInfo*>(std::uintptr_t(1));
-    require(!bad.copyGraphics(g,why),"discard route refused before ignored viewport object");reason(why,Reason::Scalar);
+    require(bad.copyGraphics(g,why) && !g.hasViewport && !g.hasMultisample && !g.hasDepth && !g.hasBlend,"static rasterizer discard preserves ignored viewport/multisample/depth/blend semantics without reading their pointers");
     Fixture bounds;
     bounds.vertex.vertexAttributeDescriptionCount=MaxAttributes+1;bounds.vertex.pVertexAttributeDescriptions=reinterpret_cast<const VkVertexInputAttributeDescription*>(std::uintptr_t(1));require(!bounds.copyGraphics(g,why),"attribute count bound");reason(why,Reason::Bounds);
     require(!captureRenderPass(nullptr,rp,why),"async renderpass handle is insufficient");reason(why,Reason::RenderPassMissing);

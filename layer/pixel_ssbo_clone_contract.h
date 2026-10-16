@@ -380,7 +380,7 @@ struct RenderPass2View {
 };
 struct RenderPassDefinition:SubpassDefinition {
     std::uint32_t attachmentCount=0,dependencyCount=0,subpassCount=1;
-    bool complete=false,route2=false;
+    bool complete=false,route2=false,route2KHR=false;
     std::array<VkAttachmentDescription,MaxAttachments> attachments{};
     std::array<VkSubpassDependency,MaxDependencies> dependencies{};
     std::array<SubpassDefinition,MaxSubpasses-1> following{};
