@@ -163,6 +163,15 @@ class LiveTracker {
 
 public:
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    // Return false for unknown metadata, rather than silently classifying an
+    // unknown pool as unrelated to the observer's selected descriptor set.
+    bool ssboPoolContainsSet(std::uint64_t device, VkDescriptorPool pool,
+                            VkDescriptorSet selected, bool& contains) noexcept {
+        contains = false;
+        return locked("ssboPoolContainsSet", [&] {
+            return bindings_.descriptorPoolContainsSet(device, pool, selected, contains) && coreHealthy();
+        });
+    }
     // Original successful CreateDevice identity, not an inferred dispatch key.
     // This optional mapping never changes ordinary capture eligibility.
     bool ssboDeviceCreated(std::uint64_t tag, VkDevice nativeDevice) noexcept {

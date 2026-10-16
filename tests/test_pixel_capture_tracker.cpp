@@ -1098,6 +1098,18 @@ void ssboNativeTickets() {
         return r;
     }();
     auto f = uniformFixture();
+    bool contains = false;
+    require(f->tracker.ssboPoolContainsSet(device, dp, ds, contains) && contains,
+            "selected descriptor set retains exact actual native pool ownership");
+    const auto otherPool = h<VkDescriptorPool>(31);
+    require(f->tracker.observe([&](auto& core) {
+        auto pool = info<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
+        pool.maxSets = 1; core.createPool(device, otherPool, pool);
+    }), "observe an unrelated native pool");
+    require(f->tracker.ssboPoolContainsSet(device, otherPool, ds, contains) && !contains,
+            "retiring an unrelated pool cannot cancel the selected observer set");
+    require(!f->tracker.ssboPoolContainsSet(device, h<VkDescriptorPool>(9999), ds, contains) && !contains,
+            "unknown pool never becomes affirmative unrelated ownership evidence");
     Transaction::RecordingTicket recording, next;
     Transaction::TargetTicket target;
     require(!f->tracker.ssboRecordingTicket(device, cb, recording), "unmapped device mints no recording proof");

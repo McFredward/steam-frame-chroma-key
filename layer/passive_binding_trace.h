@@ -1089,6 +1089,15 @@ public:
         return {};
     }
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    bool descriptorPoolContainsSet(std::uint64_t device, VkDescriptorPool value,
+                                   VkDescriptorSet selected, bool& contains) noexcept {
+        contains = false;
+        auto lock = acquire(); if (!lock.owns_lock()) return false;
+        const auto* pool = find(pools_, device, handle(value));
+        const auto* set = find(sets_, device, handle(selected));
+        if (!pool || !pool->complete || !set || !set->complete) return false;
+        contains = same(pool->id, set->pool); return true;
+    }
     // Original creation-time prefix identity for the optional SSBO observer.
     // A later equal raw layout handle is not the prefix baked into a pipeline.
     bool pipelinePrefixIdentity(std::uint64_t device, VkPipelineLayout value,

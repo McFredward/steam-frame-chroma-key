@@ -154,6 +154,7 @@ public:
     VkCommandBuffer command() const noexcept {return command_;}
     VkCommandPool pool() const noexcept {return pool_;}
     VkDescriptorSet descriptorSet() const noexcept {return currentSet0_;}
+    Cohort selectedSource() const noexcept {return selectedSource_;} // same original CB callback synchronization
     SubmitObservation submitObservation() const noexcept {return submitObservation_;}
     std::uint64_t drawOrdinal() const noexcept {return drawOrdinal_;}
     std::uint64_t selectedOrdinal() const noexcept {return selectedOrdinal_;}
