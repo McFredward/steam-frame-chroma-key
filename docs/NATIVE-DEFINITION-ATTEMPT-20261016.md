@@ -32,7 +32,8 @@ new claim of native eye/ray/frame association or live mask output.
   does not waive the declared array's interface rule. The attempted relaxation
   is reverted before deployment. Changing the native layout to3 would break
   compatibility. A separate exact-pin module-interface specialization, with
-  unchanged executed accesses and valid count1, is being checked offline.
+  unchanged executed accesses and valid count1, now passes the actual owned
+  Intel and llvmpipe output matrix described below.
 
 The approved manual rollback first removed activation/config/arm files, then
 restarted SteamVR, then removed the now-unmapped exact run library. The final
@@ -84,3 +85,33 @@ route and safe original-state/lifetime binding. Offline affine fixtures must
 not stand in for those native proofs. The next hardware request must name the
 specific unresolved boundary and its decisive success/failure result; it must
 not promise visible MR before that output is actually prepared.
+
+## Composed offline output, not another device diagnosis
+
+The new [single-attachment output fixture](../tests/native-fragment-packed-output-gpu/README.md)
+combines the existing two native reconstruction cones with explicit linear
+coverage and produces premultiplied RGBA. Both host drivers pass64 asymmetric
+stereo cases for each ordinary-count3 and explicitly specialized-count1 output.
+Each enabled run includes16 sources with actual GPU-rendered overlapping
+transparent layers, independently calculated alpha/RGB and64 separate original
+shader color oracles. Maximum absolute error is7.45e-8; positive validation and
+synchronization errors are zero. Off/original recovery is bit-identical.
+Missing RGB premultiplication and double aperture application fail their
+respective independent output oracles. The unmodified count1 profiles still
+fail their precise pre-draw negative; this is not concealed as a successful run.
+
+The enabled-only count1 specialization first verifies the original full pin,
+exact variable/type/decorations and exhaustive constant0 uses. It changes only
+the owned binding9 variable's type and adds three fresh interface declarations;
+all executed image access instructions remain identical. It never rewrites a
+native layout or installs a native shader. The original count3 interface stays
+the default, and disabled output remains byte-for-byte original.
+
+Five focused Python controls pass. Private evidence/source pins, initial
+failures, exact validation messages and cleanup receipts are retained at
+`build/private-packed-output-20261016/`. This establishes the composed output
+on owned linear RGBA32F sources and explicit maps. It does not establish native
+P010 conversion, actual chart B, physical eye, source-frame matching, native
+pipeline lifetime or a live alpha presenter. Those are the next integration
+boundaries; the Frame remains fully restored and no new device test is requested
+by this offline work.
