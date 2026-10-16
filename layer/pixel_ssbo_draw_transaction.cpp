@@ -48,9 +48,21 @@ bool Transaction::deviceCreated(VkDevice device,const VkDeviceCreateInfo& input,
     if(device_ || !device || input.sType!=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO || input.flags ||
        input.queueCreateInfoCount!=1 || !input.pQueueCreateInfos)return refuse(Reason::InvalidConfiguration);
     const auto& q=input.pQueueCreateInfos[0];
-    if(q.sType!=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO || q.pNext || q.flags || q.queueCount!=1 ||
+    if(q.sType!=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO || q.flags || q.queueCount!=1 ||
        !q.pQueuePriorities || q.queueFamilyIndex==VK_QUEUE_FAMILY_IGNORED || !std::isfinite(q.pQueuePriorities[0]) ||
        q.pQueuePriorities[0]<0 || q.pQueuePriorities[0]>1)return refuse(Reason::InvalidConfiguration);
+    if(q.pNext){
+        const auto* node=static_cast<const VkBaseInStructure*>(q.pNext);
+        if(node->sType!=VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR || node->pNext)
+            return refuse(Reason::InvalidConfiguration);
+        const auto priority=reinterpret_cast<const VkDeviceQueueGlobalPriorityCreateInfoKHR*>(node)->globalPriority;
+        if(priority!=VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR && priority!=VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR &&
+           priority!=VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR && priority!=VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR)
+            return refuse(Reason::InvalidConfiguration);
+        // The ORIGINAL successful create already selected this scheduling
+        // priority. It changes neither queue identity nor marker ordering; do
+        // not reject an ordinary high-priority compositor queue or rewrite it.
+    }
     device_=device;family_=q.queueFamilyIndex;return epoch_!=0;
 }
 bool Transaction::queueRetrieved(VkDevice device,std::uint32_t family,std::uint32_t index,VkQueue queue) noexcept {

@@ -422,6 +422,30 @@ void originalDeviceDestroyEntry(){
         require(f.transaction.release() && f.ownerDriver.live.empty() && f.driver.fences.empty(),"owned clone/fence destroyed before untouched native DestroyDevice");
     }
 }
+void originalQueuePriorities(){
+    for(unsigned mode=0;mode<7;++mode){
+        Transaction transaction;float value=1;
+        VkDeviceQueueGlobalPriorityCreateInfoKHR priority{};
+        priority.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR;
+        const std::array<VkQueueGlobalPriorityKHR,4> levels{{VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR,
+            VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR,VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR}};
+        priority.globalPriority=levels[mode%levels.size()];
+        if(mode==4)priority.globalPriority=static_cast<VkQueueGlobalPriorityKHR>(0);
+        if(mode==5)priority.pNext=&priority;
+        if(mode==6)priority.sType=VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO;
+        VkDeviceQueueCreateInfo queue{};queue.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queue.queueFamilyIndex=7;queue.queueCount=1;queue.pQueuePriorities=&value;queue.pNext=&priority;
+        VkDeviceCreateInfo device{};device.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        device.queueCreateInfoCount=1;device.pQueueCreateInfos=&queue;
+        const auto before=priority;
+        require(transaction.deviceCreated(obj<VkDevice>(1),device,VK_SUCCESS)==(mode<4),
+                "known original queue priority preserves one-queue proof; malformed/unknown chains refuse");
+        require(!std::memcmp(&priority,&before,sizeof(priority)) && queue.pNext==&priority && value==1,
+                "observation never edits native scheduling request or chain pointers");
+        if(mode<4)require(transaction.queueRetrieved(obj<VkDevice>(1),7,0,obj<VkQueue>(2)),
+                "priority is not substituted for exact original queue retrieval");
+    }
+}
 void reentryAndConcurrency(){
     for(bool threaded:{false,true}){
         Fixture f;f.initialize();f.arm();require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE),"test pass");f.prefix();
@@ -436,5 +460,8 @@ void reentryAndConcurrency(){
     }
 }
 }
-int main(){serial(true);serial(false);boundedRefusals();ticketsAndFences();boundedNativeBatches();transactionEpochReuse();rejectSharedReferencedOwner();sourceCohortMismatch();adoptionAndQueueHistory();precedingNativeDraws();retirementOperations();originalDeviceDestroyEntry();reentryAndConcurrency();
+int main(int argc,char** argv){
+    if(argc==2 && !std::strcmp(argv[1],"priorities")){originalQueuePriorities();std::cout<<"queue priority checks="<<checks<<'\n';return 0;}
+    if(argc!=1)return 2;
+    serial(true);serial(false);boundedRefusals();ticketsAndFences();boundedNativeBatches();transactionEpochReuse();rejectSharedReferencedOwner();sourceCohortMismatch();adoptionAndQueueHistory();precedingNativeDraws();retirementOperations();originalDeviceDestroyEntry();originalQueuePriorities();reentryAndConcurrency();
     std::cout<<"ssbo_draw_transaction checks="<<checks<<" owned_fixture_checks="<<owned_fixture::checks<<'\n';}
