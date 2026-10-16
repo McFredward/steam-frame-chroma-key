@@ -162,6 +162,9 @@ struct Device {
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 template<class F> void observeDefinitions(Device* d,F&& observe) noexcept {
     d->definitionBoundary.observe([&]{observe(d->definitions);});
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(d->definitionBoundary.failed())d->bridge.definitionObservationFailed();
+#endif
 }
 #endif
 bool uniformCompanionEnabled() noexcept {
