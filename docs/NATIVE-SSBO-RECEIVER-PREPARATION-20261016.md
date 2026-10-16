@@ -1,5 +1,30 @@
 # Same-invocation receiver integration
 
+## r3 native result: retention repaired; semantics still refused
+
+The approved r3 candidate loads successfully against all79 native imports,
+passes isolated loading/device/UI health and receives the maintainer's visible
+moving-stream confirmation. The cold pre-arm gate still refuses zero complete
+recipes. No observer is bound, arm created, or image/SSBO acquired.
+
+Actual occupancy now retains105 qualifying layouts within256 and one shared
+Set0 fact, with no capacity refusal. The prior retention bottleneck is removed.
+New original RP2 shape counts show2/3 subpasses with1-3 attachments; the existing
+single-subpass decoder rejects those. One actual pinned target reaches
+DynamicState refusal1000455017 (SAMPLE_LOCATIONS_ENABLE_EXT). Additional enums
+and subordinate state payloads were not observed and are not inferred. The
+old once-per-shape report also does not publish later lastObject updates, so it
+cannot always correlate a late target to its full original pass handle.
+
+Manual rollback is complete, with no activation/run-library or mapped diagnosis,
+fresh healthy original UI and the maintainer's visible/usable confirmation.
+The Frame is safe for standby. Exact completion and consumed plan live privately
+in `build/private-native-ssbo-run-20261016-r3/`. Further work is offline: a bounded
+complete subpass cohort, preserved original RP2 creation/input-aspect semantics,
+exact recording/target-subpass provenance and extended dynamic/static-state
+ownership with ignored pointers respected. No native output or sender hook is
+enabled; another headset request needs the complete route and GPU review first.
+
 ## Complete startup repair after r2
 
 The reviewed repair separates native layout instances from shared immutable
