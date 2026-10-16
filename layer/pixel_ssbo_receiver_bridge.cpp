@@ -14,7 +14,7 @@ const char* refusalName(Refusal r) noexcept {
     NAME(Clone,"clone") NAME(Configure,"configure") NAME(ColdCancelled,"cold_cancelled")
     NAME(Recording,"recording") NAME(Target,"target") NAME(CopyCohort,"copy_cohort")
     NAME(SubmitShape,"submit_shape") NAME(Execution,"execution") NAME(DescriptorMutation,"descriptor_mutation")
-    NAME(UnknownRoute,"unknown_route") NAME(Release,"release") NAME(Record,"invalid_original_invocation_record")
+    NAME(Selection,"selection") NAME(UnknownRoute,"unknown_route") NAME(Release,"release") NAME(Record,"invalid_original_invocation_record")
 #undef NAME
     }return "unknown_bridge_refusal";
 }
@@ -41,17 +41,16 @@ void Bridge::shaderCreated(const VkShaderModuleCreateInfo& ci,frame_pixel_ssbo_j
         profile_.store(true,std::memory_order_release);
     }catch(...){refuse(Refusal::Shader);}
 }
-void Bridge::prepare(const frame_pixel_ssbo_journal::Ready& input) noexcept {
-    try{std::lock_guard<std::mutex> lock(cold_);if(!pendingReady_&&!ready_.load()){pending_=input;pendingReady_=true;}}catch(...){refuse(Refusal::Clone);}
-}
 void Bridge::tick(frame_pixel_ssbo_journal::Journal& journal) noexcept {
     try{std::lock_guard<std::mutex> lock(cold_);
-        if(!pendingReady_)return;
-        const auto& input=pending_;
+        if(selectionState_.load(std::memory_order_acquire)!=2)return;
         if(ready_.load(std::memory_order_acquire)||reason_.load(std::memory_order_acquire)||!profile_.load(std::memory_order_acquire))return;
         if(!queueKnown_.load(std::memory_order_acquire))return; // Queue lookup may legally occur after pipeline creation.
-        if(!input.recipe.set0.probeInterface.sameProfile(artifact_.profile)){refuse(Refusal::Shader);return;}
         const auto epoch=cancellationEpoch_.load(std::memory_order_acquire);
+        const clone::Identity selected{selectedPipelineDevice_.load(std::memory_order_relaxed),selectedPipelineValue_.load(std::memory_order_relaxed),selectedPipelineGeneration_.load(std::memory_order_relaxed)};
+        if(!journal.lookupPipeline(selected,pending_)){refuse(Refusal::Selection);return;}
+        const auto& input=pending_;
+        if(!input.recipe.set0.probeInterface.sameProfile(artifact_.profile)){refuse(Refusal::Shader);return;}
         if(!journal.current(input.pipeline)){refuse(Refusal::ColdCancelled);return;}
         originalPipeline_.store(input.recipe.provenance[5].value);originalLayout_.store(input.recipe.provenance[1].value);originalPass_.store(input.recipe.provenance[2].value);
         preparing_.store(true,std::memory_order_release);
@@ -103,17 +102,27 @@ void Bridge::descriptorPoolRetiring(frame_pixel_capture::LiveTracker& tracker,st
     if(!tracker.ssboPoolContainsSet(tag,pool,selected,contains)||contains)descriptorMutation(selected);
 }
 void Bridge::learn(const frame_pixel_capture::Candidate& c) noexcept {
-    if(!usable()||!c.command||!c.pool||adopted_.load(std::memory_order_acquire))return;
-    std::uint64_t empty=0;if(learnedCommand_.compare_exchange_strong(empty,clone::handle(c.command),std::memory_order_acq_rel))learnedPool_.store(clone::handle(c.pool),std::memory_order_release);
+    if(reason_.load(std::memory_order_acquire)||!profile_.load(std::memory_order_acquire)||!c.command||!c.pool||adopted_.load(std::memory_order_acquire))return;
+    // Called only after manual arm by the native wrapper. This is a bounded
+    // scalar mailbox, never a cold recipe lookup or driver call on this thread.
+    const auto selected=c.ssboPipeline;
+    if(selected.device!=clone::handle(device_)||!selected.value||!selected.generation){unmappedCandidate_.store(true,std::memory_order_release);return;}
+    unsigned empty=0;if(!selectionState_.compare_exchange_strong(empty,1,std::memory_order_acq_rel))return;
+    selectedPipelineDevice_.store(selected.device,std::memory_order_relaxed);selectedPipelineValue_.store(selected.value,std::memory_order_relaxed);selectedPipelineGeneration_.store(selected.generation,std::memory_order_relaxed);
+    learnedCommand_.store(clone::handle(c.command),std::memory_order_relaxed);learnedPool_.store(clone::handle(c.pool),std::memory_order_relaxed);
+    learnedCommandGeneration_.store(c.commandGeneration,std::memory_order_relaxed);learnedPoolGeneration_.store(c.poolGeneration,std::memory_order_relaxed);
+    selectionState_.store(2,std::memory_order_release);
 }
 void Bridge::forget(VkCommandBuffer c,VkCommandPool p) noexcept {
     if(adopted_.load(std::memory_order_acquire))return;
-    if((c&&clone::handle(c)==learnedCommand_.load())||(!c&&p&&clone::handle(p)==learnedPool_.load())){learnedCommand_.store(0,std::memory_order_release);learnedPool_.store(0,std::memory_order_release);}
+    if(selectionState_.load(std::memory_order_acquire)==2&&((c&&clone::handle(c)==learnedCommand_.load())||(!c&&p&&clone::handle(p)==learnedPool_.load()))){cancellationEpoch_.fetch_add(1,std::memory_order_acq_rel);refuse(Refusal::Recording);}
 }
 void Bridge::begin(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,VkCommandBuffer c,bool armed) noexcept {
     if(!armed||!usable()||adopted_.load(std::memory_order_acquire)||clone::handle(c)!=learnedCommand_.load(std::memory_order_acquire))return;
     tx::Transaction::RecordingTicket ticket;
-    if(!tracker.ssboRecordingTicket(tag,c,ticket)||!transaction_.adoptRecording(ticket)||!transaction_.arm(c)){refuse(Refusal::Recording);return;}
+    if(!tracker.ssboRecordingTicket(tag,c,ticket)||!transaction_.adoptRecording(ticket)||
+       clone::handle(transaction_.pool())!=learnedPool_.load(std::memory_order_relaxed)||transaction_.poolGeneration()!=learnedPoolGeneration_.load(std::memory_order_relaxed)||
+       transaction_.generation()<=learnedCommandGeneration_.load(std::memory_order_relaxed)||!transaction_.arm(c)){refuse(Refusal::Recording);return;}
     adoptedCommand_.store(clone::handle(c),std::memory_order_relaxed);adoptedPool_.store(clone::handle(transaction_.pool()),std::memory_order_relaxed);commandGeneration_.store(transaction_.generation());poolGeneration_.store(transaction_.poolGeneration());adopted_.store(true,std::memory_order_release);
 }
 void Bridge::pipeline(VkCommandBuffer c,VkPipeline p) noexcept {if(matches(c))transaction_.pipelineBound(c,p);}
@@ -218,7 +227,9 @@ Snapshot Bridge::snapshot() const noexcept {
     s.cloneStatus=cloneStatus_.load();s.cloneStage=cloneStage_.load();s.cloneDriver=cloneDriver_.load();
     s.queueCreateInfos=queueCreateInfos_.load();s.queueCount=queueCount_.load();s.queueFamily=queueFamily_.load();
     s.queueKnown=queueKnown_.load();s.retrievedFamily=retrievedFamily_.load();s.retrievedIndex=retrievedIndex_.load();s.retrievedQueue=retrievedQueue_.load();
-    s.profile=profile_.load();s.ready=ready_.load();s.learned=learnedCommand_.load()!=0;s.adopted=adopted_.load();s.replaced=replaced_.load();s.copy=copy_.load();
+    s.profile=profile_.load();s.ready=ready_.load();s.learned=selectionState_.load(std::memory_order_acquire)==2;
+    if(s.learned){s.selectedPipeline={selectedPipelineDevice_.load(),selectedPipelineValue_.load(),selectedPipelineGeneration_.load()};s.learnedCommandGeneration=learnedCommandGeneration_.load();s.learnedPoolGeneration=learnedPoolGeneration_.load();}
+    s.unmappedCandidate=unmappedCandidate_.load();s.adopted=adopted_.load();s.replaced=replaced_.load();s.copy=copy_.load();
     s.drawKind=drawKind_.load();s.submitRoute=submitRoute_.load();for(unsigned i=0;i<5;++i)s.drawArgs[i]=drawArgs_[i].load();
     s.submit={submitBatches_.load(),submitBatch_.load(),submitCommands_.load(),submitNext_.load(),submitOccurrences_.load()};
     s.commandGeneration=commandGeneration_.load();s.poolGeneration=poolGeneration_.load();s.drawOrdinal=drawOrdinal_.load();

@@ -1,4 +1,5 @@
 #include "layer/pixel_ssbo_definition_journal.h"
+#include "layer/pixel_ssbo_profile_transform.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -102,10 +103,10 @@ void publicInventory(){
     const auto first=j.inspectStats().firstRefusal;
     require(!j.createSet(f.nativeSet,bad,VK_ERROR_OUT_OF_HOST_MEMORY,&event),"failed object creation does not inspect CI");reason(event,journal::Reason::NativeCreationFailed);
     for(std::uint64_t i=0;i<journal::SetCapacity;++i){require(j.createSet(object<VkDescriptorSetLayout>(0x10+i),f.set,VK_SUCCESS,&event),"fill finite set inventory");require(event.generation==i+1,"only successful captured creates advance serial");}
-    require(!j.createSet(object<VkDescriptorSetLayout>(0x19),f.set,VK_SUCCESS,&event),"capacity refuses optional tracking only");reason(event,journal::Reason::Capacity);
+    require(!j.createSet(object<VkDescriptorSetLayout>(0x10+journal::SetCapacity),f.set,VK_SUCCESS,&event),"capacity refuses optional tracking only");reason(event,journal::Reason::Capacity);
     require(!j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"live duplicate never replaces existing identity");reason(event,journal::Reason::DuplicateHandle);
     require(j.destroySet(f.nativeSet,&event) && event.generation==1,"destroy entry reports old generation");
-    require(j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.generation==5,"same raw handle receives fresh generation");
+    require(j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.generation==journal::SetCapacity+1,"same raw handle receives fresh generation");
     require(j.destroySet(VK_NULL_HANDLE),"native null destroy remains no-op");
     require(!j.destroySet(object<VkDescriptorSetLayout>(0x999),&event),"unknown destroy named");reason(event,journal::Reason::UnknownObject);
     require(!j.createLayout(f.graphics.layout,f.layout,VK_ERROR_OUT_OF_HOST_MEMORY,&event),"failed layout not captured");
@@ -228,6 +229,7 @@ void privateRecipes(const std::vector<std::uint32_t>& sourceVs,const std::vector
     require(j.inspectStats().cancelled==1,"queued cancellation counted once");
     require(j.takeReady(empty) && empty.pipeline.value==0x62,"FIFO remaining ready generation after cancellation");
     require(j.takeReady(empty) && empty.pipeline.value==0x63,"next FIFO generation");
+    for(unsigned i=4;i<journal::PipelineCapacity;++i)require(j.takeReady(empty)&&empty.pipeline.value==0x60+i,"remaining expanded FIFO variants independently retained");
     require(!j.takeReady(empty),"cancelled pending recipe never delivered");
     journal::Journal replacement;fresh.initialize(replacement);fresh.definitions(replacement);loadShaders(replacement,sourceVs,sourcePs);require(replacement.createPipeline(object<VkPipeline>(0x60),fresh.graphics,VK_SUCCESS),"new journal can see identical device/pipeline handles");
     require(!replacement.current(newer.pipeline),"old device lifetime token cannot alias replacement journal");
@@ -255,10 +257,40 @@ void privateConcurrency(const std::vector<std::uint32_t>& vs,const std::vector<s
     for(const auto& token:tokens)require(!j.current(token),"every consumed token stale after joined destroy");
     require(j.inspectStats().taken==4 && j.inspectStats().created==9,"bounded inventory retains every successful causal event");
 }
+void privateVariants(const std::vector<std::uint32_t>& vs,const std::vector<std::uint32_t>& ps){
+    Fixture f;journal::Journal j(1,{},journal::PendingCount1::RetainFacts);f.initialize(j);
+    std::array<VkDescriptorSetLayoutBinding,29> bindings{};
+    for(unsigned i=0;i<bindings.size();++i)bindings[i]={i,i<8?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:i==8?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i<25?VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_ALL,nullptr};
+    f.set.bindingCount=bindings.size();f.set.pBindings=bindings.data();
+    auto shader=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);shader.codeSize=ps.size()*4;shader.pCode=ps.data();clone::ShaderDefinition original;clone::Refusal why;
+    require(clone::captureShader(shader,clone::ShaderRole::Fragment,original,why),"private native original PS pins canonical profile input");
+    frame_pixel_ssbo_profile::Artifact artifact;require(frame_pixel_ssbo_profile::transform(original,frame_pixel_ssbo_profile::Election::Sparse32,artifact,why),"actual canonical sparse32 profile, never caller Boolean authority");
+    std::array<clone::Identity,6> identities{};
+    for(unsigned i=0;i<6;++i){
+        const auto offset=i*0x1000;f.nativeSet=object<VkDescriptorSetLayout>(0x10+offset);f.graphics.layout=object<VkPipelineLayout>(0x20+offset);f.graphics.renderPass=object<VkRenderPass>(0x30+offset);f.stages[0].module=object<VkShaderModule>(0x40+offset);f.stages[1].module=object<VkShaderModule>(0x50+offset);
+        f.definitions(j);
+        if(!i)require(j.authorizeProbeInterface(artifact.profile),"first29-binding pending original Set0/layout promote without callback replay");
+        shader.codeSize=vs.size()*4;shader.pCode=vs.data();require(j.createShader(f.stages[0].module,shader,VK_SUCCESS),"all six distinct original VS modules retained");
+        shader.codeSize=ps.size()*4;shader.pCode=ps.data();require(j.createShader(f.stages[1].module,shader,VK_SUCCESS),"all six distinct original PS modules retained");
+        journal::Event event;require(j.createPipeline(object<VkPipeline>(0x60+offset),f.graphics,VK_SUCCESS,&event),"six complete potentially-live variants fit finite inventories");identities[i]={1,event.value,event.generation};
+    }
+    journal::Ready out;for(unsigned i=0;i<4;++i)require(j.takeReady(out)&&out.pipeline.value==identities[i].value,"four reporting receipts consumed independently");
+    const auto taken=j.inspectStats().taken;
+    for(const auto i:{5u,4u,0u}){
+        require(j.lookupPipeline(identities[i],out)&&out.recipe.provenance[5].generation==identities[i].generation,"exact generation lookup works in opposite creation order and after receipt consumption");
+        require(out.recipe.set0.count==29&&out.recipe.set0.probeInterface.sparseGrid32()&&out.recipe.provenance[1].value==0x20+i*0x1000&&out.recipe.provenance[3].value==0x40+i*0x1000,"lookup retains exact own original prefix/layout/shader variant");
+        require(!out.nativeAuthority&&!out.recipe.nativeLifetimeProven&&!out.recipe.runtimeActivationAuthorized,"lookup is cold definition metadata only");
+    }
+    require(j.inspectStats().taken==taken&&j.inspectStats().created==36,"selection never consumes reporting slots or invents creates");
+    auto bad=identities[5];++bad.device;require(!j.lookupPipeline(bad,out)&&!out.recipe.definitionComplete,"wrong-device selected identity grants no fallback recipe");bad=identities[5];++bad.generation;require(!j.lookupPipeline(bad,out),"wrong selected generation grants no first-ready fallback");
+    require(j.destroyPipeline(object<VkPipeline>(identities[5].value))&&j.createPipeline(object<VkPipeline>(identities[5].value),f.graphics,VK_SUCCESS),"same native numeric handle can be recreated with different exact generation");
+    require(!j.lookupPipeline(identities[5],out)&&!out.recipe.definitionComplete,"stale original selection cannot alias reused live pipeline");
+    require(j.lookupPipeline(identities[4],out)&&out.pipeline.value==identities[4].value,"independent current actual variant remains selectable after another variant retires");
+}
 void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
     const auto vs=readShader(vsPath),ps=readShader(psPath);
     std::ifstream input(probePath,std::ios::binary|std::ios::ate);require(bool(input),"private canonical probe readable");const auto bytes=input.tellg();
-    require(bytes==std::streamoff(clone::ProbeInterface::Count1Bytes) || bytes==std::streamoff(clone::ProbeInterface::FirstCoveredBytes),"canonical count1 probe extent");std::vector<std::uint32_t> probe(static_cast<std::size_t>(bytes)/4);input.seekg(0);
+    require(bytes==std::streamoff(clone::ProbeInterface::Count1Bytes) || bytes==std::streamoff(clone::ProbeInterface::FirstCoveredBytes) || bytes==std::streamoff(clone::ProbeInterface::Sparse32Bytes),"canonical count1 probe extent");std::vector<std::uint32_t> probe(static_cast<std::size_t>(bytes)/4);input.seekg(0);
     require(bool(input.read(reinterpret_cast<char*>(probe.data()),bytes)),"complete canonical count1 probe");
     clone::ProbeInterface profile;clone::Refusal why;require(clone::ProbeInterface::count1(probe.data(),probe.size()*4,profile,why),"actual-byte verified cold count1 interface");
     Fixture f;f.binding.descriptorCount=1;journal::Journal original;f.initialize(original);journal::Event event;
@@ -288,11 +320,12 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
 }
 }
 int main(int argc,char** argv){
+    if(argc==4 && std::strcmp(argv[1],"--variants-only")==0){privateVariants(readShader(argv[2]),readShader(argv[3]));std::cout<<"{\"scope\":\"private-pipeline-variants-subset\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)<<",\"native_authority\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--layout-flags-only")==0){layoutFlags();std::cout<<"{\"scope\":\"layout-flags-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--metadata-facts-only")==0){metadataDespiteRefusal();std::cout<<"{\"scope\":\"metadata-facts-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     require(argc==1 || argc==3 || argc==4,"optional private VS/PS [count1 probe] arguments only");
     deviceControls();publicInventory();publicConcurrency();layoutFlags();metadataDespiteRefusal();
-    if(argc>=3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);}
+    if(argc>=3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);privateVariants(vs,ps);}
     if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-definition-journal-controls-v1\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)
              <<",\"event_bytes\":"<<sizeof(journal::Event)<<",\"private_native_pins_tested\":"<<(argc>=3?"true":"false")

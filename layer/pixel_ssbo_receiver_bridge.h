@@ -12,7 +12,7 @@ namespace frame_pixel_capture { class LiveTracker; struct Candidate; }
 namespace frame_pixel_ssbo_receiver {
 namespace tx=frame_pixel_ssbo_transaction;
 enum class Refusal : unsigned {None,Device,Queue,Shader,Clone,Configure,ColdCancelled,
-    Recording,Target,CopyCohort,SubmitShape,Execution,DescriptorMutation,UnknownRoute,Release,Record};
+    Recording,Target,CopyCohort,SubmitShape,Execution,DescriptorMutation,UnknownRoute,Release,Record,Selection};
 const char* refusalName(Refusal) noexcept;
 struct Snapshot {
     Refusal refusal=Refusal::None;
@@ -23,6 +23,8 @@ struct Snapshot {
     unsigned drawKind=0,submitRoute=0;std::array<std::uint32_t,5> drawArgs{};
     tx::SubmitObservation submit{};std::uint64_t commandGeneration=0,poolGeneration=0,drawOrdinal=0;
     std::uint64_t sourceExecutions=0,pairedExecution=0,cancellationEpoch=0;
+    frame_pixel_ssbo_clone::Identity selectedPipeline{};std::uint64_t learnedCommandGeneration=0,learnedPoolGeneration=0;
+    bool unmappedCandidate=false;
 };
 class Bridge {
 public:
@@ -33,7 +35,6 @@ public:
                        const VkPhysicalDeviceProperties&,const VkPhysicalDeviceMemoryProperties&) noexcept;
     void queueRetrieved(std::uint32_t,std::uint32_t,VkQueue,bool ordinary=true) noexcept;
     void shaderCreated(const VkShaderModuleCreateInfo&,frame_pixel_ssbo_journal::Journal&) noexcept;
-    void prepare(const frame_pixel_ssbo_journal::Ready&) noexcept;
     void tick(frame_pixel_ssbo_journal::Journal&) noexcept;
     // Cancellation at original native destroy ENTRY, including cold preparation.
     void definitionRetiring(frame_pixel_ssbo_journal::ObjectKind,std::uint64_t) noexcept;
@@ -74,7 +75,10 @@ private:
     frame_pixel_ssbo_owned::Clone clone_;
     tx::Transaction transaction_;
     tx::SourceReadbackMetadata source_{};
-    frame_pixel_ssbo_journal::Ready pending_{};bool pendingReady_=false;
+    frame_pixel_ssbo_journal::Ready pending_{};
+    std::atomic<unsigned> selectionState_{0}; // 0 empty, 1 owned writer, 2 immutable selected metadata
+    std::atomic<std::uint64_t> selectedPipelineDevice_{0},selectedPipelineValue_{0},selectedPipelineGeneration_{0},learnedCommandGeneration_{0},learnedPoolGeneration_{0};
+    std::atomic<bool> unmappedCandidate_{false};
     std::atomic<std::uint64_t> learnedCommand_{0},learnedPool_{0},adoptedCommand_{0},adoptedPool_{0};
     std::atomic<std::uint64_t> originalPipeline_{0},originalLayout_{0},originalPass_{0};
     std::atomic<std::uint64_t> cancellationEpoch_{0},sourceExecutions_{0},pairedExecution_{0},selectedSet_{0},descriptorEpoch_{0},resourceEpoch_{0};

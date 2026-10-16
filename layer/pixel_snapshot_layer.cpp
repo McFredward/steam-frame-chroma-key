@@ -433,9 +433,6 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
     journal::Ready ready;
     if(!d.definitions.takeReady(ready))return;
     ++reportedRecipes;
-#ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d.bridge.prepare(ready);
-#endif
     std::ostringstream out;
     out<<"{\"event\":\"ssbo_definition_owned\",\"pipeline_generation\":"<<ready.pipeline.generation
        <<",\"current_at_cold_lookup\":"<<(d.definitions.current(ready.pipeline)?"true":"false")
@@ -457,7 +454,7 @@ void bridgeStatus(Device& d,int fd,std::uint64_t& seen) {
     const auto s=d.bridge.snapshot();
     const std::uint64_t state=1u|std::uint64_t(s.profile)<<1|std::uint64_t(s.ready)<<2|std::uint64_t(s.learned)<<3|
         std::uint64_t(s.adopted)<<4|std::uint64_t(s.replaced)<<5|std::uint64_t(s.copy)<<6|std::uint64_t(s.queueKnown)<<7|std::uint64_t(s.refusal)<<8|
-        std::uint64_t(s.transaction)<<16|std::uint64_t(s.cloneStatus)<<24;
+        std::uint64_t(s.transaction)<<16|std::uint64_t(s.cloneStatus)<<24|std::uint64_t(s.unmappedCandidate)<<32;
     if(seen==state)return;
     seen=state;
     char report[2048]{};const auto n=std::snprintf(report,sizeof(report),
@@ -466,12 +463,12 @@ void bridgeStatus(Device& d,int fd,std::uint64_t& seen) {
         "\"queue_create_infos\":%u,\"queue_count\":%u,\"queue_family\":%u,\"queue_retrieved\":%s,\"retrieved_family\":%u,\"retrieved_index\":%u,\"retrieved_queue\":%llu,\"clone_status\":%u,\"clone_stage\":%u,"
         "\"clone_vk_result\":%d,\"draw_kind\":%u,\"draw_ordinal\":%llu,\"draw_args\":[%u,%u,%u,%u,%u],"
         "\"submit_route\":%u,\"submit_batches\":%u,\"submit_batch\":%u,\"submit_commands\":%u,\"submit_next_type\":%u,\"submit_occurrences\":%u,"
-        "\"command_generation\":%llu,\"pool_generation\":%llu,\"source_executions\":%llu,\"paired_execution\":%llu,\"original_color_expression_preserved\":true,\"native_visual_result_verified\":false,\"native_frame_association_proven\":false,\"mask_enabled\":false}\n",
+        "\"command_generation\":%llu,\"pool_generation\":%llu,\"selected_pipeline\":%llu,\"selected_pipeline_generation\":%llu,\"learned_command_generation\":%llu,\"learned_pool_generation\":%llu,\"unmapped_candidate\":%s,\"source_executions\":%llu,\"paired_execution\":%llu,\"original_color_expression_preserved\":true,\"native_visual_result_verified\":false,\"native_frame_association_proven\":false,\"mask_enabled\":false}\n",
         frame_pixel_ssbo_receiver::refusalName(s.refusal),s.transaction,s.profile?"true":"false",s.ready?"true":"false",
         s.learned?"true":"false",s.adopted?"true":"false",s.replaced?"true":"false",s.copy?"true":"false",
         s.queueCreateInfos,s.queueCount,s.queueFamily,s.queueKnown?"true":"false",s.retrievedFamily,s.retrievedIndex,static_cast<unsigned long long>(s.retrievedQueue),s.cloneStatus,s.cloneStage,s.cloneDriver,s.drawKind,static_cast<unsigned long long>(s.drawOrdinal),
         s.drawArgs[0],s.drawArgs[1],s.drawArgs[2],s.drawArgs[3],s.drawArgs[4],s.submitRoute,s.submit.batches,s.submit.batch,s.submit.commandCount,s.submit.nextType,s.submit.selectedOccurrences,
-        static_cast<unsigned long long>(s.commandGeneration),static_cast<unsigned long long>(s.poolGeneration),static_cast<unsigned long long>(s.sourceExecutions),static_cast<unsigned long long>(s.pairedExecution));
+        static_cast<unsigned long long>(s.commandGeneration),static_cast<unsigned long long>(s.poolGeneration),static_cast<unsigned long long>(s.selectedPipeline.value),static_cast<unsigned long long>(s.selectedPipeline.generation),static_cast<unsigned long long>(s.learnedCommandGeneration),static_cast<unsigned long long>(s.learnedPoolGeneration),s.unmappedCandidate?"true":"false",static_cast<unsigned long long>(s.sourceExecutions),static_cast<unsigned long long>(s.pairedExecution));
     if(n>0&&std::size_t(n)<sizeof(report))frame_pixel_io::writeAll(fd,report,std::size_t(n));
 }
 #endif

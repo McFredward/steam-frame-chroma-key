@@ -12,8 +12,11 @@
 
 namespace frame_pixel_ssbo_journal {
 namespace clone=frame_pixel_ssbo_clone;
-constexpr std::size_t SetCapacity=4, LayoutCapacity=4, PassCapacity=4;
-constexpr std::size_t ShaderCapacity=2, PipelineCapacity=4;
+// The retained native sequence has six created distortion variants; their
+// overlapping lifetimes are unknown, so all six may need retention. Definition
+// retention is independent of the smaller progress-report budget.
+constexpr std::size_t SetCapacity=16, LayoutCapacity=16, PassCapacity=16;
+constexpr std::size_t ShaderCapacity=16, PipelineCapacity=16;
 enum class PendingCount1 : std::uint8_t {Refuse,RetainFacts};
 enum class ObjectKind : std::uint8_t {Device,Set,Layout,RenderPass,Shader,Pipeline};
 enum class Reason : std::uint8_t {
@@ -220,6 +223,20 @@ public:
         out.recipe=selected->definition;out.pipeline={stats_.device,selected->identity.value,selected->identity.generation,stats_.journalEpoch};
         selected->ready=false;increment(stats_.taken);clear(why,ObjectKind::Pipeline,out.pipeline.value,out.pipeline.generation);return true;
     }
+    // Select from the exact identity observed at a real original target draw.
+    // This lookup neither consumes the reporting queue nor replays a create.
+    // Already-reported live variants remain selectable; stale/reused handles
+    // cannot silently select a different generation or the first ready recipe.
+    bool lookupPipeline(clone::Identity identity,Ready& out,Event* why=nullptr) {
+        std::lock_guard<std::mutex> lock(mutex_);out={};clear(why,ObjectKind::Pipeline,identity.value,identity.generation);
+        if(!deviceEligible(why,ObjectKind::Pipeline,identity.value))return false;
+        const auto* slot=find(pipelines_,identity.value);
+        if(!identity.device || identity.device!=stats_.device || !identity.generation || !slot ||
+           slot->identity.generation!=identity.generation)
+            return fail(why,Reason::StalePipeline,ObjectKind::Pipeline,identity.value,identity.generation);
+        out.recipe=slot->definition;out.pipeline={stats_.device,identity.value,identity.generation,stats_.journalEpoch};
+        return true;
+    }
     // Cold instantaneous lookup only, NOT a lease or permission to touch a native
     // pipeline after this method releases its mutex. Activation needs a separate
     // synchronized native lifetime/cancellation contract, absent from this class.
@@ -318,6 +335,6 @@ private:
         *slot={};increment(stats_.destroyed);clear(out,kind,value,generation);return true;
     }
 };
-static_assert(sizeof(Journal)<=256*1024,"bounded per-device cold definition inventory");
+static_assert(sizeof(Journal)<=2*1024*1024,"bounded per-device cold definition inventory");
 static_assert(static_cast<unsigned>(Reason::Count)<64,"fixed deduplicated reason mask");
 } // namespace frame_pixel_ssbo_journal

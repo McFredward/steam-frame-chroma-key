@@ -28,6 +28,7 @@ namespace journal_fixture {
 namespace {
 using Bridge=frame_pixel_ssbo_receiver::Bridge;
 namespace tx=frame_pixel_ssbo_transaction;
+unsigned expectedPrefixBindings=6;
 struct Calls {unsigned resets=0,draws=0,indexed=0,markers=0,fences=0;bool signaled=true;} calls;
 VKAPI_ATTR void VKAPI_CALL mockBarrier(VkCommandBuffer,VkPipelineStageFlags,VkPipelineStageFlags,VkDependencyFlags,
     std::uint32_t,const VkMemoryBarrier*,std::uint32_t,const VkBufferMemoryBarrier*,std::uint32_t,const VkImageMemoryBarrier*){}
@@ -45,7 +46,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockStatus(VkDevice,VkFence){return calls.signale
 VKAPI_ATTR VkResult VKAPI_CALL mockSubmit(VkQueue,std::uint32_t,const VkSubmitInfo*,VkFence){++calls.markers;return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL mockSet(VkDevice d,const VkDescriptorSetLayoutCreateInfo* ci,const VkAllocationCallbacks* a,VkDescriptorSetLayout* out){
     owned_fixture::common(d,a);const bool first=!owned_fixture::driver->set0;
-    require(first?ci->bindingCount==6:ci->bindingCount==1,"original six-binding mock prefix vs owned storage Set1");
+    require(first?ci->bindingCount==expectedPrefixBindings:ci->bindingCount==1,"original retained prefix vs owned storage Set1");
     const auto result=owned_fixture::driver->create(first?frame_pixel_ssbo_owned::Stage::Set0:frame_pixel_ssbo_owned::Stage::Set1,out);
     if(result==VK_SUCCESS)(first?owned_fixture::driver->set0:owned_fixture::driver->set1)=*out;
     return result;
@@ -68,7 +69,7 @@ void publicGuards(){
     require(!b.publish(absent,output)&&!observed.ready,"failed actual shape grants no clone or callback work");
 }
 void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned mode){
-    calls={};owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;
+    calls={};expectedPrefixBindings=6;owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;
     driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
     owned_fixture::Fixture limits;
     auto native=std::make_unique<Fixture>(true,0,VK_COMMAND_BUFFER_LEVEL_PRIMARY,0,true);
@@ -94,10 +95,12 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     frame_pixel_ssbo_journal::Event event;require(journal.createPipeline(pipeline,shape.graphics,VK_SUCCESS,&event)&&native->tracker.createPipeline(device,pipeline,shape.graphics),"production cold recipe assembled from retained actual private shader definitions");
     require(native->tracker.ssboPipelineCreated(device,pipeline,{1,event.value,event.generation}),"original pipeline creation generation associated synchronously");
     native->bind(); // Rebind after the original layout/pipeline generations changed.
-    frame_pixel_ssbo_journal::Ready ready;require(journal.takeReady(ready),"one cold ready recipe");
-    b.prepare(ready);b.tick(journal);require(!b.snapshot().ready&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None,"queue retrieval may legally arrive later without dropping recipe");
-    b.queueRetrieved(3,0,h<VkQueue>(2));b.tick(journal);if(!b.snapshot().ready){auto s=b.snapshot();std::cerr<<"cold failure reason="<<unsigned(s.refusal)<<" clone="<<s.cloneStatus<<" stage="<<s.cloneStage<<" tx="<<s.transaction<<" driver="<<s.cloneDriver<<"\n";}require(b.snapshot().ready&&driver.calls&&calls.fences==1,"late actual queue retrieval completes the retained cold recipe");
-    const auto learned=native->finishPass();require(!learned.oneTimeSubmit&&learned.retirementRequired,"serial replay control uses flags0 reusable native command recording");b.learn(learned);require(!calls.resets,"learning an unarmed live candidate never injects into its already-ended scope");
+    frame_pixel_ssbo_journal::Ready ready;require(journal.takeReady(ready),"one reporting receipt; does not choose a clone");
+    b.tick(journal);require(!b.snapshot().ready&&!driver.calls,"no arbitrary first-created recipe prepared before actual candidate selection");
+    const auto learned=native->finishPass();require(!learned.oneTimeSubmit&&learned.retirementRequired,"serial replay control uses flags0 reusable native command recording");
+    b.learn(learned);b.tick(journal);require(!b.snapshot().ready&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None,"exact selected recipe waits for later actual queue retrieval");
+    b.queueRetrieved(3,0,h<VkQueue>(2));b.tick(journal);require(b.snapshot().ready&&driver.calls&&calls.fences==1,"late actual queue retrieval completes the exact selected cold recipe");
+    require(!calls.resets,"selected completed candidate never injects into its already-ended scope");
     require(native->tracker.beginCommand(device,cb,native->beginInfo,true),"next original successful native Begin");
     b.begin(native->tracker,device,cb,false);require(!calls.resets,"explicit manual arm required");
     b.begin(native->tracker,device,cb,true);require(calls.resets==1&&b.tracks(cb),"opaque live next-Begin ticket admits only one bounded GPU reset");
@@ -148,9 +151,67 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     }
     require(b.release(VK_SUCCESS)&&driver.live.empty()&&!calls.fences,"actual device-destroy entry plus actual idle frees every owned child exactly once");
 }
+// The recorded Set0 census is29 bindings: UBO0..7, storage8,
+// sampled-image9..24 and sampler25..28, all count1/stage ALL. These
+// finite callback controls retain six potentially-live full variants; archived
+// creation metadata does not establish their simultaneous native lifetimes.
+void privateVariantSelection(const char* vertexPath,const char* fragmentPath,unsigned selected,bool stale){
+    calls={};expectedPrefixBindings=29;owned_fixture::Driver driver;owned_fixture::driver=&driver;
+    driver.expectedCount=1;driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
+    owned_fixture::Fixture limits;auto native=std::make_unique<Fixture>(true,0,VK_COMMAND_BUFFER_LEVEL_PRIMARY,0,true);
+    Bridge b;frame_pixel_ssbo_journal::Journal journal{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
+    journal_fixture::Fixture shape;
+    std::array<VkDescriptorSetLayoutBinding,29> bindings{};
+    for(unsigned i=0;i<bindings.size();++i)bindings[i]={i,i<8?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:i==8?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i<25?VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_ALL,nullptr};
+    shape.set.bindingCount=bindings.size();shape.set.pBindings=bindings.data();shape.push={VK_SHADER_STAGE_VERTEX_BIT,0,16};
+    float priority=1;auto queue=info<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);queue.queueCount=1;queue.queueFamilyIndex=3;queue.pQueuePriorities=&priority;
+    shape.device.queueCreateInfoCount=1;shape.device.pQueueCreateInfos=&queue;
+    VkPhysicalDeviceProperties properties{};properties.limits=limits.p.limits;
+    b.deviceCreated(h<VkDevice>(1),shape.device,bridgeProc,properties,limits.p.memory);shape.initialize(journal);
+    b.queueRetrieved(3,0,h<VkQueue>(2));require(native->tracker.ssboDeviceCreated(device,h<VkDevice>(1)),"variant selection uses actual original device identity");
+    require(native->tracker.destroyPipeline(device,pipeline)&&native->tracker.destroyShader(device,vs)&&native->tracker.destroyShader(device,fs),"retire only synthetic seed target before actual private definitions");
+    require(native->tracker.observe([&](auto& core){core.destroyPipelineLayout(device,pl);core.destroySetLayout(device,sl);core.freeSets(device,dp,1,&ds);auto pool=info<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);pool.maxSets=16;core.createPool(device,h<VkDescriptorPool>(100000),pool);auto sampler=info<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);core.createSampler(device,h<VkSampler>(100001),sampler);}),"prepare independent actual-prefix mock descriptor pool and sampler");
+    const auto vertex=journal_fixture::readShader(vertexPath),fragment=journal_fixture::readShader(fragmentPath);
+    auto module=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);module.codeSize=fragment.size()*4;module.pCode=fragment.data();b.shaderCreated(module,journal);
+    std::array<VkDescriptorSet,6> sets{};std::array<VkPipelineLayout,6> layouts{};std::array<VkPipeline,6> pipelines{};std::array<VkRenderPass,6> passes{};
+    std::array<frame_pixel_ssbo_clone::Identity,6> identities{};
+    for(unsigned i=0;i<6;++i){
+        const auto delta=1000*i;shape.nativeSet=h<VkDescriptorSetLayout>(10+delta);shape.graphics.layout=layouts[i]=h<VkPipelineLayout>(20+delta);shape.graphics.renderPass=passes[i]=h<VkRenderPass>(30+delta);sets[i]=h<VkDescriptorSet>(40+delta);pipelines[i]=h<VkPipeline>(110+delta);
+        shape.stages[0].module=h<VkShaderModule>(100+delta);shape.stages[1].module=h<VkShaderModule>(101+delta);
+        shape.definitions(journal);
+        require(native->tracker.observe([&](auto& core){core.createSetLayout(device,shape.nativeSet,shape.set);core.createPipelineLayout(device,layouts[i],shape.layout);auto allocate=info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);allocate.descriptorPool=h<VkDescriptorPool>(100000);allocate.descriptorSetCount=1;allocate.pSetLayouts=&shape.nativeSet;core.allocateSets(device,allocate,&sets[i]);
+            constexpr std::array<VkDeviceSize,5> ranges{{272,2800,400,272,2800}};
+            for(unsigned n=0;n<5;++n){VkDescriptorBufferInfo buffer{native->uniformBuffers[n],256,ranges[n]};auto write=info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);write.dstSet=sets[i];write.dstBinding=frame_pixel_uniform::UniformBindings[n];write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;write.pBufferInfo=&buffer;core.updateSets(device,1,&write,0,nullptr);}
+            VkDescriptorImageInfo sampler{h<VkSampler>(100001),VK_NULL_HANDLE,VK_IMAGE_LAYOUT_UNDEFINED};auto write=info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);write.dstSet=sets[i];write.dstBinding=25;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLER;write.pImageInfo=&sampler;core.updateSets(device,1,&write,0,nullptr);
+        }),"both observers retain the same29-binding prefix and independent layout");
+        native->write(sets[i]);
+        module.codeSize=vertex.size()*4;module.pCode=vertex.data();require(journal.createShader(shape.stages[0].module,module,VK_SUCCESS)&&native->tracker.createShader(device,shape.stages[0].module,module),"each variant owns independently observed private VS module");
+        module.codeSize=fragment.size()*4;module.pCode=fragment.data();require(journal.createShader(shape.stages[1].module,module,VK_SUCCESS)&&native->tracker.createShader(device,shape.stages[1].module,module),"all twelve original shader module definitions retained");
+        frame_pixel_ssbo_journal::Event event;require(journal.createPipeline(pipelines[i],shape.graphics,VK_SUCCESS,&event)&&native->tracker.createPipeline(device,pipelines[i],shape.graphics),"all six distinct full pipeline definitions retained");
+        identities[i]={1,event.value,event.generation};require(native->tracker.ssboPipelineCreated(device,pipelines[i],identities[i]),"same successful native callback associates exact journal generation");
+    }
+    // Model the existing four progress receipts. Selection must not drain or
+    // depend on this separate reporting allowance.
+    frame_pixel_ssbo_journal::Ready reported;for(unsigned i=0;i<4;++i)require(journal.takeReady(reported)&&reported.pipeline.value==frame_bindings::handle(pipelines[i]),"first four progress receipts do not select a driver clone");
+    b.tick(journal);require(!driver.calls&&!b.snapshot().ready,"six creates and four reports alone issue no owned driver call");
+    const auto other=h<VkCommandBuffer>(61);auto allocate=native->allocate;allocate.commandBufferCount=1;require(native->tracker.allocateCommands(device,allocate,&other)&&native->tracker.beginCommand(device,other,native->beginInfo,true),"second independent original primary command buffer");
+    const auto bind=[&](VkCommandBuffer command,unsigned i){require(native->tracker.bindPipeline(device,command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipelines[i])&&native->tracker.observe([&](auto& core){core.bindSets(device,command,VK_PIPELINE_BIND_POINT_GRAPHICS,layouts[i],0,1,&sets[i],0,nullptr);}),"bind actual chosen variant and its full native prefix");};
+    const auto candidate=[&](VkCommandBuffer command,unsigned i){bind(command,i);Candidate out;require(native->tracker.beginRenderPass(device,command,VK_SUBPASS_CONTENTS_INLINE)&&native->tracker.draw(device,command)&&native->tracker.endRenderPass(device,command,out),"actual original target produces generation-associated candidate metadata");require(out.ssboPipeline.value==identities[i].value&&out.ssboPipeline.generation==identities[i].generation,"candidate identifies its selected draw, never first-created pipeline");return out;};
+    const auto fifth=candidate(cb,4),sixth=candidate(other,5);const auto chosen=selected==4?fifth:sixth;const auto ignored=selected==4?sixth:fifth;
+    b.learn(chosen);b.learn(ignored);
+    if(stale){require(journal.destroyPipeline(pipelines[selected])&&native->tracker.destroyPipeline(device,pipelines[selected]),"selected original generation actually retired before cold lookup");require(journal.createPipeline(pipelines[selected],shape.graphics,VK_SUCCESS),"same numeric pipeline may be reused for another generation");b.tick(journal);require(b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::Selection&&!driver.calls,"stale actual selected generation has no first-ready or reused-handle fallback");require(b.release(VK_SUCCESS)&&driver.live.empty(),"stale selection allocated no Vulkan objects");return;}
+    b.tick(journal);require(b.snapshot().ready&&b.snapshot().selectedPipeline.value==identities[selected].value&&calls.fences==1,"cold clone selects actual fifth/sixth pipeline independently of creation/report order");
+    if(selected==4){const auto before=b.beforeRetirement(tx::Retirement::ResetPool,VK_NULL_HANDLE,pool);require(native->tracker.resetCommandPool(device,pool),"actual successful pool reset between scalar selection and next Begin");b.afterRetirement(before,VK_SUCCESS);require(b.snapshot().ready&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None,"legitimate pre-adoption pool reset preserves exact selected object generation");}
+    require(native->tracker.beginCommand(device,ignored.command,native->beginInfo,true),"other live candidate begins a later recording");b.begin(native->tracker,device,ignored.command,true);require(!calls.resets,"other concurrently valid pipeline command cannot adopt selected clone");
+    require(native->tracker.beginCommand(device,chosen.command,native->beginInfo,true),"selected exact command begins its next real generation");b.begin(native->tracker,device,chosen.command,true);require(calls.resets==1,"only selected command next Begin records one GPU reset");bind(chosen.command,selected);b.pipeline(chosen.command,pipelines[selected]);require(native->tracker.beginRenderPass(device,chosen.command,VK_SUBPASS_CONTENTS_INLINE),"chosen original render pass starts");b.beginPass(chosen.command,passes[selected],VK_SUBPASS_CONTENTS_INLINE);native->tracker.draw(device,chosen.command);require(b.draw(native->tracker,device,chosen.command,6,1,0,0,0,true),"selected exact variant indexed draw receives original-output observer");
+    Candidate copied;require(native->tracker.endRenderPass(device,chosen.command,copied),"selected source scope completes");b.endPass(chosen.command);b.copyRecorded(copied);b.endCommand(chosen.command,VK_SUCCESS);
+    auto submit=info<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);submit.commandBufferCount=1;submit.pCommandBuffers=&chosen.command;const auto ticket=b.beforeSubmit(h<VkQueue>(2),1,&submit);b.afterSubmit(ticket,h<VkQueue>(2),1,&submit,VK_SUCCESS);const auto retire=b.beforeRetirement(tx::Retirement::BeginCommand,chosen.command);b.afterRetirement(retire,VK_SUCCESS);
+    frame_pixels::View source;source.source=image;source.sourceGeneration=copied.binding.image.identity.generation;source.commandGeneration=copied.commandGeneration;source.layout.extent={1152,4608};source.generationRetired=true;tx::RecordView output;require(b.publish(source,output)&&output.execution==1,"same execution source pairing survives out-of-order multi-variant selection");require(b.release(VK_SUCCESS)&&driver.live.empty()&&!calls.fences,"only selected variant owned children explicitly released");
+}
 }
 int main(int argc,char** argv){
+    if(argc==4&&std::strcmp(argv[1],"--variants-only")==0){privateVariantSelection(argv[2],argv[3],4,false);privateVariantSelection(argv[2],argv[3],5,false);privateVariantSelection(argv[2],argv[3],5,true);std::cout<<"{\"scope\":\"private-pipeline-selection-subset, fake dispatch only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     publicGuards();require(argc==1||argc==3,"optional private original VS/PS only");
-    if(argc==3)for(unsigned mode=0;mode<5;++mode)privateCallbacks(argv[1],argv[2],mode);
+    if(argc==3){for(unsigned mode=0;mode<5;++mode)privateCallbacks(argv[1],argv[2],mode);privateVariantSelection(argv[1],argv[2],4,false);privateVariantSelection(argv[1],argv[2],5,false);privateVariantSelection(argv[1],argv[2],5,true);}
     std::cout<<"{\"scope\":\"owned callback simulation; not native/GPU authority\",\"checks\":"<<checks.load()<<",\"private_pins_tested\":"<<(argc==3?"true":"false")<<",\"passthrough_authorized\":false}\n";
 }
