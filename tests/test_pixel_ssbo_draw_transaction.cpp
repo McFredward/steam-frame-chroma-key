@@ -31,10 +31,10 @@ struct TransactionTestAccess {
         t.device_=1;t.command_=owned_fixture::object<VkCommandBuffer>(44);t.pool_=owned_fixture::object<VkCommandPool>(55);
         t.commandGeneration_=generation;t.poolGeneration_=poolGeneration;t.family_=7;return t;
     }
-    static Transaction::TargetTicket target(const Cohort& source,std::uint64_t ordinal=1){
+    static Transaction::TargetTicket target(const Cohort& source,std::uint64_t ordinal=1,std::uint32_t subpass=0){
         Transaction::TargetTicket t;t.tracker_=reinterpret_cast<const frame_pixel_capture::LiveTracker*>(std::uintptr_t(0x111));
         t.device_=1;t.command_=owned_fixture::object<VkCommandBuffer>(44);t.pool_=owned_fixture::object<VkCommandPool>(55);
-        t.commandGeneration_=41;t.poolGeneration_=17;t.ordinal_=ordinal;t.pipeline_={1,60,1};t.layout_={1,20,1};t.set0_={1,70,88};t.source_=source;return t;
+        t.commandGeneration_=41;t.poolGeneration_=17;t.ordinal_=ordinal;t.subpass_=subpass;t.pipeline_={1,60,1};t.layout_={1,20,1};t.set0_={1,70,88};t.source_=source;return t;
     }
 };
 static_assert(!std::is_aggregate_v<Transaction::RecordingTicket> && !std::is_aggregate_v<Transaction::TargetTicket> &&
@@ -125,15 +125,33 @@ VKAPI_ATTR VkResult VKAPI_CALL invalidate(VkDevice device,std::uint32_t count,co
         !ranges[0].pNext && ranges[0].memory && !ranges[0].offset && ranges[0].size==VK_WHOLE_SIZE,"whole own mapped record invalidate after fence+retirement");
     ++recorder->invalidates;return recorder->invalidateResult;
 }
+std::uint32_t expectedSubpassCount=1;
+VKAPI_ATTR VkResult VKAPI_CALL multiplePass(VkDevice device,const VkRenderPassCreateInfo* ci,const VkAllocationCallbacks* allocator,VkRenderPass* out){
+    owned_fixture::common(device,allocator);
+    require(ci->subpassCount==expectedSubpassCount&&ci->pSubpasses,"owned pass preserves exact bounded original subpass count");
+    for(unsigned i=0;i<ci->subpassCount;++i)require(ci->pSubpasses[i].colorAttachmentCount==1&&ci->pSubpasses[i].pColorAttachments[0].attachment==0,"every owned subpass retains its actual color reference");
+    const auto result=owned_fixture::driver->create(frame_pixel_ssbo_owned::Stage::RenderPass,out);
+    if(result==VK_SUCCESS)owned_fixture::driver->pass=*out;
+    return result;
+}
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL multipleProc(VkDevice device,const char* name){
+    if(!std::strcmp(name,"vkCreateRenderPass"))return reinterpret_cast<PFN_vkVoidFunction>(multiplePass);
+    return owned_fixture::getProc(device,name);
+}
 struct Fixture {
     owned_fixture::Driver ownerDriver;Recorder driver;Transaction transaction;
     owned_fixture::Fixture captured;frame_pixel_ssbo_owned::Clone clone;
     VkDescriptorSet set0=obj<VkDescriptorSet>(70);Cohort source{};
     static owned_fixture::Driver* activate(owned_fixture::Driver& d){owned_fixture::driver=&d;return &d;}
-    Fixture(bool noncoherent=false):ownerDriver(),driver(),transaction(),captured((activate(ownerDriver),owned_fixture::Fixture{})){
+    Fixture(bool noncoherent=false,std::uint32_t subpasses=1,std::uint32_t selected=0):ownerDriver(),driver(),transaction(),captured((activate(ownerDriver),owned_fixture::Fixture{})){
         ownerDriver.noncoherent=noncoherent;
         if(noncoherent)captured.p.memory.memoryTypes[0].propertyFlags=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         for(unsigned i=0;i<captured.recipe.provenance.size();++i)captured.recipe.provenance[i]={1,(i+1)*10,1};
+        if(subpasses>1){
+            captured.recipe.renderPass.subpassCount=subpasses;
+            for(unsigned i=1;i<subpasses;++i)*captured.recipe.renderPass.subpass(i)=*captured.recipe.renderPass.subpass(0);
+            captured.recipe.graphics.info.subpass=selected;expectedSubpassCount=subpasses;captured.p.downstream=multipleProc;
+        }
         require(clone.prepare(captured.p).status==frame_pixel_ssbo_owned::Status::Ok,"reuse existing real owned-clone finite creation fixture");
         recorder=&driver;driver.transaction=&transaction;driver.probe=clone.pipeline();driver.record=clone.recordBuffer();driver.set1=clone.set1();
         source={Id{1,1001,1},Id{1,1002,1},Id{1,1003,1},VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,{16,16}};
@@ -446,6 +464,49 @@ void originalQueuePriorities(){
                 "priority is not substituted for exact original queue retrieval");
     }
 }
+void multipleSubpassRecordings(){
+    for(unsigned count:{2u,3u}){
+        Fixture f(false,count,1);f.initialize();f.arm();
+        require(f.transaction.targetSubpass()==1&&f.transaction.subpassCount()==count,"target subpass derives exclusively from immutable actual prepared graphics/pass recipe");
+        require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE),"enter complete target pass at original subpass0");
+        f.transaction.pipelineBound(f.driver.command,obj<VkPipeline>(999));
+        require(f.transaction.draw(f.driver.command,3,1,0,0)==DrawResult::ForwardOriginal,"preceding unrelated original draw remains unmodified");
+        const auto beforeNext=f.driver.commands.size();
+        require(f.transaction.nextSubpass(f.driver.command)&&f.transaction.currentSubpass()==1&&f.driver.commands.size()==beforeNext,"original inline subpass transition emits no owned command");
+        f.prefix();require(f.transaction.drawIndexed(f.driver.command,6,1,2,-3,4)==DrawResult::ReplacedOriginal,"exact configured nonzero-subpass original indexed draw instrumented once");
+        const auto beforeEnd=f.driver.commands.size();
+        if(count==3)require(f.transaction.nextSubpass(f.driver.command)&&f.transaction.currentSubpass()==2&&f.driver.commands.size()==beforeEnd,"empty remaining original subpass preserves target record without premature HOST barrier");
+        require(f.driver.commands.back().op==Recorder::Op::Pipeline&&f.driver.commands.back().object==frame_pixel_ssbo_clone::handle(f.driver.original),"original pipeline restoration remains immediate at selected indexed draw");
+        f.transaction.endRenderPass(f.driver.command);require(f.driver.commands.size()==beforeEnd+1&&f.driver.commands.back().op==Recorder::Op::Barrier,"one HOST completion barrier only after whole original pass ends");
+        f.transaction.endCommand(f.driver.command,VK_SUCCESS);f.submitOriginal();f.retire();f.driver.status=VK_SUCCESS;
+        RecordView record;require(f.transaction.publish(f.readback(),record)&&record.bytes==128,"full original multi-subpass command cohort publishes only after matching completion and retirement");f.release();
+    }
+    for(unsigned mutation=0;mutation<6;++mutation){
+        Fixture f(false,3,1);f.initialize();f.arm();
+        if(mutation==0)require(!f.transaction.nextSubpass(f.driver.command),"Next outside original pass refuses");
+        else{
+            require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE),"negative original multi-subpass pass");
+            if(mutation==1)f.transaction.endRenderPass(f.driver.command);
+            else if(mutation==2)require(!f.transaction.nextSubpass(f.driver.command,VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS),"secondary contents never acquire primary native authorization");
+            else{
+                require(f.transaction.nextSubpass(f.driver.command),"original transition to actual target subpass");f.prefix();
+                require(f.transaction.drawIndexed(f.driver.command,6,1,2,-3,4)==DrawResult::ReplacedOriginal,"target selected before later route refusal");
+                if(mutation==3){require(f.transaction.nextSubpass(f.driver.command),"advance to last original subpass");require(!f.transaction.nextSubpass(f.driver.command),"too many original subpass transitions refused");}
+                if(mutation==4){require(f.transaction.nextSubpass(f.driver.command),"remaining original subpass");require(f.transaction.draw(f.driver.command,3,1,0,0)==DrawResult::ForwardOriginal,"later original draw forwards once while publication is invalidated");}
+                if(mutation==5)f.transaction.endRenderPass(f.driver.command);
+            }
+        }
+        require(f.transaction.refusal()!=Reason::None,"bad original subpass route has precise bounded refusal");
+        RecordView record;require(!f.transaction.publish(f.readback(),record)&&!record.record,"incomplete/out-of-bounds/secondary/later-draw route never publishes");f.release();
+    }
+    for(bool correct:{false,true}){
+        Fixture f(false,2,1);f.observeDevice();require(f.transaction.configure(f.clone,f.config()),"cold multi-subpass owner attaches before original adoption");
+        require(f.transaction.adoptRecording(TransactionTestAccess::recording()),"actual modeled fresh recording token");
+        f.driver.command=obj<VkCommandBuffer>(44);f.driver.pool=obj<VkCommandPool>(55);f.arm();
+        require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE)&&f.transaction.nextSubpass(f.driver.command),"actual target subpass1 reached");
+        require(f.transaction.adoptTargetState(TransactionTestAccess::target(f.source,1,correct?1:0))==correct,"opaque ticket must prove same actual target and current subpass, never caller-selected index");f.release();
+    }
+}
 void reentryAndConcurrency(){
     for(bool threaded:{false,true}){
         Fixture f;f.initialize();f.arm();require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE),"test pass");f.prefix();
@@ -461,7 +522,8 @@ void reentryAndConcurrency(){
 }
 }
 int main(int argc,char** argv){
+    if(argc==2 && !std::strcmp(argv[1],"subpasses")){multipleSubpassRecordings();std::cout<<"subpass transaction checks="<<checks<<'\n';return 0;}
     if(argc==2 && !std::strcmp(argv[1],"priorities")){originalQueuePriorities();std::cout<<"queue priority checks="<<checks<<'\n';return 0;}
     if(argc!=1)return 2;
-    serial(true);serial(false);boundedRefusals();ticketsAndFences();boundedNativeBatches();transactionEpochReuse();rejectSharedReferencedOwner();sourceCohortMismatch();adoptionAndQueueHistory();precedingNativeDraws();retirementOperations();originalDeviceDestroyEntry();originalQueuePriorities();reentryAndConcurrency();
+    serial(true);serial(false);boundedRefusals();ticketsAndFences();boundedNativeBatches();transactionEpochReuse();rejectSharedReferencedOwner();sourceCohortMismatch();adoptionAndQueueHistory();precedingNativeDraws();retirementOperations();originalDeviceDestroyEntry();originalQueuePriorities();multipleSubpassRecordings();reentryAndConcurrency();
     std::cout<<"ssbo_draw_transaction checks="<<checks<<" owned_fixture_checks="<<owned_fixture::checks<<'\n';}

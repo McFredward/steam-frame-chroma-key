@@ -36,6 +36,7 @@ struct HookCalls {
     std::vector<HookEvent> events;
 } hookCalls;
 unsigned ownedResets=0,ownedFences=0;
+unsigned ownedPassCount=1,ownedTargetSubpass=0,ownedLegacyPasses=0,ownedPasses2=0;
 void emulateShader(){const std::array<std::uint32_t,4> header{{1,0x5353424f,1,32}};std::memcpy(owned_fixture::driver->mapped.data(),header.data(),16);}
 VKAPI_ATTR void VKAPI_CALL hookFill(VkCommandBuffer,VkBuffer,VkDeviceSize,VkDeviceSize,std::uint32_t){++ownedResets;}
 VKAPI_ATTR void VKAPI_CALL hookSets(VkCommandBuffer,VkPipelineBindPoint,VkPipelineLayout,std::uint32_t,std::uint32_t,const VkDescriptorSet*,std::uint32_t,const std::uint32_t*){}
@@ -53,6 +54,19 @@ VKAPI_ATTR VkResult VKAPI_CALL hookSetLayout(VkDevice d,const VkDescriptorSetLay
     if(result==VK_SUCCESS)(first?owned_fixture::driver->set0:owned_fixture::driver->set1)=*out;
     return result;
 }
+template<class Info>VkResult hookOwnedPass(VkDevice d,const Info* ci,const VkAllocationCallbacks* a,VkRenderPass* out){
+    owned_fixture::common(d,a);require(ci->subpassCount==ownedPassCount&&ci->pSubpasses,"owned factory preserves complete exact original pass count");
+    for(unsigned i=0;i<ci->subpassCount;++i)require(ci->pSubpasses[i].colorAttachmentCount==1,"owned factory retains every original subpass color definition");
+    const auto result=owned_fixture::driver->create(frame_pixel_ssbo_owned::Stage::RenderPass,out);
+    if(result==VK_SUCCESS)owned_fixture::driver->pass=*out;
+    return result;
+}
+VKAPI_ATTR VkResult VKAPI_CALL hookOwnedPass1(VkDevice d,const VkRenderPassCreateInfo* ci,const VkAllocationCallbacks* a,VkRenderPass* out){++ownedLegacyPasses;return hookOwnedPass(d,ci,a,out);}
+VKAPI_ATTR VkResult VKAPI_CALL hookOwnedPass2(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* a,VkRenderPass* out){++ownedPasses2;return hookOwnedPass(d,ci,a,out);}
+VKAPI_ATTR VkResult VKAPI_CALL hookOwnedPipelineCreate(VkDevice d,VkPipelineCache cache,std::uint32_t count,const VkGraphicsPipelineCreateInfo* ci,const VkAllocationCallbacks* a,VkPipeline* out){
+    require(count==1&&ci->subpass==ownedTargetSubpass,"owned graphics pipeline preserves exact original nonzero target subpass");
+    return owned_fixture::createPipeline(d,cache,count,ci,a,out);
+}
 VKAPI_ATTR VkResult VKAPI_CALL hookCreatePass2(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* allocator,VkRenderPass* out){
     require(d==hookCalls.dispatchDevice&&!allocator&&ci==hookCalls.createInfo,"original RP2 creation arguments forwarded unchanged");
     ++hookCalls.creates;if(hookCalls.createResult==VK_SUCCESS)*out=h<VkRenderPass>(29+hookCalls.creates);return hookCalls.createResult;
@@ -69,6 +83,13 @@ VKAPI_ATTR void VKAPI_CALL hookEnd2(VkCommandBuffer c,const VkSubpassEndInfo* en
     require(c==hookCalls.command&&end==hookCalls.subEnd,"original End2 arguments forwarded unchanged");
     ++hookCalls.ends;hookCalls.events.push_back(HookEvent::End);
 }
+VKAPI_ATTR void VKAPI_CALL hookBegin1(VkCommandBuffer c,const VkRenderPassBeginInfo* ci,VkSubpassContents contents){
+    require(contents==hookCalls.subBegin->contents,"original legacy contents preserved");hookBegin2(c,ci,hookCalls.subBegin);
+}
+VKAPI_ATTR void VKAPI_CALL hookNext1(VkCommandBuffer c,VkSubpassContents contents){
+    require(contents==hookCalls.subBegin->contents,"original legacy Next contents preserved");hookNext2(c,hookCalls.subBegin,hookCalls.subEnd);
+}
+VKAPI_ATTR void VKAPI_CALL hookEnd1(VkCommandBuffer c){hookEnd2(c,hookCalls.subEnd);}
 VKAPI_ATTR void VKAPI_CALL hookIndexed(VkCommandBuffer c,std::uint32_t count,std::uint32_t instances,std::uint32_t first,std::int32_t offset,std::uint32_t firstInstance){
     require(c==hookCalls.command&&count==6&&instances==1&&first==2&&offset==-3&&firstInstance==4,"native indexed original arguments preserved");
     ++hookCalls.nativeIndexed;hookCalls.events.push_back(HookEvent::NativeIndexed);
@@ -98,6 +119,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hookGdpa(VkDevice,const char* name){
     ENTRY(CmdBeginRenderPass2,hookBegin2) ENTRY(CmdBeginRenderPass2KHR,hookBegin2)
     ENTRY(CmdNextSubpass2,hookNext2) ENTRY(CmdNextSubpass2KHR,hookNext2)
     ENTRY(CmdEndRenderPass2,hookEnd2) ENTRY(CmdEndRenderPass2KHR,hookEnd2)
+    ENTRY(CmdBeginRenderPass,hookBegin1) ENTRY(CmdNextSubpass,hookNext1) ENTRY(CmdEndRenderPass,hookEnd1)
     ENTRY(CmdDrawIndexed,hookIndexed) ENTRY(CmdBindPipeline,hookPipeline)
     ENTRY(BeginCommandBuffer,hookCommandBegin) ENTRY(EndCommandBuffer,hookCommandEnd)
     ENTRY(DeviceWaitIdle,hookIdle) ENTRY(DestroyDevice,hookDestroy)
@@ -108,6 +130,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hookOwnedProc(VkDevice d,const char* na
 #define ENTRY(n,f) if(!std::strcmp(name,"vk" #n))return reinterpret_cast<PFN_vkVoidFunction>(f);
     ENTRY(CmdDrawIndexed,hookOwnedIndexed) ENTRY(CmdBindPipeline,hookPipeline) ENTRY(CmdPipelineBarrier,hookBarrier)
     ENTRY(CreateDescriptorSetLayout,hookSetLayout) ENTRY(CmdFillBuffer,hookFill) ENTRY(CmdBindDescriptorSets,hookSets) ENTRY(CmdDraw,hookDraw)
+    ENTRY(CreateRenderPass,hookOwnedPass1) ENTRY(CreateRenderPass2,hookOwnedPass2) ENTRY(CreateRenderPass2KHR,hookOwnedPass2) ENTRY(CreateGraphicsPipelines,hookOwnedPipelineCreate)
     ENTRY(CreateFence,hookFence) ENTRY(DestroyFence,hookDestroyFence) ENTRY(ResetFences,hookResetFence) ENTRY(GetFenceStatus,hookFenceStatus)
     ENTRY(QueueSubmit,hookSubmit) ENTRY(InvalidateMappedMemoryRanges,hookInvalidate)
 #undef ENTRY
@@ -130,18 +153,22 @@ struct HookFixture {
     VkAttachmentDescription2 attachment=info<VkAttachmentDescription2>(VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2);
     VkAttachmentReference2 color=info<VkAttachmentReference2>(VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2);
     VkSubpassDescription2 subpass=info<VkSubpassDescription2>(VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2);
+    std::array<VkSubpassDescription2,3> allSubpasses{};
     VkRenderPassCreateInfo2 pass=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);
     std::array<VkDescriptorSetLayoutBinding,6> setDefinitions{};
     float priority=1;VkDeviceQueueCreateInfo queue=info<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
-    HookFixture(){
+    HookFixture(unsigned subpasses=1,unsigned selected=0){
         hookCalls={};ownedResets=ownedFences=0;hookCalls.command=command;hookCalls.dispatchDevice=dispatchDevice;owned_fixture::driver=&driver;
         driver.expectedCount=1;driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
+        ownedPassCount=subpasses;ownedTargetSubpass=selected;ownedLegacyPasses=ownedPasses2=0;
         shape.nativeSet=sl;shape.graphics.layout=pl;shape.graphics.renderPass=h<VkRenderPass>(30);shape.stages[0].module=vs;shape.stages[1].module=fs;shape.push={VK_SHADER_STAGE_VERTEX_BIT,0,16};
+        shape.graphics.subpass=selected;
         for(unsigned i=0;i<5;++i)setDefinitions[i]={frame_pixel_uniform::UniformBindings[i],i==1?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr};
         setDefinitions.back()={9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};shape.set.bindingCount=6;shape.set.pBindings=setDefinitions.data();
         queue.queueCount=1;queue.queueFamilyIndex=3;queue.pQueuePriorities=&priority;shape.device.queueCreateInfoCount=1;shape.device.pQueueCreateInfos=&queue;
         auto deviceContext=std::make_unique<Device>();context=deviceContext.get();context->native=h<VkDevice>(1);context->id=device;context->gdpa=hookGdpa;
         context->CreateRenderPass2=hookCreatePass2;context->CmdBeginRenderPass2=hookBegin2;context->CmdNextSubpass2=hookNext2;context->CmdEndRenderPass2=hookEnd2;
+        context->CmdBeginRenderPass=hookBegin1;context->CmdNextSubpass=hookNext1;context->CmdEndRenderPass=hookEnd1;
         context->BeginCommandBuffer=hookCommandBegin;context->EndCommandBuffer=hookCommandEnd;context->CmdDrawIndexed=hookIndexed;context->CmdBindPipeline=hookPipeline;
         context->DeviceWaitIdle=hookIdle;context->DestroyDevice=hookDestroy;
         require(contexts().devices.emplace(&key,std::move(deviceContext)).second,"install one isolated fake native dispatch context");
@@ -153,7 +180,9 @@ struct HookFixture {
         attachment.initialLayout=shape.attachment.initialLayout;attachment.finalLayout=shape.attachment.finalLayout;
         color.attachment=0;color.layout=shape.color.layout;color.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
         subpass.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;subpass.colorAttachmentCount=1;subpass.pColorAttachments=&color;
-        pass.attachmentCount=1;pass.pAttachments=&attachment;pass.subpassCount=1;pass.pSubpasses=&subpass;
+        require(subpasses>0&&subpasses<=allSubpasses.size()&&selected<subpasses,"bounded original hook pass cohort");
+        for(unsigned i=0;i<subpasses;++i)allSubpasses[i]=subpass;
+        pass.attachmentCount=1;pass.pAttachments=&attachment;pass.subpassCount=subpasses;pass.pSubpasses=allSubpasses.data();
     }
     ~HookFixture(){
         if(context){
@@ -189,8 +218,13 @@ struct HookFixture {
         frame_pixel_ssbo_journal::Event event;
         require(context->definitions.createPipeline(pipeline,shape.graphics,VK_SUCCESS,&event)&&native->tracker.createPipeline(device,pipeline,shape.graphics),"actual RP2 definition supports exact private pinned recipe");
         require(native->tracker.ssboPipelineCreated(device,pipeline,{1,event.value,event.generation}),"associate exact original pipeline generation");bindTarget();
-        Candidate learned;require(native->tracker.beginRenderPass(device,command,VK_SUBPASS_CONTENTS_INLINE)&&native->tracker.draw(device,command)&&native->tracker.endRenderPass(device,command,learned),"completed original metadata candidate selects next recording");
+        Candidate learned;require(native->tracker.beginRenderPass(device,command,VK_SUBPASS_CONTENTS_INLINE),"original metadata pass begins");
+        for(unsigned i=0;i<shape.graphics.subpass;++i)require(native->tracker.nextSubpass(device,command,VK_SUBPASS_CONTENTS_INLINE),"original learned target subpass reached");
+        require(native->tracker.draw(device,command),"actual original target metadata draw");
+        for(unsigned i=shape.graphics.subpass+1;i<pass.subpassCount;++i)require(native->tracker.nextSubpass(device,command,VK_SUBPASS_CONTENTS_INLINE),"remaining original learned subpass observed");
+        require(native->tracker.endRenderPass(device,command,learned),"completed whole original metadata pass selects next recording");
         context->bridge.learn(learned);context->bridge.tick(context->definitions);require(context->bridge.snapshot().ready,"real cold bridge ready from actual original private definitions");
+        require(ownedPasses2==1&&!ownedLegacyPasses,"original RP2 creation route retained by owned cold factory");
         session().armed=true;
         hookExport<PFN_vkBeginCommandBuffer>(dispatchDevice,"vkBeginCommandBuffer")(command,&native->beginInfo);
         require(context->bridge.snapshot().adopted&&ownedResets==1,"actual successful Begin hook adopts and GPU-resets exact fresh recording");bindTarget();
@@ -267,14 +301,55 @@ void privateHooks(const char* vertex,const char* fragment,unsigned mutation,bool
         require(events.size()>=2&&events[events.size()-2]==HookEvent::End&&events.back()==HookEvent::HostBarrier,"original End2 executes before transaction emits outside-pass HOST barrier");
     }else{
         if(mutation==5)require(state.refusal==frame_pixel_ssbo_receiver::Refusal::DefinitionHistory,"missing definition history refuses future intervention on already-adopted generation");
-        else require(state.refusal==frame_pixel_ssbo_receiver::Refusal::UnknownRoute&&state.transaction==unsigned(frame_pixel_ssbo_transaction::Reason::UnknownRoute),"pNext/Next2 invalidates exact transaction generation");
+        else if(mutation==4)require(state.refusal==frame_pixel_ssbo_receiver::Refusal::None&&state.transaction==unsigned(frame_pixel_ssbo_transaction::Reason::Subpass),"known Next2 beyond captured single-subpass count invalidates exact generation");
+        else require(state.refusal==frame_pixel_ssbo_receiver::Refusal::UnknownRoute&&state.transaction==unsigned(frame_pixel_ssbo_transaction::Reason::UnknownRoute),"unsupported pNext invalidates exact transaction generation");
         require(hookCalls.ownedIndexed==unsigned(mutation==3)&&hookCalls.nativeIndexed==unsigned(mutation!=3),"refused route preserves exactly one original indexed operation");
         require(std::find(hookCalls.events.begin(),hookCalls.events.end(),HookEvent::HostBarrier)==hookCalls.events.end(),"refused End/Next/Begin never emits publication completion barrier");
         frame_pixel_ssbo_transaction::RecordView record;require(!fixture.context->bridge.publish({},record)&&!record.record,"unsupported generation cannot publish output");
     }
 }
+void multipleSubpassHooks(const char* vertex,const char* fragment,unsigned count,unsigned route,unsigned mutation=0){
+    HookFixture fixture(count,1);fixture.preparePrivate(vertex,fragment,route==2);
+    auto begin=info<VkRenderPassBeginInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);begin.renderPass=fixture.shape.graphics.renderPass;
+    auto subBegin=info<VkSubpassBeginInfo>(VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO);subBegin.contents=VK_SUBPASS_CONTENTS_INLINE;
+    auto subEnd=info<VkSubpassEndInfo>(VK_STRUCTURE_TYPE_SUBPASS_END_INFO);VkBaseInStructure extension{VK_STRUCTURE_TYPE_APPLICATION_INFO,nullptr};
+    hookCalls.beginInfo=&begin;hookCalls.subBegin=&subBegin;hookCalls.subEnd=&subEnd;
+    if(route==0)hookExport<PFN_vkCmdBeginRenderPass>(fixture.dispatchDevice,"vkCmdBeginRenderPass")(fixture.command,&begin,subBegin.contents);
+    else hookExport<PFN_vkCmdBeginRenderPass2>(fixture.dispatchDevice,route==2?"vkCmdBeginRenderPass2KHR":"vkCmdBeginRenderPass2")(fixture.command,&begin,&subBegin);
+    const auto next=[&]{
+        if(route==0)hookExport<PFN_vkCmdNextSubpass>(fixture.dispatchDevice,"vkCmdNextSubpass")(fixture.command,subBegin.contents);
+        else hookExport<PFN_vkCmdNextSubpass2>(fixture.dispatchDevice,route==2?"vkCmdNextSubpass2KHR":"vkCmdNextSubpass2")(fixture.command,&subBegin,&subEnd);
+    };
+    if(mutation==1)subBegin.pNext=&extension;
+    if(mutation==2)subEnd.pNext=&extension;
+    next();subBegin.pNext=nullptr;subEnd.pNext=nullptr;
+    hookExport<PFN_vkCmdDrawIndexed>(fixture.dispatchDevice,"vkCmdDrawIndexed")(fixture.command,6,1,2,-3,4);
+    require(std::find(hookCalls.events.begin(),hookCalls.events.end(),HookEvent::HostBarrier)==hookCalls.events.end(),"selected subpass must not emit a HOST/copy barrier while whole original pass remains open");
+    for(unsigned i=2;i<count;++i)next();
+    require(hookCalls.nexts==count-1&&std::find(hookCalls.events.begin(),hookCalls.events.end(),HookEvent::HostBarrier)==hookCalls.events.end(),"every original Next transition is forwarded once without early source readback");
+    if(route==0)hookExport<PFN_vkCmdEndRenderPass>(fixture.dispatchDevice,"vkCmdEndRenderPass")(fixture.command);
+    else hookExport<PFN_vkCmdEndRenderPass2>(fixture.dispatchDevice,route==2?"vkCmdEndRenderPass2KHR":"vkCmdEndRenderPass2")(fixture.command,&subEnd);
+    hookExport<PFN_vkEndCommandBuffer>(fixture.dispatchDevice,"vkEndCommandBuffer")(fixture.command);
+    const auto state=fixture.context->bridge.snapshot();const auto& events=hookCalls.events;
+    require(hookCalls.begins==1&&hookCalls.ends==1,"original complete multi-subpass Begin/End each forwarded exactly once");
+    if(!mutation){
+        require(state.replaced&&state.refusal==frame_pixel_ssbo_receiver::Refusal::None&&!state.transaction,"actual exported legacy/Core2/KHR reaches exact configured nonzero-subpass transaction");
+        require(hookCalls.ownedIndexed==1&&!hookCalls.nativeIndexed,"nonzero-subpass original indexed draw never duplicated");
+        const auto draw=std::find(events.begin(),events.end(),HookEvent::OwnedIndexed);
+        require(draw!=events.end()&&draw+1!=events.end()&&*(draw+1)==HookEvent::OriginalPipeline,"immediate original pipeline restoration survives actual Next2 route");
+        require(events.size()>=2&&events[events.size()-2]==HookEvent::End&&events.back()==HookEvent::HostBarrier,"HOST/source work follows final whole-pass original End only");
+    }else{
+        require(state.refusal==frame_pixel_ssbo_receiver::Refusal::UnknownRoute&&!hookCalls.ownedIndexed&&hookCalls.nativeIndexed==1,"unknown Next2 child extension refuses only observer and preserves one original draw");
+        require(std::find(events.begin(),events.end(),HookEvent::HostBarrier)==events.end(),"unsupported Next2 metadata never produces HOST completion publication");
+    }
+}
 }
 int main(int argc,char** argv){
+    if(argc==4&&!std::strcmp(argv[1],"--subpasses-only")){
+        for(unsigned count:{2u,3u})for(unsigned route=0;route<3;++route)multipleSubpassHooks(argv[2],argv[3],count,route);
+        for(unsigned route:{1u,2u})for(unsigned mutation:{1u,2u})multipleSubpassHooks(argv[2],argv[3],3,route,mutation);
+        std::cout<<"{\"scope\":\"actual exported multi-subpass Snapshot hooks, fake downstream only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;
+    }
     require(argc==1||argc==3,"optional private original VS/PS arguments");
     exportedCreation();exportedObservationFailure();
     if(argc==3)for(bool khr:{false,true})for(unsigned mutation=0;mutation<=5;++mutation)privateHooks(argv[1],argv[2],mutation,khr);

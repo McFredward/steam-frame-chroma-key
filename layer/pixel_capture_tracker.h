@@ -134,6 +134,7 @@ class LiveTracker {
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
         frame_pixel_ssbo_clone::Identity ssboJournalIdentity{};
         Identity ssboCreationLayout{}, ssboCreationSet0{};
+        std::uint32_t ssboSubpass=0;
 #endif
         // Pipeline creation consumes shader modules. These facts remain valid
         // when Vulkan legally destroys/reuses the original module handles.
@@ -165,6 +166,9 @@ class LiveTracker {
         std::uint64_t drawOrdinal = 0;
         UniformSelection uniform{};
         Candidate candidate{};
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+        std::uint32_t ssboSubpass=0;
+#endif
     };
 
 public:
@@ -257,6 +261,7 @@ public:
             if (!nativeId || !command || !pool || !pipeline || !recipe.definitionComplete ||
                 !command->supported || !command->recording || command->scope != Scope::RenderPass ||
                 !command->drawOrdinal || !pipeline->supported ||
+                command->ssboSubpass!=recipe.graphics.info.subpass || pipeline->ssboSubpass!=recipe.graphics.info.subpass ||
                 !frame_bindings::same(command->pool, pool->id) ||
                 !frame_bindings::same(command->pipeline, pipeline->id) ||
                 !frame_pixel_uniform::nativeStagesMatch(pipeline->stages) ||
@@ -280,6 +285,7 @@ public:
             out.pool_ = native<VkCommandPool>(pool->id.handle);
             out.commandGeneration_ = command->id.generation; out.poolGeneration_ = pool->id.generation;
             out.ordinal_ = command->drawOrdinal; out.pipeline_ = recipe.provenance[5];
+            out.subpass_ = command->ssboSubpass;
             out.layout_ = recipe.provenance[1]; out.set0_ = identity(state.set);
             out.source_.image = identity(source->image.identity);
             out.source_.view = identity(source->view.identity);
@@ -353,6 +359,9 @@ public:
             auto* pipeline = insert(pipelines_, device, frame_bindings::handle(value));
             if (!pipeline) return false;
             pipeline->layout = info.layout;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+            pipeline->ssboSubpass = info.subpass;
+#endif
             pipeline->supported = ordinaryPipeline(info);
             bool vertex = false, fragment = false;
             if (pipeline->supported) for (std::uint32_t i = 0; i < info.stageCount; ++i) {
@@ -511,6 +520,10 @@ public:
             auto* command = recording(device, value); if (!command) return false;
             if (command->scope != Scope::RenderPass || contents != VK_SUBPASS_CONTENTS_INLINE)
                 return invalidate(*command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+            if(command->ssboSubpass==UINT32_MAX)return invalidate(*command);
+            ++command->ssboSubpass;
+#endif
             discardUniform(*command, UniformRefusal::Subpass);
             return true;
         });
@@ -779,6 +792,9 @@ private:
             auto* command = recording(device, value); if (!command) return false;
             if (!command->supported || !supported || command->scope != Scope::None) return invalidate(*command);
             command->scope = scope; command->selected = false;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+            command->ssboSubpass = 0;
+#endif
             command->uniform = {};
             return true;
         });

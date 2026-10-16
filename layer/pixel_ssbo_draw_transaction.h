@@ -77,6 +77,7 @@ public:
         friend class Transaction; friend class frame_pixel_capture::LiveTracker; friend struct TransactionTestAccess;
         const frame_pixel_capture::LiveTracker* tracker_=nullptr;
         std::uint64_t device_=0,commandGeneration_=0,poolGeneration_=0,ordinal_=0;
+        std::uint32_t subpass_=0;
         VkCommandBuffer command_=VK_NULL_HANDLE;VkCommandPool pool_=VK_NULL_HANDLE;
         Id pipeline_{},layout_{},set0_{};Cohort source_{};
     public: TargetTicket() noexcept=default;
@@ -126,7 +127,9 @@ public:
     void endRenderPass(VkCommandBuffer) noexcept;
     void endCommand(VkCommandBuffer,VkResult) noexcept;
     void laterDraw(VkCommandBuffer) noexcept;
-    void nextSubpass(VkCommandBuffer) noexcept;
+    // Invoke AFTER the untouched original NextSubpass/NextSubpass2. Only
+    // inline transitions inside the complete captured pass are admitted.
+    bool nextSubpass(VkCommandBuffer,VkSubpassContents=VK_SUBPASS_CONTENTS_INLINE) noexcept;
     void executeSecondary(VkCommandBuffer) noexcept;
     void unknownRoute(VkCommandBuffer) noexcept;
     // Exact identity retirement notification at entry, before native destruction.
@@ -160,6 +163,9 @@ public:
     std::uint64_t selectedOrdinal() const noexcept {return selectedOrdinal_;}
     std::uint64_t execution() const noexcept {return serial_;}
     std::uint64_t poolGeneration() const noexcept {return poolGeneration_;}
+    std::uint32_t targetSubpass() const noexcept {return targetSubpass_;}
+    std::uint32_t subpassCount() const noexcept {return subpassCount_;}
+    std::uint32_t currentSubpass() const noexcept {return currentSubpass_;}
 private:
     inline static std::atomic<std::uint64_t> epochs_{1};
     static std::uint64_t reserveEpoch() noexcept;
@@ -185,13 +191,14 @@ private:
     VkCommandPool pool_=VK_NULL_HANDLE; VkCommandBuffer command_=VK_NULL_HANDLE;
     VkPipeline original_=VK_NULL_HANDLE,current_=VK_NULL_HANDLE;
     VkPipelineLayout originalLayout_=VK_NULL_HANDLE; VkRenderPass pass_=VK_NULL_HANDLE;
+    std::uint32_t targetSubpass_=0,subpassCount_=0,currentSubpass_=0;
     VkDescriptorSet currentSet0_=VK_NULL_HANDLE;
     Cohort currentSource_{},selectedSource_{};Id setIdentity_{};SubmitObservation submitObservation_{};
     std::uint64_t epoch_=0,generation_=0,poolGeneration_=0,serial_=0,submitNonce_=0,retireNonce_=0;
     std::uint64_t pendingSubmit_=0,pendingRetirement_=0,drawOrdinal_=0,selectedOrdinal_=0;
     bool configured_=false,recording_=false,armed_=false,reset_=false,inPass_=false;
     const frame_pixel_capture::LiveTracker* adoptedTracker_=nullptr;
-    bool prefixValid_=false,matchingPass_=false;
+    bool prefixValid_=false,matchingPass_=false,targetPass_=false;
     bool cleanHistory_=true;
     bool selected_=false,scopeEnded_=false,executable_=false,retired_=false;
     bool submitted_=false,pending_=false,complete_=false,quiescent_=false,deviceLost_=false;

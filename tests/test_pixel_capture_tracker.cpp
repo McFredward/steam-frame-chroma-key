@@ -76,6 +76,7 @@ struct TransactionTestAccess {
             t.source_.extent.height == 4608;
     }
     static bool empty(const Transaction::TargetTicket& t) { return !t.tracker_ && !t.device_ && !t.ordinal_; }
+    static std::uint32_t subpass(const Transaction::TargetTicket& t) { return t.subpass_; }
 };
 }
 #endif
@@ -244,13 +245,13 @@ struct Fixture {
         }), "write five complete native uniform candidate descriptors");
     }
     void makePipeline(VkPipeline output, VkPipelineLayout layout, const char* entry,
-                      const char* vertexEntry = "VS_DISTORT") {
+                      const char* vertexEntry = "VS_DISTORT",std::uint32_t subpass=0) {
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = vertexEntry;
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = entry;
         auto create = info<VkGraphicsPipelineCreateInfo>(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
-        create.stageCount = 2; create.pStages = stages; create.layout = layout;
+        create.stageCount = 2; create.pStages = stages; create.layout = layout; create.subpass=subpass;
         require(tracker.createPipeline(device, output, create), "observe ordinary pipeline");
     }
     void write(VkDescriptorSet output, VkImageView input = view) {
@@ -1114,6 +1115,33 @@ void ssboSelectedPipelineIdentity() {
     require(!unassociated.ssboPipeline.device && !unassociated.ssboPipeline.value && !unassociated.ssboPipeline.generation,
             "raw-only candidate never invents an SSBO pipeline creation association");
 }
+void ssboSubpassTickets() {
+    using Transaction=frame_pixel_ssbo_transaction::Transaction;
+    using Access=frame_pixel_ssbo_transaction::TransactionTestAccess;
+    auto f=uniformFixture();
+    frame_pixel_ssbo_clone::Recipe recipe;recipe.definitionComplete=true;recipe.graphics.info.subpass=1;recipe.renderPass.subpassCount=3;
+    const std::array<std::uint64_t,6> handles{{10,20,2000,100,101,110}};
+    for(unsigned i=0;i<handles.size();++i)recipe.provenance[i]={1,handles[i],900+i};
+    require(f->tracker.destroyPipeline(device,pipeline),"retire index0 synthetic pipeline before original index1 creation");
+    f->makePipeline(pipeline,pl,"PS_DISTORT","VS_DISTORT",1);
+    require(f->tracker.ssboDeviceCreated(device,h<VkDevice>(1))&&f->tracker.ssboPipelineCreated(device,pipeline,recipe.provenance[5]),"associate exact original nonzero-subpass pipeline creation");f->bind();
+    require(f->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"begin actual original multi-subpass scope");
+    f->tracker.draw(device,cb);Transaction::TargetTicket ticket;
+    require(!f->tracker.ssboTargetTicket(device,cb,recipe,ticket),"pipeline bound at wrong actual current subpass grants no opaque target");
+    require(f->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"observed original inline transition increments current subpass");f->tracker.draw(device,cb);
+    require(f->tracker.ssboTargetTicket(device,cb,recipe,ticket)&&Access::subpass(ticket)==1,"opaque target proves exact created/current/recipe subpass1");
+    auto wrong=recipe;wrong.graphics.info.subpass=0;
+    require(!f->tracker.ssboTargetTicket(device,cb,wrong,ticket),"same original handle/generation never grants a different caller-supplied subpass");
+    require(f->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"empty remaining original subpass still belongs to whole renderpass");
+    require(!f->tracker.ssboTargetTicket(device,cb,recipe,ticket),"prior target ticket cannot be reminted after transition to another actual subpass");
+    Candidate candidate;require(f->tracker.endRenderPass(device,cb,candidate)&&candidate.ssboPipeline.generation==recipe.provenance[5].generation,"source candidate remains deferred until whole original renderpass ends");
+    require(f->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"a subsequent original pass resets observed subpass to zero");f->tracker.draw(device,cb);
+    require(!f->tracker.ssboTargetTicket(device,cb,recipe,ticket),"subpass index never leaks between original render scopes");
+    auto mismatch=uniformFixture();
+    require(mismatch->tracker.ssboDeviceCreated(device,h<VkDevice>(1))&&mismatch->tracker.ssboPipelineCreated(device,pipeline,recipe.provenance[5]),"separate original pipeline was created for subpass0");
+    require(mismatch->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE)&&mismatch->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"current original scope independently reaches subpass1");mismatch->tracker.draw(device,cb);
+    require(!mismatch->tracker.ssboTargetTicket(device,cb,recipe,ticket),"matching current/recipe index cannot erase the pipeline's actual created-subpass identity");
+}
 void ssboNativeTickets() {
     using Transaction = frame_pixel_ssbo_transaction::Transaction;
     using Access = frame_pixel_ssbo_transaction::TransactionTestAccess;
@@ -1225,9 +1253,13 @@ void ssboNativeTickets() {
 
 int main(int argc, char** argv) {
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if (argc == 2 && !std::strcmp(argv[1], "ssbo-subpasses")) {
+        ssboSubpassTickets();std::cout << "pixel SSBO subpass tickets: " << checks << " checks passed\n";return 0;
+    }
     if (argc == 2 && !std::strcmp(argv[1], "ssbo")) {
         ssboSelectedPipelineIdentity();
         ssboNativeTickets();
+        ssboSubpassTickets();
         std::cout << "pixel SSBO live tracker bridge: " << checks << " checks passed; no GPU/frame/eye authority\n";
         return 0;
     }

@@ -51,6 +51,7 @@ public:
     bool tracks(VkCommandBuffer c) const noexcept{return matches(c);}
     void pipeline(VkCommandBuffer,VkPipeline) noexcept;
     void beginPass(VkCommandBuffer,VkRenderPass,VkSubpassContents) noexcept;
+    void nextPass(VkCommandBuffer,VkSubpassContents) noexcept;
     void endPass(VkCommandBuffer) noexcept;
     void endCommand(VkCommandBuffer,VkResult) noexcept;
     bool draw(frame_pixel_capture::LiveTracker&,std::uint64_t,VkCommandBuffer,

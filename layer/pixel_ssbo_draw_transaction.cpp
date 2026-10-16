@@ -77,7 +77,8 @@ bool Transaction::configure(frame_pixel_ssbo_owned::Clone& clone,const Configura
     const auto& recipe=*prepared;const auto& p=config.dispatch;const auto device=frame_pixel_ssbo_clone::handle(device_);
     if(refusal()!=Reason::None || configured_ || !device_ || !queue_ || family_==VK_QUEUE_FAMILY_IGNORED || !clone.ready() ||
        clone.referenced() || !recipe.definitionComplete || !recipe.set0.complete || !recipe.layout.complete ||
-       !recipe.renderPass.complete || recipe.runtimeActivationAuthorized || recipe.nativeLifetimeProven ||
+       !recipe.renderPass.complete || !recipe.renderPass.subpassCount || recipe.renderPass.subpassCount>frame_pixel_ssbo_clone::MaxSubpasses ||
+       recipe.graphics.info.subpass>=recipe.renderPass.subpassCount || recipe.runtimeActivationAuthorized || recipe.nativeLifetimeProven ||
        !p.barrier || !p.fill || !p.pipeline || !p.sets || !p.draw || !p.drawIndexed || !p.createFence || !p.destroyFence ||
        !p.resetFence || !p.fenceStatus || !p.submit || !p.invalidate)return refuse(Reason::InvalidConfiguration);
     for(const auto& id:recipe.provenance)if(!valid(id,device))return refuse(Reason::Identity);
@@ -89,7 +90,8 @@ bool Transaction::configure(frame_pixel_ssbo_owned::Clone& clone,const Configura
     if(result!=VK_SUCCESS || !created)return refuse(Reason::Fence); // failed output is undefined, never destroy it
     config_=config;clone_=&clone;fence_=created;set0_=recipe.set0;prefix_=recipe.layout;provenance_=recipe.provenance;
     original_=handle<VkPipeline>(provenance_[5].value);originalLayout_=handle<VkPipelineLayout>(provenance_[1].value);
-    pass_=handle<VkRenderPass>(provenance_[2].value);configured_=true;return true;
+    pass_=handle<VkRenderPass>(provenance_[2].value);targetSubpass_=recipe.graphics.info.subpass;
+    subpassCount_=recipe.renderPass.subpassCount;configured_=true;return true;
 }
 bool Transaction::poolCreated(VkCommandPool pool,std::uint32_t family,VkResult result) noexcept {
     Guard guard(*this);if(!guard)return false;
@@ -111,7 +113,7 @@ bool Transaction::beginSucceeded(VkCommandBuffer command,const VkCommandBufferBe
     if(!advance(generation_))return false;
     recording_=true;retired_=false;inPass_=false;scopeEnded_=false;selected_=false;
     current_=VK_NULL_HANDLE;currentSet0_=VK_NULL_HANDLE;setIdentity_={};currentSource_={};selectedSource_={};
-    drawOrdinal_=selectedOrdinal_=0;prefixValid_=false;matchingPass_=false;cleanHistory_=true;return true;
+    drawOrdinal_=selectedOrdinal_=0;currentSubpass_=0;prefixValid_=false;matchingPass_=targetPass_=false;cleanHistory_=true;return true;
 }
 bool Transaction::adoptRecording(const RecordingTicket& ticket) noexcept {
     Guard guard(*this);if(!guard)return false;
@@ -122,7 +124,7 @@ bool Transaction::adoptRecording(const RecordingTicket& ticket) noexcept {
        (command_==ticket.command_ && generation_>=ticket.commandGeneration_))return refuse(Reason::Identity);
     adoptedTracker_=ticket.tracker_;command_=ticket.command_;pool_=ticket.pool_;
     generation_=ticket.commandGeneration_;poolGeneration_=ticket.poolGeneration_;
-    recording_=true;retired_=false;inPass_=matchingPass_=false;scopeEnded_=selected_=false;
+    recording_=true;retired_=false;inPass_=matchingPass_=targetPass_=false;scopeEnded_=selected_=false;currentSubpass_=0;
     current_=VK_NULL_HANDLE;currentSet0_=VK_NULL_HANDLE;setIdentity_={};currentSource_={};selectedSource_={};
     drawOrdinal_=selectedOrdinal_=0;prefixValid_=false;cleanHistory_=true;return true;
 }
@@ -131,7 +133,8 @@ bool Transaction::adoptTargetState(const TargetTicket& ticket) noexcept {
     if(!configured_ || !armed_ || !active(ticket.command_) || !inPass_ || !matchingPass_ || selected_ ||
        !adoptedTracker_ || ticket.tracker_!=adoptedTracker_ || ticket.device_!=frame_pixel_ssbo_clone::handle(device_) ||
        ticket.commandGeneration_!=generation_ || ticket.pool_!=pool_ || ticket.poolGeneration_!=poolGeneration_ ||
-       ticket.ordinal_!=drawOrdinal_+1 || !same(ticket.pipeline_,provenance_[5]) || !same(ticket.layout_,provenance_[1]) ||
+       ticket.ordinal_!=drawOrdinal_+1 || ticket.subpass_!=currentSubpass_ || ticket.subpass_!=targetSubpass_ ||
+       !same(ticket.pipeline_,provenance_[5]) || !same(ticket.layout_,provenance_[1]) ||
        !valid(ticket.set0_,ticket.device_) || !valid(ticket.source_.image,ticket.device_) ||
        !valid(ticket.source_.view,ticket.device_) || !valid(ticket.source_.memory,ticket.device_) ||
        ticket.source_.layout!=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || !same(ticket.source_,ticket.source_))return refuse(Reason::Identity);
@@ -166,8 +169,10 @@ bool Transaction::beginRenderPass(VkCommandBuffer command,VkRenderPass pass,VkSu
     if(!armed_){cleanHistory_=false;return false;}
     if(!reset_)return refuse(Reason::MissingReset);
     if(selected_ || scopeEnded_)return refuse(Reason::Scope);
-    matchingPass_=pass==pass_ && contents==VK_SUBPASS_CONTENTS_INLINE;
-    return matchingPass_;
+    if(contents!=VK_SUBPASS_CONTENTS_INLINE)return refuse(Reason::Secondary);
+    currentSubpass_=0;targetPass_=pass==pass_;
+    matchingPass_=targetPass_ && currentSubpass_==targetSubpass_;
+    return targetPass_;
 }
 void Transaction::pipelineBound(VkCommandBuffer command,VkPipeline pipeline) noexcept {
     Guard guard(*this);if(!guard || !active(command))return;current_=pipeline;
@@ -236,7 +241,8 @@ void Transaction::endRenderPass(VkCommandBuffer command) noexcept {
     Guard guard(*this);if(!guard || !active(command))return;
     if(!armed_){inPass_=false;scopeEnded_=true;return;}
     if(!inPass_){refuse(Reason::Scope);return;}
-    inPass_=false;matchingPass_=false;
+    if(targetPass_ && currentSubpass_+1!=subpassCount_){refuse(Reason::Subpass);return;}
+    inPass_=false;matchingPass_=targetPass_=false;
     if(selected_){
         scopeEnded_=true;
         if(!clone_->ready()){refuse(Reason::InvalidConfiguration);return;}
@@ -261,7 +267,17 @@ void Transaction::laterDraw(VkCommandBuffer command) noexcept {
     Guard guard(*this);if(!guard || !matches(command) || retired_)return;
     if(advance(drawOrdinal_) && selected_)refuse(Reason::LaterDraw);
 }
-void Transaction::nextSubpass(VkCommandBuffer c) noexcept{unknown(c,Reason::Subpass);}
+bool Transaction::nextSubpass(VkCommandBuffer c,VkSubpassContents contents) noexcept {
+    Guard guard(*this);if(!guard || !active(c))return false;
+    if(!inPass_)return refuse(Reason::Scope);
+    if(contents!=VK_SUBPASS_CONTENTS_INLINE)return refuse(Reason::Secondary);
+    // An unrelated preceding pass has no captured shape and grants no target
+    // authority. Bound its observed transitions without inventing its count.
+    const auto count=targetPass_?subpassCount_:std::uint32_t(frame_pixel_ssbo_clone::MaxSubpasses);
+    if(currentSubpass_+1>=count)return refuse(Reason::Subpass);
+    ++currentSubpass_;matchingPass_=targetPass_ && currentSubpass_==targetSubpass_;
+    return true;
+}
 void Transaction::executeSecondary(VkCommandBuffer c) noexcept{unknown(c,Reason::Secondary);}
 void Transaction::unknownRoute(VkCommandBuffer c) noexcept{unknown(c,Reason::UnknownRoute);}
 void Transaction::resourceRetiring(Resource kind,Id id) noexcept {

@@ -135,6 +135,7 @@ void Bridge::begin(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,V
 }
 void Bridge::pipeline(VkCommandBuffer c,VkPipeline p) noexcept {if(matches(c))transaction_.pipelineBound(c,p);}
 void Bridge::beginPass(VkCommandBuffer c,VkRenderPass p,VkSubpassContents contents) noexcept {if(matches(c))transaction_.beginRenderPass(c,p,contents);}
+void Bridge::nextPass(VkCommandBuffer c,VkSubpassContents contents) noexcept {if(matches(c))transaction_.nextSubpass(c,contents);}
 void Bridge::endPass(VkCommandBuffer c) noexcept {if(matches(c))transaction_.endRenderPass(c);}
 void Bridge::endCommand(VkCommandBuffer c,VkResult r) noexcept {if(matches(c))transaction_.endCommand(c,r);}
 bool Bridge::draw(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,VkCommandBuffer c,

@@ -1232,16 +1232,17 @@ VKAPI_ATTR void VKAPI_CALL traceCmdExecuteCommands(VkCommandBuffer command,std::
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass(VkCommandBuffer command,const VkRenderPassBeginInfo* info,VkSubpassContents contents) {
     auto* d=deviceFor(command);session().tracker->beginRenderPass(d->id,command,contents);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.beginPass(command,info->renderPass,contents);
+    if(info->sType==VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO&&!info->pNext)d->bridge.beginPass(command,info->renderPass,contents);
+    else d->bridge.unknown(command);
 #endif
     d->CmdBeginRenderPass(command,info,contents);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass(VkCommandBuffer command,VkSubpassContents contents) {
     auto* d=deviceFor(command);session().tracker->nextSubpass(d->id,command,contents);
-#ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
-#endif
     d->CmdNextSubpass(command,contents);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.nextPass(command,contents);
+#endif
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass(VkCommandBuffer command) {
     auto* d=deviceFor(command);d->CmdEndRenderPass(command);
@@ -1261,10 +1262,12 @@ VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2(VkCommandBuffer command,cons
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass2(VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
     auto* d=deviceFor(command);session().tracker->nextSubpass(d->id,command,begin->contents);
-#ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    d->bridge.unknown(command);
-#endif
     d->CmdNextSubpass2(command,begin,end);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(begin->sType==VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO&&!begin->pNext&&end->sType==VK_STRUCTURE_TYPE_SUBPASS_END_INFO&&!end->pNext)
+        d->bridge.nextPass(command,begin->contents);
+    else d->bridge.unknown(command);
+#endif
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass2(VkCommandBuffer command,const VkSubpassEndInfo* end) {
     auto* d=deviceFor(command);d->CmdEndRenderPass2(command,end);

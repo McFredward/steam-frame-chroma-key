@@ -29,10 +29,11 @@ namespace {
 using Bridge=frame_pixel_ssbo_receiver::Bridge;
 namespace tx=frame_pixel_ssbo_transaction;
 unsigned expectedPrefixBindings=6;
+unsigned expectedSubpassCount=1;
 Bridge* failHistoryOnCreate=nullptr;
-struct Calls {unsigned resets=0,draws=0,indexed=0,markers=0,fences=0;bool signaled=true;} calls;
-VKAPI_ATTR void VKAPI_CALL mockBarrier(VkCommandBuffer,VkPipelineStageFlags,VkPipelineStageFlags,VkDependencyFlags,
-    std::uint32_t,const VkMemoryBarrier*,std::uint32_t,const VkBufferMemoryBarrier*,std::uint32_t,const VkImageMemoryBarrier*){}
+struct Calls {unsigned resets=0,draws=0,indexed=0,markers=0,fences=0,hostBarriers=0;bool signaled=true;} calls;
+VKAPI_ATTR void VKAPI_CALL mockBarrier(VkCommandBuffer,VkPipelineStageFlags,VkPipelineStageFlags destination,VkDependencyFlags,
+    std::uint32_t,const VkMemoryBarrier*,std::uint32_t,const VkBufferMemoryBarrier*,std::uint32_t,const VkImageMemoryBarrier*){if(destination==VK_PIPELINE_STAGE_HOST_BIT)++calls.hostBarriers;}
 VKAPI_ATTR void VKAPI_CALL mockFill(VkCommandBuffer,VkBuffer,VkDeviceSize,VkDeviceSize,std::uint32_t){++calls.resets;}
 VKAPI_ATTR void VKAPI_CALL mockPipeline(VkCommandBuffer,VkPipelineBindPoint,VkPipeline){}
 VKAPI_ATTR void VKAPI_CALL mockSets(VkCommandBuffer,VkPipelineBindPoint,VkPipelineLayout,std::uint32_t,std::uint32_t,const VkDescriptorSet*,std::uint32_t,const std::uint32_t*){}
@@ -53,9 +54,14 @@ VKAPI_ATTR VkResult VKAPI_CALL mockSet(VkDevice d,const VkDescriptorSetLayoutCre
     if(result==VK_SUCCESS)(first?owned_fixture::driver->set0:owned_fixture::driver->set1)=*out;
     return result;
 }
+VKAPI_ATTR VkResult VKAPI_CALL mockPass(VkDevice d,const VkRenderPassCreateInfo* ci,const VkAllocationCallbacks* a,VkRenderPass* out){
+    owned_fixture::common(d,a);require(ci->subpassCount==expectedSubpassCount&&ci->pSubpasses,"owned clone preserves complete actual original pass count");
+    for(unsigned i=0;i<ci->subpassCount;++i)require(ci->pSubpasses[i].colorAttachmentCount==1,"selected and preceding subpass attachment facts retained");
+    const auto result=owned_fixture::driver->create(frame_pixel_ssbo_owned::Stage::RenderPass,out);if(result==VK_SUCCESS)owned_fixture::driver->pass=*out;return result;
+}
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL bridgeProc(VkDevice d,const char* name){
 #define PROC(n,f) if(!std::strcmp(name,"vk" #n))return reinterpret_cast<PFN_vkVoidFunction>(f);
-    PROC(CreateDescriptorSetLayout,mockSet) PROC(CmdPipelineBarrier,mockBarrier) PROC(CmdFillBuffer,mockFill)
+    PROC(CreateDescriptorSetLayout,mockSet) PROC(CreateRenderPass,mockPass) PROC(CmdPipelineBarrier,mockBarrier) PROC(CmdFillBuffer,mockFill)
     PROC(CmdBindPipeline,mockPipeline) PROC(CmdBindDescriptorSets,mockSets) PROC(CmdDraw,mockDraw) PROC(CmdDrawIndexed,mockIndexed)
     PROC(CreateFence,mockFence) PROC(DestroyFence,mockDestroyFence) PROC(ResetFences,mockReset) PROC(GetFenceStatus,mockStatus) PROC(QueueSubmit,mockSubmit) PROC(InvalidateMappedMemoryRanges,mockInvalidate)
 #undef PROC
@@ -78,13 +84,15 @@ void historyGuards(){
     Bridge earlier;auto ci=info<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);earlier.deviceCreated(h<VkDevice>(1),ci,nullptr,{},{});earlier.definitionObservationFailed();
     require(earlier.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::Device,"history failure never overwrites an earlier permanent refusal");
 }
-void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned mode){
-    calls={};failHistoryOnCreate=nullptr;expectedPrefixBindings=6;owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;
+void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned mode,unsigned subpasses=1){
+    calls={};failHistoryOnCreate=nullptr;expectedPrefixBindings=6;expectedSubpassCount=subpasses;owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;
     driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
     owned_fixture::Fixture limits;
     auto native=std::make_unique<Fixture>(true,0,VK_COMMAND_BUFFER_LEVEL_PRIMARY,0,true);
     Bridge b;frame_pixel_ssbo_journal::Journal journal{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
     journal_fixture::Fixture shape;shape.nativeSet=sl;shape.graphics.layout=pl;shape.graphics.renderPass=h<VkRenderPass>(30);
+    std::array<VkSubpassDescription,3> originalSubpasses{};
+    if(subpasses>1){require(subpasses<=originalSubpasses.size(),"bounded multi-subpass callback fixture");for(unsigned i=0;i<subpasses;++i)originalSubpasses[i]=shape.sub;shape.pass.subpassCount=subpasses;shape.pass.pSubpasses=originalSubpasses.data();shape.graphics.subpass=1;}
     shape.stages[0].module=vs;shape.stages[1].module=fs;shape.push={VK_SHADER_STAGE_VERTEX_BIT,0,16};
     std::array<VkDescriptorSetLayoutBinding,6> definitions{};
     for(unsigned i=0;i<5;++i)definitions[i]={frame_pixel_uniform::UniformBindings[i],i==1?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr};
@@ -107,7 +115,14 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     native->bind(); // Rebind after the original layout/pipeline generations changed.
     frame_pixel_ssbo_journal::Ready ready;require(journal.takeReady(ready),"one reporting receipt; does not choose a clone");
     b.tick(journal);require(!b.snapshot().ready&&!driver.calls,"no arbitrary first-created recipe prepared before actual candidate selection");
-    const auto learned=native->finishPass();require(!learned.oneTimeSubmit&&learned.retirementRequired,"serial replay control uses flags0 reusable native command recording");
+    Candidate learned;
+    if(subpasses==1)learned=native->finishPass();
+    else{
+        require(native->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE)&&native->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"actual learned original pass reaches configured subpass1");
+        native->tracker.draw(device,cb);if(subpasses==3)require(native->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"remaining original learned subpass");
+        require(native->tracker.endRenderPass(device,cb,learned),"learn source only after complete original multi-subpass pass");
+    }
+    require(!learned.oneTimeSubmit&&learned.retirementRequired,"serial replay control uses flags0 reusable native command recording");
     b.learn(learned);b.tick(journal);require(!b.snapshot().ready&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None,"exact selected recipe waits for later actual queue retrieval");
     if(mode==5){
         b.definitionObservationFailed();b.queueRetrieved(3,0,h<VkQueue>(2));b.tick(journal);
@@ -142,6 +157,7 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     native->tracker.draw(device,cb,nullptr,false);require(!b.draw(native->tracker,device,cb,0,1,0,0,0,false),"zero-count preceding direct draw preserves matching observed ordinals");
     native->tracker.draw(device,cb,nullptr,false);require(!b.draw(native->tracker,device,cb,0,1,0,0,0,true),"zero-count preceding indexed draw preserves matching observed ordinals");
     native->tracker.draw(device,cb);require(!b.draw(native->tracker,device,cb,3,1,0,0,0,false),"preceding UI draw remains native and uninstrumented");
+    if(subpasses>1){require(native->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"original inline transition to configured subpass1");b.nextPass(cb,VK_SUBPASS_CONTENTS_INLINE);}
     native->bind();b.pipeline(cb,pipeline);native->tracker.draw(device,cb);
     if(mode==7){
         b.definitionObservationFailed();
@@ -157,7 +173,10 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     if(mode==3)b.resourceRetiring(tx::Resource::Image,frame_bindings::handle(image));
     if(mode==4)b.descriptorPoolRetiring(native->tracker,device,dp);
     require(b.snapshot().drawOrdinal==4,"selected original ordinal includes both empty direct/indexed calls plus prior UI draw");
+    require(!calls.hostBarriers,"no readback barrier before full original renderpass End");
+    if(subpasses==3){require(native->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"original final empty subpass after selected draw");b.nextPass(cb,VK_SUBPASS_CONTENTS_INLINE);require(!calls.hostBarriers,"Next never inserts HOST/copy work inside original multi-subpass renderpass");}
     Candidate candidate;require(native->tracker.endRenderPass(device,cb,candidate),"matching source candidate from production tracker");b.endPass(cb);
+    if(mode<3)require(calls.hostBarriers==1,"whole original End emits one outside-pass HOST barrier");
     if(mode!=1)b.copyRecorded(candidate);
     b.endCommand(cb,VK_SUCCESS);
     auto submit=info<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);submit.commandBufferCount=1;submit.pCommandBuffers=&cb;
@@ -196,7 +215,7 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
 // finite callback controls retain six potentially-live full variants; archived
 // creation metadata does not establish their simultaneous native lifetimes.
 void privateVariantSelection(const char* vertexPath,const char* fragmentPath,unsigned selected,bool stale){
-    calls={};expectedPrefixBindings=29;owned_fixture::Driver driver;owned_fixture::driver=&driver;
+    calls={};expectedPrefixBindings=29;expectedSubpassCount=1;owned_fixture::Driver driver;owned_fixture::driver=&driver;
     driver.expectedCount=1;driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
     owned_fixture::Fixture limits;auto native=std::make_unique<Fixture>(true,0,VK_COMMAND_BUFFER_LEVEL_PRIMARY,0,true);
     Bridge b;frame_pixel_ssbo_journal::Journal journal{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
@@ -250,6 +269,7 @@ void privateVariantSelection(const char* vertexPath,const char* fragmentPath,uns
 }
 }
 int main(int argc,char** argv){
+    if(argc==4&&std::strcmp(argv[1],"--subpasses-only")==0){privateCallbacks(argv[2],argv[3],0,2);privateCallbacks(argv[2],argv[3],0,3);std::cout<<"{\"scope\":\"private multi-subpass callback subset, fake dispatch only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     if(argc==4&&std::strcmp(argv[1],"--history-only")==0){historyGuards();for(unsigned mode=5;mode<=9;++mode)privateCallbacks(argv[2],argv[3],mode);std::cout<<"{\"scope\":\"definition-history-cancellation-subset,fake-dispatch\",\"checks\":"<<checks.load()<<",\"native_authority\":false,\"actual_r2_cause\":false}\n";return 0;}
     if(argc==4&&std::strcmp(argv[1],"--variants-only")==0){privateVariantSelection(argv[2],argv[3],4,false);privateVariantSelection(argv[2],argv[3],5,false);privateVariantSelection(argv[2],argv[3],5,true);std::cout<<"{\"scope\":\"private-pipeline-selection-subset, fake dispatch only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     publicGuards();historyGuards();require(argc==1||argc==3,"optional private original VS/PS only");
