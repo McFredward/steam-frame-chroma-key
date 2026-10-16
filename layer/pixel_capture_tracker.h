@@ -63,6 +63,12 @@ struct Candidate {
     // This does not prove the device/queue or unsupported routes are eligible.
     bool noPriorComputeState = false;
     frame_bindings::Binding binding{};
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    // Creation association of the actual selected draw, for cold exact-recipe
+    // lookup. It is not the currently bound pipeline, a native handle lease or
+    // permission to instrument this completed candidate recording.
+    frame_pixel_ssbo_clone::Identity ssboPipeline{};
+#endif
     // Optional exact-final-draw metadata; default calls never populate a plan.
     // This is observed API adjacency, NOT GPU bytes, frame/eye identity, queue
     // ownership, a completion fence or permission to publish a uniform copy.
@@ -796,6 +802,9 @@ private:
             // native render scope ends. Sample insertion uses the full history
             // at this actual injection boundary, not just the draw snapshot.
             command->candidate.noPriorComputeState = command->noPriorComputeState;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+            command->candidate.ssboPipeline = pipeline->ssboJournalIdentity;
+#endif
             out = command->candidate;
             return true;
         });

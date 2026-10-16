@@ -1085,6 +1085,35 @@ void uniformSourceAndAliasGuards() {
             "unexpected status values do not borrow or format native data");
 }
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+void ssboSelectedPipelineIdentity() {
+    constexpr std::uint64_t nativeId = 0x510;
+    for (bool alternate : {false, true}) {
+        auto f = uniformFixture();
+        const auto another = h<VkPipeline>(112);
+        const frame_pixel_ssbo_clone::Identity original{nativeId,frame_bindings::handle(pipeline),905};
+        const frame_pixel_ssbo_clone::Identity second{nativeId,frame_bindings::handle(another),999};
+        require(f->tracker.ssboDeviceCreated(device,h<VkDevice>(nativeId)) &&
+                f->tracker.ssboPipelineCreated(device,pipeline,original),
+                "associate actual original target for cold selected-draw lookup");
+        f->makePipeline(another,pl,"PS_DISTORT");
+        require(f->tracker.ssboPipelineCreated(device,another,second),
+                "separate live native variant has its own exact creation identity");
+        f->bind(ds,alternate?another:pipeline);
+        require(f->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE) && f->tracker.draw(device,cb),
+                "observe selected variant with uniform companion disabled");
+        f->bind(ds,alternate?pipeline:another);
+        Candidate candidate;
+        require(f->tracker.endRenderPass(device,cb,candidate),"later binding-only change preserves original raw candidate");
+        const auto expected=alternate?second:original;
+        require(candidate.ssboPipeline.device==expected.device && candidate.ssboPipeline.value==expected.value &&
+                candidate.ssboPipeline.generation==expected.generation,
+                "cold selector gets actual drawn pipeline, never the last binding or first created variant");
+    }
+    auto missing=uniformFixture();
+    const auto unassociated=missing->finishPass();
+    require(!unassociated.ssboPipeline.device && !unassociated.ssboPipeline.value && !unassociated.ssboPipeline.generation,
+            "raw-only candidate never invents an SSBO pipeline creation association");
+}
 void ssboNativeTickets() {
     using Transaction = frame_pixel_ssbo_transaction::Transaction;
     using Access = frame_pixel_ssbo_transaction::TransactionTestAccess;
@@ -1197,6 +1226,7 @@ void ssboNativeTickets() {
 int main(int argc, char** argv) {
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     if (argc == 2 && !std::strcmp(argv[1], "ssbo")) {
+        ssboSelectedPipelineIdentity();
         ssboNativeTickets();
         std::cout << "pixel SSBO live tracker bridge: " << checks << " checks passed; no GPU/frame/eye authority\n";
         return 0;
