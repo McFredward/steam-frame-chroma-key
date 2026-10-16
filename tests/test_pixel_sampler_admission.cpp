@@ -7,19 +7,35 @@
 namespace {
 using namespace frame_pixel_sampler;
 unsigned checks = 0;
+constexpr auto ReasonCount = static_cast<std::size_t>(RefusalReason::UnreviewedChainType) + 1;
+std::array<bool, ReasonCount> exercisedReasons{};
 void require(bool condition, const char* message) {
     ++checks;
     if (!condition) { std::cerr << "FAIL: " << message << '\n'; std::exit(1); }
 }
 template<class T> T info(VkStructureType type) { T value{}; value.sType = type; return value; }
 
+void expectRefusal(const DeviceEligibility& result, RefusalReason reason,
+                   std::uint32_t index = NoOffendingInput,
+                   std::uint32_t type = NoOffendingInput,
+                   std::uint32_t function = NoOffendingInput) {
+    require(!result.complete && !result.eligible(), "a malformed input never admits sampler work");
+    require(result.refusal == reason, "the exact first refusal identifies its branch");
+    require(result.offendingIndex == index && result.offendingStructureType == type &&
+            result.offendingLoaderFunction == function, "refusal context contains exact bounded numeric inputs only");
+    exercisedReasons[static_cast<std::size_t>(reason)] = true;
+}
+
 void enabledFeatureInputs() {
     auto create = info<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
     ReviewedRoutes routes;
-    routes.coreComputeRoutesObserved = true;
+    routes.coreComputeRoutesObserved = true; routes.queryRoutesObserved = true;
     const auto missing = inspectDeviceCreate(create, routes);
-    require(missing.complete && !missing.samplerYcbcrConversionEnabled && !missing.eligible(),
+    require(missing.complete && !missing.samplerYcbcrConversionObserved && !missing.samplerYcbcrConversionEnabled && !missing.eligible(),
             "absence of enabled feature cannot borrow physical-device support");
+    require(!missing.pipelineStatisticsObserved && !missing.pipelineStatisticsEnabled &&
+            missing.pipelineStatisticsSource == FeatureSource::None,
+            "missing statistics feature input is distinguished from an observed disabled value");
     VkPhysicalDeviceFeatures oldFeatures{};
     oldFeatures.robustBufferAccess = VK_TRUE;
     create.pEnabledFeatures = &oldFeatures;
@@ -31,15 +47,24 @@ void enabledFeatureInputs() {
     ycbcr.samplerYcbcrConversion = VK_TRUE; create.pNext = &ycbcr;
     require(inspectDeviceCreate(create, routes).eligible(), "actual enabled KHR/core YCbCr feature is recognized");
     oldFeatures.pipelineStatisticsQuery = VK_TRUE; create.pEnabledFeatures = &oldFeatures;
-    require(!inspectDeviceCreate(create, routes).complete,
-            "enabled legacy pipeline statistics refuses inserted compute work even outside known query scopes");
+    const auto legacy = inspectDeviceCreate(create, routes);
+    require(legacy.eligible() && legacy.pipelineStatisticsObserved && legacy.pipelineStatisticsEnabled &&
+            legacy.pipelineStatisticsSource == FeatureSource::Legacy && legacy.pipelineStatisticsValue == VK_TRUE,
+            "enabled-unused legacy statistics no longer blanket-refuses explicitly query-observed commands");
+    auto unobserved = routes; unobserved.queryRoutesObserved = false;
+    const auto unsafe = inspectDeviceCreate(create, unobserved);
+    require(unsafe.complete && unsafe.pipelineStatisticsEnabled && !unsafe.queryRoutesObserved && !unsafe.eligible(),
+            "enabled statistics remains unavailable without explicit query-route coverage");
     oldFeatures.pipelineStatisticsQuery = VK_FALSE;
-    require(inspectDeviceCreate(create, routes).eligible(), "disabled legacy query feature retains the ordinary diagnostic");
+    const auto legacyDisabled = inspectDeviceCreate(create, routes);
+    require(legacyDisabled.eligible() && legacyDisabled.pipelineStatisticsObserved && !legacyDisabled.pipelineStatisticsEnabled &&
+            legacyDisabled.pipelineStatisticsSource == FeatureSource::Legacy,
+            "observed disabled legacy query feature retains the ordinary diagnostic");
     create.pEnabledFeatures = nullptr;
     require(!inspectDeviceCreate(create, {}).eligible(), "missing explicit core-route coverage refuses sampling");
     ycbcr.samplerYcbcrConversion = VK_FALSE;
     const auto disabled = inspectDeviceCreate(create, routes);
-    require(disabled.complete && !disabled.samplerYcbcrConversionEnabled && !disabled.eligible(),
+    require(disabled.complete && disabled.samplerYcbcrConversionObserved && !disabled.samplerYcbcrConversionEnabled && !disabled.eligible(),
             "explicitly disabled feature remains disabled despite physical support");
     ycbcr.samplerYcbcrConversion = 2;
     require(!inspectDeviceCreate(create, routes).complete, "noncanonical feature enablement is refused conservatively");
@@ -52,7 +77,10 @@ void enabledFeatureInputs() {
     features2.pNext = &vulkan11; create.pNext = &features2;
     require(inspectDeviceCreate(create, routes).eligible(), "actual device Features2 chain is traversed to enabled feature");
     features2.features.pipelineStatisticsQuery = VK_TRUE;
-    require(!inspectDeviceCreate(create, routes).complete, "Features2-enabled pipeline statistics is refused independently");
+    const auto modern = inspectDeviceCreate(create, routes);
+    require(modern.eligible() && modern.pipelineStatisticsObserved && modern.pipelineStatisticsEnabled &&
+            modern.pipelineStatisticsSource == FeatureSource::Features2,
+            "Features2-enabled unused statistics admits only explicitly guarded query routes");
     features2.features.pipelineStatisticsQuery = VK_FALSE;
     create.pEnabledFeatures = &oldFeatures;
     require(!inspectDeviceCreate(create, routes).complete, "conflicting Features2 and pEnabledFeatures is not silently accepted");
@@ -76,7 +104,7 @@ void routesAndQueueCapabilities() {
     auto ycbcr = info<VkPhysicalDeviceSamplerYcbcrConversionFeatures>(
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES);
     ycbcr.samplerYcbcrConversion = VK_TRUE; create.pNext = &ycbcr;
-    ReviewedRoutes routes; routes.coreComputeRoutesObserved = true;
+    ReviewedRoutes routes; routes.coreComputeRoutesObserved = true; routes.queryRoutesObserved = true;
     const char* known[] = {"VK_KHR_sampler_ycbcr_conversion", "VK_KHR_swapchain"};
     routes.extensionNames = known; routes.extensionCount = 2;
     create.ppEnabledExtensionNames = known; create.enabledExtensionCount = 2;
@@ -111,7 +139,7 @@ void boundedMalformedInputs() {
     auto ycbcr = info<VkPhysicalDeviceSamplerYcbcrConversionFeatures>(
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES);
     ycbcr.samplerYcbcrConversion = VK_TRUE; create.pNext = &ycbcr;
-    ReviewedRoutes routes; routes.coreComputeRoutesObserved = true;
+    ReviewedRoutes routes; routes.coreComputeRoutesObserved = true; routes.queryRoutesObserved = true;
     auto malformed = create; malformed.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     require(!inspectDeviceCreate(malformed, routes).complete, "wrong device create type is refused");
     malformed = create; malformed.flags = 1;
@@ -182,7 +210,7 @@ void publicLoaderChainRecords() {
     link.function = VK_LAYER_LINK_INFO; callback.function = VK_LOADER_DATA_CALLBACK;
     link.pNext = &callback; callback.pNext = &ycbcr; create.pNext = &link;
     const auto originalLink = link; const auto originalCallback = callback;
-    ReviewedRoutes routes; routes.coreComputeRoutesObserved = true;
+    ReviewedRoutes routes; routes.coreComputeRoutesObserved = true; routes.queryRoutesObserved = true;
     require(!inspectDeviceCreate(create, routes).complete, "loader ABI nodes still need explicit owner review");
     const VkStructureType loaderType = VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO;
     routes.additionalChainTypes = &loaderType; routes.additionalChainTypeCount = 1;
@@ -204,9 +232,148 @@ void publicLoaderChainRecords() {
     callback.function = VK_LOADER_DATA_CALLBACK; layerCallback.pNext = &link;
     require(!inspectDeviceCreate(create, routes).complete, "loader-node exception never permits a pNext pointer cycle");
 }
+
+void exactFirstRefusalControls() {
+    auto create = info<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+    auto ycbcr = info<VkPhysicalDeviceSamplerYcbcrConversionFeatures>(
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES);
+    ycbcr.samplerYcbcrConversion = VK_TRUE; create.pNext = &ycbcr;
+    ReviewedRoutes routes; routes.coreComputeRoutesObserved = true; routes.queryRoutesObserved = true;
+    require(inspectDeviceCreate(create, routes).eligible(), "each refusal fixture starts from an admitted profile");
+
+    auto bad = create; bad.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO; bad.flags = 1;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::DeviceCreateType, NoOffendingInput, bad.sType);
+    bad = create; bad.flags = 1; bad.enabledExtensionCount = MaximumDeviceExtensions + 1;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::DeviceCreateFlags);
+    bad = create; bad.enabledExtensionCount = MaximumDeviceExtensions + 1;
+    bad.ppEnabledExtensionNames = reinterpret_cast<const char* const*>(1);
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::DeviceExtensionLimit);
+    bad = create; bad.enabledExtensionCount = 1;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::DeviceExtensionArray);
+    auto badRoutes = routes; badRoutes.extensionCount = MaximumReviewedExtensions + 1;
+    badRoutes.extensionNames = reinterpret_cast<const char* const*>(1);
+    expectRefusal(inspectDeviceCreate(create, badRoutes), RefusalReason::ReviewedExtensionLimit);
+    badRoutes = routes; badRoutes.extensionCount = 1;
+    expectRefusal(inspectDeviceCreate(create, badRoutes), RefusalReason::ReviewedExtensionArray);
+    badRoutes = routes; badRoutes.additionalChainTypeCount = MaximumReviewedChainTypes + 1;
+    badRoutes.additionalChainTypes = reinterpret_cast<const VkStructureType*>(1);
+    expectRefusal(inspectDeviceCreate(create, badRoutes), RefusalReason::ReviewedChainLimit);
+    badRoutes = routes; badRoutes.additionalChainTypeCount = 1;
+    expectRefusal(inspectDeviceCreate(create, badRoutes), RefusalReason::ReviewedChainArray);
+
+    VkPhysicalDeviceFeatures legacy{}; legacy.pipelineStatisticsQuery = 2;
+    bad = create; bad.pEnabledFeatures = &legacy;
+    const auto invalidLegacy = inspectDeviceCreate(bad, routes);
+    expectRefusal(invalidLegacy, RefusalReason::PipelineStatisticsValue);
+    require(invalidLegacy.pipelineStatisticsObserved && !invalidLegacy.pipelineStatisticsEnabled &&
+            invalidLegacy.pipelineStatisticsValue == 2 && invalidLegacy.pipelineStatisticsSource == FeatureSource::Legacy,
+            "noncanonical legacy statistics retains the exact observed value and source");
+    legacy.pipelineStatisticsQuery = VK_TRUE;
+    require(inspectDeviceCreate(bad, routes).eligible(), "repairing only the malformed legacy bool restores admission");
+
+    auto features2 = info<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+    features2.pNext = &ycbcr; features2.features.pipelineStatisticsQuery = 2;
+    bad = create; bad.pNext = &features2;
+    const auto invalidFeatures2 = inspectDeviceCreate(bad, routes);
+    expectRefusal(invalidFeatures2, RefusalReason::PipelineStatisticsValue, 0, features2.sType);
+    require(invalidFeatures2.pipelineStatisticsObserved && invalidFeatures2.pipelineStatisticsValue == 2 &&
+            invalidFeatures2.pipelineStatisticsSource == FeatureSource::Features2,
+            "noncanonical Features2 statistics identifies its actual chain declaration");
+    features2.features.pipelineStatisticsQuery = VK_TRUE;
+    require(inspectDeviceCreate(bad, routes).eligible(), "repairing only the malformed Features2 bool restores admission");
+    bad.pEnabledFeatures = &legacy;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::Features2Conflict, 0, features2.sType);
+
+    const char* known[] = {"VK_KHR_sampler_ycbcr_conversion", "VK_KHR_sampler_ycbcr_conversion"};
+    auto namedRoutes = routes; namedRoutes.extensionNames = known; namedRoutes.extensionCount = 1;
+    bad = create; bad.ppEnabledExtensionNames = known; bad.enabledExtensionCount = 2;
+    expectRefusal(inspectDeviceCreate(bad, namedRoutes), RefusalReason::DuplicateExtension, 1);
+    bad.enabledExtensionCount = 1;
+    require(inspectDeviceCreate(bad, namedRoutes).eligible(), "removing only a repeated enabled name restores admission");
+    const char* unknown[] = {"VK_FUTURE_unknown", "VK_FUTURE_unknown"};
+    bad.ppEnabledExtensionNames = unknown; bad.enabledExtensionCount = 2;
+    expectRefusal(inspectDeviceCreate(bad, namedRoutes), RefusalReason::UnreviewedExtension, 0);
+
+    ycbcr.pNext = &ycbcr;
+    const auto cycle = inspectDeviceCreate(create, routes);
+    expectRefusal(cycle, RefusalReason::ChainCycle, 1, ycbcr.sType);
+    require(cycle.samplerYcbcrConversionObserved && cycle.samplerYcbcrConversionEnabled,
+            "a later refusal preserves previously validated native feature evidence");
+    ycbcr.pNext = nullptr;
+    auto duplicateYcbcrType = ycbcr; duplicateYcbcrType.pNext = &ycbcr;
+    bad = create; bad.pNext = &duplicateYcbcrType;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::DuplicateChainType, 1, ycbcr.sType);
+    auto vulkan11 = info<VkPhysicalDeviceVulkan11Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
+    vulkan11.samplerYcbcrConversion = VK_TRUE; vulkan11.pNext = &ycbcr;
+    bad.pNext = &vulkan11;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::DuplicateYcbcrFeature, 1, ycbcr.sType);
+    vulkan11.pNext = nullptr; vulkan11.samplerYcbcrConversion = 2;
+    const auto badVulkan11 = inspectDeviceCreate(bad, routes);
+    expectRefusal(badVulkan11, RefusalReason::YcbcrFeatureValue, 0, vulkan11.sType);
+    require(!badVulkan11.samplerYcbcrConversionObserved, "malformed YCbCr bool is not a validated feature declaration");
+    bad = create; ycbcr.samplerYcbcrConversion = 2;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::YcbcrFeatureValue, 0, ycbcr.sType);
+    ycbcr.samplerYcbcrConversion = VK_TRUE;
+
+    auto group = info<VkDeviceGroupDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO);
+    bad = create; bad.pNext = &group;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::DeviceGroup, 0, group.sType);
+    auto unreviewed = info<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+    bad.pNext = &unreviewed;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::UnreviewedChainType, 0, unreviewed.sType);
+
+    auto loader = info<VkLayerDeviceCreateInfo>(VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
+    const std::underlying_type_t<VkLayerFunction> unknownFunction = 99;
+    std::memcpy(&loader.function, &unknownFunction, sizeof(unknownFunction));
+    bad.pNext = &loader;
+    expectRefusal(inspectDeviceCreate(bad, routes), RefusalReason::LoaderFunction, 0, loader.sType, 99);
+    loader.function = VK_LAYER_LINK_INFO;
+    auto loader2 = loader; loader.pNext = &loader2;
+    const VkStructureType loaderType = loader.sType;
+    auto loaderRoutes = routes; loaderRoutes.additionalChainTypes = &loaderType; loaderRoutes.additionalChainTypeCount = 1;
+    expectRefusal(inspectDeviceCreate(bad, loaderRoutes), RefusalReason::DuplicateLoaderFunction, 1, loaderType, VK_LAYER_LINK_INFO);
+    loader2.function = VK_LOADER_DATA_CALLBACK; loader2.pNext = &ycbcr;
+    require(inspectDeviceCreate(bad, loaderRoutes).eligible(), "changing only the repeated public loader function restores admission");
+    loader2.pNext = &loader;
+    expectRefusal(inspectDeviceCreate(bad, loaderRoutes), RefusalReason::ChainCycle, 2, loaderType);
+
+    std::array<VkBaseInStructure, MaximumDeviceChain> nodes{};
+    std::array<VkStructureType, MaximumDeviceChain> types{};
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        types[i] = static_cast<VkStructureType>(1000998000 + i);
+        nodes[i].sType = types[i]; nodes[i].pNext = i + 1 < nodes.size() ? &nodes[i + 1] : nullptr;
+    }
+    auto chainRoutes = routes; chainRoutes.additionalChainTypes = types.data(); chainRoutes.additionalChainTypeCount = types.size();
+    ycbcr.pNext = nodes.data();
+    expectRefusal(inspectDeviceCreate(create, chainRoutes), RefusalReason::ChainLimit, MaximumDeviceChain);
+    nodes[nodes.size() - 2].pNext = reinterpret_cast<const VkBaseInStructure*>(1);
+    expectRefusal(inspectDeviceCreate(create, chainRoutes), RefusalReason::ChainLimit, MaximumDeviceChain);
+    nodes[nodes.size() - 2].pNext = nullptr;
+    require(inspectDeviceCreate(create, chainRoutes).eligible(), "an exact32-node valid boundary restores admission without raising the cap");
+    ycbcr.pNext = nullptr;
+
+    const char* expectedNames[] = {"none", "device_create_type", "device_create_flags", "device_extension_limit",
+        "device_extension_array", "reviewed_extension_limit", "reviewed_extension_array", "reviewed_chain_limit",
+        "reviewed_chain_array", "pipeline_statistics_value", "duplicate_extension", "unreviewed_extension",
+        "chain_limit", "chain_cycle", "duplicate_chain_type", "loader_function", "duplicate_loader_function",
+        "features2_conflict", "duplicate_ycbcr_feature", "ycbcr_feature_value", "device_group", "unreviewed_chain_type"};
+    static_assert(sizeof(expectedNames) / sizeof(*expectedNames) == ReasonCount, "Every refusal needs a stable report name");
+    for (std::size_t i = 0; i < ReasonCount; ++i) {
+        require(std::strcmp(refusalName(static_cast<RefusalReason>(i)), expectedNames[i]) == 0,
+                "each finite refusal has a stable literal report name");
+        if (i) require(exercisedReasons[i], "each refusal enum has a causal negative control");
+    }
+    require(std::strcmp(refusalName(static_cast<RefusalReason>(255)), "unknown_refusal") == 0,
+            "unknown reason formatting remains bounded and contains no borrowed data");
+    const auto repaired = inspectDeviceCreate(create, routes);
+    require(repaired.eligible() && repaired.refusal == RefusalReason::None && repaired.offendingIndex == NoOffendingInput &&
+            repaired.offendingStructureType == NoOffendingInput && repaired.offendingLoaderFunction == NoOffendingInput,
+            "a repaired independent inspection does not inherit prior refusal context");
+}
 } // namespace
 
 int main() {
     enabledFeatureInputs(); routesAndQueueCapabilities(); boundedMalformedInputs(); publicLoaderChainRecords();
+    exactFirstRefusalControls();
     std::cout << "pixel sampler admission: " << checks << " checks passed; no device support or native mapping inferred\n";
 }
