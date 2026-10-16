@@ -102,6 +102,12 @@ this changed helper; the spent package is not silently updated or reactivated.
 
 ## Remaining path
 
+The changing application source has since passed the actual Build677 PC check.
+See [changing-source registration](CHANGING-SOURCE-REGISTRATION-20261016.md)
+for its bounded evidence, strict untrusted header bootstrap and the next
+ordinary sampler observation. Native uniform consumption and live mapping
+remain unproven; the next package does not enable the uniform companion.
+
 The next source increment belongs in GloomhavenVR: a fresh app-owned session,
 changing pair IDs and dense asymmetric per-eye registration patterns. Both eye
 outputs must consume one frozen source pair, with GPU resource ownership proven.
