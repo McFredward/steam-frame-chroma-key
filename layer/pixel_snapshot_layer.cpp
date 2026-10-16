@@ -12,6 +12,10 @@
 #include "pixel_sampler_admission.h"
 #include "pixel_sampler_format.h"
 #include "pixel_sampler_routes.h"
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+#include "pixel_uniform_copy.h"
+#include "pixel_uniform_metadata.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -121,11 +125,46 @@ struct Device {
     bool samplerRecorded = false;
     std::atomic<unsigned> queryRoutesUsed{0};
     std::atomic<SamplerRefusal> samplerRefusal{SamplerRefusal::None};
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    frame_uniform_copy::CopyRecorder uniformCopy;
+    frame_uniform_copy::Dispatch uniformDispatch;
+    frame_pixel_uniform::Limits uniformLimits{};
+    bool uniformPrepared = false, uniformRecorded = false;
+    std::atomic<unsigned> uniformRuntimeRefusal{0}, uniformRefusal{0}, uniformContractRefusal{0}, uniformResourceRefusal{0}, uniformOffendingBinding{UINT32_MAX};
+#endif
     Candidate candidate{};
     std::thread writer;
     std::atomic<bool> stop{false}, selected{false};
     bool ownsCapture = false;
 };
+bool uniformCompanionEnabled() noexcept {
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    return true;
+#else
+    return false;
+#endif
+}
+bool uniformCompanionReady(const Device& device) noexcept {
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    return device.uniformPrepared;
+#else
+    (void)device;
+    return false;
+#endif
+}
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+enum class UniformRuntimeRefusal : unsigned { None, ColdPreparation, LastDrawMetadata, StagingCapacity };
+void uniformRefuse(Device& device, UniformRuntimeRefusal reason, unsigned tracker = 0,
+                   unsigned resources = 0, unsigned binding = UINT32_MAX, unsigned contract = 0) noexcept {
+    unsigned empty = 0;
+    if (!device.uniformRuntimeRefusal.compare_exchange_strong(empty, UINT32_MAX, std::memory_order_acq_rel)) return;
+    device.uniformRefusal.store(tracker,std::memory_order_relaxed);
+    device.uniformContractRefusal.store(contract,std::memory_order_relaxed);
+    device.uniformResourceRefusal.store(resources,std::memory_order_relaxed);
+    device.uniformOffendingBinding.store(binding,std::memory_order_relaxed);
+    device.uniformRuntimeRefusal.store(static_cast<unsigned>(reason),std::memory_order_release);
+}
+#endif
 struct Contexts {
     std::mutex mutex;
     std::unordered_map<void*, std::unique_ptr<Instance>> instances;
@@ -157,6 +196,12 @@ void status(int fd, const char* name, int result = 0) {
 }
 void save(Device& d, const frame_pixels::View& view, int progress) {
     const auto& config = session().config;
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    if (!d.uniformRecorded || !frame_uniform_metadata::compatible(
+            d.candidate,d.uniformDispatch,view,d.samplerDispatch.totalBytes())) {
+        status(progress,"uniform_record_refused");return;
+    }
+#endif
     const auto bytes = static_cast<std::size_t>(view.bytes);
     const auto yBytes = static_cast<std::size_t>(view.layout.planes[1].bufferOffset);
     const auto& dispatch=d.samplerDispatch;
@@ -177,6 +222,13 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
     if(sampledOutput<0){status(progress,"sampler_output_refused");return;}
     const bool sampledWritten=frame_pixel_io::writeAll(sampledOutput,sampledData,sampledBytes) && !fsync(sampledOutput);
     close(sampledOutput);if(!sampledWritten){status(progress,"sampler_output_failed");return;}
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    const int uniformOutput=frame_pixel_io::create(config,"uniform-bytes.bin");
+    if(uniformOutput<0){status(progress,"uniform_output_refused");return;}
+    const bool uniformWritten=frame_pixel_io::writeAll(uniformOutput,view.data+d.uniformDispatch.offset(),
+        static_cast<std::size_t>(d.uniformDispatch.bytes())) && !fsync(uniformOutput);
+    close(uniformOutput);if(!uniformWritten){status(progress,"uniform_output_failed");return;}
+#endif
     const auto& b = d.candidate.binding;
     const auto& conversion = b.view.conversion;
     std::ostringstream record;
@@ -239,10 +291,16 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
         record<<"{\"offset\":"<<plane.offset<<",\"row_pitch\":"<<plane.rowPitch
               <<",\"array_pitch\":"<<plane.arrayPitch<<",\"depth_pitch\":"<<plane.depthPitch<<'}';
     }
-    record<<"]},\"source_frame_associated\":false,\"uv_owned\":false,\"passthrough_authorized\":false}\n";
+    record<<"]}";
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    if(!frame_uniform_metadata::append(record,d.candidate,d.uniformDispatch,view,
+        d.samplerDispatch.totalBytes(),config.captureId)){status(progress,"uniform_metadata_refused");return;}
+#endif
+    record<<",\"source_frame_associated\":false,\"uv_owned\":false,\"passthrough_authorized\":false}\n";
     const int meta = frame_pixel_io::create(config, "snapshot.json");
     if (meta < 0) { status(progress, "metadata_refused"); return; }
     const auto text = record.str();
+    if(text.size()>16384){close(meta);status(progress,"metadata_extent_refused");return;}
     const bool good = frame_pixel_io::writeAll(meta,text.data(),text.size()) && !fsync(meta);
     close(meta); status(progress,good ? "complete" : "metadata_failed");
 }
@@ -251,7 +309,7 @@ void writer(Device* d) noexcept {
     if (progress < 0 || flock(progress,LOCK_EX|LOCK_NB)) { if(progress>=0)close(progress); return; }
     // One cold background record. It must explain a refused preparation before
     // asking the maintainer to start a stream; never emit per-frame diagnostics.
-    char preparation[2048]{};
+    char preparation[4096]{};
     const auto preparedCount=std::snprintf(preparation,sizeof(preparation),
         "{\"event\":\"prepared\",\"vk_result\":0,\"sampler_ready\":%s,\"sampler_vk_result\":%d,\"sampler_prepare_attempted\":%s,"
         "\"device_admission_complete\":%s,\"ycbcr_enabled\":%s,\"compute_routes_observed\":%s,"
@@ -260,7 +318,9 @@ void writer(Device* d) noexcept {
         "\"pipeline_statistics_query_observed\":%s,\"pipeline_statistics_query_enabled\":%s,"
         "\"pipeline_statistics_query_source\":%u,\"pipeline_statistics_query_value\":%u,"
         "\"instance_api_version\":%u,\"unreviewed_extension\":\"%s\",\"format_queries_complete\":%s,"
-        "\"format_routes\":%u,\"pool_descriptor_count\":%u,\"native_compute_queue\":%s,\"mask_enabled\":false,\"native_frame_association_proven\":false}\n",
+        "\"format_routes\":%u,\"pool_descriptor_count\":%u,\"native_compute_queue\":%s,"
+        "\"uniform_companion_enabled\":%s,\"uniform_companion_ready\":%s,"
+        "\"mask_enabled\":false,\"native_frame_association_proven\":false}\n",
         d->sampler.state()==frame_pixel_sampler::State::Ready?"true":"false",int(d->samplerPrepareResult),
         d->samplerPrepareAttempted?"true":"false",
         d->samplerEligibility.complete?"true":"false",d->samplerEligibility.samplerYcbcrConversionEnabled?"true":"false",
@@ -271,10 +331,14 @@ void writer(Device* d) noexcept {
         d->samplerEligibility.pipelineStatisticsObserved?"true":"false",d->samplerEligibility.pipelineStatisticsEnabled?"true":"false",
         unsigned(d->samplerEligibility.pipelineStatisticsSource),d->samplerEligibility.pipelineStatisticsValue,
         d->instanceApiVersion,d->unreviewedExtension,
-        d->samplerFormats.complete?"true":"false",d->samplerFormats.routeCount,d->samplerFormats.poolDescriptorCount,d->nativeComputeQueue?"true":"false");
+        d->samplerFormats.complete?"true":"false",d->samplerFormats.routeCount,d->samplerFormats.poolDescriptorCount,d->nativeComputeQueue?"true":"false",
+        uniformCompanionEnabled()?"true":"false",uniformCompanionReady(*d)?"true":"false");
     if(preparedCount>0 && static_cast<std::size_t>(preparedCount)<sizeof(preparation))
         frame_pixel_io::writeAll(progress,preparation,static_cast<std::size_t>(preparedCount));
     bool announced = false, refusalAnnounced = false;
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    bool uniformRefusalAnnounced = false;
+#endif
     unsigned announcedQueryRoutes=0;
     try { while (!d->stop.load(std::memory_order_acquire)) {
         const auto queryRoutes=d->queryRoutesUsed.load(std::memory_order_relaxed);
@@ -300,6 +364,25 @@ void writer(Device* d) noexcept {
             if (result == frame_pixels::Status::VulkanFailure) { status(progress,"gpu_failure",d->readback.lastResult()); break; }
         }
         const auto samplerRefusal=d->samplerRefusal.load(std::memory_order_relaxed);
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+        const auto uniformRefusal=d->uniformRuntimeRefusal.load(std::memory_order_acquire);
+        if(!uniformRefusalAnnounced && uniformRefusal && uniformRefusal!=UINT32_MAX) {
+            const auto tracker=d->uniformRefusal.load(std::memory_order_relaxed);
+            const auto resources=d->uniformResourceRefusal.load(std::memory_order_relaxed);
+            char report[768]{};
+            const auto count=std::snprintf(report,sizeof(report),
+                "{\"event\":\"uniform_candidate_refused\",\"runtime_reason\":%u,\"tracker_reason\":%u,"
+                "\"tracker_reason_name\":\"%s\",\"contract_reason\":%u,\"resource_reason\":%u,"
+                "\"offending_binding\":%u,\"mask_enabled\":false,\"native_frame_association_proven\":false}\n",
+                uniformRefusal,tracker,
+                frame_pixel_capture::uniformRefusalName(static_cast<frame_pixel_capture::UniformRefusal>(tracker)),
+                d->uniformContractRefusal.load(std::memory_order_relaxed),resources,
+                d->uniformOffendingBinding.load(std::memory_order_relaxed));
+            if(count>0 && static_cast<std::size_t>(count)<sizeof(report))
+                frame_pixel_io::writeAll(progress,report,static_cast<std::size_t>(count));
+            uniformRefusalAnnounced=true;
+        }
+#endif
         if(!refusalAnnounced && samplerRefusal!=SamplerRefusal::None) {
             char report[256]{};
             const auto count=std::snprintf(report,sizeof(report),
@@ -380,6 +463,27 @@ void afterRenderPass(Device* d, VkCommandBuffer command, bool dynamic) {
     if (!conversion.extensions.chain.complete || conversion.extensions.chain.count){refuse(SamplerRefusal::Conversion);return;}
     frame_pixel_sampler::Dispatch dispatch;
     if(!d->sampler.admit(sampled,dispatch)){refuse(SamplerRefusal::Profile);return;} // Pure; no descriptor/GPU mutation.
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    if(!d->uniformPrepared){uniformRefuse(*d,UniformRuntimeRefusal::ColdPreparation);return;}
+    if(!candidate.uniformFinalDraw || !candidate.uniformPlan.metadataCandidate) {
+        uniformRefuse(*d,UniformRuntimeRefusal::LastDrawMetadata,
+            static_cast<unsigned>(candidate.uniformRefusal),static_cast<unsigned>(candidate.uniformResourceRefusal.reason),
+            candidate.uniformOffendingBinding,static_cast<unsigned>(candidate.uniformContractRefusal));
+        return;
+    }
+    std::array<frame_uniform_copy::Slice,5> uniformSources{};
+    for(std::size_t n=0;n<uniformSources.size();++n) {
+        const auto& original=candidate.uniformPlan.slices[n];
+        auto& target=uniformSources[n];
+        target.buffer=reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(original.buffer.identity.handle));
+        target.size=original.buffer.size;target.usage=original.buffer.usage;
+        target.effectiveOffset=original.effectiveOffset;target.bytes=original.effectiveRange;
+    }
+    frame_uniform_copy::Dispatch uniformDispatch;
+    if(!d->uniformCopy.admit(uniformSources.data(),uniformSources.size(),dispatch.totalBytes(),uniformDispatch)) {
+        uniformRefuse(*d,UniformRuntimeRefusal::StagingCapacity);return;
+    }
+#endif
     frame_pixels::Source source;
     source.image = reinterpret_cast<VkImage>(static_cast<std::uintptr_t>(image.identity.handle));
     source.generation=image.identity.generation; source.format=image.format; source.extent=image.extent;
@@ -398,6 +502,11 @@ void afterRenderPass(Device* d, VkCommandBuffer command, bool dynamic) {
         const auto result=d->sampler.record(command,dispatch);
         d->candidate=candidate;d->samplerDispatch=dispatch;
         d->samplerRecorded=result==frame_pixel_sampler::Status::Ok;
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+        d->uniformDispatch=uniformDispatch;
+        d->uniformRecorded=d->samplerRecorded &&
+            d->uniformCopy.record(command,uniformDispatch)==frame_uniform_copy::Status::Ok;
+#endif
         d->selected.store(true,std::memory_order_release);
     }
 }
@@ -503,6 +612,14 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     if(session().allowed && ordinary && !session().deviceClaimed.exchange(true)) {
         VkPhysicalDeviceMemoryProperties properties{};
         reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(i->gipa(i->native,"vkGetPhysicalDeviceMemoryProperties"))(physical,&properties);
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+        const auto deviceProperties=reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(i->gipa(i->native,"vkGetPhysicalDeviceProperties"));
+        if(deviceProperties) {
+            VkPhysicalDeviceProperties nativeProperties{};deviceProperties(physical,&nativeProperties);
+            published->uniformLimits.minUniformBufferOffsetAlignment=nativeProperties.limits.minUniformBufferOffsetAlignment;
+            published->uniformLimits.maxUniformBufferRange=nativeProperties.limits.maxUniformBufferRange;
+        }
+#endif
         auto queueProperties=reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(i->gipa(i->native,"vkGetPhysicalDeviceQueueFamilyProperties"));
         std::array<VkQueueFamilyProperties,64> queueData{};
         std::uint32_t queueCount=0;
@@ -527,6 +644,17 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
             published->samplerFormats=frame_pixel_sampler_format::querySupport(physical,formatProperties,imageProperties);
         frame_pixels::Config readbackConfig;readbackConfig.sampledCompanion=true;
         if(published->readback.prepare(*out,published->gdpa,properties,readbackConfig)==frame_pixels::Status::Ok) {
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+            frame_uniform_copy::Preparation uniformPreparation;
+            uniformPreparation.target=published->readback.companionBuffer();
+            uniformPreparation.capacity=published->readback.companionCapacity();
+            // Readback::prepare with sampledCompanion creates these exact flags.
+            uniformPreparation.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            const auto alignment=published->uniformLimits.minUniformBufferOffsetAlignment;
+            published->uniformPrepared=alignment && !(alignment&(alignment-1)) &&
+                published->uniformLimits.maxUniformBufferRange>=frame_pixel_uniform::CandidateMatrixEnd &&
+                published->uniformCopy.prepare(*out,published->gdpa,uniformPreparation)==frame_uniform_copy::Status::Ok;
+#endif
             if(published->samplerEligibility.eligible() && published->nativeComputeQueue && published->samplerFormats.complete && published->samplerFormats.routeCount) {
                 frame_pixel_sampler::Preparation preparation;
                 preparation.targetBuffer=published->readback.companionBuffer();preparation.capacity=published->readback.companionCapacity();
@@ -667,11 +795,25 @@ VKAPI_ATTR void VKAPI_CALL traceCmdBeginQueryIndexedEXT(VkCommandBuffer command,
     d->CmdBeginQueryIndexedEXT(command,pool,query,flags,index);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDraw(VkCommandBuffer command,std::uint32_t vertices,std::uint32_t instances,std::uint32_t firstVertex,std::uint32_t firstInstance) {
-    auto* d=deviceFor(command);if(vertices && instances)session().tracker->draw(d->id,command);
+    auto* d=deviceFor(command);
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    const auto* limits=session().armed.load(std::memory_order_acquire) && !d->selected.load(std::memory_order_acquire)
+        ?&d->uniformLimits:nullptr;
+    session().tracker->draw(d->id,command,limits,vertices && instances);
+#else
+    if(vertices && instances)session().tracker->draw(d->id,command);
+#endif
     d->CmdDraw(command,vertices,instances,firstVertex,firstInstance);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexed(VkCommandBuffer command,std::uint32_t indices,std::uint32_t instances,std::uint32_t firstIndex,std::int32_t vertexOffset,std::uint32_t firstInstance) {
-    auto* d=deviceFor(command);if(indices && instances)session().tracker->draw(d->id,command);
+    auto* d=deviceFor(command);
+#ifdef FRAME_PIXEL_UNIFORM_COMPANION
+    const auto* limits=session().armed.load(std::memory_order_acquire) && !d->selected.load(std::memory_order_acquire)
+        ?&d->uniformLimits:nullptr;
+    session().tracker->draw(d->id,command,limits,indices && instances);
+#else
+    if(indices && instances)session().tracker->draw(d->id,command);
+#endif
     d->CmdDrawIndexed(command,indices,instances,firstIndex,vertexOffset,firstInstance);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirect(VkCommandBuffer command,VkBuffer buffer,VkDeviceSize offset,std::uint32_t count,std::uint32_t stride) {

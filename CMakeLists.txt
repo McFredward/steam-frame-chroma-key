@@ -7,6 +7,11 @@ include(CTest)
 option(FRAME_MASK_BUILD_TRACE "Build the opt-in passive compositor diagnostic layer" OFF)
 option(FRAME_MASK_BUILD_PIXEL_SNAPSHOT
     "Build an uninstalled one-shot explicit-pattern GPU pixel diagnostic" OFF)
+option(FRAME_PIXEL_UNIFORM_COMPANION
+    "Require a bounded same-command native uniform companion in the uninstalled diagnostic" OFF)
+if(FRAME_PIXEL_UNIFORM_COMPANION AND NOT FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
+    message(FATAL_ERROR "Native uniform companion requires the uninstalled pixel snapshot target")
+endif()
 option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
 option(FRAME_MASK_BUILD_IMPORT_ENTRY
@@ -202,6 +207,10 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
     endif()
     add_library(VkLayer_frame_pixel_snapshot SHARED
         layer/pixel_snapshot_layer.cpp layer/pixel_readback.cpp layer/pixel_sampler_probe.cpp)
+    if(FRAME_PIXEL_UNIFORM_COMPANION)
+        target_sources(VkLayer_frame_pixel_snapshot PRIVATE layer/pixel_uniform_copy.cpp)
+        target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_UNIFORM_COMPANION=1)
+    endif()
     target_include_directories(VkLayer_frame_pixel_snapshot PRIVATE ${Vulkan_INCLUDE_DIRS})
     target_compile_options(VkLayer_frame_pixel_snapshot PRIVATE
         -Wall -Wextra -Wpedantic -Werror -fvisibility=hidden)
@@ -216,8 +225,13 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
 endif()
 
 if(BUILD_TESTING AND UNIX)
-    # Preparatory uniform-capture primitives remain unlinked from the installed
-    # diagnostic until native draw/alias/queue ownership is established.
+    # The native companion is an explicit, uninstalled diagnostic build option.
+    # Its contracts remain independently testable without a headset or capture.
+    add_executable(test_pixel_uniform_resources tests/test_pixel_uniform_resources.cpp)
+    target_include_directories(test_pixel_uniform_resources PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_uniform_resources PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_uniform_resources PRIVATE Threads::Threads)
+    add_test(NAME pixel_uniform_resources COMMAND test_pixel_uniform_resources)
     add_executable(test_pixel_uniform_contract tests/test_pixel_uniform_contract.cpp)
     target_include_directories(test_pixel_uniform_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_uniform_contract PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -230,6 +244,11 @@ if(BUILD_TESTING AND UNIX)
     add_test(NAME pixel_uniform_copy_controls COMMAND test_pixel_uniform_copy controls)
     add_test(NAME pixel_uniform_copy_gpu COMMAND test_pixel_uniform_copy gpu)
     set_tests_properties(pixel_uniform_copy_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(test_pixel_uniform_metadata tests/test_pixel_uniform_metadata.cpp layer/pixel_uniform_copy.cpp)
+    target_include_directories(test_pixel_uniform_metadata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_uniform_metadata PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_uniform_metadata PRIVATE Threads::Threads)
+    add_test(NAME pixel_uniform_metadata COMMAND test_pixel_uniform_metadata)
     add_executable(test_pixel_sampler_probe tests/test_pixel_sampler_probe.cpp layer/pixel_sampler_probe.cpp)
     target_include_directories(test_pixel_sampler_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_sampler_probe PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -295,6 +314,11 @@ if(BUILD_TESTING)
     add_test(NAME mask_module_guard COMMAND test_mask_module_guard)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(UNIX)
+        add_test(NAME pixel_uniform_recovery COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_recovery.py)
+        add_test(NAME pixel_uniform_metadata_bridge COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_metadata.py
+            --fixture $<TARGET_FILE:test_pixel_uniform_metadata>)
         add_test(NAME pixel_sampler_shader COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_sampler_shader.py)
         add_test(NAME pixel_sampler_routes COMMAND ${Python3_EXECUTABLE} -B

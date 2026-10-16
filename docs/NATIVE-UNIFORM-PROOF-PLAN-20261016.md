@@ -8,7 +8,7 @@ coordinates or a later CPU read of mutable uniform memory.
 
 ## Existing observations and missing facts
 
-The current public-API binding tracker already retains object generations,
+The pre-companion public-API binding tracker already retained object generations,
 descriptor revisions, effective dynamic offsets and buffer ranges. However,
 the pixel candidate keeps only image binding 9 and selects the first matching
 draw in a render scope. Its pipeline admission identifies the fragment but
@@ -32,10 +32,10 @@ usage bits, offsets and aliases are not fresh admission for another capture.
 
 ## Inert local foundations
 
-The new candidate-contract helper and one-shot GPU-copy helper are preparatory
-components only. They are tested independently and are not linked into the
-installed pixel diagnostic. They neither enable extra native reads nor make
-the current package ready for another device experiment.
+The first candidate-contract helper and one-shot GPU-copy helper checkpoint
+contained preparatory components only. Those independently tested helpers were
+not linked into the previously installed pixel diagnostic. That checkpoint did
+not enable extra native reads or authorize another device experiment.
 
 The candidate helper compares selected and reobserved bounded metadata, requires
 both known shader stages and complete, aligned, generation-bearing native UBO
@@ -61,7 +61,65 @@ a new complete mod gate or Frame GPU validation. Small reports remain under
 `build/private-uniform-{contract,copy,integration}-20261016/`; generated test
 executables, CMake caches and completed worker worktrees are removed after use.
 
-## Required native integration before deployment
+## Optional integrated diagnostic
+
+`FRAME_PIXEL_UNIFORM_COMPANION=ON` now builds an explicit, uninstalled diagnostic
+variant; it is off by default and cannot be selected without the pixel-snapshot
+target. It does not replace a native shader or add a PC sender hook.
+
+The tracker pins both original stages and retains a complete snapshot for the
+last supported, nonempty direct draw. Every later draw, including a zero-count
+call, invalidates that selection before the old first-image fast path. A later
+supported final draw may select again. Render-scope end reobserves the current
+pipeline, descriptor revisions, effective slices and image/view generations.
+Legal shader-module destruction after pipeline creation does not invalidate the
+retained pipeline's original stage facts. Unknown routes still refuse.
+
+The live resource guard requires observed EXCLUSIVE buffers and ordinary current
+allocations. Repeated references to the exact same buffer are allowed. Every
+other buffer or image in that allocation is conservatively refused, even if its
+logical byte ranges appear disjoint: the existing graph has no complete native
+memory-requirements spans with which to prove nonaliasing. It never substitutes
+logical buffer size for a Vulkan memory requirement. Queue ownership relies on
+valid original Vulkan use of this same native draw/queue and the EXCLUSIVE
+resources, not on an independently observed queue-transfer journal.
+
+After the unchanged original render-scope end, the one winning recording appends
+the existing raw copy and native sampler, then five bounded buffer copies to
+unused tail space in the same owned staging buffer. Actual physical-device UBO
+limits are queried at cold creation. No native flags, descriptors, pipelines or
+host mappings are changed. Background publication requires the existing owned
+fence and exact reusable-generation retirement. The optional fourth file is
+`uniform-bytes.bin`, at most20,480 bytes; `native_uniform_control` in the bounded
+snapshot metadata records each source range, stage, revision and SHA256.
+
+The offline reader checks the production file contract and parses raw selectors,
+the declaration-derived matrix columns, patch fields and raw integer flag bits.
+It explicitly retains false physical-eye, video-frame, spatial-map and
+passthrough authority. Its eight guard booleans are validated producer assertions,
+not independent evidence that the original runtime mapping has been reproduced.
+It validates uniform bytes, not the two large paired pixel files; their original
+validation remains separate.
+
+Focused new evidence includes118 live-resource controls,541 optional final-draw
+controls and81 production-formatter controls, each normal and ASan/UBSan, plus
+strict AArch64 checks. Four C++-to-Python bridge tests verify the actual emitted
+6,544-byte synthetic file through the strict reader. The complete original5,391
+tracker controls passed before the later optional-only refusal-label repair;
+they were not unnecessarily repeated afterward. The real Vulkan loader passes
+14 default-variant cases and two enabled-companion query cases; the latter also
+report cold uniform preparation ready. Neither loader fixture contains the
+original native distortion draw or proves an actual native uniform acquisition.
+
+The final CMake metadata/reader integration passes separately. The actual ARM
+library has exactly three private loader exports, no TLS segment or Vulkan
+dependency, and NOW/RELRO. Sources, composed test evidence and independent
+source/ELF/activation reviews remain under ignored
+`build/private-uniform-{resources,native-tracker,reader,metadata,runtime}-20261016/`.
+This is bounded fork validation, not a repeated complete GloomhavenVR gate or a
+headset result. No Frame installation, connection or restart occurs during it.
+
+Native integration must satisfy the following boundaries before deployment:
 
 1. Pin the actual VS_DISTORT/PS_DISTORT pair, entries, byte sizes and generations.
    The version-specific original stages must be read-only for the target

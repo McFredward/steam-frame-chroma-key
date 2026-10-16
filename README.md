@@ -37,8 +37,10 @@ coverage codes through native GPU sampling. The diagnostic was fully removed.
 Native spatial/temporal association and live alpha composition remain open;
 this does not enable streamed passthrough.
 The [next receiver-parameter proof](docs/NATIVE-UNIFORM-PROOF-PLAN-20261016.md)
-has inert metadata/copy foundations; these are not linked into the installed
-diagnostic and do not authorize another native read or a replacement shader.
+adds an optional, uninstalled final-draw uniform companion with bounded copies,
+an offline reader and strict resource guards. It remains off by default. A new
+native capture requires a reviewed package and fresh agreement; this does not
+authorize a replacement shader or establish the remaining spatial/video mapping.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
