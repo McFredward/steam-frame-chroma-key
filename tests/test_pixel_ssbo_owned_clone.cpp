@@ -16,9 +16,9 @@ template<class T>std::uint64_t number(T value){return frame_pixel_ssbo_clone::ha
 struct Driver {
     unsigned calls=0,failAt=0,destroys=0,flushes=0,updates=0;
     bool noncoherent=false,partialPipeline=false,missing=false,wrongRequirements=false;
-    bool refuseMemoryType=false,oversize=false;
+    bool refuseMemoryType=false,oversize=false,missingPass2=false,aliasPass2=false;
     bool mappedLive=false;
-    unsigned expectedCount=3,expectedFragmentBytes=20;
+    unsigned expectedCount=3,expectedFragmentBytes=20,expectedSubpasses=1,expectedSubpass=0,pass2Calls=0;
     std::uint64_t next=100;
     std::set<std::uint64_t> live;
     std::array<std::uint8_t,256> mapped{};
@@ -57,7 +57,12 @@ VKAPI_ATTR VkResult VKAPI_CALL createLayout(VkDevice d,const VkPipelineLayoutCre
 }
 VKAPI_ATTR void VKAPI_CALL destroyLayout(VkDevice d,VkPipelineLayout obj,const VkAllocationCallbacks* a){common(d,a);driver->destroy(obj);}
 VKAPI_ATTR VkResult VKAPI_CALL createPass(VkDevice d,const VkRenderPassCreateInfo* ci,const VkAllocationCallbacks* a,VkRenderPass* out){
-    common(d,a);demand(ci->subpassCount==1 && ci->pSubpasses && ci->pSubpasses[0].colorAttachmentCount==1,"owned renderpass rebased view");
+    common(d,a);demand(ci->subpassCount==driver->expectedSubpasses && ci->pSubpasses && ci->pSubpasses[0].colorAttachmentCount==1,"owned renderpass rebased view");
+    auto result=driver->create(Stage::RenderPass,out);if(result==VK_SUCCESS)driver->pass=*out;return result;
+}
+VKAPI_ATTR VkResult VKAPI_CALL createPass2(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* a,VkRenderPass* out){
+    common(d,a);++driver->pass2Calls;demand(ci->sType==VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2 && !ci->pNext && ci->subpassCount==driver->expectedSubpasses,"owned RP2 preserves original route and whole cohort");
+    demand(ci->pSubpasses[1].inputAttachmentCount==1 && ci->pSubpasses[1].pInputAttachments[0].aspectMask==VK_IMAGE_ASPECT_COLOR_BIT,"owned RP2 input aspect cannot be lost via legacy fallback");
     auto result=driver->create(Stage::RenderPass,out);if(result==VK_SUCCESS)driver->pass=*out;return result;
 }
 VKAPI_ATTR void VKAPI_CALL destroyPass(VkDevice d,VkRenderPass obj,const VkAllocationCallbacks* a){common(d,a);driver->destroy(obj);}
@@ -74,6 +79,7 @@ VKAPI_ATTR VkResult VKAPI_CALL createPipeline(VkDevice d,VkPipelineCache cache,s
     demand(ci->stageCount==2 && ci->pStages && ci->pStages[0].module==driver->vertex && ci->pStages[1].module==driver->fragment,"only owned shader handles reach pipeline");
     demand(std::string(ci->pStages[0].pName)=="VS_DISTORT" && std::string(ci->pStages[1].pName)=="PS_DISTORT","original entry names retained");
     demand(!ci->basePipelineHandle,"no native derivative handle borrowed");
+    demand(ci->subpass==driver->expectedSubpass,"owned pipeline preserves exact selected original subpass index");
     return driver->create(Stage::Pipeline,out);
 }
 VKAPI_ATTR void VKAPI_CALL destroyPipeline(VkDevice d,VkPipeline obj,const VkAllocationCallbacks* a){common(d,a);driver->destroy(obj);}
@@ -117,6 +123,8 @@ VKAPI_ATTR void VKAPI_CALL update(VkDevice d,std::uint32_t count,const VkWriteDe
 }
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL getProc(VkDevice d,const char* name){
     demand(d==driver->device,"resolve only downstream own device");if(driver->missing)return nullptr;
+    if(!std::strcmp(name,"vkCreateRenderPass2"))return driver->missingPass2 || driver->aliasPass2?nullptr:reinterpret_cast<PFN_vkVoidFunction>(createPass2);
+    if(!std::strcmp(name,"vkCreateRenderPass2KHR"))return driver->missingPass2?nullptr:reinterpret_cast<PFN_vkVoidFunction>(createPass2);
 #define MAP(n,f) if(!std::strcmp(name,"vk" #n))return reinterpret_cast<PFN_vkVoidFunction>(f);
     MAP(CreateDescriptorSetLayout,createSet) MAP(DestroyDescriptorSetLayout,destroySet)
     MAP(CreatePipelineLayout,createLayout) MAP(DestroyPipelineLayout,destroyLayout)
@@ -222,6 +230,17 @@ void refusals(){
         demand(clone.prepare(f.p).status==Status::Ok,"unreferenced cold allocation created");
         demand(clone.release().status==Status::Ok && state.live.empty(),"never-recorded allocation needs no invented queue wait");}
 }
+void renderPassCohorts(){
+    namespace c=frame_pixel_ssbo_clone;
+    for(unsigned count:{2u,3u})for(unsigned mode=0;mode<4;++mode){Driver state;driver=&state;state.expectedSubpasses=count;state.expectedSubpass=1;state.aliasPass2=mode==2;state.missingPass2=mode==3;Fixture f;Clone clone;
+        auto& pass=f.recipe.renderPass;pass.subpassCount=count;for(unsigned i=1;i<count;++i)*pass.subpass(i)=static_cast<const c::SubpassDefinition&>(pass);
+        pass.route2=mode!=0;pass.subpass(1)->inputCount=1;pass.subpass(1)->inputs[0]={0,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};pass.subpass(1)->inputAspects[0]=VK_IMAGE_ASPECT_COLOR_BIT;f.recipe.graphics.info.subpass=1;
+        const auto result=clone.prepare(f.p);
+        if(mode==3)demand(result.status==Status::MissingProc && result.stage==Stage::RenderPass && !state.calls && state.live.empty(),"absent same-route RP2 PFNs refuse before any owned driver create");
+        else {demand(result.status==Status::Ok && clone.preparedRecipe()->renderPass.subpassCount==count && clone.preparedRecipe()->graphics.info.subpass==1,"complete owned cohort and selected index survive actual clone snapshot");demand(state.pass2Calls==(mode?1u:0u),"legacy vs core/KHR RP2 owned creation route exact");}
+        demand(clone.release().status==Status::Ok && state.live.empty(),"cohort owner success/refusal safely releases all children");
+    }
+}
 std::vector<std::uint32_t> readShader(const char* path){
     std::ifstream input(path,std::ios::binary|std::ios::ate);demand(bool(input),"explicit private shader readable");const auto bytes=input.tellg();
     demand(bytes>=20 && bytes<=std::streamoff(MaximumProbeBytes) && bytes%4==0,"bounded explicit shader extent");
@@ -247,4 +266,4 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
     }
 }
 }
-int main(int argc,char** argv){demand(argc==1 || argc==4,"optional private VS PS count1-probe paths");happy(false);happy(true);failures(false);failures(true);refusals();if(argc==4)count1Profile(argv[1],argv[2],argv[3]);std::cout<<"owned cold-clone lifecycle: "<<checks<<" checks\n";}
+int main(int argc,char** argv){if(argc==2 && !std::strcmp(argv[1],"--renderpass-cohort-only")){renderPassCohorts();std::cout<<"{\"scope\":\"owned-renderpass-cohort-fake-dispatch\",\"checks\":"<<checks<<"}\n";return 0;}demand(argc==1 || argc==4,"optional private VS PS count1-probe paths");happy(false);happy(true);failures(false);failures(true);refusals();if(argc==4)count1Profile(argv[1],argv[2],argv[3]);std::cout<<"owned cold-clone lifecycle: "<<checks<<" checks\n";}

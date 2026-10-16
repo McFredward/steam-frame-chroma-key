@@ -21,7 +21,8 @@ bool limitsPermit(const frame_pixel_ssbo_clone::Recipe& recipe,const VkPhysicalD
 }
 bool validRecipe(const frame_pixel_ssbo_clone::Recipe& r) noexcept {
     return r.definitionComplete && r.feature.complete && r.feature.enabled && r.set0.complete &&
-        r.layout.complete && r.renderPass.complete && r.vertex.complete && r.fragment.complete && r.graphics.complete &&
+        r.layout.complete && r.renderPass.complete && r.renderPass.bounded() && r.renderPass.subpass(r.graphics.info.subpass) &&
+        r.vertex.complete && r.fragment.complete && r.graphics.complete &&
         r.set0.count<=frame_pixel_ssbo_clone::MaxBindings && r.layout.count<=frame_pixel_ssbo_clone::MaxPushRanges &&
         r.vertex.bytes==9460 && r.fragment.bytes==6620 && !r.nativeCompatibilityProven &&
         !r.nativeLifetimeProven && !r.runtimeActivationAuthorized;
