@@ -15,6 +15,9 @@
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 #include "pixel_ssbo_definition_journal.h"
 #include "pixel_observation_boundary.h"
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+#include "pixel_ssbo_receiver_bridge.h"
+#endif
 #endif
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
 #include "pixel_uniform_copy.h"
@@ -103,6 +106,9 @@ struct Device {
     FIELD(CreateGraphicsPipelines) FIELD(DestroyPipeline) FIELD(CreateCommandPool)
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     FIELD(CreateRenderPass) FIELD(CreateRenderPass2) FIELD(DestroyRenderPass)
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    FIELD(GetDeviceQueue) FIELD(GetDeviceQueue2) FIELD(CmdDrawIndirectCount) FIELD(CmdDrawIndexedIndirectCount)
+#endif
 #endif
     FIELD(AllocateCommandBuffers) FIELD(FreeCommandBuffers) FIELD(BeginCommandBuffer) FIELD(EndCommandBuffer)
     FIELD(ResetCommandBuffer) FIELD(ResetCommandPool) FIELD(DestroyCommandPool) FIELD(CmdBindPipeline)
@@ -133,7 +139,12 @@ struct Device {
     std::atomic<unsigned> queryRoutesUsed{0};
     std::atomic<SamplerRefusal> samplerRefusal{SamplerRefusal::None};
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    frame_pixel_ssbo_journal::Journal definitions{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
+    frame_pixel_ssbo_receiver::Bridge bridge;
+#else
     frame_pixel_ssbo_journal::Journal definitions;
+#endif
     frame_pixel_observation::Boundary definitionBoundary;
 #endif
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
@@ -245,6 +256,16 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
         static_cast<std::size_t>(d.uniformDispatch.bytes())) && !fsync(uniformOutput);
     close(uniformOutput);if(!uniformWritten){status(progress,"uniform_output_failed");return;}
 #endif
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    frame_pixel_ssbo_transaction::RecordView invocation;
+    const bool ssboReady=d.bridge.publish(view,invocation);
+    if(ssboReady){
+        const int output=frame_pixel_io::create(config,"ssbo-original-invocation.bin");
+        if(output<0){status(progress,"ssbo_output_refused");return;}
+        const bool written=invocation.bytes==128&&frame_pixel_io::writeAll(output,invocation.record,128)&&!fsync(output);
+        close(output);if(!written){status(progress,"ssbo_output_failed");return;}
+    }
+#endif
     const auto& b = d.candidate.binding;
     const auto& conversion = b.view.conversion;
     std::ostringstream record;
@@ -314,6 +335,21 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
     if(!frame_uniform_metadata::append(record,d.candidate,d.uniformDispatch,view,
         d.samplerDispatch.totalBytes(),config.captureId)){status(progress,"uniform_metadata_refused");return;}
+#endif
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    const auto ssbo=d.bridge.snapshot();
+    record<<",\"native_ssbo_control\":{\"available\":"<<(ssboReady?"true":"false")
+          <<",\"reason\":\""<<frame_pixel_ssbo_receiver::refusalName(ssbo.refusal)<<"\",\"transaction_reason\":"<<ssbo.transaction
+          <<",\"draw_kind\":"<<ssbo.drawKind<<",\"draw_ordinal\":"<<ssbo.drawOrdinal<<",\"draw_args\":["<<ssbo.drawArgs[0]<<','<<ssbo.drawArgs[1]<<','<<ssbo.drawArgs[2]<<','<<ssbo.drawArgs[3]<<','<<ssbo.drawArgs[4]<<']'
+          <<",\"submit_route\":"<<ssbo.submitRoute<<",\"submit_batches\":"<<ssbo.submit.batches<<",\"submit_batch\":"<<ssbo.submit.batch<<",\"submit_commands\":"<<ssbo.submit.commandCount
+          <<",\"submit_next_type\":"<<ssbo.submit.nextType<<",\"submit_occurrences\":"<<ssbo.submit.selectedOccurrences<<",\"pool_generation\":"<<ssbo.poolGeneration
+          <<",\"source_executions\":"<<ssbo.sourceExecutions<<",\"paired_execution\":"<<ssbo.pairedExecution
+          <<",\"original_color_expression_preserved\":true,\"native_visual_result_verified\":false,\"sparse_grid32_invocation\":true";
+    if(ssboReady)record<<",\"file\":\"ssbo-original-invocation.bin\",\"bytes\":128,\"sha256\":\""
+          <<frame_pixel_io::digest(static_cast<const std::uint8_t*>(invocation.record),128)<<"\",\"command_generation\":"<<invocation.commandGeneration
+          <<",\"execution\":"<<invocation.execution<<",\"source_cohort\":{\"device\":"<<invocation.source.image.device<<",\"layout\":"<<unsigned(invocation.source.layout)<<",\"extent\":["<<invocation.source.extent.width<<','<<invocation.source.extent.height<<"],\"image\":"<<invocation.source.image.value<<",\"image_generation\":"<<invocation.source.image.generation
+          <<",\"view\":"<<invocation.source.view.value<<",\"view_generation\":"<<invocation.source.view.generation<<",\"memory\":"<<invocation.source.memory.value<<",\"memory_generation\":"<<invocation.source.memory.generation<<'}';
+    record<<",\"native_frame_association_proven\":false,\"physical_eye_proven\":false,\"passthrough_authorized\":false}";
 #endif
     record<<",\"source_frame_associated\":false,\"uv_owned\":false,\"passthrough_authorized\":false}\n";
     const int meta = frame_pixel_io::create(config, "snapshot.json");
@@ -397,6 +433,9 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
     journal::Ready ready;
     if(!d.definitions.takeReady(ready))return;
     ++reportedRecipes;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d.bridge.prepare(ready);
+#endif
     std::ostringstream out;
     out<<"{\"event\":\"ssbo_definition_owned\",\"pipeline_generation\":"<<ready.pipeline.generation
        <<",\"current_at_cold_lookup\":"<<(d.definitions.current(ready.pipeline)?"true":"false")
@@ -411,6 +450,29 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
        <<",\"native_lifetime_lease\":false,\"native_compatibility_proven\":false,\"pipeline_changed\":false,\"mask_enabled\":false}\n";
     const auto text=out.str();
     if(text.size()<=8192)frame_pixel_io::writeAll(fd,text.data(),text.size());
+}
+#endif
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+void bridgeStatus(Device& d,int fd,std::uint64_t& seen) {
+    const auto s=d.bridge.snapshot();
+    const std::uint64_t state=1u|std::uint64_t(s.profile)<<1|std::uint64_t(s.ready)<<2|std::uint64_t(s.learned)<<3|
+        std::uint64_t(s.adopted)<<4|std::uint64_t(s.replaced)<<5|std::uint64_t(s.copy)<<6|std::uint64_t(s.queueKnown)<<7|std::uint64_t(s.refusal)<<8|
+        std::uint64_t(s.transaction)<<16|std::uint64_t(s.cloneStatus)<<24;
+    if(seen==state)return;
+    seen=state;
+    char report[2048]{};const auto n=std::snprintf(report,sizeof(report),
+        "{\"event\":\"ssbo_transaction_state\",\"reason\":\"%s\",\"transaction_reason\":%u,"
+        "\"profile\":%s,\"ready\":%s,\"learned\":%s,\"adopted\":%s,\"replaced\":%s,\"copy\":%s,"
+        "\"queue_create_infos\":%u,\"queue_count\":%u,\"queue_family\":%u,\"queue_retrieved\":%s,\"retrieved_family\":%u,\"retrieved_index\":%u,\"retrieved_queue\":%llu,\"clone_status\":%u,\"clone_stage\":%u,"
+        "\"clone_vk_result\":%d,\"draw_kind\":%u,\"draw_ordinal\":%llu,\"draw_args\":[%u,%u,%u,%u,%u],"
+        "\"submit_route\":%u,\"submit_batches\":%u,\"submit_batch\":%u,\"submit_commands\":%u,\"submit_next_type\":%u,\"submit_occurrences\":%u,"
+        "\"command_generation\":%llu,\"pool_generation\":%llu,\"source_executions\":%llu,\"paired_execution\":%llu,\"original_color_expression_preserved\":true,\"native_visual_result_verified\":false,\"mask_enabled\":false}\n",
+        frame_pixel_ssbo_receiver::refusalName(s.refusal),s.transaction,s.profile?"true":"false",s.ready?"true":"false",
+        s.learned?"true":"false",s.adopted?"true":"false",s.replaced?"true":"false",s.copy?"true":"false",
+        s.queueCreateInfos,s.queueCount,s.queueFamily,s.queueKnown?"true":"false",s.retrievedFamily,s.retrievedIndex,static_cast<unsigned long long>(s.retrievedQueue),s.cloneStatus,s.cloneStage,s.cloneDriver,s.drawKind,static_cast<unsigned long long>(s.drawOrdinal),
+        s.drawArgs[0],s.drawArgs[1],s.drawArgs[2],s.drawArgs[3],s.drawArgs[4],s.submitRoute,s.submit.batches,s.submit.batch,s.submit.commandCount,s.submit.nextType,s.submit.selectedOccurrences,
+        static_cast<unsigned long long>(s.commandGeneration),static_cast<unsigned long long>(s.poolGeneration),static_cast<unsigned long long>(s.sourceExecutions),static_cast<unsigned long long>(s.pairedExecution));
+    if(n>0&&std::size_t(n)<sizeof(report))frame_pixel_io::writeAll(fd,report,std::size_t(n));
 }
 #endif
 void writer(Device* d) noexcept {
@@ -449,6 +511,9 @@ void writer(Device* d) noexcept {
     bool uniformRefusalAnnounced = false;
 #endif
     unsigned announcedQueryRoutes=0;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    std::uint64_t bridgeState=0;
+#endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     bool definitionFeatureReported=false;std::uint64_t definitionReasons=0;unsigned definitionRecipes=0,definitionSets=0;
     std::uint32_t definitionSetSkips=0;
@@ -456,6 +521,10 @@ void writer(Device* d) noexcept {
     try { while (!d->stop.load(std::memory_order_acquire)) {
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
         definitionStatus(*d,progress,definitionFeatureReported,definitionReasons,definitionRecipes,definitionSets,definitionSetSkips);
+#endif
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+        d->bridge.tick(d->definitions);
+        bridgeStatus(*d,progress,bridgeState);
 #endif
         const auto queryRoutes=d->queryRoutesUsed.load(std::memory_order_relaxed);
         if(queryRoutes!=announcedQueryRoutes) {
@@ -476,7 +545,16 @@ void writer(Device* d) noexcept {
             if (!announced) { status(progress,"commands_recorded"); announced=true; }
             frame_pixels::View view;
             const auto result = d->readback.poll(view);
-            if (result == frame_pixels::Status::Complete) { save(*d,view,progress); break; }
+            if (result == frame_pixels::Status::Complete) {
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+                const auto s=d->bridge.snapshot();frame_pixel_ssbo_transaction::RecordView observed;
+                if(s.copy&&s.replaced&&s.refusal==frame_pixel_ssbo_receiver::Refusal::None&&!s.transaction&&!d->bridge.publish(view,observed)){
+                    const auto after=d->bridge.snapshot();
+                    if(after.refusal==frame_pixel_ssbo_receiver::Refusal::None&&!after.transaction){std::this_thread::sleep_for(std::chrono::milliseconds(5));continue;}
+                }
+#endif
+                save(*d,view,progress);break;
+            }
             if (result == frame_pixels::Status::VulkanFailure) { status(progress,"gpu_failure",d->readback.lastResult()); break; }
         }
         const auto samplerRefusal=d->samplerRefusal.load(std::memory_order_relaxed);
@@ -543,8 +621,14 @@ void afterRenderPass(Device* d, VkCommandBuffer command, bool dynamic) {
     Candidate candidate;
     const bool ready = dynamic ? session().tracker->endRendering(d->id,command,candidate)
                                : session().tracker->endRenderPass(d->id,command,candidate);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(ready&&session().armed.load(std::memory_order_acquire))d->bridge.learn(candidate);
+#endif
     if (!ready || !d->ownsCapture || d->selected.load(std::memory_order_acquire) ||
         !session().armed.load(std::memory_order_acquire)) return;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(d->bridge.deferCopy(candidate))return;
+#endif
     const auto& image = candidate.binding.image;
     const auto refuse=[&](SamplerRefusal reason) noexcept {
         auto empty=SamplerRefusal::None;
@@ -617,6 +701,9 @@ void afterRenderPass(Device* d, VkCommandBuffer command, bool dynamic) {
         // Both operations stay within this same valid native primary recording.
         const auto result=d->sampler.record(command,dispatch);
         d->candidate=candidate;d->samplerDispatch=dispatch;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+        d->bridge.copyRecorded(candidate);
+#endif
         d->samplerRecorded=result==frame_pixel_sampler::Status::Ok;
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
         d->uniformDispatch=uniformDispatch;
@@ -669,6 +756,15 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     link->u.pLayerInfo=link->u.pLayerInfo->pNext;
     const auto result=next(physical,info,alloc,out);if(result!=VK_SUCCESS)return result;
     d->native=*out;d->id=++nextDevice;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(session().allowed){
+    VkPhysicalDeviceProperties nativeProperties{};VkPhysicalDeviceMemoryProperties nativeMemory{};
+    reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(i->gipa(i->native,"vkGetPhysicalDeviceProperties"))(physical,&nativeProperties);
+    reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(i->gipa(i->native,"vkGetPhysicalDeviceMemoryProperties"))(physical,&nativeMemory);
+    d->bridge.deviceCreated(*out,*info,d->gdpa,nativeProperties,nativeMemory);
+    session().tracker->ssboDeviceCreated(d->id,*out);
+    }
+#endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     // The successful call's pointers are still readable HERE. This observes
     // enabled state without modifying the native feature/extension request.
@@ -700,6 +796,9 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     LOAD(CreateGraphicsPipelines) LOAD(DestroyPipeline) LOAD(CreateCommandPool)
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     LOAD(CreateRenderPass) LOAD(CreateRenderPass2) LOAD(DestroyRenderPass)
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    LOAD(GetDeviceQueue) LOAD(GetDeviceQueue2) LOAD(CmdDrawIndirectCount) LOAD(CmdDrawIndexedIndirectCount)
+#endif
 #endif
     LOAD(AllocateCommandBuffers) LOAD(FreeCommandBuffers) LOAD(BeginCommandBuffer) LOAD(EndCommandBuffer)
     LOAD(ResetCommandBuffer) LOAD(ResetCommandPool) LOAD(DestroyCommandPool) LOAD(CmdBindPipeline)
@@ -717,6 +816,9 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     ALIAS(CmdBeginRenderPass2,"KHR") ALIAS(CmdNextSubpass2,"KHR") ALIAS(CmdEndRenderPass2,"KHR")
     ALIAS(CmdBeginRendering,"KHR") ALIAS(CmdEndRendering,"KHR") ALIAS(QueueSubmit2,"KHR")
     ALIAS(CmdDispatchBase,"KHR")
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    ALIAS(CmdDrawIndirectCount,"KHR") ALIAS(CmdDrawIndexedIndirectCount,"KHR")
+#endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     ALIAS(CreateRenderPass2,"KHR")
 #endif
@@ -806,22 +908,42 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocation
     // Explicit shutdown only, never a rendering/recording callback. The added
     // completion fence also belongs to this queue, so native fence waits alone
     // cannot be substituted for quiescing our own children before destruction.
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    VkResult ssboIdle=VK_NOT_READY;
+#endif
     const auto state=d->readback.state();
     if(state!=frame_pixels::State::Empty && state!=frame_pixels::State::Released) {
         const auto idle=d->DeviceWaitIdle(device);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+        ssboIdle=idle;
+#endif
         d->sampler.release(idle==VK_SUCCESS || idle==VK_ERROR_DEVICE_LOST);
         d->readback.release(idle==VK_SUCCESS || idle==VK_ERROR_DEVICE_LOST);
     }
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(session().allowed){
+        if(d->bridge.snapshot().ready&&ssboIdle==VK_NOT_READY)ssboIdle=d->DeviceWaitIdle(device);
+        d->bridge.release(ssboIdle);session().tracker->ssboDeviceDestroyed(d->id);
+    }
+#endif
     const auto key=dispatchKey(device);d->DestroyDevice(device,alloc);
     auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.devices.erase(key);
 }
 #define observeBindings(...) observeBindingsAt(__func__, __VA_ARGS__)
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+#define FRAME_PIXEL_COMPUTE_BIND(d,command,point) do { if((point)!=VK_PIPELINE_BIND_POINT_GRAPHICS) { session().tracker->touchComputeState((d)->id,command); (d)->bridge.unknown(command); } } while(false)
+#else
 #define FRAME_PIXEL_COMPUTE_BIND(d,command,point) do { if((point)!=VK_PIPELINE_BIND_POINT_GRAPHICS) session().tracker->touchComputeState((d)->id,command); } while(false)
+#endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 #define FRAME_PIXEL_DEFINITION_SET_CREATED(d,object,info) observeDefinitions(d,[&](auto& definitions){definitions.createSet(object,info,VK_SUCCESS);})
 #define FRAME_PIXEL_DEFINITION_SET_DESTROYED(d,object) observeDefinitions(d,[&](auto& definitions){definitions.destroySet(object);})
 #define FRAME_PIXEL_DEFINITION_LAYOUT_CREATED(d,object,info) observeDefinitions(d,[&](auto& definitions){definitions.createLayout(object,info,VK_SUCCESS);})
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+#define FRAME_PIXEL_DEFINITION_LAYOUT_DESTROYED(d,object) do { (d)->bridge.definitionRetiring(frame_pixel_ssbo_journal::ObjectKind::Layout,frame_pixel_ssbo_clone::handle(object)); observeDefinitions(d,[&](auto& definitions){definitions.destroyLayout(object);}); } while(false)
+#else
 #define FRAME_PIXEL_DEFINITION_LAYOUT_DESTROYED(d,object) observeDefinitions(d,[&](auto& definitions){definitions.destroyLayout(object);})
+#endif
 #endif
 #include "passive_binding_hooks.inc"
 #undef FRAME_PIXEL_DEFINITION_SET_CREATED
@@ -833,6 +955,9 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocation
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateShaderModule(VkDevice device,const VkShaderModuleCreateInfo* info,const VkAllocationCallbacks* alloc,VkShaderModule* out) {
     auto* d=deviceFor(device);const auto result=d->CreateShaderModule(device,info,alloc,out);
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(result==VK_SUCCESS)d->bridge.shaderCreated(*info,d->definitions);
+#endif
     if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){definitions.createShader(*out,*info,result);});
 #endif
     if(result==VK_SUCCESS)session().tracker->createShader(d->id,*out,*info);
@@ -850,15 +975,23 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateGraphicsPipelines(VkDevice device,VkPi
     // Partial success handles are not an admitted diagnostic pipeline.
     if(result==VK_SUCCESS && count<=256)for(std::uint32_t n=0;n<count;++n){
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-        observeDefinitions(d,[&](auto& definitions){definitions.createPipeline(out[n],info[n],result);});
+        frame_pixel_ssbo_journal::Event definitionEvent;
+        observeDefinitions(d,[&](auto& definitions){definitions.createPipeline(out[n],info[n],result,&definitionEvent);});
 #endif
         session().tracker->createPipeline(d->id,out[n],info[n]);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+        if(definitionEvent.reason==frame_pixel_ssbo_journal::Reason::None&&definitionEvent.generation)
+            session().tracker->ssboPipelineCreated(d->id,out[n],{frame_pixel_ssbo_clone::handle(device),definitionEvent.value,definitionEvent.generation});
+#endif
     }
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyPipeline(VkDevice device,VkPipeline pipeline,const VkAllocationCallbacks* alloc) {
     auto* d=deviceFor(device);
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.definitionRetiring(frame_pixel_ssbo_journal::ObjectKind::Pipeline,frame_pixel_ssbo_clone::handle(pipeline));
+#endif
     observeDefinitions(d,[&](auto& definitions){definitions.destroyPipeline(pipeline);});
 #endif
     session().tracker->destroyPipeline(d->id,pipeline);d->DestroyPipeline(device,pipeline,alloc);
@@ -876,7 +1009,11 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass2(VkDevice device,const VkRe
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyRenderPass(VkDevice device,VkRenderPass value,const VkAllocationCallbacks* alloc) {
-    auto* d=deviceFor(device);observeDefinitions(d,[&](auto& definitions){definitions.destroyRenderPass(value);});d->DestroyRenderPass(device,value,alloc);
+    auto* d=deviceFor(device);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.definitionRetiring(frame_pixel_ssbo_journal::ObjectKind::RenderPass,frame_pixel_ssbo_clone::handle(value));
+#endif
+    observeDefinitions(d,[&](auto& definitions){definitions.destroyRenderPass(value);});d->DestroyRenderPass(device,value,alloc);
 }
 #endif
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateCommandPool(VkDevice device,const VkCommandPoolCreateInfo* info,const VkAllocationCallbacks* alloc,VkCommandPool* out) {
@@ -888,7 +1025,13 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyCommandPool(VkDevice device,VkCommandPool
     auto* d=deviceFor(device);
     const auto before=d->selected.load(std::memory_order_acquire)
         ? retiring(d,d->candidate.command,pool) : RetirementTicket{};
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    const auto ssbo=d->bridge.beforeRetirement(frame_pixel_ssbo_transaction::Retirement::DestroyPool,VK_NULL_HANDLE,pool);
+#endif
     d->DestroyCommandPool(device,pool,alloc);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.afterRetirement(ssbo,VK_SUCCESS);
+#endif
     retired(d,before,true);
     session().tracker->destroyCommandPool(d->id,pool);
 }
@@ -896,7 +1039,13 @@ VKAPI_ATTR VkResult VKAPI_CALL traceResetCommandPool(VkDevice device,VkCommandPo
     auto* d=deviceFor(device);
     const auto before=d->selected.load(std::memory_order_acquire)
         ? retiring(d,d->candidate.command,pool) : RetirementTicket{};
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    const auto ssbo=d->bridge.beforeRetirement(frame_pixel_ssbo_transaction::Retirement::ResetPool,VK_NULL_HANDLE,pool);
+#endif
     const auto result=d->ResetCommandPool(device,pool,flags);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.afterRetirement(ssbo,result);
+#endif
     retired(d,before,result==VK_SUCCESS);
     if(result==VK_SUCCESS)session().tracker->resetCommandPool(d->id,pool);
     return result;
@@ -912,44 +1061,91 @@ VKAPI_ATTR void VKAPI_CALL traceFreeCommandBuffers(VkDevice device,VkCommandPool
     if(d->selected.load(std::memory_order_acquire) && count<=512)
         for(std::uint32_t n=0;n<count;++n)
             if(commands[n]==d->candidate.command)before=retiring(d,commands[n],pool);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    frame_pixel_ssbo_receiver::Bridge::RetirementTicket ssbo;
+    if(count<=512)for(std::uint32_t n=0;n<count;++n){d->bridge.forget(commands[n],pool);if(d->bridge.tracks(commands[n]))
+        ssbo=d->bridge.beforeRetirement(frame_pixel_ssbo_transaction::Retirement::FreeCommand,commands[n],pool);}
+#endif
     d->FreeCommandBuffers(device,pool,count,commands);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.afterRetirement(ssbo,VK_SUCCESS);
+#endif
     retired(d,before,true);
     session().tracker->freeCommands(d->id,pool,count,commands);
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceBeginCommandBuffer(VkCommandBuffer command,const VkCommandBufferBeginInfo* info) {
     auto* d=deviceFor(command);
     const auto before=retiring(d,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    const auto ssbo=d->bridge.beforeRetirement(frame_pixel_ssbo_transaction::Retirement::BeginCommand,command);
+#endif
     const auto result=d->BeginCommandBuffer(command,info);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.afterRetirement(ssbo,result);
+#endif
     retired(d,before,result==VK_SUCCESS);
-    session().tracker->beginCommand(d->id,command,*info,result==VK_SUCCESS);return result;
+    session().tracker->beginCommand(d->id,command,*info,result==VK_SUCCESS);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(result==VK_SUCCESS)d->bridge.begin(*session().tracker,d->id,command,session().armed.load(std::memory_order_acquire));
+#endif
+    return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceEndCommandBuffer(VkCommandBuffer command) {
     auto* d=deviceFor(command);const auto result=d->EndCommandBuffer(command);
-    session().tracker->endCommand(d->id,command,result==VK_SUCCESS);return result;
+    session().tracker->endCommand(d->id,command,result==VK_SUCCESS);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.endCommand(command,result);
+#endif
+    return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceResetCommandBuffer(VkCommandBuffer command,VkCommandBufferResetFlags flags) {
     auto* d=deviceFor(command);
     const auto before=retiring(d,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    const auto ssbo=d->bridge.beforeRetirement(frame_pixel_ssbo_transaction::Retirement::ResetCommand,command);
+#endif
     const auto result=d->ResetCommandBuffer(command,flags);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.afterRetirement(ssbo,result);
+#endif
     retired(d,before,result==VK_SUCCESS);
     if(result==VK_SUCCESS)session().tracker->resetCommand(d->id,command);
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBindPipeline(VkCommandBuffer command,VkPipelineBindPoint point,VkPipeline pipeline) {
-    auto* d=deviceFor(command);session().tracker->bindPipeline(d->id,command,point,pipeline);d->CmdBindPipeline(command,point,pipeline);
+    auto* d=deviceFor(command);session().tracker->bindPipeline(d->id,command,point,pipeline);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(point==VK_PIPELINE_BIND_POINT_GRAPHICS)d->bridge.pipeline(command,pipeline);else d->bridge.unknown(command);
+#endif
+    d->CmdBindPipeline(command,point,pipeline);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBindShadersEXT(VkCommandBuffer command,std::uint32_t count,const VkShaderStageFlagBits* stages,const VkShaderEXT* shaders) {
     auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
     d->CmdBindShadersEXT(command,count,stages,shaders);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDispatch(VkCommandBuffer command,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
-    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);d->CmdDispatch(command,x,y,z);
+    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdDispatch(command,x,y,z);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDispatchIndirect(VkCommandBuffer command,VkBuffer buffer,VkDeviceSize offset) {
-    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);d->CmdDispatchIndirect(command,buffer,offset);
+    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdDispatchIndirect(command,buffer,offset);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDispatchBase(VkCommandBuffer command,std::uint32_t bx,std::uint32_t by,std::uint32_t bz,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
-    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);d->CmdDispatchBase(command,bx,by,bz,x,y,z);
+    auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdDispatchBase(command,bx,by,bz,x,y,z);
 }
 // Queries must begin/end in their own command buffer; accepted primaries cannot
 // inherit them and never execute secondary recordings. Refuse every recording
@@ -959,11 +1155,17 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDispatchBase(VkCommandBuffer command,std::uin
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginQuery(VkCommandBuffer command,VkQueryPool pool,std::uint32_t query,VkQueryControlFlags flags) {
     auto* d=deviceFor(command);
     if(session().tracker->touchComputeState(d->id,command))d->queryRoutesUsed.fetch_or(1u,std::memory_order_relaxed);
+    #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
     d->CmdBeginQuery(command,pool,query,flags);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginQueryIndexedEXT(VkCommandBuffer command,VkQueryPool pool,std::uint32_t query,VkQueryControlFlags flags,std::uint32_t index) {
     auto* d=deviceFor(command);
     if(session().tracker->touchComputeState(d->id,command))d->queryRoutesUsed.fetch_or(2u,std::memory_order_relaxed);
+    #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
     d->CmdBeginQueryIndexedEXT(command,pool,query,flags,index);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDraw(VkCommandBuffer command,std::uint32_t vertices,std::uint32_t instances,std::uint32_t firstVertex,std::uint32_t firstInstance) {
@@ -974,6 +1176,9 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDraw(VkCommandBuffer command,std::uint32_t ve
     session().tracker->draw(d->id,command,limits,vertices && instances);
 #else
     if(vertices && instances)session().tracker->draw(d->id,command);
+#endif
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(d->bridge.draw(*session().tracker,d->id,command,vertices,instances,firstVertex,firstInstance,0,false))return;
 #endif
     d->CmdDraw(command,vertices,instances,firstVertex,firstInstance);
 }
@@ -986,40 +1191,87 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexed(VkCommandBuffer command,std::uint
 #else
     if(indices && instances)session().tracker->draw(d->id,command);
 #endif
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(d->bridge.draw(*session().tracker,d->id,command,indices,instances,firstIndex,firstInstance,vertexOffset,true))return;
+#endif
     d->CmdDrawIndexed(command,indices,instances,firstIndex,vertexOffset,firstInstance);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirect(VkCommandBuffer command,VkBuffer buffer,VkDeviceSize offset,std::uint32_t count,std::uint32_t stride) {
-    auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);d->CmdDrawIndirect(command,buffer,offset,count,stride);
+    auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdDrawIndirect(command,buffer,offset,count,stride);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirect(VkCommandBuffer command,VkBuffer buffer,VkDeviceSize offset,std::uint32_t count,std::uint32_t stride) {
-    auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);d->CmdDrawIndexedIndirect(command,buffer,offset,count,stride);
+    auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdDrawIndexedIndirect(command,buffer,offset,count,stride);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdExecuteCommands(VkCommandBuffer command,std::uint32_t count,const VkCommandBuffer* children) {
-    auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);d->CmdExecuteCommands(command,count,children);
+    auto* d=deviceFor(command);session().tracker->unknownCommand(d->id,command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdExecuteCommands(command,count,children);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass(VkCommandBuffer command,const VkRenderPassBeginInfo* info,VkSubpassContents contents) {
-    auto* d=deviceFor(command);session().tracker->beginRenderPass(d->id,command,contents);d->CmdBeginRenderPass(command,info,contents);
+    auto* d=deviceFor(command);session().tracker->beginRenderPass(d->id,command,contents);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.beginPass(command,info->renderPass,contents);
+#endif
+    d->CmdBeginRenderPass(command,info,contents);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass(VkCommandBuffer command,VkSubpassContents contents) {
-    auto* d=deviceFor(command);session().tracker->nextSubpass(d->id,command,contents);d->CmdNextSubpass(command,contents);
+    auto* d=deviceFor(command);session().tracker->nextSubpass(d->id,command,contents);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdNextSubpass(command,contents);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass(VkCommandBuffer command) {
-    auto* d=deviceFor(command);d->CmdEndRenderPass(command);afterRenderPass(d,command,false);
+    auto* d=deviceFor(command);d->CmdEndRenderPass(command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.endPass(command);
+#endif
+    afterRenderPass(d,command,false);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2(VkCommandBuffer command,const VkRenderPassBeginInfo* info,const VkSubpassBeginInfo* begin) {
-    auto* d=deviceFor(command);session().tracker->beginRenderPass(d->id,command,begin->contents);d->CmdBeginRenderPass2(command,info,begin);
+    auto* d=deviceFor(command);session().tracker->beginRenderPass(d->id,command,begin->contents);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdBeginRenderPass2(command,info,begin);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdNextSubpass2(VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);session().tracker->nextSubpass(d->id,command,begin->contents);d->CmdNextSubpass2(command,begin,end);
+    auto* d=deviceFor(command);session().tracker->nextSubpass(d->id,command,begin->contents);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdNextSubpass2(command,begin,end);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRenderPass2(VkCommandBuffer command,const VkSubpassEndInfo* end) {
-    auto* d=deviceFor(command);d->CmdEndRenderPass2(command,end);afterRenderPass(d,command,false);
+    auto* d=deviceFor(command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdEndRenderPass2(command,end);afterRenderPass(d,command,false);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdBeginRendering(VkCommandBuffer command,const VkRenderingInfo* info) {
-    auto* d=deviceFor(command);session().tracker->beginRendering(d->id,command,*info);d->CmdBeginRendering(command,info);
+    auto* d=deviceFor(command);session().tracker->beginRendering(d->id,command,*info);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdBeginRendering(command,info);
 }
 VKAPI_ATTR void VKAPI_CALL traceCmdEndRendering(VkCommandBuffer command) {
-    auto* d=deviceFor(command);d->CmdEndRendering(command);afterRenderPass(d,command,true);
+    auto* d=deviceFor(command);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unknown(command);
+#endif
+    d->CmdEndRendering(command);afterRenderPass(d,command,true);
 }
 template<class Info,class Count,class Command> SubmitTicket ticket(Device* d,std::uint32_t count,const Info* info,Count commandCount,Command command) {
     if(!d->ownsCapture || !d->selected.load(std::memory_order_acquire) || d->readback.state()!=frame_pixels::State::Recorded || count>32)return {};
@@ -1045,18 +1297,84 @@ void submitted(Device* d,VkQueue queue,const SubmitTicket& before,VkResult nativ
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit(VkQueue queue,std::uint32_t count,const VkSubmitInfo* info,VkFence fence) {
     auto* d=deviceFor(queue);const auto before=ticket(d,count,info,[](const auto& i){return i.commandBufferCount;},[](const auto& i,std::uint32_t n){return i.pCommandBuffers[n];});
-    const auto result=d->QueueSubmit(queue,count,info,fence);submitted(d,queue,before,result);return result;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    const auto ssbo=d->bridge.beforeSubmit(queue,count,info);
+#endif
+    const auto result=d->QueueSubmit(queue,count,info,fence);submitted(d,queue,before,result);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.afterSubmit(ssbo,queue,count,info,result);
+#endif
+    return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL traceQueueSubmit2(VkQueue queue,std::uint32_t count,const VkSubmitInfo2* info,VkFence fence) {
     auto* d=deviceFor(queue);const auto before=ticket(d,count,info,[](const auto& i){return i.commandBufferInfoCount;},[](const auto& i,std::uint32_t n){return i.pCommandBufferInfos[n].commandBuffer;});
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d->bridge.unsupportedSubmit(queue,count,info);
+#endif
     const auto result=d->QueueSubmit2(queue,count,info,fence);submitted(d,queue,before,result);return result;
 }
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+VKAPI_ATTR void VKAPI_CALL traceGetDeviceQueue(VkDevice device,std::uint32_t family,std::uint32_t index,VkQueue* out){
+    auto* d=deviceFor(device);d->GetDeviceQueue(device,family,index,out);d->bridge.queueRetrieved(family,index,*out);
+}
+VKAPI_ATTR void VKAPI_CALL traceGetDeviceQueue2(VkDevice device,const VkDeviceQueueInfo2* info,VkQueue* out){
+    auto* d=deviceFor(device);d->GetDeviceQueue2(device,info,out);
+    d->bridge.queueRetrieved(info->queueFamilyIndex,info->queueIndex,*out,info->sType==VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2&&!info->pNext&&!info->flags);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndirectCount(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){
+    auto* d=deviceFor(c);session().tracker->unknownCommand(d->id,c);d->bridge.unknown(c);d->CmdDrawIndirectCount(c,buffer,offset,counts,countOffset,count,stride);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdDrawIndexedIndirectCount(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkBuffer counts,VkDeviceSize countOffset,std::uint32_t count,std::uint32_t stride){
+    auto* d=deviceFor(c);session().tracker->unknownCommand(d->id,c);d->bridge.unknown(c);d->CmdDrawIndexedIndirectCount(c,buffer,offset,counts,countOffset,count,stride);
+}
+VKAPI_ATTR void VKAPI_CALL bridgeDestroyImage(VkDevice device,VkImage value,const VkAllocationCallbacks* alloc){
+    auto* d=deviceFor(device);d->bridge.resourceRetiring(frame_pixel_ssbo_transaction::Resource::Image,frame_pixel_ssbo_clone::handle(value));traceDestroyImage(device,value,alloc);
+}
+VKAPI_ATTR void VKAPI_CALL bridgeDestroyImageView(VkDevice device,VkImageView value,const VkAllocationCallbacks* alloc){
+    auto* d=deviceFor(device);d->bridge.resourceRetiring(frame_pixel_ssbo_transaction::Resource::View,frame_pixel_ssbo_clone::handle(value));traceDestroyImageView(device,value,alloc);
+}
+VKAPI_ATTR void VKAPI_CALL bridgeFreeMemory(VkDevice device,VkDeviceMemory value,const VkAllocationCallbacks* alloc){
+    auto* d=deviceFor(device);d->bridge.resourceRetiring(frame_pixel_ssbo_transaction::Resource::Memory,frame_pixel_ssbo_clone::handle(value));traceFreeMemory(device,value,alloc);
+}
+VKAPI_ATTR void VKAPI_CALL bridgeUpdateDescriptorSets(VkDevice device,std::uint32_t count,const VkWriteDescriptorSet* writes,std::uint32_t copies,const VkCopyDescriptorSet* copy){
+    auto* d=deviceFor(device);
+    if(count>256||copies>256)d->bridge.descriptorMutation();
+    else {for(std::uint32_t i=0;i<count;++i)d->bridge.descriptorMutation(writes[i].dstSet);for(std::uint32_t i=0;i<copies;++i)d->bridge.descriptorMutation(copy[i].dstSet);}
+    traceUpdateDescriptorSets(device,count,writes,copies,copy);
+}
+VKAPI_ATTR void VKAPI_CALL bridgeUpdateDescriptorSetWithTemplate(VkDevice device,VkDescriptorSet set,VkDescriptorUpdateTemplate update,const void* data){
+    deviceFor(device)->bridge.descriptorMutation(set);traceUpdateDescriptorSetWithTemplate(device,set,update,data);
+}
+VKAPI_ATTR VkResult VKAPI_CALL bridgeFreeDescriptorSets(VkDevice device,VkDescriptorPool pool,std::uint32_t count,const VkDescriptorSet* sets){
+    auto* d=deviceFor(device);if(count>512)d->bridge.descriptorMutation();else for(std::uint32_t i=0;i<count;++i)d->bridge.descriptorMutation(sets[i]);
+    return traceFreeDescriptorSets(device,pool,count,sets);
+}
+VKAPI_ATTR VkResult VKAPI_CALL bridgeResetDescriptorPool(VkDevice device,VkDescriptorPool pool,VkDescriptorPoolResetFlags flags){
+    auto* d=deviceFor(device);d->bridge.descriptorPoolRetiring(*session().tracker,d->id,pool);return traceResetDescriptorPool(device,pool,flags);
+}
+VKAPI_ATTR void VKAPI_CALL bridgeDestroyDescriptorPool(VkDevice device,VkDescriptorPool pool,const VkAllocationCallbacks* alloc){
+    auto* d=deviceFor(device);d->bridge.descriptorPoolRetiring(*session().tracker,d->id,pool);traceDestroyDescriptorPool(device,pool,alloc);
+}
+#endif
 PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
     if(!native || !session().allowed)return native;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(!std::strcmp(name,"vkDestroyImage"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeDestroyImage);
+    if(!std::strcmp(name,"vkDestroyImageView"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeDestroyImageView);
+    if(!std::strcmp(name,"vkFreeMemory"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeFreeMemory);
+    if(!std::strcmp(name,"vkUpdateDescriptorSets"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeUpdateDescriptorSets);
+    if(!std::strcmp(name,"vkUpdateDescriptorSetWithTemplate")||!std::strcmp(name,"vkUpdateDescriptorSetWithTemplateKHR"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeUpdateDescriptorSetWithTemplate);
+    if(!std::strcmp(name,"vkFreeDescriptorSets"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeFreeDescriptorSets);
+    if(!std::strcmp(name,"vkResetDescriptorPool"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeResetDescriptorPool);
+    if(!std::strcmp(name,"vkDestroyDescriptorPool"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeDestroyDescriptorPool);
+#endif
 #define HOOK(method) if(!std::strcmp(name,"vk" #method))return reinterpret_cast<PFN_vkVoidFunction>(trace##method);
     HOOK(CreateShaderModule) HOOK(DestroyShaderModule) HOOK(CreateGraphicsPipelines) HOOK(DestroyPipeline)
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     HOOK(CreateRenderPass) HOOK(CreateRenderPass2) HOOK(DestroyRenderPass)
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    HOOK(GetDeviceQueue) HOOK(GetDeviceQueue2) HOOK(CmdDrawIndirectCount) HOOK(CmdDrawIndexedIndirectCount)
+#endif
     if(!std::strcmp(name,"vkCreateRenderPass2KHR"))return reinterpret_cast<PFN_vkVoidFunction>(traceCreateRenderPass2);
 #endif
     HOOK(CreateCommandPool) HOOK(DestroyCommandPool) HOOK(ResetCommandPool)
@@ -1079,6 +1397,9 @@ PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
     ALIAS("vkCmdBeginRenderPass2KHR",CmdBeginRenderPass2) ALIAS("vkCmdNextSubpass2KHR",CmdNextSubpass2) ALIAS("vkCmdEndRenderPass2KHR",CmdEndRenderPass2)
     ALIAS("vkCmdBeginRenderingKHR",CmdBeginRendering) ALIAS("vkCmdEndRenderingKHR",CmdEndRendering) ALIAS("vkQueueSubmit2KHR",QueueSubmit2)
     ALIAS("vkCmdDispatchBaseKHR",CmdDispatchBase)
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    ALIAS("vkCmdDrawIndirectCountKHR",CmdDrawIndirectCount) ALIAS("vkCmdDrawIndexedIndirectCountKHR",CmdDrawIndexedIndirectCount)
+#endif
 #undef ALIAS
     return native;
 }
