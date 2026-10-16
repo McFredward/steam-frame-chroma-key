@@ -29,6 +29,7 @@ namespace {
 using Bridge=frame_pixel_ssbo_receiver::Bridge;
 namespace tx=frame_pixel_ssbo_transaction;
 unsigned expectedPrefixBindings=6;
+Bridge* failHistoryOnCreate=nullptr;
 struct Calls {unsigned resets=0,draws=0,indexed=0,markers=0,fences=0;bool signaled=true;} calls;
 VKAPI_ATTR void VKAPI_CALL mockBarrier(VkCommandBuffer,VkPipelineStageFlags,VkPipelineStageFlags,VkDependencyFlags,
     std::uint32_t,const VkMemoryBarrier*,std::uint32_t,const VkBufferMemoryBarrier*,std::uint32_t,const VkImageMemoryBarrier*){}
@@ -46,6 +47,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockStatus(VkDevice,VkFence){return calls.signale
 VKAPI_ATTR VkResult VKAPI_CALL mockSubmit(VkQueue,std::uint32_t,const VkSubmitInfo*,VkFence){++calls.markers;return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL mockSet(VkDevice d,const VkDescriptorSetLayoutCreateInfo* ci,const VkAllocationCallbacks* a,VkDescriptorSetLayout* out){
     owned_fixture::common(d,a);const bool first=!owned_fixture::driver->set0;
+    if(first && failHistoryOnCreate){auto* bridge=failHistoryOnCreate;failHistoryOnCreate=nullptr;bridge->definitionObservationFailed();}
     require(first?ci->bindingCount==expectedPrefixBindings:ci->bindingCount==1,"original retained prefix vs owned storage Set1");
     const auto result=owned_fixture::driver->create(first?frame_pixel_ssbo_owned::Stage::Set0:frame_pixel_ssbo_owned::Stage::Set1,out);
     if(result==VK_SUCCESS)(first?owned_fixture::driver->set0:owned_fixture::driver->set1)=*out;
@@ -68,8 +70,16 @@ void publicGuards(){
     require(observed.refusal==frame_pixel_ssbo_receiver::Refusal::Device&&observed.queueCount==2,"actual two-queue request refused and retained, never inferred single queue");
     require(!b.publish(absent,output)&&!observed.ready,"failed actual shape grants no clone or callback work");
 }
+void historyGuards(){
+    Bridge b;b.definitionObservationFailed();const auto first=b.snapshot();
+    require(first.refusal==frame_pixel_ssbo_receiver::Refusal::DefinitionHistory && !std::strcmp(frame_pixel_ssbo_receiver::refusalName(first.refusal),"definition_history"),"missing history has explicit named sticky refusal");
+    b.definitionObservationFailed();require(b.snapshot().cancellationEpoch==first.cancellationEpoch && first.cancellationEpoch==1,"repeated failed callbacks do not restart cancellation generations");
+    tx::RecordView output;frame_pixels::View absent;require(!b.publish(absent,output) && !output.record,"unprepared incomplete history cannot publish");
+    Bridge earlier;auto ci=info<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);earlier.deviceCreated(h<VkDevice>(1),ci,nullptr,{},{});earlier.definitionObservationFailed();
+    require(earlier.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::Device,"history failure never overwrites an earlier permanent refusal");
+}
 void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned mode){
-    calls={};expectedPrefixBindings=6;owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;
+    calls={};failHistoryOnCreate=nullptr;expectedPrefixBindings=6;owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;
     driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
     owned_fixture::Fixture limits;
     auto native=std::make_unique<Fixture>(true,0,VK_COMMAND_BUFFER_LEVEL_PRIMARY,0,true);
@@ -99,7 +109,26 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     b.tick(journal);require(!b.snapshot().ready&&!driver.calls,"no arbitrary first-created recipe prepared before actual candidate selection");
     const auto learned=native->finishPass();require(!learned.oneTimeSubmit&&learned.retirementRequired,"serial replay control uses flags0 reusable native command recording");
     b.learn(learned);b.tick(journal);require(!b.snapshot().ready&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None,"exact selected recipe waits for later actual queue retrieval");
-    b.queueRetrieved(3,0,h<VkQueue>(2));b.tick(journal);require(b.snapshot().ready&&driver.calls&&calls.fences==1,"late actual queue retrieval completes the exact selected cold recipe");
+    if(mode==5){
+        b.definitionObservationFailed();b.queueRetrieved(3,0,h<VkQueue>(2));b.tick(journal);
+        require(!b.snapshot().ready && !driver.calls && b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::DefinitionHistory,"failed history before preparation prevents every owned driver create");
+        require(native->tracker.beginCommand(device,cb,native->beginInfo,true),"native recording may continue after cold history refusal");b.begin(native->tracker,device,cb,true);
+        require(!calls.resets && !b.tracks(cb) && !b.draw(native->tracker,device,cb,6,1,0,0,0,true),"refused unprepared history cannot adopt or replace original draw");
+        require(b.release(VK_SUCCESS) && driver.live.empty() && !calls.fences,"unprepared history refusal retains ordinary safe release");return;
+    }
+    if(mode==9)failHistoryOnCreate=&b;
+    b.queueRetrieved(3,0,h<VkQueue>(2));b.tick(journal);
+    if(mode==9){
+        require(!b.snapshot().ready && driver.calls && driver.live.empty() && !calls.fences && b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::DefinitionHistory,"history failure inside cold driver preparation releases unused children before configure");
+        require(b.release(VK_SUCCESS) && driver.live.empty(),"cancelled preparation never leaks or double releases children");return;
+    }
+    require(b.snapshot().ready&&driver.calls&&calls.fences==1,"late actual queue retrieval completes the exact selected cold recipe");
+    if(mode==6){
+        const auto created=driver.calls;b.definitionObservationFailed();b.tick(journal);
+        require(native->tracker.beginCommand(device,cb,native->beginInfo,true),"next original Begin still succeeds after prepared history loss");b.begin(native->tracker,device,cb,true);
+        require(b.snapshot().ready && b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::DefinitionHistory && driver.calls==created && !calls.resets && !b.tracks(cb),"owned ready resources remain releasable but cannot adopt a new generation");
+        require(b.release(VK_SUCCESS) && driver.live.empty() && !calls.fences,"prepared history loss preserves explicit device idle and release");return;
+    }
     require(!calls.resets,"selected completed candidate never injects into its already-ended scope");
     require(native->tracker.beginCommand(device,cb,native->beginInfo,true),"next original successful native Begin");
     b.begin(native->tracker,device,cb,false);require(!calls.resets,"explicit manual arm required");
@@ -114,6 +143,13 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     native->tracker.draw(device,cb,nullptr,false);require(!b.draw(native->tracker,device,cb,0,1,0,0,0,true),"zero-count preceding indexed draw preserves matching observed ordinals");
     native->tracker.draw(device,cb);require(!b.draw(native->tracker,device,cb,3,1,0,0,0,false),"preceding UI draw remains native and uninstrumented");
     native->bind();b.pipeline(cb,pipeline);native->tracker.draw(device,cb);
+    if(mode==7){
+        b.definitionObservationFailed();
+        require(!b.draw(native->tracker,device,cb,6,1,0,0,-3,true) && !calls.indexed && !calls.draws,"history loss after adoption leaves target draw to original caller");
+        require(b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::DefinitionHistory && calls.resets==1,"one prior reset does not grant permission after history loss");
+        const auto retirement=b.beforeRetirement(tx::Retirement::ResetCommand,cb);b.afterRetirement(retirement,VK_SUCCESS);require(!b.tracks(cb),"failed history still retires exact adopted command generation");
+        require(b.release(VK_SUCCESS) && driver.live.empty() && !calls.fences,"adopted history loss does not loosen retirement or leak owned resources");return;
+    }
     require(b.draw(native->tracker,device,cb,6,1,0,0,-3,true)&&calls.indexed==1&&!calls.draws,"one exact indexed target replaced once with original args, never duplicated");
     require(native->tracker.observe([&](auto& core){auto pool=info<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);pool.maxSets=1;core.createPool(device,h<VkDescriptorPool>(999),pool);}),"observe independent unrelated original descriptor pool");
     b.descriptorPoolRetiring(native->tracker,device,h<VkDescriptorPool>(999));b.descriptorMutation(uiDs);b.resourceRetiring(tx::Resource::Image,999);
@@ -132,7 +168,11 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     require(!b.publish(source,record),"raw retirement observer alone cannot race the still-open bridge generation");
     const auto ticket=b.beforeRetirement(tx::Retirement::BeginCommand,cb);b.afterRetirement(ticket,VK_SUCCESS);
     require(!b.tracks(cb),"exact old generation closes synchronously before native caller can reuse same raw CB");
-    if(mode==0){
+    if(mode==8){
+        b.definitionObservationFailed();const auto markers=calls.markers;
+        require(!b.publish(source,record) && !record.record && !record.bytes && b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::DefinitionHistory,"retired otherwise-complete record cannot publish after missing definition history");
+        b.definitionObservationFailed();require(!b.publish(source,record) && calls.markers==markers,"repeated late history failure neither publishes bytes nor submits work");
+    }else if(mode==0){
         require(b.publish(source,record)&&record.execution==2,"independently counted final raw-copy replay matches original-invocation SSBO execution");
         require(native->tracker.beginCommand(device,cb,native->beginInfo,true),"replacement generation legitimately reuses native raw handle");
         b.pipeline(cb,pipeline);b.descriptorMutation(ds);b.resourceRetiring(tx::Resource::Image,frame_bindings::handle(image));
@@ -210,8 +250,9 @@ void privateVariantSelection(const char* vertexPath,const char* fragmentPath,uns
 }
 }
 int main(int argc,char** argv){
+    if(argc==4&&std::strcmp(argv[1],"--history-only")==0){historyGuards();for(unsigned mode=5;mode<=9;++mode)privateCallbacks(argv[2],argv[3],mode);std::cout<<"{\"scope\":\"definition-history-cancellation-subset,fake-dispatch\",\"checks\":"<<checks.load()<<",\"native_authority\":false,\"actual_r2_cause\":false}\n";return 0;}
     if(argc==4&&std::strcmp(argv[1],"--variants-only")==0){privateVariantSelection(argv[2],argv[3],4,false);privateVariantSelection(argv[2],argv[3],5,false);privateVariantSelection(argv[2],argv[3],5,true);std::cout<<"{\"scope\":\"private-pipeline-selection-subset, fake dispatch only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
-    publicGuards();require(argc==1||argc==3,"optional private original VS/PS only");
+    publicGuards();historyGuards();require(argc==1||argc==3,"optional private original VS/PS only");
     if(argc==3){for(unsigned mode=0;mode<5;++mode)privateCallbacks(argv[1],argv[2],mode);privateVariantSelection(argv[1],argv[2],4,false);privateVariantSelection(argv[1],argv[2],5,false);privateVariantSelection(argv[1],argv[2],5,true);}
     std::cout<<"{\"scope\":\"owned callback simulation; not native/GPU authority\",\"checks\":"<<checks.load()<<",\"private_pins_tested\":"<<(argc==3?"true":"false")<<",\"passthrough_authorized\":false}\n";
 }
