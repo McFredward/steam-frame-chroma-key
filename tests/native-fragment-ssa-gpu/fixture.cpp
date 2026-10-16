@@ -191,17 +191,23 @@ struct Gpu {
         si.addressModeU=si.addressModeV=si.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;check(vkCreateSampler(device,&si,nullptr,&sampler));
         VkDescriptorSetLayoutBinding bindings[4]{{4,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
             {6,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-            {9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+            {9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,3,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
             {25,VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
         VkDescriptorSetLayoutCreateInfo l{};l.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;l.bindingCount=4;l.pBindings=bindings;check(vkCreateDescriptorSetLayout(device,&l,nullptr,&descriptorLayout));
-        VkDescriptorPoolSize sizes[3]{{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1},{VK_DESCRIPTOR_TYPE_SAMPLER,1}};
+        VkDescriptorPoolSize sizes[3]{{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,3},{VK_DESCRIPTOR_TYPE_SAMPLER,1}};
         VkDescriptorPoolCreateInfo p{};p.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;p.poolSizeCount=3;p.pPoolSizes=sizes;p.maxSets=1;check(vkCreateDescriptorPool(device,&p,nullptr,&descriptorPool));
         VkDescriptorSetAllocateInfo a{};a.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;a.descriptorPool=descriptorPool;a.descriptorSetCount=1;a.pSetLayouts=&descriptorLayout;check(vkAllocateDescriptorSets(device,&a,&set));
         VkDescriptorBufferInfo bi[2]{{buffers[b4].value,0,272},{buffers[b6].value,0,2800}};
-        VkDescriptorImageInfo ii[2]{{VK_NULL_HANDLE,images[source].view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{sampler,VK_NULL_HANDLE,VK_IMAGE_LAYOUT_UNDEFINED}};
+        // The original declares three sampled images. All entries intentionally
+        // reference the same owned source; this fixture does not prove which
+        // native source index is selected or that native sources are equivalent.
+        VkDescriptorImageInfo ii[4]{{VK_NULL_HANDLE,images[source].view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE,images[source].view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {VK_NULL_HANDLE,images[source].view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {sampler,VK_NULL_HANDLE,VK_IMAGE_LAYOUT_UNDEFINED}};
         VkWriteDescriptorSet writes[4]{};
-        for(unsigned i=0;i<4;++i){writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;writes[i].dstSet=set;writes[i].dstBinding=bindings[i].binding;writes[i].descriptorCount=1;writes[i].descriptorType=bindings[i].descriptorType;
-            if(i<2)writes[i].pBufferInfo=&bi[i];else writes[i].pImageInfo=&ii[i-2];}
+        for(unsigned i=0;i<4;++i){writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;writes[i].dstSet=set;writes[i].dstBinding=bindings[i].binding;writes[i].descriptorCount=bindings[i].descriptorCount;writes[i].descriptorType=bindings[i].descriptorType;
+            if(i<2)writes[i].pBufferInfo=&bi[i];else writes[i].pImageInfo=&ii[i==2?0:3];}
         vkUpdateDescriptorSets(device,4,writes,0,nullptr);
         VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT,0,16};
         VkPipelineLayoutCreateInfo pl{};pl.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;pl.setLayoutCount=1;pl.pSetLayouts=&descriptorLayout;pl.pushConstantRangeCount=1;pl.pPushConstantRanges=&push;
@@ -242,9 +248,15 @@ struct Gpu {
         VkPipeline out{};check(vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&p,nullptr,&out));return out;
     }
     void pipelines(const char* vp,const char* originalPath,const char* probePath){
-        const auto vertex=module(shader(vp));const auto old=module(shader(originalPath));const auto instrumented=module(shader(probePath));
-        try{original=pipeline(vertex,old);probe=pipeline(vertex,instrumented);}catch(...){vkDestroyShaderModule(device,instrumented,nullptr);vkDestroyShaderModule(device,old,nullptr);vkDestroyShaderModule(device,vertex,nullptr);throw;}
-        vkDestroyShaderModule(device,instrumented,nullptr);vkDestroyShaderModule(device,old,nullptr);vkDestroyShaderModule(device,vertex,nullptr);
+        VkShaderModule vertex{}, old{}, instrumented{};
+        auto release=[&]{
+            for(auto value:{instrumented,old,vertex})if(value)vkDestroyShaderModule(device,value,nullptr);
+        };
+        try{
+            vertex=module(shader(vp));old=module(shader(originalPath));instrumented=module(shader(probePath));
+            original=pipeline(vertex,old);probe=pipeline(vertex,instrumented);
+        }catch(...){release();throw;}
+        release();
     }
     std::array<std::uint32_t,20> draw(const Case& c,VkPipeline which){
         std::memset(buffers[b4].mapped,0,272);std::memset(buffers[b6].mapped,0,2800);
