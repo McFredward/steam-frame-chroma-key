@@ -305,6 +305,11 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:test_pixel_snapshot_layer> $<TARGET_FILE:VkLayer_frame_pixel_snapshot>
                 ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json)
             set_tests_properties(pixel_snapshot_real_loader PROPERTIES TIMEOUT 90)
+            add_test(NAME pixel_snapshot_query_loader COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_snapshot_layer.py
+                $<TARGET_FILE:test_pixel_snapshot_layer> $<TARGET_FILE:VkLayer_frame_pixel_snapshot>
+                ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json --statistics-only)
+            set_tests_properties(pixel_snapshot_query_loader PROPERTIES TIMEOUT 90)
         endif()
         add_executable(test_compositor_bootstrap tests/test_compositor_bootstrap.cpp
             import/compositor_main_preparation.cpp import/import_main_preparation.cpp

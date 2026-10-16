@@ -77,7 +77,7 @@ enum class SamplerRefusal : unsigned { None, Device, ComputeState, Queue, Format
 const char* refusalName(SamplerRefusal refusal) noexcept {
     switch(refusal) {
     case SamplerRefusal::Device:return "device_not_admitted";
-    case SamplerRefusal::ComputeState:return "prior_compute_state";
+    case SamplerRefusal::ComputeState:return "prior_compute_or_query_state";
     case SamplerRefusal::Queue:return "queue_without_compute";
     case SamplerRefusal::Format:return "unqueried_native_image_profile";
     case SamplerRefusal::Extent:return "extent_outside_reader_budget";
@@ -98,6 +98,7 @@ struct Device {
     FIELD(CmdDraw) FIELD(CmdDrawIndexed) FIELD(CmdDrawIndirect) FIELD(CmdDrawIndexedIndirect)
     FIELD(CmdBindShadersEXT)
     FIELD(CmdDispatch) FIELD(CmdDispatchIndirect) FIELD(CmdDispatchBase)
+    FIELD(CmdBeginQuery) FIELD(CmdBeginQueryIndexedEXT)
     FIELD(CmdExecuteCommands) FIELD(CmdBeginRenderPass) FIELD(CmdNextSubpass) FIELD(CmdEndRenderPass)
     FIELD(CmdBeginRenderPass2) FIELD(CmdNextSubpass2) FIELD(CmdEndRenderPass2)
     FIELD(CmdBeginRendering) FIELD(CmdEndRendering) FIELD(QueueSubmit) FIELD(QueueSubmit2)
@@ -115,8 +116,10 @@ struct Device {
     bool nativeComputeQueue = false;
     std::uint32_t instanceApiVersion = 0;
     char unreviewedExtension[VK_MAX_EXTENSION_NAME_SIZE]{};
-    VkResult samplerPrepareResult = VK_ERROR_FEATURE_NOT_PRESENT;
+    VkResult samplerPrepareResult = VK_NOT_READY; // No driver call until samplerPrepareAttempted.
+    bool samplerPrepareAttempted = false;
     bool samplerRecorded = false;
+    std::atomic<unsigned> queryRoutesUsed{0};
     std::atomic<SamplerRefusal> samplerRefusal{SamplerRefusal::None};
     Candidate candidate{};
     std::thread writer;
@@ -248,20 +251,44 @@ void writer(Device* d) noexcept {
     if (progress < 0 || flock(progress,LOCK_EX|LOCK_NB)) { if(progress>=0)close(progress); return; }
     // One cold background record. It must explain a refused preparation before
     // asking the maintainer to start a stream; never emit per-frame diagnostics.
-    char preparation[1024]{};
+    char preparation[2048]{};
     const auto preparedCount=std::snprintf(preparation,sizeof(preparation),
-        "{\"event\":\"prepared\",\"vk_result\":0,\"sampler_ready\":%s,\"sampler_vk_result\":%d,"
+        "{\"event\":\"prepared\",\"vk_result\":0,\"sampler_ready\":%s,\"sampler_vk_result\":%d,\"sampler_prepare_attempted\":%s,"
         "\"device_admission_complete\":%s,\"ycbcr_enabled\":%s,\"compute_routes_observed\":%s,"
+        "\"ycbcr_feature_observed\":%s,\"query_routes_observed\":%s,\"device_admission_reason\":\"%s\","
+        "\"offending_index\":%u,\"offending_structure_type\":%u,\"offending_loader_function\":%u,"
+        "\"pipeline_statistics_query_observed\":%s,\"pipeline_statistics_query_enabled\":%s,"
+        "\"pipeline_statistics_query_source\":%u,\"pipeline_statistics_query_value\":%u,"
         "\"instance_api_version\":%u,\"unreviewed_extension\":\"%s\",\"format_queries_complete\":%s,"
         "\"format_routes\":%u,\"pool_descriptor_count\":%u,\"native_compute_queue\":%s,\"mask_enabled\":false,\"native_frame_association_proven\":false}\n",
         d->sampler.state()==frame_pixel_sampler::State::Ready?"true":"false",int(d->samplerPrepareResult),
+        d->samplerPrepareAttempted?"true":"false",
         d->samplerEligibility.complete?"true":"false",d->samplerEligibility.samplerYcbcrConversionEnabled?"true":"false",
-        d->samplerEligibility.computeRoutesObserved?"true":"false",d->instanceApiVersion,d->unreviewedExtension,
+        d->samplerEligibility.computeRoutesObserved?"true":"false",
+        d->samplerEligibility.samplerYcbcrConversionObserved?"true":"false",d->samplerEligibility.queryRoutesObserved?"true":"false",
+        frame_pixel_sampler::refusalName(d->samplerEligibility.refusal),d->samplerEligibility.offendingIndex,
+        d->samplerEligibility.offendingStructureType,d->samplerEligibility.offendingLoaderFunction,
+        d->samplerEligibility.pipelineStatisticsObserved?"true":"false",d->samplerEligibility.pipelineStatisticsEnabled?"true":"false",
+        unsigned(d->samplerEligibility.pipelineStatisticsSource),d->samplerEligibility.pipelineStatisticsValue,
+        d->instanceApiVersion,d->unreviewedExtension,
         d->samplerFormats.complete?"true":"false",d->samplerFormats.routeCount,d->samplerFormats.poolDescriptorCount,d->nativeComputeQueue?"true":"false");
     if(preparedCount>0 && static_cast<std::size_t>(preparedCount)<sizeof(preparation))
         frame_pixel_io::writeAll(progress,preparation,static_cast<std::size_t>(preparedCount));
     bool announced = false, refusalAnnounced = false;
+    unsigned announcedQueryRoutes=0;
     try { while (!d->stop.load(std::memory_order_acquire)) {
+        const auto queryRoutes=d->queryRoutesUsed.load(std::memory_order_relaxed);
+        if(queryRoutes!=announcedQueryRoutes) {
+            // At most two observations per device, even under continuous native
+            // queries. Formatting and I/O remain on this background thread.
+            char report[256]{};
+            const auto count=std::snprintf(report,sizeof(report),
+                "{\"event\":\"sampler_query_history_observed\",\"query_routes_used\":%u,\"prior_query_blocks_sampling\":true,"
+                "\"mask_enabled\":false,\"native_frame_association_proven\":false}\n",queryRoutes);
+            if(count>0 && static_cast<std::size_t>(count)<sizeof(report))
+                frame_pixel_io::writeAll(progress,report,static_cast<std::size_t>(count));
+            announcedQueryRoutes=queryRoutes;
+        }
         if (!session().armed.load(std::memory_order_acquire) && frame_pixel_io::armed(session().config)) {
             session().armed.store(true,std::memory_order_release); status(progress,"armed");
         }
@@ -421,6 +448,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     frame_pixel_sampler::ReviewedRoutes reviewed;
     reviewed.coreComputeRoutesObserved=VK_API_VERSION_VARIANT(i->apiVersion)==0 &&
         VK_API_VERSION_MAJOR(i->apiVersion)==1 && VK_API_VERSION_MINOR(i->apiVersion)<=4;
+    reviewed.queryRoutesObserved=reviewed.coreComputeRoutesObserved;
     reviewed.extensionNames=frame_pixel_sampler_routes::DeviceExtensions;
     reviewed.extensionCount=sizeof(frame_pixel_sampler_routes::DeviceExtensions)/sizeof(*frame_pixel_sampler_routes::DeviceExtensions);
     reviewed.additionalChainTypes=frame_pixel_sampler_routes::DeviceChainTypes;
@@ -445,6 +473,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     LOAD(CmdDraw) LOAD(CmdDrawIndexed) LOAD(CmdDrawIndirect) LOAD(CmdDrawIndexedIndirect) LOAD(CmdExecuteCommands)
     LOAD(CmdBindShadersEXT)
     LOAD(CmdDispatch) LOAD(CmdDispatchIndirect) LOAD(CmdDispatchBase)
+    LOAD(CmdBeginQuery) LOAD(CmdBeginQueryIndexedEXT)
     LOAD(CmdBeginRenderPass) LOAD(CmdNextSubpass) LOAD(CmdEndRenderPass) LOAD(CmdBeginRenderPass2) LOAD(CmdNextSubpass2) LOAD(CmdEndRenderPass2)
     LOAD(CmdBeginRendering) LOAD(CmdEndRendering) LOAD(QueueSubmit) LOAD(QueueSubmit2)
 #define BINDING_FIELD(name) LOAD(name)
@@ -503,6 +532,7 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
                 preparation.targetBuffer=published->readback.companionBuffer();preparation.capacity=published->readback.companionCapacity();
                 preparation.samplerYcbcrConversionEnabled=published->samplerEligibility.samplerYcbcrConversionEnabled;
                 preparation.combinedImageSamplerDescriptorCount=published->samplerFormats.poolDescriptorCount;
+                published->samplerPrepareAttempted=true;
                 const auto prepared=published->sampler.prepare(*out,published->gdpa,preparation);
                 published->samplerPrepareResult=prepared==frame_pixel_sampler::Status::Ok?VK_SUCCESS:published->sampler.lastResult();
             }
@@ -621,6 +651,21 @@ VKAPI_ATTR void VKAPI_CALL traceCmdDispatchIndirect(VkCommandBuffer command,VkBu
 VKAPI_ATTR void VKAPI_CALL traceCmdDispatchBase(VkCommandBuffer command,std::uint32_t bx,std::uint32_t by,std::uint32_t bz,std::uint32_t x,std::uint32_t y,std::uint32_t z) {
     auto* d=deviceFor(command);session().tracker->touchComputeState(d->id,command);d->CmdDispatchBase(command,bx,by,bz,x,y,z);
 }
+// Queries must begin/end in their own command buffer; accepted primaries cannot
+// inherit them and never execute secondary recordings. Refuse every recording
+// which has begun ANY query, even if it has already ended. Sharing the existing
+// monotonic sampler-history bit preserves generation/reset/end-scope semantics.
+// Merely enabling pipelineStatisticsQuery on a device is not an active query.
+VKAPI_ATTR void VKAPI_CALL traceCmdBeginQuery(VkCommandBuffer command,VkQueryPool pool,std::uint32_t query,VkQueryControlFlags flags) {
+    auto* d=deviceFor(command);
+    if(session().tracker->touchComputeState(d->id,command))d->queryRoutesUsed.fetch_or(1u,std::memory_order_relaxed);
+    d->CmdBeginQuery(command,pool,query,flags);
+}
+VKAPI_ATTR void VKAPI_CALL traceCmdBeginQueryIndexedEXT(VkCommandBuffer command,VkQueryPool pool,std::uint32_t query,VkQueryControlFlags flags,std::uint32_t index) {
+    auto* d=deviceFor(command);
+    if(session().tracker->touchComputeState(d->id,command))d->queryRoutesUsed.fetch_or(2u,std::memory_order_relaxed);
+    d->CmdBeginQueryIndexedEXT(command,pool,query,flags,index);
+}
 VKAPI_ATTR void VKAPI_CALL traceCmdDraw(VkCommandBuffer command,std::uint32_t vertices,std::uint32_t instances,std::uint32_t firstVertex,std::uint32_t firstInstance) {
     auto* d=deviceFor(command);if(vertices && instances)session().tracker->draw(d->id,command);
     d->CmdDraw(command,vertices,instances,firstVertex,firstInstance);
@@ -701,6 +746,7 @@ PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
     HOOK(CmdBindPipeline) HOOK(CmdDraw) HOOK(CmdDrawIndexed) HOOK(CmdDrawIndirect) HOOK(CmdDrawIndexedIndirect) HOOK(CmdExecuteCommands)
     HOOK(CmdBindShadersEXT)
     HOOK(CmdDispatch) HOOK(CmdDispatchIndirect) HOOK(CmdDispatchBase)
+    HOOK(CmdBeginQuery) HOOK(CmdBeginQueryIndexedEXT)
     HOOK(CmdBeginRenderPass) HOOK(CmdNextSubpass) HOOK(CmdEndRenderPass)
     HOOK(CmdBeginRenderPass2) HOOK(CmdNextSubpass2) HOOK(CmdEndRenderPass2) HOOK(CmdBeginRendering) HOOK(CmdEndRendering)
     HOOK(QueueSubmit) HOOK(QueueSubmit2)

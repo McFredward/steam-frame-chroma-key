@@ -23,6 +23,7 @@ OBSERVED = frozenset((
     "vkCmdSetDescriptorBufferOffsets2EXT", "vkCmdBindDescriptorBufferEmbeddedSamplers2EXT",
     "vkCmdExecuteCommands",
     "vkCmdDispatch", "vkCmdDispatchIndirect", "vkCmdDispatchBase", "vkCmdDispatchBaseKHR",
+    "vkCmdBeginQuery", "vkCmdBeginQueryIndexedEXT",
 ))
 
 # These bindings are independent of COMPUTE pipeline/descriptor state. New
@@ -46,7 +47,7 @@ EXCLUDED_EXTENSIONS = {
 def affects_compute_bindings(name):
     if name in INDEPENDENT_BINDINGS:
         return False
-    return bool(re.match(r"vkCmd(?:Bind|Dispatch|PushData|SetDescriptor|PushDescriptor|Execute)", name)
+    return bool(re.match(r"vkCmd(?:Bind|Dispatch|PushData|SetDescriptor|PushDescriptor|Execute|Begin.*Query)", name)
                 or re.search(r"(?:Cuda|CuLaunch|DispatchGraph|DataGraph)", name))
 
 

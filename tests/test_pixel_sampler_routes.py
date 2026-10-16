@@ -24,7 +24,7 @@ class RouteEnvelope(unittest.TestCase):
         for command in ("vkCmdBindPipeline2FUTURE", "vkCmdBindDescriptorHeapFUTURE", "vkCmdExecuteGeneratedCommandsEXT",
                         "vkCmdDispatchGraphAMDX", "vkCmdCudaLaunchKernelNV", "vkCmdBindSamplerHeapEXT",
                         "vkCmdBindResourceHeapEXT", "vkCmdPushDataEXT", "vkCmdDispatchTileQCOM",
-                        "vkCmdBindFutureStateTEST", "vkCmdDispatchFutureTEST"):
+                        "vkCmdBindFutureStateTEST", "vkCmdDispatchFutureTEST", "vkCmdBeginPerformanceQueryFUTURE"):
             with self.subTest(command=command):
                 text, excluded = routes.generate(registry(command), "a" * 40)
                 self.assertEqual(excluded, [("VK_TEST_route", [command])])
@@ -33,7 +33,8 @@ class RouteEnvelope(unittest.TestCase):
     def test_observed_aliases_and_independent_graphics_state_are_retained(self):
         for command in ("vkCmdBindPipeline", "vkCmdBindDescriptorSets2", "vkCmdPushDescriptorSet2KHR",
                         "vkCmdBindShadersEXT", "vkCmdDispatchBaseKHR", "vkCmdSetViewport",
-                        "vkCmdBindVertexBuffers2EXT", "vkCmdBindIndexBuffer2KHR", "vkCmdSetFragmentShadingRateKHR"):
+                        "vkCmdBindVertexBuffers2EXT", "vkCmdBindIndexBuffer2KHR", "vkCmdSetFragmentShadingRateKHR",
+                        "vkCmdBeginQuery", "vkCmdBeginQueryIndexedEXT"):
             text, excluded = routes.generate(registry(command), "a" * 40)
             self.assertEqual(excluded, [])
             self.assertIn('    "VK_TEST_route",', text)

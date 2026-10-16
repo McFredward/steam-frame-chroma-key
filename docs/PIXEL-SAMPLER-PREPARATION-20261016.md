@@ -41,8 +41,10 @@ No driver query or descriptor allocation is performed in a render callback.
 
 The finite API envelope is generated from pinned public Vulkan-Headers revision
 `c46850864f4661461b0f6cb9922c058ffea4915e`. Unknown extensions/types and unobserved
-binding/dispatch routes are refused. Conditional rendering, inherited command
-state and enabled pipeline statistics queries are excluded for this experiment.
+binding/dispatch/query-begin routes are refused. Conditional rendering and
+inherited command state are excluded. Any actual query begin permanently blocks
+sampling in that recording; an enabled but unused statistics feature is valid
+only with complete query-route observation and a clean recording history.
 Inserted compute reads are ordered before all later native GPU commands;
 separate host-read visibility remains intact. Ordinary native creation and
 forwarding are unchanged when this optional comparison is unavailable.
@@ -70,8 +72,10 @@ Focused evidence composes existing unchanged checks with the affected repairs:
 - Sampler: 314 normal and 314 ASan/UBSan controls; the old HOST-only barrier
   mutant fails the added ordering regression control.
 - Exact format admission: 485 controls normally and under ASan/UBSan.
-- Device admission: 48 final controls normally and under ASan/UBSan; six API
-  envelope tests cover unobserved current/future and feature-only routes.
+- Device admission: the original48 controls are superseded by180 focused
+  controls normally and under ASan/UBSan, including exact first-refusal reasons
+  and explicit query-route coverage. Six API envelope tests cover unobserved
+  current/future and feature-only routes.
 - Original generated shader: three provenance/validation tests; 246 actual Intel
   RGBA checks and 247 software-Vulkan P010 checks with an expressly different,
   fixture-only supported COSITED_EVEN/NEAREST profile. Production rejects that
@@ -97,7 +101,9 @@ fork-only diagnostic. PC source build676 remains unchanged.
 
 ## Next device run
 
-Nothing from this preparation is installed on the Frame. Request fresh readiness
+The first package was subsequently installed, refused cold admission and was
+[completely restored](PIXEL-SAMPLER-ATTEMPT-20261016.md). The query-history and
+exact-reason repair is local and has not been installed. Request fresh readiness
 and approval only after the complete local package, rollback, review and hosted
 checks are ready. The new scope includes the paired component output. Exact
 current native-provider imports/isolated loading and native UI health must pass;
