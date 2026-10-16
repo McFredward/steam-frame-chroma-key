@@ -61,6 +61,24 @@ frame, physical-eye, application-ray and decoded-source integrity unproven.
 
 ## Next receiver observation
 
+The prepared ordinary package has now completed its approved one-shot run,
+capture `b5ff764e7af8867a94aff07a56c555db`. All three transferred byte counts and
+SHA256 values match the device's completed immutable files. Independent review
+accepts the recorded owned fence, exact reusable-generation retirement and
+disjoint storage slices. No producer refusal occurs. The uniform companion and
+live mask remain disabled. The corresponding fresh PC source log is still
+needed before selecting an independent expected session and decoding a tuple;
+the earlier Build677 log must not be substituted.
+
+Manual rollback is complete after separate agreement. Activation files and the
+owned runtime library are absent, certain scans find no diagnostic mappings,
+native UI health is ready, and the maintainer confirms normal visible usable
+UI. Standby is safe. No further Frame access is needed for current offline work.
+Original artifacts and all activation/arm/transfer/rollback receipts are kept
+under `build/private-registration-source-run-20261016-r1/`. Two pinned historical
+fitted hypotheses are prepared without session discovery. No new compiler or
+Unity cache was created for the acquisition; all child processes are reaped.
+
 The next prepared package uses the ordinary pixel/native-sampler diagnostic
 with `FRAME_PIXEL_UNIFORM_COMPANION=OFF`. It acquires at most one immutable image
 as the three existing artifacts: `snapshot.p010`, `sampler-components.rgba8`
