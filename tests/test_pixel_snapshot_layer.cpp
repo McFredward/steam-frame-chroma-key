@@ -42,11 +42,22 @@ static void waitForEvent(const char* path,const char* event) {
     }
     require(false,"background-event-deadline");
 }
+static bool statusHas(const char* path,const char* token) {
+    FILE* stream=std::fopen(path,"rb");
+    if(!stream)return false;
+    std::array<char,4097> bytes{};
+    const auto count=std::fread(bytes.data(),1,bytes.size()-1,stream);
+    const bool bounded=!std::ferror(stream) && std::fgetc(stream)==EOF;
+    std::fclose(stream);require(bounded,"bounded-statistics-background-status");
+    bytes[count]=0;return std::strstr(bytes.data(),token)!=nullptr;
+}
 int main(int argc,char** argv) {
     require(argc==3 || argc==5,"arguments: mode layer [status event]");
     const bool direct=!std::strcmp(argv[1],"direct");
     const bool mixed=!std::strcmp(argv[1],"mixed");
-    require(direct || mixed || !std::strcmp(argv[1],"gpa"),"dispatch-mode");
+    const bool indexedStatistics=!std::strcmp(argv[1],"statistics-indexed");
+    const bool statistics=indexedStatistics || !std::strcmp(argv[1],"statistics");
+    require(direct || mixed || statistics || !std::strcmp(argv[1],"gpa"),"dispatch-mode");
     std::setvbuf(stdout,nullptr,_IONBF,0);
     // Probe the actual production export's null-dispatch guard separately from
     // loader global forwarding. It may legitimately return null for globals it
@@ -79,12 +90,46 @@ int main(int argc,char** argv) {
     std::vector<VkPhysicalDevice> physical(n);success(enumerate(instance,&n,physical.data()),"physical-device-enumeration");
     VkPhysicalDeviceProperties properties{};
     function<PFN_vkGetPhysicalDeviceProperties>(gipa(instance,"vkGetPhysicalDeviceProperties"),"physical-properties-proc")(physical[0],&properties);
+    VkPhysicalDeviceFeatures enabledFeatures{};
+    bool indexedExtensionAvailable=false;
+    unsigned enabledFeatureCount=0;
+    if(statistics) {
+        VkPhysicalDeviceFeatures supported{};
+        function<PFN_vkGetPhysicalDeviceFeatures>(gipa(instance,"vkGetPhysicalDeviceFeatures"),"statistics-support-proc")(physical[0],&supported);
+        if(indexedStatistics) {
+            auto enumerateDeviceExtensions=function<PFN_vkEnumerateDeviceExtensionProperties>(gipa(instance,"vkEnumerateDeviceExtensionProperties"),"statistics-extension-enumeration-proc");
+            std::uint32_t count=0;success(enumerateDeviceExtensions(physical[0],nullptr,&count,nullptr),"statistics-extension-count");
+            std::vector<VkExtensionProperties> extensions(count);
+            success(enumerateDeviceExtensions(physical[0],nullptr,&count,extensions.data()),"statistics-extension-list");
+            for(const auto& extension:extensions)
+                indexedExtensionAvailable=indexedExtensionAvailable || !std::strcmp(extension.extensionName,VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
+        }
+        if(supported.pipelineStatisticsQuery!=VK_TRUE || (indexedStatistics && !indexedExtensionAvailable)) {
+            function<PFN_vkDestroyInstance>(gipa(instance,"vkDestroyInstance"),"statistics-skip-instance-destroy")(instance,nullptr);
+            require(!dlclose(loader) && !dlclose(layer),"statistics-skip-library-close");
+            std::printf("RESULT={\"checks\":%u,\"statistics_skip\":\"%s\",\"statistics_feature_supported\":%s,\"statistics_feature_requested\":false,\"matched_capture\":false,\"native_frame\":false,\"mask_enabled\":false,\"teardown\":true}\n",
+                checks,supported.pipelineStatisticsQuery!=VK_TRUE?"pipelineStatisticsQuery unsupported":"VK_EXT_transform_feedback unavailable",
+                supported.pipelineStatisticsQuery==VK_TRUE?"true":"false");
+            return 0;
+        }
+        // Actual vkCreateDevice input: one supported core feature, no Features2
+        // or transform-feedback feature chain, and no sampling capture feature.
+        enabledFeatures.pipelineStatisticsQuery=VK_TRUE;
+        static_assert(sizeof(VkPhysicalDeviceFeatures)%sizeof(VkBool32)==0,"core feature words");
+        std::array<VkBool32,sizeof(VkPhysicalDeviceFeatures)/sizeof(VkBool32)> featureWords{};
+        std::memcpy(featureWords.data(),&enabledFeatures,sizeof(enabledFeatures));
+        for(const auto feature:featureWords)enabledFeatureCount+=feature!=VK_FALSE;
+        require(enabledFeatureCount==1,"statistics-only-actual-device-feature-input");
+    }
     auto families=function<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(gipa(instance,"vkGetPhysicalDeviceQueueFamilyProperties"),"queue-families-proc");
     families(physical[0],&n,nullptr);std::vector<VkQueueFamilyProperties> queues(n);families(physical[0],&n,queues.data());
     unsigned family=0;while(family<n && !(queues[family].queueFlags&VK_QUEUE_GRAPHICS_BIT))++family;require(family<n,"graphics-family-exists");
     float priority=1;
     VkDeviceQueueCreateInfo q{};q.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;q.queueFamilyIndex=family;q.queueCount=1;q.pQueuePriorities=&priority;
     VkDeviceCreateInfo dc{};dc.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;dc.queueCreateInfoCount=1;dc.pQueueCreateInfos=&q;
+    const char* indexedExtension=VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME;
+    if(statistics)dc.pEnabledFeatures=&enabledFeatures;
+    if(indexedStatistics) {dc.enabledExtensionCount=1;dc.ppEnabledExtensionNames=&indexedExtension;}
     auto createDevice=function<PFN_vkCreateDevice>(gipa(instance,"vkCreateDevice"),"create-device-proc");
     VkDevice device{};success(direct?::vkCreateDevice(physical[0],&dc,nullptr,&device):createDevice(physical[0],&dc,nullptr,&device),"actual-device-create");
     auto gdpa=mixed?reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(loader,"vkGetDeviceProcAddr")):function<PFN_vkGetDeviceProcAddr>(gipa(instance,"vkGetDeviceProcAddr"),"public-gdpa-interface");
@@ -95,6 +140,13 @@ int main(int argc,char** argv) {
     VkQueryPoolCreateInfo qi{};qi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;qi.queryType=VK_QUERY_TYPE_OCCLUSION;qi.queryCount=2;
     auto queryCreate=function<PFN_vkCreateQueryPool>(gdpa(device,"vkCreateQueryPool"),"query-create-proc");
     VkQueryPool query{};success(direct||mixed?::vkCreateQueryPool(device,&qi,nullptr,&query):queryCreate(device,&qi,nullptr,&query),"actual-query-pool-create");
+    VkQueryPool statisticsPool{};
+    const std::uint32_t statisticsCount=indexedStatistics?2:1;
+    if(statistics) {
+        auto info=qi;info.queryType=VK_QUERY_TYPE_PIPELINE_STATISTICS;info.queryCount=statisticsCount;
+        info.pipelineStatistics=VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT;
+        success(queryCreate(device,&info,nullptr,&statisticsPool),"statistics-pool-create");
+    }
     VkCommandPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;pi.queueFamilyIndex=family;pi.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VkCommandPool pool{};success(function<PFN_vkCreateCommandPool>(gdpa(device,"vkCreateCommandPool"),"create-command-pool-proc")(device,&pi,nullptr,&pool),"actual-command-pool-create");
     VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=pool;ai.commandBufferCount=1;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -103,6 +155,18 @@ int main(int argc,char** argv) {
     auto begin=function<PFN_vkBeginCommandBuffer>(gdpa(device,"vkBeginCommandBuffer"),"command-begin-proc");
     success(begin(command,&bi),"actual-command-begin");
     function<PFN_vkCmdResetQueryPool>(gdpa(device,"vkCmdResetQueryPool"),"query-reset-proc")(command,query,0,2);
+    if(statistics) {
+        function<PFN_vkCmdResetQueryPool>(gdpa(device,"vkCmdResetQueryPool"),"statistics-reset-proc")(command,statisticsPool,0,statisticsCount);
+        function<PFN_vkCmdBeginQuery>(gdpa(device,"vkCmdBeginQuery"),"statistics-core-begin-proc")(command,statisticsPool,0,0);
+        function<PFN_vkCmdEndQuery>(gdpa(device,"vkCmdEndQuery"),"statistics-core-end-proc")(command,statisticsPool,0);
+        if(indexedStatistics) {
+            // PIPELINE_STATISTICS is not a transform-feedback stream query:
+            // index0 is required and needs no transformFeedback feature. The
+            // graphics queue and reset/closed query scopes satisfy core rules.
+            function<PFN_vkCmdBeginQueryIndexedEXT>(gdpa(device,"vkCmdBeginQueryIndexedEXT"),"statistics-indexed-begin-proc")(command,statisticsPool,1,0,0);
+            function<PFN_vkCmdEndQueryIndexedEXT>(gdpa(device,"vkCmdEndQueryIndexedEXT"),"statistics-indexed-end-proc")(command,statisticsPool,1,0);
+        }
+    }
     success(function<PFN_vkEndCommandBuffer>(gdpa(device,"vkEndCommandBuffer"),"command-end-proc")(command),"actual-command-end");
     VkFenceCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence fence{};success(function<PFN_vkCreateFence>(gdpa(device,"vkCreateFence"),"create-fence-proc")(device,&fi,nullptr,&fence),"actual-fence-create");
@@ -113,6 +177,18 @@ int main(int argc,char** argv) {
     auto getResults=function<PFN_vkGetQueryPoolResults>(gdpa(device,"vkGetQueryPoolResults"),"query-results-proc");
     const auto qr=getResults(device,query,0,2,sizeof(values),values.data(),2*sizeof(std::uint64_t),VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
     require(qr==VK_NOT_READY && values[1]==0 && values[3]==0,"exact-native-reset-query-not-ready-and-availability");
+    if(statistics) {
+        values.fill(~0ULL);
+        success(getResults(device,statisticsPool,0,statisticsCount,sizeof(values),values.data(),2*sizeof(std::uint64_t),
+            VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT),"statistics-native-results");
+        for(std::uint32_t index=0;index<statisticsCount;++index)
+            require(values[index*2]==0 && values[index*2+1]!=0,"statistics-native-empty-scope-zero-and-available");
+        // The old layer may refuse this enabled feature cold. Finish its native
+        // smoke so the Python negative control diagnoses complete=false instead
+        // of failing merely because that older layer lacks this new event.
+        if(argc==5 && statusHas(argv[3],"\"device_admission_complete\":true"))
+            waitForEvent(argv[3],indexedStatistics?"\"query_routes_used\":3":"\"query_routes_used\":1");
+    }
     success(function<PFN_vkResetCommandBuffer>(gdpa(device,"vkResetCommandBuffer"),"command-reset-proc")(command,0),"actual-command-reset");
     success(begin(command,&bi),"actual-command-rebegin");
     success(function<PFN_vkEndCommandBuffer>(gdpa(device,"vkEndCommandBuffer"),"command-end-again-proc")(command),"actual-command-end-again");
@@ -121,6 +197,7 @@ int main(int argc,char** argv) {
     function<PFN_vkDestroyCommandPool>(gdpa(device,"vkDestroyCommandPool"),"command-pool-destroy-proc")(device,pool,nullptr);
     function<PFN_vkDestroyFence>(gdpa(device,"vkDestroyFence"),"fence-destroy-proc")(device,fence,nullptr);
     function<PFN_vkDestroyQueryPool>(gdpa(device,"vkDestroyQueryPool"),"query-destroy-proc")(device,query,nullptr);
+    if(statisticsPool)function<PFN_vkDestroyQueryPool>(gdpa(device,"vkDestroyQueryPool"),"statistics-pool-destroy-proc")(device,statisticsPool,nullptr);
     VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.imageType=VK_IMAGE_TYPE_2D;ii.format=VK_FORMAT_R8G8B8A8_UNORM;
     ii.extent={16,16,1};ii.mipLevels=ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=VK_IMAGE_TILING_OPTIMAL;
     ii.usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;ii.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
@@ -194,5 +271,9 @@ int main(int argc,char** argv) {
     function<PFN_vkDestroyDevice>(gdpa(device,"vkDestroyDevice"),"device-destroy-proc")(device,nullptr);
     function<PFN_vkDestroyInstance>(gipa(instance,"vkDestroyInstance"),"instance-destroy-proc")(instance,nullptr);
     require(!dlclose(loader) && !dlclose(layer),"native-library-close");
-    std::printf("RESULT={\"checks\":%u,\"driver\":\"%s\",\"query_pool\":true,\"query_not_ready_native\":true,\"image_bind_view\":true,\"parallel_image_memory_view\":true,\"parallel_lifecycles\":72,\"command_submit_reset\":true,\"teardown\":true,\"matched_capture\":false,\"native_frame\":false,\"mask_enabled\":false}\n",checks,properties.deviceName);
+    if(statistics)
+        std::printf("RESULT={\"checks\":%u,\"driver\":\"%s\",\"query_pool\":true,\"query_not_ready_native\":true,\"image_bind_view\":true,\"parallel_image_memory_view\":true,\"parallel_lifecycles\":72,\"command_submit_reset\":true,\"teardown\":true,\"matched_capture\":false,\"native_frame\":false,\"mask_enabled\":false,\"statistics_skip\":null,\"statistics_feature_supported\":true,\"statistics_feature_requested\":true,\"statistics_feature_enabled\":true,\"other_core_features_enabled\":%u,\"device_extension_count\":%u,\"statistics_core_query\":true,\"statistics_indexed_query\":%s,\"statistics_empty_counter_zero\":true,\"statistics_queries_available\":true}\n",
+            checks,properties.deviceName,enabledFeatureCount-1,dc.enabledExtensionCount,indexedStatistics?"true":"false");
+    else
+        std::printf("RESULT={\"checks\":%u,\"driver\":\"%s\",\"query_pool\":true,\"query_not_ready_native\":true,\"image_bind_view\":true,\"parallel_image_memory_view\":true,\"parallel_lifecycles\":72,\"command_submit_reset\":true,\"teardown\":true,\"matched_capture\":false,\"native_frame\":false,\"mask_enabled\":false}\n",checks,properties.deviceName);
 }

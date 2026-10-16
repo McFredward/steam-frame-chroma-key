@@ -24,6 +24,12 @@ EXPORTS = {"frame_pixel_vkGetInstanceProcAddr", "frame_pixel_vkGetDeviceProcAddr
 MAGIC = "GHVR_PIXEL_SNAPSHOT/1\n"
 ARM = "GHVR_PIXEL_SNAPSHOT_ARM/1\n"
 CAPTURE_ID = "0123456789abcdef0123456789abcdef"
+ORIGINAL_CASES = ("unrelated_valid_config", "inert_missing", "inert_permissions", "inert_contents",
+                  "inert_config_parent_symlink", "inert_config_file_symlink", "inert_output_symlink",
+                  "inert_output_permissions", "inert_config_hardlink", "implicit_unarmed_gpa",
+                  "implicit_armed_direct", "implicit_armed_mixed", "explicit_armed_gpa",
+                  "implicit_disable_environment")
+STATISTICS_CASES = ("implicit_statistics_query_enabled", "implicit_statistics_query_indexed")
 
 
 def execute(command, env=None):
@@ -47,10 +53,15 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def smoke(result):
+def smoke(result, statistics=False):
     assert result["exit_code"] == 0, result
     line = next(x for x in result["stdout"].splitlines() if x.startswith("RESULT="))
     facts = json.loads(line[len("RESULT="):])
+    if statistics and facts.get("statistics_skip"):
+        assert facts["statistics_skip"] in ("pipelineStatisticsQuery unsupported", "VK_EXT_transform_feedback unavailable"), facts
+        assert facts["statistics_feature_requested"] is False and facts["teardown"] is True, facts
+        assert facts["matched_capture"] is False and facts["native_frame"] is False and facts["mask_enabled"] is False
+        return facts
     for key in ("query_pool", "query_not_ready_native", "image_bind_view", "parallel_image_memory_view", "command_submit_reset", "teardown"):
         assert facts[key] is True, (key, facts)
     assert facts["parallel_lifecycles"] == 72, facts
@@ -84,7 +95,15 @@ def main():
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--retention-checkout", type=Path,
                         help="Optional checkout containing scripts/town_run_retention.py")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--case", action="append", choices=ORIGINAL_CASES + STATISTICS_CASES,
+                           help="Run only this named case; may be repeated")
+    selection.add_argument("--statistics-only", action="store_true",
+                           help="Run only enabled pipeline-statistics/query-wrapper controls")
     args = parser.parse_args()
+    if args.case and len(set(args.case)) != len(args.case):
+        parser.error("A selected case must not be repeated")
+    selected = set(args.case or (STATISTICS_CASES if args.statistics_only else ORIGINAL_CASES))
     layer = args.production_layer.resolve(strict=True)
     fixture = args.fixture.resolve(strict=True)
     manifest = json.loads(args.production_manifest.read_text())
@@ -118,6 +137,9 @@ def main():
 
             def case(label, *, mode="gpa", invalid=None, armed=False,
                      enabled=True, explicit=False, unrelated_exe=False):
+                if label not in selected:
+                    return
+                statistics = mode in ("statistics", "statistics-indexed")
                 folder = private_directory(temporary / label)
                 profile = private_directory(folder / "profile")
                 config_parent = private_directory(folder / "setup")
@@ -173,19 +195,54 @@ def main():
                 if active:
                     command += [str(output / "status.jsonl"), '"event":"armed"' if armed else '"event":"prepared"']
                 result = execute(command, env)
-                result["facts"] = smoke(result)
+                # Preserve the actual native facts/status before assertions so
+                # an older-library negative control exposes its causal refusal.
+                report["cases"][label] = result
+                result["facts"] = smoke(result, statistics)
                 result["loader_selected_production_library"] = str(layer) in result["stderr"]
                 if enabled:
                     assert result["loader_selected_production_library"], (label, result)
                 before = inventory(output)
-                if active:
+                result["output_inventory"] = before
+                if statistics and result["facts"].get("statistics_skip"):
+                    assert before == {}, (label, before)
+                    result["status"] = []
+                elif active:
                     assert set(before) == ({"capture.arm", "launch.claim", "status.jsonl"} if armed else {"launch.claim", "status.jsonl"}), (label, before)
                     records = [json.loads(line) for line in (output / "status.jsonl").read_text().splitlines()]
+                    result["status"] = records
                     assert records and records[0]["event"] == "prepared", (label, records)
-                    assert [r["event"] for r in records] == (["prepared", "armed"] if armed else ["prepared"]), (label, records)
+                    if statistics:
+                        facts, prepared = result["facts"], records[0]
+                        for key in ("statistics_feature_supported", "statistics_feature_requested", "statistics_feature_enabled",
+                                    "statistics_core_query", "statistics_empty_counter_zero", "statistics_queries_available"):
+                            assert facts[key] is True, (label, key, facts)
+                        indexed = mode == "statistics-indexed"
+                        assert facts["statistics_indexed_query"] is indexed, (label, facts)
+                        assert facts["other_core_features_enabled"] == 0 and facts["device_extension_count"] == int(indexed), (label, facts)
+                        # Check admission before new status fields: the b16
+                        # negative must fail here, not on a missing new field.
+                        assert prepared["device_admission_complete"] is True, (label, "enabled statistics admission refused", prepared)
+                        for key in ("pipeline_statistics_query_observed", "pipeline_statistics_query_enabled", "query_routes_observed"):
+                            assert prepared[key] is True, (label, key, prepared)
+                        assert prepared["device_admission_reason"] == "none", (label, prepared)
+                        # YCbCr is intentionally not requested. Host profile
+                        # unavailability is separate from this query gate.
+                        assert prepared["sampler_prepare_attempted"] is False, (label, prepared)
+                        history = records[1:]
+                        assert 1 <= len(history) <= 2, (label, records)
+                        masks = []
+                        for event in history:
+                            assert event["event"] == "sampler_query_history_observed" and event["prior_query_blocks_sampling"] is True, (label, event)
+                            mask = event["query_routes_used"]
+                            assert type(mask) is int and mask in (1, 2, 3), (label, event)
+                            assert not masks or masks[-1] != mask and masks[-1] & mask == masks[-1], (label, history)
+                            masks.append(mask)
+                        assert masks[-1] == (3 if indexed else 1), (label, history)
+                    else:
+                        assert [r["event"] for r in records] == (["prepared", "armed"] if armed else ["prepared"]), (label, records)
                     assert all(r["mask_enabled"] is False and r["native_frame_association_proven"] is False for r in records)
                     assert (output / "launch.claim").read_text() == "GHVR_PIXEL_CLAIM/1\n"
-                    result["status"] = records
                     if armed:
                         # A second process with the very same valid config and
                         # arm must not claim or overwrite an earlier run.
@@ -195,9 +252,7 @@ def main():
                         result["stale_claim_second_process"] = second
                 else:
                     assert set(before) == ({"capture.arm"} if armed else set()), (label, before)
-                assert not (output / "snapshot.p010").exists() and not (output / "snapshot.json").exists(), (label, "unexpected unmatched snapshot")
-                result["output_inventory"] = before
-                report["cases"][label] = result
+                assert not any((output / name).exists() for name in ("snapshot.p010", "snapshot.json", "sampler-components.rgba8")), (label, "unexpected unmatched snapshot")
 
             case("unrelated_valid_config", unrelated_exe=True, armed=True)
             for invalid in ("missing", "permissions", "contents", "config_parent_symlink",
@@ -208,6 +263,9 @@ def main():
             case("implicit_armed_mixed", mode="mixed", armed=True)
             case("explicit_armed_gpa", armed=True, explicit=True)
             case("implicit_disable_environment", armed=True, enabled=False)
+            case("implicit_statistics_query_enabled", mode="statistics")
+            case("implicit_statistics_query_indexed", mode="statistics-indexed")
+            assert set(report["cases"]) == selected, "Selected case not executed"
             assert digest(layer) == report["production_layer_sha256"], "Production library changed during this evidence run"
         report["private_temporary_outputs_removed"] = True
         report["user_home_files_written"] = False
