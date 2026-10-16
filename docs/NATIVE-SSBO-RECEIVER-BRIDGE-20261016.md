@@ -19,11 +19,13 @@ wins, the zero header refuses publication instead of inventing a sample.
 
 The actual original device queue creation request and original queue retrieval
 must satisfy the transaction profile. Queue retrieval may legally happen after
-pipeline creation: the owned ready definition is retained until the queue exists.
+pipeline creation: selected owned definitions wait until that queue exists.
 The bridge never assumes queue zero or the queue used by a different device.
 
-After manual arming, a valid source candidate identifies a native command
-buffer. The bridge waits for that command buffer's **next actual successful
+After manual arming, a valid source candidate identifies its actual drawn
+pipeline and native command buffer. The cold worker looks up and clones that
+exact creation generation, independently of creation order and the four-receipt
+logging budget. The bridge then waits for that command buffer's **next actual successful
 Begin**. The production tracker mints opaque recording and target tickets from
 its observed generations; the bridge cannot construct those tickets. Reset is
 recorded before any render pass. Prior ordinary direct/indexed draws are
@@ -85,3 +87,6 @@ retirement boundary, replacement-generation reuse and explicit terminal cleanup.
 Actual Sparse32 shader color/record and cost evidence comes from the separate
 canonical original-shader GPU fixture; it is inherited rather than rerun here.
 No Frame installation or native activation is part of this integration.
+
+The later [pipeline selection review](NATIVE-PIPELINE-SELECTION-20261016.md)
+records the actual six-variant evidence and the corrected post-arm selection.

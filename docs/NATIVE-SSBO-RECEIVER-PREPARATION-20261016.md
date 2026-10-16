@@ -1,5 +1,29 @@
 # Same-invocation receiver integration
 
+The first assembled ARM candidate was tested and fully restored without arming:
+native imports, isolated load and UI health passed, while the device-definition
+contract refused HostQueryReset at index5. That attempt first supplies the full
+12-header device census; the preceding native artifact exposed only the initial
+timeline-feature refusal. Private results are in
+`build/private-native-ssbo-run-20261016-r1/`; its run plan is consumed.
+
+The complete known chain now has 1,192 focused scalar/chain controls normally
+and under ASan/UBSan, plus ARM compilation. All public named payload booleans
+are checked without rewriting the original request or inferring native validity
+of promoted feature aliases. Unknown/cyclic/duplicate chains still refuse.
+The cold operator gate independently checks native UI, sampler, device contract,
+transaction state, canonical profile, queue and a complete pipeline-definition
+receipt before arming. The exact stored healthy-UI/refused-device record now
+rejects; no clone is required before the actual post-arm candidate can select it.
+
+An additional source review found creation-order selection could choose an
+unused or opposite native variant. The
+[exact pipeline selector](NATIVE-PIPELINE-SELECTION-20261016.md) fixes that
+independently of the reporting budget, with 16 bounded slots per definition kind.
+The new selected-draw tracker metadata passes 228 focused controls normally and
+under ASan/UBSan. The Frame remains restored; another test needs a fully prepared
+corrected package and actual restart readiness.
+
 This is development of the receiver component for GloomhavenVR's streamed
 explicit-opacity path. It does not enable live passthrough. GloomhavenVR677's
 manual source-pattern setting remains unchanged; the native Steam PC sender is
