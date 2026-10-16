@@ -469,6 +469,7 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
     out<<"],\"push_range_count\":"<<ready.recipe.layout.count<<",\"color_attachment_count\":"<<(selected?selected->colorCount:0)
        <<",\"subpass_count\":"<<ready.recipe.renderPass.subpassCount<<",\"selected_subpass\":"<<ready.recipe.graphics.info.subpass
        <<",\"renderpass2_route\":"<<(ready.recipe.renderPass.route2?"true":"false")
+       <<",\"renderpass2_khr_route\":"<<(ready.recipe.renderPass.route2KHR?"true":"false")
        <<",\"vertex_bytes\":"<<ready.recipe.vertex.bytes<<",\"fragment_bytes\":"<<ready.recipe.fragment.bytes
        <<",\"native_lifetime_lease\":false,\"native_compatibility_proven\":false,\"pipeline_changed\":false,\"mask_enabled\":false}\n";
     const auto text=out.str();

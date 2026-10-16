@@ -175,12 +175,15 @@ public:
         if(!clone::captureRenderPass(&ci,definition,why))return fail(out,Reason::Contract,ObjectKind::RenderPass,value,0,why);
         return insert(passes_,value,definition,ObjectKind::RenderPass,out);
     }
-    bool createRenderPass2(VkRenderPass object,const VkRenderPassCreateInfo2& ci,VkResult result,Event* out=nullptr) {
+    bool createRenderPass2(VkRenderPass object,const VkRenderPassCreateInfo2& ci,VkResult result,Event* out=nullptr,bool route2KHR=false) {
         std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
         if(!retired_)frame_pixel_definition_facts::renderPass2(facts_,ci,result,value);
         if(!beginCreate(passes_,value,result,ObjectKind::RenderPass,out))return false;
         clone::RenderPassDefinition definition;clone::Refusal why;
         if(!clone::captureRenderPass2(&ci,definition,why))return fail(out,Reason::Contract,ObjectKind::RenderPass,value,0,why);
+        // The original caller's actual core/KHR command is the route evidence.
+        // A nonnull promoted core PFN alone does not prove its version usable.
+        definition.route2KHR=route2KHR;
         return insert(passes_,value,definition,ObjectKind::RenderPass,out);
     }
     bool createShader(VkShaderModule object,const VkShaderModuleCreateInfo& ci,VkResult result,Event* out=nullptr) {
