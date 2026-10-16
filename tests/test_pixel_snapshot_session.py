@@ -279,9 +279,10 @@ class SessionTests(unittest.TestCase):
 
     def test_full_exact_target_receipts_fit_progress_without_enlarging_small_json(self):
         self.prepare()
-        # Prior bounded creation/context receipts plus eight worst-case16KiB
-        # target-state lines; the legacy256KiB reader would lose this evidence.
-        payload = b" " * (245416 + 8 * 16 * 1024)
+        # Complete creation/graphics banks plus 64 recording-context lines,
+        # an independently reserved first failure and a small overflow receipt.
+        # The reader must retain them without enlarging ordinary JSON documents.
+        payload = b" " * (245416 + 8 * 16 * 1024 + 65 * 2048 + 1024)
         self.assertGreater(len(payload), 256 * 1024)
         self.assertLess(len(payload), mod.MAX_PROGRESS)
         self.write(self.run / "status.jsonl", payload)

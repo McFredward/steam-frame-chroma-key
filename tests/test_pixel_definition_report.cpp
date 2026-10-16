@@ -33,7 +33,10 @@ int main(){
     require(text.find("\"native_pipeline_association_proven\":false")!=std::string::npos,"observation never promotes entry names to shader identity authority");
     // Previous worst-case grouped progress plus all new target lines must fit
     // the separate 512-KiB reader. Ordinary configuration JSON stays 16 KiB.
-    require(245416+facts::MaxGraphics*report::MaxGraphicsReportBytes<512*1024,"entire finite receipt bank fits the explicit progress envelope");
+    // The recording census adds 64 finite contexts, its independently reserved
+    // first refusal and one small overflow receipt. Repeated callback counts
+    // must not become repeated output lines.
+    require(245416+facts::MaxGraphics*report::MaxGraphicsReportBytes+65*2048+1024<512*1024,"complete creation, graphics and recording banks fit the progress envelope");
     item.dynamicCount=65;require(!report::graphics(item,0,text)&&text.empty(),"bad array count refuses without indexing beyond bank");
     item.dynamicCount=64;item.states[11].chainCount=33;
     require(!report::graphics(item,0,text)&&text.empty(),"bad last chain refuses before following it");
