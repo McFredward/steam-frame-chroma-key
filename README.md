@@ -61,6 +61,10 @@ The subsequent [dual-panel reconstruction](docs/ATLAS-RECONSTRUCTION-20261016.md
 checks separate color/coverage reads with explicit diagnostic transforms and
 the actual original fragment on two host Vulkan drivers. It remains offline;
 it does not calibrate a live stream or enable passthrough.
+The [packed-coordinate prototype](docs/PACKED-ATLAS-REGISTRATION-20261016.md)
+then removes the CPU uniform join using the original fragment's own coordinates.
+An independent [game-coverage fixture](docs/GAME-COVERAGE-PROTOTYPE-20261016.md)
+tests explicit alpha rules for four owned Unity shader families. Both remain inert.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
