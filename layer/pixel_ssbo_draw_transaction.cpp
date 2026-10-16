@@ -16,7 +16,7 @@ const char* reasonName(Reason value) noexcept {
     NAME(CommandEnd,"command_end") NAME(SubmitShape,"submit_shape") NAME(SubmitExtension,"submit_extension") NAME(SubmitBounds,"submit_bounds") NAME(UnknownQueue,"unknown_queue")
     NAME(Overlap,"overlap") NAME(NativeSubmit,"native_submit") NAME(MarkerSubmit,"marker_submit")
     NAME(Fence,"fence") NAME(NotRetired,"not_retired") NAME(CohortMismatch,"cohort_mismatch")
-    NAME(SourceRetired,"source_retired") NAME(UnsafeRelease,"unsafe_release") NAME(AlreadyArmed,"already_armed")
+    NAME(SourceRetired,"source_retired") NAME(UnsafeRelease,"unsafe_release") NAME(AlreadyArmed,"already_armed") NAME(DeviceDestroying,"device_destroying")
 #undef NAME
     }return "unknown_transaction_refusal";
 }
@@ -361,6 +361,18 @@ bool Transaction::afterRetirement(const RetirementTicket& ticket,VkResult result
 void Transaction::afterDeviceWaitIdle(VkResult result) noexcept {
     Guard guard(*this);if(!guard || !configured_)return;
     if(result==VK_SUCCESS)quiescent_=true;else if(result==VK_ERROR_DEVICE_LOST)deviceLost_=true;
+}
+bool Transaction::deviceDestroying(VkDevice device) noexcept {
+    Guard guard(*this);if(!guard)return false;
+    if(!device_ || device!=device_)return refuse(Reason::Identity);
+    if(!quiescent_ && !deviceLost_)return false;
+    // This is the actual original DestroyDevice ENTRY, not an ordinary idle
+    // notification. Vulkan requires external synchronization of the device and
+    // all its queues, so no valid future submission/recording may follow. The
+    // separate actual idle/lost observation rules out pending GPU references.
+    // Retire only this exact adopted generation and invalidate publication.
+    retired_=true;recording_=false;executable_=false;
+    pendingSubmit_=pendingRetirement_=0;refuse(Reason::DeviceDestroying);return true;
 }
 bool Transaction::publish(const SourceReadbackMetadata& readback,RecordView& out) noexcept {
     Guard guard(*this);out={};if(!guard || !configured_ || refusal()!=Reason::None)return false;

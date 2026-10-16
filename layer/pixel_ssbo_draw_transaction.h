@@ -20,7 +20,7 @@ enum class Reason : std::uint8_t {
     Begin, NotArmed, MissingReset, Scope, Prefix, Pipeline, Source, EmptyDraw,
     LaterDraw, Subpass, Secondary, UnknownRoute, CommandEnd, SubmitShape, SubmitExtension, SubmitBounds,
     UnknownQueue, Overlap, NativeSubmit, MarkerSubmit, Fence, NotRetired,
-    CohortMismatch, SourceRetired, UnsafeRelease, AlreadyArmed
+    CohortMismatch, SourceRetired, UnsafeRelease, AlreadyArmed, DeviceDestroying
 };
 const char* reasonName(Reason) noexcept;
 enum class DrawResult : std::uint8_t { ForwardOriginal, ReplacedOriginal };
@@ -138,6 +138,11 @@ public:
     // Invoke after the native DeviceWaitIdle returned, or on terminal device
     // loss. It performs no speculative wait and never waits in a destructor.
     void afterDeviceWaitIdle(VkResult) noexcept;
+    // Only at original vkDestroyDevice ENTRY, after native device/queues were
+    // externally closed to future use and actual idle/lost was observed. This
+    // explicit destruction event can retire the last reusable recording;
+    // ordinary DeviceWaitIdle alone cannot. No Vulkan call is issued here.
+    bool deviceDestroying(VkDevice) noexcept;
     bool publish(const SourceReadbackMetadata& matchingSourceReadback,RecordView&) noexcept;
     bool release() noexcept;
     Reason refusal() const noexcept {return reason_.load(std::memory_order_acquire);}

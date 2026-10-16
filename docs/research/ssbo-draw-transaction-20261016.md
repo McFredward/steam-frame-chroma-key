@@ -81,7 +81,14 @@ an actual original DeviceWaitIdle success or terminal device loss was observed.
 A marker fence alone and idle alone are each insufficient. One Clone has one
 externally synchronized cold owner. Sequential accidental second-controller
 arming or release of another controller's referenced Clone is refused. Refusal/error never
-loosens this requirement. Destruction performs no Vulkan calls or waits.
+loosens this requirement. The actual original `vkDestroyDevice` entry is a separate explicit terminal
+event: after device/all-queue external synchronization and actual idle/lost, it
+retires the adopted generation and cancels obsolete tickets before freeing owned
+children and forwarding untouched native destruction. A wrong device or an idle
+observation without that destruction event cannot certify final retirement.
+This follows the [Vulkan DestroyDevice contract](https://docs.vulkan.org/refpages/latest/refpages/source/vkDestroyDevice.html),
+which externally synchronizes device/queues and requires destroying owned
+children first. The C++ destructor performs no Vulkan calls or waits.
 
 ## Focused evidence
 
@@ -95,7 +102,7 @@ mismatches cover command/pool/serial/image/view/memory/extent independently.
 
 Final local focused results:
 
-- 2,019 transaction checks and 5,473 invoked owned-factory fixture checks pass.
+- 2,151 transaction checks and 5,777 invoked owned-factory fixture checks pass.
 - The same checks pass under ASan + UBSan with leak detection.
 - AArch64 C++17 cross-build succeeds (ELF64 AArch64); not executed on Frame.
 - `-Wall -Wextra -Werror -pedantic` passes for all three builds.

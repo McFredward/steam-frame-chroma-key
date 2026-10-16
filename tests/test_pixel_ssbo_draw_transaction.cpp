@@ -406,6 +406,22 @@ void retirementOperations(){
         f.transaction.afterDeviceWaitIdle(VK_ERROR_DEVICE_LOST);require(f.transaction.release(),"retired + terminal device loss permits explicit release");
     }
 }
+void originalDeviceDestroyEntry(){
+    for(unsigned mode=0;mode<4;++mode){Fixture f;f.record();
+        Transaction::SubmitTicket pendingSubmit;Transaction::RetirementTicket pendingRetire;
+        if(mode==0)f.submitOriginal();
+        if(mode==2)pendingSubmit=f.before();
+        if(mode==3)pendingRetire=f.transaction.beforeRetirement(Retirement::ResetCommand,f.driver.command);
+        require(!f.transaction.deviceDestroying(f.driver.device) && !f.transaction.retired(),"DestroyDevice entry alone cannot replace actual idle/lost");
+        f.transaction.afterDeviceWaitIdle(mode==1?VK_ERROR_DEVICE_LOST:VK_SUCCESS);
+        require(!f.transaction.release(),"even actual idle/lost alone does not retire reusable original recording");
+        if(mode==0)require(!f.transaction.deviceDestroying(obj<VkDevice>(999)) && !f.transaction.retired(),"another actual device's Destroy cannot retire this generation");
+        require(f.transaction.deviceDestroying(f.driver.device) && f.transaction.retired(),"exact original DestroyDevice ENTRY after idle/lost closes final reusable generation");
+        require(!f.transaction.afterSubmit(pendingSubmit,VK_SUCCESS) && !f.transaction.afterRetirement(pendingRetire,VK_SUCCESS),"teardown cancels only obsolete exact generation tickets");
+        RecordView view;require(!f.transaction.publish(f.readback(),view) && !view.record,"DestroyDevice path cannot create a late diagnostic publication");
+        require(f.transaction.release() && f.ownerDriver.live.empty() && f.driver.fences.empty(),"owned clone/fence destroyed before untouched native DestroyDevice");
+    }
+}
 void reentryAndConcurrency(){
     for(bool threaded:{false,true}){
         Fixture f;f.initialize();f.arm();require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE),"test pass");f.prefix();
@@ -420,5 +436,5 @@ void reentryAndConcurrency(){
     }
 }
 }
-int main(){serial(true);serial(false);boundedRefusals();ticketsAndFences();boundedNativeBatches();transactionEpochReuse();rejectSharedReferencedOwner();sourceCohortMismatch();adoptionAndQueueHistory();precedingNativeDraws();retirementOperations();reentryAndConcurrency();
+int main(){serial(true);serial(false);boundedRefusals();ticketsAndFences();boundedNativeBatches();transactionEpochReuse();rejectSharedReferencedOwner();sourceCohortMismatch();adoptionAndQueueHistory();precedingNativeDraws();retirementOperations();originalDeviceDestroyEntry();reentryAndConcurrency();
     std::cout<<"ssbo_draw_transaction checks="<<checks<<" owned_fixture_checks="<<owned_fixture::checks<<'\n';}
