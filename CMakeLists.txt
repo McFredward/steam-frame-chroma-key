@@ -322,12 +322,16 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_registration_source_recovery.py)
         add_test(NAME registration_header_discovery COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_registration_header_discovery.py)
+        add_test(NAME registration_canvas_locator COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_registration_canvas_locator.py)
         # Public parser controls run without redistributing any native module.
         # Private original-shader checks require an explicit local input.
         add_test(NAME native_fragment_ssa_probe COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_ssa_probe.py)
         add_test(NAME native_fragment_atlas_probe COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_atlas_probe.py)
+        add_test(NAME native_fragment_ssbo_probe COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_ssbo_probe.py)
         add_test(NAME pixel_uniform_metadata_bridge COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_metadata.py
             --fixture $<TARGET_FILE:test_pixel_uniform_metadata>)
@@ -791,6 +795,9 @@ if(BUILD_TESTING)
             add_executable(test_native_fragment_aperture tests/native-fragment-atlas-gpu/aperture_diagnostic.cpp)
             target_link_libraries(test_native_fragment_aperture PRIVATE Vulkan::Vulkan)
             target_compile_options(test_native_fragment_aperture PRIVATE -Wall -Wextra -Wpedantic -Werror)
+            add_executable(test_native_fragment_ssbo_gpu tests/native-fragment-ssbo-gpu/fixture.cpp)
+            target_link_libraries(test_native_fragment_ssbo_gpu PRIVATE Vulkan::Vulkan)
+            target_compile_options(test_native_fragment_ssbo_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
             add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/native_fragment_ssa_fixture.vert.spv
                 COMMAND ${GLSLC} --target-env=vulkan1.1
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/native-fragment-ssa-gpu/fixture.vert

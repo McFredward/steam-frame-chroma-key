@@ -72,6 +72,46 @@ describe lifetimes, not new decoder contents. Reusing a VkImage handle or findin
 the same periodic body does not establish a video-frame epoch. Encoded source-eye
 labels remain distinct from physical-eye proof.
 
+### Actual current-pixel locator
+
+The new bounded positive axis-aligned locator takes no historical map or fit
+coefficients. Current sampled-G magic edges produce header-band hypotheses; a
+fixed coarse grid, CRC-recovered full-header edge fit and fixed fine grid produce
+the candidate. All three unchanged strict headers must agree. Only afterwards
+do canonical source/DLL/artifact provenance, disjoint dense markers and
+source-selected homogeneous coverage interiors validate it. False source hashes,
+wrong/stale tuples, changed bytes/extents, duplicate complete copies, cropped
+canvases and exhausted work budgets refuse. Caller records cannot upgrade the
+false native/live authorities.
+
+The exact immutable capture `b5ff764e7af8867a94aff07a56c555db` independently
+recovers encoded source-eye labels left and right, session
+`a0bff9cdfd7e4deda4181c33a88df645`, pair682/phase41. Both final CLI runs validate
+the full original P010/sampler pair and the original C# emitter provenance;
+all six headers agree with canonical artifacts. Each eye passes221 background
+plus220 color held-out marker cells with no incorrect/ambiguous bits. Minimum
+contrasts are75/74.5 for left and74/76.5 for right. Six source-selected7x7-uniform
+coverage levels have at least846 observations each: maximum code error0 left,
+1 right. This is not a boundary-quality or alpha-transfer result.
+
+Candidate pixel-chart parameters `(sx,sy,tx,ty)` are approximately
+`(1.67465992,2.10234236,-.13776314,1151.96478594)` and
+`(1.67449444,2.10231527,-.09805465,3455.96825984)`. Feasible sampled-grid ranges
+and edge residuals remain in the records. These are not exact continuous
+transforms or outer-band labels. Only a post-discovery comparison reads the
+previous fit; maximum source-centre receiver-coordinate differences are
+(.277,.049) and(.351,.037) pixels. The previous fit never seeds the locator.
+
+Ten public controls are composed from six passing controls before a bounded
+header-cache repair and four remaining controls afterwards. The original240s
+timeout is preserved. The cache reuses only byte-identical complete three-header
+inputs to the unchanged parser, within one immutable locate/session/eye, bounded
+to128 entries (about13.4MB). It never merges physical copies or hypotheses. No
+fresh full-ten-method local replay is claimed; the existing successful controls
+are inherited. Final strict actual CLIs take about30/28 seconds: this is an
+offline diagnostic, not a real-time GPU registrar. Private records remain at
+`build/private-canvas-locator-20261016/`.
+
 Even a complete-copy candidate must match the same original invocation's first
 lookup/R1 domain before any native use. Current post-render-pass acquisition is
 appropriate for immutable offline evidence; moving it before the draw can precede

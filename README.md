@@ -65,6 +65,11 @@ The [packed-coordinate prototype](docs/PACKED-ATLAS-REGISTRATION-20261016.md)
 then removes the CPU uniform join using the original fragment's own coordinates.
 An independent [game-coverage fixture](docs/GAME-COVERAGE-PROTOTYPE-20261016.md)
 tests explicit alpha rules for four owned Unity shader families. Both remain inert.
+The [bounded canvas locator](docs/PACKED-ATLAS-REGISTRATION-20261016.md#actual-current-pixel-locator)
+now derives capture-specific candidates from current pixels without historical
+fit inputs; the [SSBO observer](docs/NATIVE-FRAGMENT-SSBO-PROBE-20261016.md)
+checks original-invocation values with one owned color attachment. Neither is a
+native receiver installation or a live presenter.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
