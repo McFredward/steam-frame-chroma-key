@@ -322,6 +322,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_registration_source_recovery.py)
         add_test(NAME registration_header_discovery COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_registration_header_discovery.py)
+        # Public parser controls run without redistributing any native module.
+        # Private original-shader checks require an explicit local input.
+        add_test(NAME native_fragment_ssa_probe COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_ssa_probe.py)
         add_test(NAME pixel_uniform_metadata_bridge COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_metadata.py
             --fixture $<TARGET_FILE:test_pixel_uniform_metadata>)
@@ -772,6 +776,20 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_mask_gpu.py $<TARGET_FILE:test_mask_gpu>
             $<TARGET_FILE:test_mask_module_guard>)
         if(UNIX AND NOT CMAKE_CROSSCOMPILING)
+            # Inert host fixture only: no layer linkage, installation or native
+            # shader input in CI. Actual private GPU runs remain explicit.
+            add_executable(test_native_fragment_ssa_gpu tests/native-fragment-ssa-gpu/fixture.cpp)
+            target_link_libraries(test_native_fragment_ssa_gpu PRIVATE Vulkan::Vulkan)
+            target_compile_options(test_native_fragment_ssa_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
+            add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/native_fragment_ssa_fixture.vert.spv
+                COMMAND ${GLSLC} --target-env=vulkan1.1
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/native-fragment-ssa-gpu/fixture.vert
+                    -o ${CMAKE_CURRENT_BINARY_DIR}/native_fragment_ssa_fixture.vert.spv
+                DEPENDS tests/native-fragment-ssa-gpu/fixture.vert)
+            add_custom_target(native_fragment_ssa_fixture_vertex ALL
+                DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/native_fragment_ssa_fixture.vert.spv)
+            add_test(NAME native_fragment_ssa_vertex COMMAND ${SPIRV_VAL} --target-env vulkan1.1
+                ${CMAKE_CURRENT_BINARY_DIR}/native_fragment_ssa_fixture.vert.spv)
             # A layer-only ABI fixture uses the real loader/Mesa while remaining
             # unable to seal native compositor preparation or import entry scope.
             add_library(VkLayer_frame_compositor_private_fixture SHARED layer/passive_pipeline_trace.cpp)

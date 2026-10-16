@@ -50,8 +50,13 @@ confirmed usable.
 The next [changing registration source](docs/APP-REGISTRATION-SOURCE-20261016.md)
 is integrated in GloomhavenVR677. Real local Unity/Vulkan tests preserve its
 per-eye codes and headers exactly; a separate strict reader accepts the new
-profile without weakening the earlier static gates. Native dynamic carriage,
-application-ray registration and actual game-alpha composition remain unproven.
+profile without weakening the earlier static gates. The
+[actual changing-source recovery](docs/CHANGING-SOURCE-REGISTRATION-20261016.md)
+now identifies one encoded stereo pair against independently supplied PC logs.
+The next [inert fragment observation](docs/NATIVE-FRAGMENT-SSA-PROBE-20261016.md)
+exports original shader values only in an owned offscreen GPU fixture. Native
+temporal association, application-ray registration and actual game-alpha
+composition remain unproven; no live replacement shader is activated.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR

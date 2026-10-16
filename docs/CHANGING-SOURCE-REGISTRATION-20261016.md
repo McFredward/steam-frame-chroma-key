@@ -59,16 +59,36 @@ never be joined into a stereo pair. Header agreement alone cannot bless mixed
 or damaged scene planes. Even perfect fitted pixel agreement leaves native
 frame, physical-eye, application-ray and decoded-source integrity unproven.
 
-## Next receiver observation
+## Actual receiver observation
+
+The matching fresh PC logs now independently identify session
+`a0bff9cdfd7e4deda4181c33a88df645`. Applying only the unchanged fixed hypotheses
+recovers pair682/phase41 for both encoded source-eye labels. All six full headers
+match actual production C# regeneration, including both source-plane digest
+claims. The existing strict reader accepts both measurements, and independent
+review reproduces this chain. The source body's phase repeats every128 pairs;
+only the full header identifies682. This is not a native video-frame ID.
+
+The dense-coordinate check matches all882 marker observations with minimum
+contrast52 against a fixed32 threshold, without choosing a better map or shift.
+These are observations, not882 globally unique IDs. The original uint8 selector
+overflow is explicitly preserved as invalid; corrected int16 selection and a
+nonempty population requirement prevent vacuous success.
+
+For each eye8,138 homogeneous5x5 source-coverage interior points differ by at
+most one8-bit code, including6,158 fractional-coverage points. This does not cover
+the entire61,440-pixel plane: its MAE is2.9687/2.8814 and maximum error173/170.
+Transition filtering, resampling and compression remain plausible explanations,
+not separately measured causes. Comparing sampled G with source G/R8 does not
+reconstruct scene RGB or establish the actual native sampler's color contract.
 
 The prepared ordinary package has now completed its approved one-shot run,
 capture `b5ff764e7af8867a94aff07a56c555db`. All three transferred byte counts and
 SHA256 values match the device's completed immutable files. Independent review
 accepts the recorded owned fence, exact reusable-generation retirement and
 disjoint storage slices. No producer refusal occurs. The uniform companion and
-live mask remain disabled. The corresponding fresh PC source log is still
-needed before selecting an independent expected session and decoding a tuple;
-the earlier Build677 log must not be substituted.
+live mask remain disabled. The corresponding fresh PC log was subsequently
+supplied as described above; the earlier Build677 log was never substituted.
 
 Manual rollback is complete after separate agreement. Activation files and the
 owned runtime library are absent, certain scans find no diagnostic mappings,
@@ -79,7 +99,7 @@ under `build/private-registration-source-run-20261016-r1/`. Two pinned historica
 fitted hypotheses are prepared without session discovery. No new compiler or
 Unity cache was created for the acquisition; all child processes are reaped.
 
-The next prepared package uses the ordinary pixel/native-sampler diagnostic
+The completed package uses the ordinary pixel/native-sampler diagnostic
 with `FRAME_PIXEL_UNIFORM_COMPANION=OFF`. It acquires at most one immutable image
 as the three existing artifacts: `snapshot.p010`, `sampler-components.rgba8`
 and `snapshot.json`. It does not read additional native uniforms, inspect host
@@ -111,9 +131,11 @@ original captures. There is no automatic rollback, restart or source-test timer.
 
 Real per-eye game coverage and a verified live presenter remain separate work.
 Copied post-draw uniform bytes are not independently proven shader-consumed
-bytes. The app-canvas-to-decoded mapping is still unknown. A successful next
-header observation would identify a changing diagnostic tuple, not grant any
-of these missing authorities.
+bytes. The app-canvas-to-decoded mapping is still unknown. The successful changing
+header observation identifies an encoded diagnostic tuple, without granting any
+of these missing authorities. The subsequent inert original-fragment GPU work
+is documented in `docs/NATIVE-FRAGMENT-SSA-PROBE-20261016.md`; it adds no runtime
+activation or Frame access.
 
 Private evidence: main `.planning/debug/steamlink677/hardware-20261016/` and fork
 `build/private-registration-hardware-20261016/`,
