@@ -97,6 +97,38 @@ void creationShapes(){
     std::array<VkBaseInStructure,33> nodes{};for(unsigned i=0;i<nodes.size();++i){nodes[i].sType=static_cast<VkStructureType>(i+1);nodes[i].pNext=i+1<nodes.size()?&nodes[i+1]:nullptr;}
     facts::Creation bounded;facts::creationChain(bounded,nodes.data());require(bounded.chainCount==32&&bounded.chainEnd==facts::ChainEnd::Bounds,"creation pNext census has exact finite bound");
 }
+void graphicsDetails(){
+    facts::Facts out;auto device=info<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);facts::device(out,device,VK_SUCCESS);
+    auto ci=info<VkGraphicsPipelineCreateInfo>(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
+    std::array<VkPipelineShaderStageCreateInfo,2> stages{};for(auto& stage:stages)stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT;stages[0].pName="VS_DISTORT";stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT;stages[1].pName="PS_DISTORT";ci.stageCount=2;ci.pStages=stages.data();
+    ci.layout=reinterpret_cast<VkPipelineLayout>(std::uintptr_t(20));ci.renderPass=reinterpret_cast<VkRenderPass>(std::uintptr_t(30));ci.subpass=2;
+    auto dynamic=info<VkPipelineDynamicStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO);
+    std::array<VkDynamicState,64> values{};for(unsigned i=0;i<values.size();++i)values[i]=static_cast<VkDynamicState>(1000455000+i);
+    values[0]=VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_ENABLE_EXT;dynamic.dynamicStateCount=values.size();dynamic.pDynamicStates=values.data();ci.pDynamicState=&dynamic;
+    auto raster=info<VkPipelineRasterizationStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO);ci.pRasterizationState=&raster;
+    auto multisample=info<VkPipelineMultisampleStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO);multisample.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;ci.pMultisampleState=&multisample;
+    auto sample=info<VkBaseInStructure>(VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT);auto unknown=info<VkBaseInStructure>(static_cast<VkStructureType>(0x6fffffff));sample.pNext=&unknown;multisample.pNext=&sample;
+    ci.pDepthStencilState=reinterpret_cast<const VkPipelineDepthStencilStateCreateInfo*>(std::uintptr_t(1));ci.pColorBlendState=reinterpret_cast<const VkPipelineColorBlendStateCreateInfo*>(std::uintptr_t(1));ci.pTessellationState=reinterpret_cast<const VkPipelineTessellationStateCreateInfo*>(std::uintptr_t(1));
+    facts::graphicsDetails(out,ci,VK_ERROR_INITIALIZATION_FAILED,1);require(!out.graphicsCount,"failed create does not read deeper graphics pointers");
+    facts::graphicsDetails(out,ci,VK_SUCCESS,10);
+    const auto& first=out.graphics[0];require(out.graphicsCount==1&&first.dynamicRead==facts::GraphicsRead::Complete&&first.dynamicCount==64&&first.dynamics[0]==1000455017,"all finite original dynamic enum words retained including native sample-locations enable");
+    require(first.pipeline==10&&first.layout==20&&first.renderPass==30&&first.subpass==2&&first.sequence==1,"exact target identity and selected subpass cannot disappear in top-level shape deduplication");
+    require(first.states[static_cast<unsigned>(facts::GraphicsState::Multisample)].chainCount==2&&first.states[static_cast<unsigned>(facts::GraphicsState::Multisample)].chainTypes[1]==0x6fffffff,"all child extension headers retained without interpreting unknown payload");
+    require(first.states[static_cast<unsigned>(facts::GraphicsState::DepthStencil)].read==facts::GraphicsRead::UnknownScope&&first.states[static_cast<unsigned>(facts::GraphicsState::Tessellation)].read==facts::GraphicsRead::Ignored,"unknown selected scope and absent tessellation never dereference poison state pointers");
+    values[0]=VK_DYNAMIC_STATE_VIEWPORT;unknown.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    require(first.dynamics[0]==1000455017&&first.states[static_cast<unsigned>(facts::GraphicsState::Multisample)].chainTypes[1]==0x6fffffff,"graphics observation owns dynamic list and nested header values after overwrite");
+    for(unsigned i=1;i<facts::MaxGraphics;++i)facts::graphicsDetails(out,ci,VK_SUCCESS,10+i,{true,0,false});
+    require(out.graphicsCount==8&&out.graphics[5].pipeline==15&&out.graphics[7].sequence==8,"identical target shapes keep all six actual pipeline creations independently");
+    facts::graphicsDetails(out,ci,VK_SUCCESS,100,{true,0,false});require(out.graphicsCount==8&&out.graphicsOverflow&&out.graphicsSequence==9&&out.graphics[0].pipeline==10,"bounded graphics observation overflow is explicit without eviction");
+    facts::Facts discard;facts::device(discard,device,VK_SUCCESS);dynamic.dynamicStateCount=0;raster.rasterizerDiscardEnable=VK_TRUE;
+    ci.pViewportState=reinterpret_cast<const VkPipelineViewportStateCreateInfo*>(std::uintptr_t(1));ci.pMultisampleState=reinterpret_cast<const VkPipelineMultisampleStateCreateInfo*>(std::uintptr_t(1));
+    facts::graphicsDetails(discard,ci,VK_SUCCESS,101,{true,1,true});require(discard.graphics[0].states[static_cast<unsigned>(facts::GraphicsState::Multisample)].read==facts::GraphicsRead::Ignored,"rasterizer discard never follows ignored multisample/viewport/depth/blend pointers");
+    facts::Facts vertex;facts::device(vertex,device,VK_SUCCESS);values[0]=VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;dynamic.dynamicStateCount=1;ci.pVertexInputState=reinterpret_cast<const VkPipelineVertexInputStateCreateInfo*>(std::uintptr_t(1));
+    facts::graphicsDetails(vertex,ci,VK_SUCCESS,102);require(vertex.graphics[0].states[static_cast<unsigned>(facts::GraphicsState::VertexInput)].read==facts::GraphicsRead::Ignored,"fully dynamic vertex input skips entire ignored pointer");
+    facts::Facts unsupported;facts::device(unsupported,device,VK_SUCCESS);ci.flags=VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;ci.pStages=reinterpret_cast<const VkPipelineShaderStageCreateInfo*>(std::uintptr_t(1));facts::graphicsDetails(unsupported,ci,VK_SUCCESS,103);
+    require(!unsupported.graphicsCount,"library/unknown top-level semantics remain top-level observations only");
+}
 
 }
-int main(){deviceChain();setShapes();creationShapes();std::cout<<"{\"checks\":"<<checks<<",\"facts_bytes\":"<<sizeof(facts::Facts)<<",\"runtime_authority\":false}\n";}
+int main(){deviceChain();setShapes();creationShapes();graphicsDetails();std::cout<<"{\"checks\":"<<checks<<",\"facts_bytes\":"<<sizeof(facts::Facts)<<",\"runtime_authority\":false}\n";}
