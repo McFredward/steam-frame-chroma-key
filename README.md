@@ -47,6 +47,11 @@ bounded offline lookup reference is independently checked against the original
 fragment shader. Physical eye, source-ray registration and live alpha remain
 unproven; the temporary diagnostic is removed and the original Frame UI is
 confirmed usable.
+The next [changing registration source](docs/APP-REGISTRATION-SOURCE-20261016.md)
+is integrated in GloomhavenVR677. Real local Unity/Vulkan tests preserve its
+per-eye codes and headers exactly; a separate strict reader accepts the new
+profile without weakening the earlier static gates. Native dynamic carriage,
+application-ray registration and actual game-alpha composition remain unproven.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR

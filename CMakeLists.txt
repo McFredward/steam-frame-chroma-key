@@ -318,6 +318,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_recovery.py)
         add_test(NAME pixel_uniform_mapping COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_mapping.py)
+        add_test(NAME registration_source_recovery COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_registration_source_recovery.py)
         add_test(NAME pixel_uniform_metadata_bridge COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_metadata.py
             --fixture $<TARGET_FILE:test_pixel_uniform_metadata>)
