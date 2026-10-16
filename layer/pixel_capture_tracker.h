@@ -9,6 +9,7 @@
 // well as owned GPU completion before CPU readback: the embedded copy may run
 // again until retirement. The owner never changes native recording flags.
 #include "passive_pipeline_trace.h"
+#include "pixel_uniform_contract.h"
 
 #include <pthread.h>
 #include <utility>
@@ -21,6 +22,30 @@ constexpr std::size_t CommandCapacity = 512;
 constexpr std::size_t ShaderCapacity = 1024;
 constexpr std::size_t PipelineCapacity = 256;
 constexpr std::size_t SubmitCapacity = 64;
+
+enum class UniformRefusal : std::uint8_t {
+    Disabled, None, NoFinalTarget, NotDirectNonempty, NativeStages, Limits,
+    Metadata, ChangedSource, PipelineChanged, Resources, Subpass,
+    UnknownPath, DrawOrdinalOverflow,
+};
+inline const char* uniformRefusalName(UniformRefusal reason) noexcept {
+    switch (reason) {
+    case UniformRefusal::Disabled: return "disabled";
+    case UniformRefusal::None: return "none";
+    case UniformRefusal::NoFinalTarget: return "no_final_target";
+    case UniformRefusal::NotDirectNonempty: return "not_direct_nonempty";
+    case UniformRefusal::NativeStages: return "native_stages";
+    case UniformRefusal::Limits: return "limits";
+    case UniformRefusal::Metadata: return "metadata";
+    case UniformRefusal::ChangedSource: return "changed_source";
+    case UniformRefusal::PipelineChanged: return "pipeline_changed";
+    case UniformRefusal::Resources: return "resources";
+    case UniformRefusal::Subpass: return "subpass";
+    case UniformRefusal::UnknownPath: return "unknown_path";
+    case UniformRefusal::DrawOrdinalOverflow: return "draw_ordinal_overflow";
+    }
+    return "unknown_uniform_refusal";
+}
 
 struct Candidate {
     std::uint64_t device = 0;
@@ -35,8 +60,21 @@ struct Candidate {
     // This does not prove the device/queue or unsupported routes are eligible.
     bool noPriorComputeState = false;
     frame_bindings::Binding binding{};
+    // Optional exact-final-draw metadata; default calls never populate a plan.
+    // This is observed API adjacency, NOT GPU bytes, frame/eye identity, queue
+    // ownership, a completion fence or permission to publish a uniform copy.
+    UniformRefusal uniformRefusal = UniformRefusal::Disabled;
+    std::uint32_t uniformOffendingBinding = UINT32_MAX;
+    frame_pixel_uniform::Refusal uniformContractRefusal = frame_pixel_uniform::Refusal::None;
+    frame_bindings::UniformResourceRefusal uniformResourceRefusal{};
+    bool uniformFinalDraw = false;
+    std::uint64_t uniformDrawOrdinal = 0;
+    frame_bindings::Identity uniformPipeline{};
+    frame_pixel_uniform::NativeStages uniformStages{};
+    frame_pixel_uniform::CandidatePlan uniformPlan{};
 };
 static_assert(std::is_trivially_copyable_v<Candidate>, "Pixel candidates must own bounded metadata");
+static_assert(sizeof(Candidate) <= 8192, "Optional companion exceeds the bounded candidate budget");
 
 struct SubmitTicket {
     std::uint64_t device = 0;
@@ -80,10 +118,28 @@ class LiveTracker {
     using Identity = frame_bindings::Identity;
     struct Base { std::uint64_t device = 0; Identity id{}; };
     struct Pool : Base { std::uint32_t family = VK_QUEUE_FAMILY_IGNORED; bool supported = false; };
-    struct Shader : Base { std::uint64_t hash = 0; bool complete = false; };
-    struct Pipeline : Base { VkPipelineLayout layout = VK_NULL_HANDLE; bool supported = false; };
+    struct Shader : Base { std::uint64_t hash = 0; std::uint32_t bytes = 0; bool complete = false; };
+    struct Pipeline : Base {
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        bool supported = false;
+        // Pipeline creation consumes shader modules. These facts remain valid
+        // when Vulkan legally destroys/reuses the original module handles.
+        frame_pixel_uniform::NativeStages stages{};
+    };
     struct PendingSubmit : Base { SubmitTicket ticket{}; };
     enum class Scope : std::uint8_t { None, RenderPass, Dynamic };
+    struct UniformSelection {
+        bool requested = false, selected = false;
+        UniformRefusal refusal = UniformRefusal::Disabled;
+        std::uint32_t binding = UINT32_MAX;
+        frame_pixel_uniform::Refusal contract = frame_pixel_uniform::Refusal::None;
+        frame_bindings::UniformResourceRefusal resources{};
+        Identity pipeline{};
+        std::uint64_t ordinal = 0;
+        frame_pixel_uniform::NativeStages stages{};
+        frame_pixel_uniform::Limits limits{};
+        frame_bindings::Snapshot snapshot{};
+    };
     struct Command : Base {
         Identity pool{}, pipeline{}, selectedPipeline{};
         std::uint32_t family = VK_QUEUE_FAMILY_IGNORED;
@@ -93,6 +149,8 @@ class LiveTracker {
         bool supported = false, recording = false, executable = false;
         bool selected = false, issued = false, submitted = false, prepared = false;
         bool noPriorComputeState = false;
+        std::uint64_t drawOrdinal = 0;
+        UniformSelection uniform{};
         Candidate candidate{};
     };
 
@@ -144,7 +202,10 @@ public:
                 info.flags == 0 && info.pCode && info.codeSize >= 5 * sizeof(std::uint32_t) &&
                 info.codeSize <= frame_trace::MaxShaderBytes && info.codeSize % sizeof(std::uint32_t) == 0 &&
                 info.pCode[0] == UINT32_C(0x07230203);
-            if (shader->complete) shader->hash = frame_trace::fingerprint(info.pCode, info.codeSize);
+            if (shader->complete) {
+                shader->hash = frame_trace::fingerprint(info.pCode, info.codeSize);
+                shader->bytes = static_cast<std::uint32_t>(info.codeSize);
+            }
             return true;
         });
     }
@@ -166,9 +227,13 @@ public:
                     stage.flags || stage.pSpecializationInfo || !shader || !shader->complete) {
                     pipeline->supported = false; break;
                 }
-                if (stage.stage == VK_SHADER_STAGE_VERTEX_BIT && !vertex) vertex = true;
+                if (stage.stage == VK_SHADER_STAGE_VERTEX_BIT && !vertex) {
+                    vertex = true; pipeline->stages.vertex = describeStage(*shader, stage);
+                }
                 else if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT && !fragment &&
-                         shader->hash == DistortionFragmentHash && exactEntry(stage.pName, "PS_DISTORT")) fragment = true;
+                         shader->hash == DistortionFragmentHash && exactEntry(stage.pName, "PS_DISTORT")) {
+                    fragment = true; pipeline->stages.fragment = describeStage(*shader, stage);
+                }
                 else { pipeline->supported = false; break; }
             }
             pipeline->supported = pipeline->supported && vertex && fragment;
@@ -196,6 +261,7 @@ public:
         return locked("touchComputeState", [&] {
             auto* command = recording(device, value); if (!command) return false;
             command->noPriorComputeState = false;
+            discardUniform(*command, UniformRefusal::UnknownPath);
             return true;
         });
     }
@@ -310,6 +376,7 @@ public:
             auto* command = recording(device, value); if (!command) return false;
             if (command->scope != Scope::RenderPass || contents != VK_SUBPASS_CONTENTS_INLINE)
                 return invalidate(*command);
+            discardUniform(*command, UniformRefusal::Subpass);
             return true;
         });
     }
@@ -327,30 +394,85 @@ public:
         return endScope(device, value, Scope::Dynamic, out, "endRendering");
     }
 
-    bool draw(std::uint64_t device, VkCommandBuffer value) noexcept {
+    // Return value preserves the original first raw-image selection policy.
+    // Every observed direct draw, INCLUDING zero-count calls, must reach this
+    // method for an enabled companion. Indirect/secondary/unknown routes keep
+    // their existing strict unknownCommand policy. Limits are copied, not held.
+    bool draw(std::uint64_t device, VkCommandBuffer value,
+              const frame_pixel_uniform::Limits* limits = nullptr,
+              bool directNonempty = true) noexcept {
         return locked("draw", [&] {
             auto* command = recording(device, value); if (!command) return false;
-            if (!command->supported || command->scope == Scope::None || command->selected || command->issued) return false;
+            if (limits) command->uniform.requested = true;
+            discardUniform(*command, UniformRefusal::NoFinalTarget);
+            const bool ordinalValid = command->drawOrdinal != UINT64_MAX;
+            if (ordinalValid) ++command->drawOrdinal;
+            else discardUniform(*command, UniformRefusal::DrawOrdinalOverflow);
+            command->uniform.ordinal = command->drawOrdinal;
+            // This invalidation intentionally precedes the legacy selected
+            // early return: a later UI/zero/foreign draw is not the first draw.
+            if (!command->supported || command->scope == Scope::None || command->issued) return false;
+            if (!directNonempty) { discardUniform(*command, UniformRefusal::NotDirectNonempty); return false; }
+            if (!limits && command->selected) return false; // Original fast path.
             const auto* pipeline = pipelines_.find(device, command->pipeline.handle);
             if (!pipeline || !frame_bindings::same(pipeline->id, command->pipeline) || !pipeline->supported) return false;
+            bool uniform = limits && ordinalValid;
+            if (limits && ordinalValid) {
+                command->uniform.pipeline = pipeline->id; command->uniform.stages = pipeline->stages;
+                if (!frame_pixel_uniform::nativeStagesMatch(pipeline->stages)) {
+                    discardUniform(*command, UniformRefusal::NativeStages); uniform = false;
+                } else if (!validLimits(*limits)) {
+                    discardUniform(*command, UniformRefusal::Limits); uniform = false;
+                }
+            }
+            if (command->selected && !uniform) return false;
             const auto state = bindings_.snapshot(device, value, pipeline->layout);
-            if (!coreHealthy() || !state.sourceComplete) return false;
+            if (!coreHealthy()) return false;
+            if (!state.sourceComplete) {
+                if (uniform) {
+                    discardUniform(*command, UniformRefusal::Metadata);
+                    command->uniform.contract = frame_pixel_uniform::Refusal::SnapshotIncomplete;
+                }
+                return false;
+            }
             const frame_bindings::Binding* source = nullptr;
             for (const auto& binding : state.bindings) if (binding.binding == 9) { source = &binding; break; }
             if (!source || !eligible(*source)) return false;
-            command->candidate = {};
-            command->candidate.device = device; command->candidate.command = value;
-            command->candidate.pool = native<VkCommandPool>(command->pool.handle);
-            command->candidate.poolGeneration = command->pool.generation;
-            command->candidate.commandGeneration = command->id.generation;
-            command->candidate.beginFlags = command->beginFlags;
-            command->candidate.oneTimeSubmit = (command->beginFlags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) != 0;
-            command->candidate.noSimultaneousUse = (command->beginFlags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) == 0;
-            command->candidate.retirementRequired = !command->candidate.oneTimeSubmit;
-            command->candidate.noPriorComputeState = command->noPriorComputeState;
-            command->candidate.queueFamily = command->family; command->candidate.binding = *source;
-            command->selectedPipeline = pipeline->id; command->selected = true;
-            return true;
+            const bool selected = !command->selected;
+            if (selected) {
+                command->candidate = {};
+                command->candidate.device = device; command->candidate.command = value;
+                command->candidate.pool = native<VkCommandPool>(command->pool.handle);
+                command->candidate.poolGeneration = command->pool.generation;
+                command->candidate.commandGeneration = command->id.generation;
+                command->candidate.beginFlags = command->beginFlags;
+                command->candidate.oneTimeSubmit = (command->beginFlags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) != 0;
+                command->candidate.noSimultaneousUse = (command->beginFlags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) == 0;
+                command->candidate.retirementRequired = !command->candidate.oneTimeSubmit;
+                command->candidate.noPriorComputeState = command->noPriorComputeState;
+                command->candidate.queueFamily = command->family; command->candidate.binding = *source;
+                command->selectedPipeline = pipeline->id; command->selected = true;
+            }
+            if (uniform) {
+                // This first same-snapshot call checks only bounded shape. It
+                // is never published as a two-observation/currentness proof.
+                const auto shape = frame_pixel_uniform::planCandidate(state, state, pipeline->stages, *limits);
+                if (!shape.metadataCandidate) {
+                    discardUniform(*command, UniformRefusal::Metadata);
+                    command->uniform.contract = shape.refusal; command->uniform.binding = shape.offendingBinding;
+                } else {
+                    frame_bindings::UniformResourceRefusal resources;
+                    if (!bindings_.validateUnaliasedUniformResources(state, &resources)) {
+                        discardUniform(*command, UniformRefusal::Resources);
+                        command->uniform.resources = resources; command->uniform.binding = resources.binding;
+                    } else {
+                        command->uniform.snapshot = state; command->uniform.limits = *limits;
+                        command->uniform.selected = true; command->uniform.refusal = UniformRefusal::None;
+                    }
+                }
+                if (!coreHealthy()) return false;
+            }
+            return selected;
         });
     }
 
@@ -508,6 +630,7 @@ private:
     bool invalidate(Command& command) noexcept {
         command.supported = false; command.executable = false;
         command.selected = false; command.issued = false;
+        discardUniform(command, UniformRefusal::UnknownPath);
         return false;
     }
     void clearRecording(Command& command) noexcept {
@@ -521,6 +644,7 @@ private:
             auto* command = recording(device, value); if (!command) return false;
             if (!command->supported || !supported || command->scope != Scope::None) return invalidate(*command);
             command->scope = scope; command->selected = false;
+            command->uniform = {};
             return true;
         });
     }
@@ -535,6 +659,8 @@ private:
             const auto* pipeline = pipelines_.find(device, command->selectedPipeline.handle);
             if (!pipeline || !frame_bindings::same(pipeline->id, command->selectedPipeline) ||
                 !bindings_.validateBindingResources(command->candidate.binding) || !coreHealthy()) return false;
+            populateUniform(*command);
+            if (!coreHealthy()) return false;
             const auto serial = next(); if (!serial) return false;
             command->candidate.serial = serial; command->issued = true;
             // Compute state can change after the selected draw but before its
@@ -544,6 +670,81 @@ private:
             out = command->candidate;
             return true;
         });
+    }
+    static bool validLimits(const frame_pixel_uniform::Limits& limits) noexcept {
+        const auto alignment = limits.minUniformBufferOffsetAlignment;
+        return alignment && !(alignment & (alignment - 1)) && limits.maxUniformBufferRange;
+    }
+    static frame_trace::Stage describeStage(const Shader& shader,
+                                            const VkPipelineShaderStageCreateInfo& info) noexcept {
+        frame_trace::Stage out;
+        out.stage = info.stage; out.module = shader.id.handle; out.generation = shader.id.generation;
+        out.hash = shader.hash; out.bytes = shader.bytes;
+        out.complete = shader.complete && frame_trace::copyEntry(out.entry, info.pName);
+        return out;
+    }
+    static void discardUniform(Command& command, UniformRefusal reason) noexcept {
+        auto& selection = command.uniform;
+        selection.selected = false;
+        selection.refusal = selection.requested ? reason : UniformRefusal::Disabled;
+        selection.binding = UINT32_MAX; selection.contract = frame_pixel_uniform::Refusal::None;
+        selection.resources = {}; selection.pipeline = {}; selection.stages = {};
+        // The prior bounded snapshot is inaccessible while selected=false. Do
+        // not memset its large scalar payload on every unrelated native draw.
+    }
+    static const frame_bindings::Binding* imageSource(const frame_bindings::Snapshot& state) noexcept {
+        for (const auto& binding : state.bindings) if (binding.binding == 9) return &binding;
+        return nullptr;
+    }
+    static bool sameImageSource(const frame_bindings::Binding& a,
+                                const frame_bindings::Binding& b) noexcept {
+        return eligible(a) && eligible(b) && frame_bindings::same(a.image.identity, b.image.identity)
+            && frame_bindings::same(a.view.identity, b.view.identity)
+            && frame_bindings::same(a.image.memory, b.image.memory);
+    }
+    void populateUniform(Command& command) noexcept {
+        auto& out = command.candidate; const auto& selection = command.uniform;
+        out.uniformRefusal = selection.refusal; out.uniformOffendingBinding = selection.binding;
+        out.uniformContractRefusal = selection.contract; out.uniformResourceRefusal = selection.resources;
+        out.uniformPipeline = selection.pipeline; out.uniformStages = selection.stages;
+        out.uniformDrawOrdinal = command.drawOrdinal;
+        if (!selection.requested || !selection.selected) return;
+        if (selection.ordinal != command.drawOrdinal || !command.drawOrdinal) {
+            out.uniformRefusal = UniformRefusal::NoFinalTarget; return;
+        }
+        const auto* pipeline = pipelines_.find(command.device, selection.pipeline.handle);
+        if (!pipeline || !frame_bindings::same(pipeline->id, selection.pipeline)
+            || !frame_bindings::same(command.pipeline, selection.pipeline) || !pipeline->supported) {
+            out.uniformRefusal = UniformRefusal::PipelineChanged; return;
+        }
+        if (!frame_pixel_uniform::nativeStagesMatch(pipeline->stages)) {
+            out.uniformRefusal = UniformRefusal::NativeStages; return;
+        }
+        const auto current = bindings_.snapshot(command.device, native<VkCommandBuffer>(command.id.handle), pipeline->layout);
+        if (!current.sourceComplete) {
+            out.uniformRefusal = UniformRefusal::Metadata;
+            out.uniformContractRefusal = frame_pixel_uniform::Refusal::SnapshotIncomplete;
+            return; // Incomplete whole-state metadata cannot identify binding9.
+        }
+        const auto* source = imageSource(current); const auto* original = imageSource(selection.snapshot);
+        if (!source || !original ||
+            !sameImageSource(*source, *original) || !sameImageSource(*source, out.binding)) {
+            out.uniformRefusal = UniformRefusal::ChangedSource;
+            out.uniformOffendingBinding = 9; return;
+        }
+        const auto plan = frame_pixel_uniform::planCandidate(selection.snapshot, current, pipeline->stages, selection.limits);
+        if (!plan.metadataCandidate) {
+            out.uniformRefusal = plan.refusal == frame_pixel_uniform::Refusal::Limits ? UniformRefusal::Limits : UniformRefusal::Metadata;
+            out.uniformContractRefusal = plan.refusal; out.uniformOffendingBinding = plan.offendingBinding;
+            return;
+        }
+        frame_bindings::UniformResourceRefusal resources;
+        if (!bindings_.validateUnaliasedUniformResources(current, &resources)) {
+            out.uniformRefusal = UniformRefusal::Resources;
+            out.uniformResourceRefusal = resources; out.uniformOffendingBinding = resources.binding;
+            return;
+        }
+        out.uniformPlan = plan; out.uniformFinalDraw = true; out.uniformRefusal = UniformRefusal::None;
     }
     static bool exactEntry(const char* entry, const char* expected) noexcept {
         if (!entry) return false;

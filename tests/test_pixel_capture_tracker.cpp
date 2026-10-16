@@ -25,6 +25,32 @@ struct TestAccess {
         const auto* shader = tracker.shaders_.find(device, frame_bindings::handle(module));
         return shader ? shader->hash : 0;
     }
+    static void pinSyntheticNativePair(LiveTracker& tracker, std::uint64_t device,
+                                       VkShaderModule vertex, VkShaderModule fragment) {
+        auto* vs = tracker.shaders_.find(device, frame_bindings::handle(vertex));
+        auto* fs = tracker.shaders_.find(device, frame_bindings::handle(fragment));
+        if (!vs || !fs || !vs->complete || !fs->complete) std::abort();
+        // Version-specific native code is private. Only this CPU state fixture
+        // pins its observed synthetic code; production still fingerprints the
+        // actual original public CreateShaderModule bytes and exact sizes.
+        vs->hash = frame_pixel_uniform::NativeVertexFingerprint; vs->bytes = frame_pixel_uniform::NativeVertexBytes;
+        fs->hash = frame_pixel_uniform::NativeFragmentFingerprint; fs->bytes = frame_pixel_uniform::NativeFragmentBytes;
+    }
+    static void wrongSyntheticVertexBytes(LiveTracker& tracker, std::uint64_t device, VkShaderModule module) {
+        auto* shader = tracker.shaders_.find(device, frame_bindings::handle(module));
+        if (!shader) std::abort();
+        shader->bytes -= 4;
+    }
+    static void wrongSyntheticVertexHash(LiveTracker& tracker, std::uint64_t device, VkShaderModule module) {
+        auto* shader = tracker.shaders_.find(device, frame_bindings::handle(module));
+        if (!shader) std::abort();
+        shader->hash ^= 1;
+    }
+    static void exhaustDrawOrdinal(LiveTracker& tracker, std::uint64_t device, VkCommandBuffer value) {
+        auto* command = tracker.commands_.find(device, frame_bindings::handle(value));
+        if (!command) std::abort();
+        command->drawOrdinal = UINT64_MAX;
+    }
     static void exhaustGeneration(LiveTracker& tracker) { tracker.serial_ = UINT64_MAX; }
     static bool ownerPresent(const LiveTracker& tracker) {
         return tracker.ownerPresent_.load(std::memory_order_acquire);
@@ -105,6 +131,10 @@ const std::uint32_t code[] = {0x07230203, 0x00010000, 0, 8, 0, 0x00010000};
 
 struct Fixture {
     LiveTracker tracker;
+    bool uniforms = false;
+    std::uint32_t dynamicOffset = 256;
+    std::array<VkBuffer, 5> uniformBuffers{};
+    std::array<VkDeviceMemory, 5> uniformMemories{};
     VkImageCreateInfo imageInfo = info<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
     VkImageViewCreateInfo viewInfo = info<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
     VkCommandBufferBeginInfo beginInfo = info<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
@@ -112,7 +142,8 @@ struct Fixture {
     VkCommandBufferAllocateInfo allocate = info<VkCommandBufferAllocateInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
 
     Fixture(bool pin = true, VkCommandBufferUsageFlags flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            VkCommandBufferLevel level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, VkCommandPoolCreateFlags poolFlags = 0) {
+            VkCommandBufferLevel level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, VkCommandPoolCreateFlags poolFlags = 0,
+            bool withUniforms = false) : uniforms(withUniforms) {
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
         imageInfo.format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
         imageInfo.extent = {1152, 4608, 1}; imageInfo.mipLevels = 1; imageInfo.arrayLayers = 1;
@@ -129,8 +160,24 @@ struct Fixture {
             core.bindImageMemory(device, image, memory, 0);
             core.createView(device, view, viewInfo);
             VkDescriptorSetLayoutBinding binding{9, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+            std::array<VkDescriptorSetLayoutBinding, 6> definitions{};
+            if (uniforms) {
+                for (unsigned i = 0; i < uniformBuffers.size(); ++i) {
+                    uniformBuffers[i] = h<VkBuffer>(200 + i); uniformMemories[i] = h<VkDeviceMemory>(300 + i);
+                    auto buffer = info<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+                    buffer.size = 8192; buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+                    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                    core.createBuffer(device, uniformBuffers[i], buffer);
+                    auto memory = info<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+                    memory.allocationSize = 16384; core.allocateMemory(device, uniformMemories[i], memory);
+                    core.bindBufferMemory(device, uniformBuffers[i], uniformMemories[i], 0);
+                    definitions[i] = {frame_pixel_uniform::UniformBindings[i], i == 1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                        : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr};
+                }
+                definitions.back() = binding;
+            }
             auto layout = info<VkDescriptorSetLayoutCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
-            layout.bindingCount = 1; layout.pBindings = &binding;
+            layout.bindingCount = uniforms ? definitions.size() : 1; layout.pBindings = uniforms ? definitions.data() : &binding;
             core.createSetLayout(device, sl, layout);
             auto pi = info<VkPipelineLayoutCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
             pi.setLayoutCount = 1; pi.pSetLayouts = &sl; core.createPipelineLayout(device, pl, pi);
@@ -144,12 +191,14 @@ struct Fixture {
             sets.pSetLayouts = &uiSl; core.allocateSets(device, sets, &uiDs);
         }), "seed production Core resource graph");
         write(ds); write(ds2);
+        if (uniforms) { writeUniforms(ds); writeUniforms(ds2); }
         auto shader = info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
         shader.codeSize = sizeof(code); shader.pCode = code;
         require(tracker.createShader(device, vs, shader) && tracker.createShader(device, fs, shader), "observe shader code");
         require(TestAccess::observedHash(tracker, device, fs) == frame_trace::fingerprint(code, sizeof(code)),
                 "real public shader bytes use existing FNV implementation");
         if (pin) TestAccess::pinSyntheticModule(tracker, device, fs);
+        if (uniforms) TestAccess::pinSyntheticNativePair(tracker, device, vs, fs);
         makePipeline(pipeline, pl, "PS_DISTORT");
         makePipeline(uiPipeline, uiPl, "PS_MAIN");
         poolInfo.queueFamilyIndex = 3; poolInfo.flags = poolFlags;
@@ -160,10 +209,23 @@ struct Fixture {
         require(tracker.beginCommand(device, cb, beginInfo, true), "begin actual observed native recording");
         bind();
     }
-    void makePipeline(VkPipeline output, VkPipelineLayout layout, const char* entry) {
+    void writeUniforms(VkDescriptorSet output) {
+        require(tracker.observe([&](auto& core) {
+            constexpr std::array<VkDeviceSize, 5> ranges{{272, 2800, 400, 272, 2800}};
+            for (unsigned i = 0; i < ranges.size(); ++i) {
+                VkDescriptorBufferInfo buffer{uniformBuffers[i], 256, ranges[i]};
+                auto write = info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+                write.dstSet = output; write.dstBinding = frame_pixel_uniform::UniformBindings[i]; write.descriptorCount = 1;
+                write.descriptorType = i == 1 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                write.pBufferInfo = &buffer; core.updateSets(device, 1, &write, 0, nullptr);
+            }
+        }), "write five complete native uniform candidate descriptors");
+    }
+    void makePipeline(VkPipeline output, VkPipelineLayout layout, const char* entry,
+                      const char* vertexEntry = "VS_DISTORT") {
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "VS_DISTORT";
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = vertexEntry;
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = entry;
         auto create = info<VkGraphicsPipelineCreateInfo>(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
         create.stageCount = 2; create.pStages = stages; create.layout = layout;
@@ -181,13 +243,14 @@ struct Fixture {
     void bind(VkDescriptorSet set = ds, VkPipeline pipe = pipeline, VkPipelineLayout layout = pl) {
         require(tracker.bindPipeline(device, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe), "bind graphics pipeline");
         require(tracker.observe([&](auto& core) {
-            core.bindSets(device, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
+            const auto count = uniforms && layout == pl ? 1u : 0u;
+            core.bindSets(device, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, count, count ? &dynamicOffset : nullptr);
         }), "bind actual production descriptor set");
     }
-    Candidate finishPass(bool select = true) {
+    Candidate finishPass(bool select = true, const frame_pixel_uniform::Limits* limits = nullptr) {
         Candidate candidate;
         require(tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE), "begin inline primary pass");
-        const bool selected = tracker.draw(device, cb);
+        const bool selected = tracker.draw(device, cb, limits);
         require(selected == select, "draw source admission result");
         const bool issued = tracker.endRenderPass(device, cb, candidate);
         require(issued == select, "end after native pass emits only selected candidate");
@@ -804,13 +867,216 @@ void computeStateAdmissionHistory() {
     require(independent->finishPass().noPriorComputeState,
             "other command's compute state never dirties the selected primary generation");
 }
+
+constexpr frame_pixel_uniform::Limits uniformLimits{256, 65536};
+std::unique_ptr<Fixture> uniformFixture() {
+    return std::make_unique<Fixture>(true, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                                    VK_COMMAND_BUFFER_LEVEL_PRIMARY, 0, true);
+}
+void noUniform(const Candidate& candidate, UniformRefusal reason) {
+    require(candidate.serial && !candidate.uniformFinalDraw && !candidate.uniformPlan.metadataCandidate
+            && candidate.uniformPlan.totalBytes == 0 && candidate.uniformRefusal == reason,
+            "refused companion preserves the ordinary raw candidate and exposes no partial uniform copy");
+}
+void uniformMetadataPositive() {
+    auto f = uniformFixture(); const auto candidate = f->finishPass(true, &uniformLimits);
+    require(candidate.uniformFinalDraw && candidate.uniformRefusal == UniformRefusal::None
+            && candidate.uniformPlan.metadataCandidate && candidate.uniformPlan.totalBytes == 6544,
+            "only explicit opt-in publishes five full final-draw uniform metadata slices");
+    require(candidate.uniformDrawOrdinal == 1 && candidate.uniformPipeline.handle == frame_bindings::handle(pipeline)
+            && candidate.uniformPipeline.generation && candidate.uniformPlan.set.handle == frame_bindings::handle(ds)
+            && candidate.uniformPlan.command.handle == frame_bindings::handle(cb),
+            "metadata retains exact last native pipeline/descriptor and observed draw ordinal");
+    require(candidate.uniformStages.vertex.hash == frame_pixel_uniform::NativeVertexFingerprint
+            && candidate.uniformStages.vertex.bytes == frame_pixel_uniform::NativeVertexBytes
+            && candidate.uniformStages.fragment.hash == frame_pixel_uniform::NativeFragmentFingerprint
+            && candidate.uniformStages.fragment.bytes == frame_pixel_uniform::NativeFragmentBytes
+            && candidate.uniformPlan.stages.vertex.generation == candidate.uniformStages.vertex.generation,
+            "pipeline creation retains both exact compiled stage fingerprints, sizes and original generations");
+    require(candidate.uniformPlan.slices[1].dynamicOffset == 256
+            && candidate.uniformPlan.slices[1].effectiveOffset == 512
+            && candidate.uniformPlan.slices[1].effectiveRange == 2800
+            && candidate.uniformOffendingBinding == UINT32_MAX
+            && candidate.uniformResourceRefusal.reason == frame_bindings::UniformResourceReason::None,
+            "effective dynamic source offset and successful exact resource guard are retained");
+    f.reset();
+    auto defaultPath = uniformFixture();
+    noUniform(defaultPath->finishPass(), UniformRefusal::Disabled);
+    // Compiled pipeline code does not require its source shader module to stay
+    // live; destroying it is legal Vulkan and never changes that pipeline.
+    auto retained = uniformFixture();
+    require(retained->tracker.destroyShader(device, vs) && retained->tracker.destroyShader(device, fs),
+            "legal original module retirement after pipeline compilation");
+    require(retained->finishPass(true, &uniformLimits).uniformFinalDraw,
+            "compiled stage facts survive legal shader module destruction without guessing a replacement module");
+    auto dynamic = uniformFixture(); auto rendering = info<VkRenderingInfo>(VK_STRUCTURE_TYPE_RENDERING_INFO);
+    rendering.layerCount = 1;
+    require(dynamic->tracker.beginRendering(device, cb, rendering) && dynamic->tracker.draw(device, cb, &uniformLimits),
+            "ordinary non-suspended dynamic scope observes its own exact direct target");
+    Candidate dynamicResult;
+    require(dynamic->tracker.endRendering(device, cb, dynamicResult) && dynamicResult.uniformFinalDraw,
+            "matching dynamic end uses the same fresh final-draw/resource validation");
+}
+void uniformFinalDrawReplacement() {
+    auto f = uniformFixture();
+    require(f->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE)
+            && f->tracker.draw(device, cb, &uniformLimits), "first target selects original raw source");
+    f->dynamicOffset = 512; f->bind(ds2);
+    require(!f->tracker.draw(device, cb, &uniformLimits), "later exact target does not replace legacy first raw selection");
+    Candidate result;
+    require(f->tracker.endRenderPass(device, cb, result) && result.uniformFinalDraw
+            && result.uniformDrawOrdinal == 2 && result.uniformPlan.set.handle == frame_bindings::handle(ds2)
+            && result.uniformPlan.slices[1].dynamicOffset == 512 && result.uniformPlan.slices[1].effectiveOffset == 768,
+            "later final target captures its own descriptor revision and dynamic ranges rather than projecting first draw data");
+    require(result.binding.image.identity.handle == frame_bindings::handle(image), "raw source remains the original matching image");
+    f.reset();
+    for (unsigned invalid = 0; invalid < 4; ++invalid) {
+        auto current = uniformFixture();
+        require(current->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE)
+                && current->tracker.draw(device, cb, &uniformLimits), "select companion before later draw event");
+        auto expected = UniformRefusal::NoFinalTarget;
+        if (invalid == 0) current->bind(uiDs, uiPipeline, uiPl);
+        if (invalid == 1) expected = UniformRefusal::NotDirectNonempty;
+        if (invalid == 2) {
+            require(current->tracker.nextSubpass(device, cb, VK_SUBPASS_CONTENTS_INLINE), "inline subpass preserves raw policy");
+            expected = UniformRefusal::Subpass;
+        } else {
+            require(!current->tracker.draw(device, cb, invalid == 3 ? nullptr : &uniformLimits, invalid != 1),
+                    "foreign, zero or unobserved later direct call is still observed before selected fast return");
+        }
+        Candidate out; require(current->tracker.endRenderPass(device, cb, out), "ordinary raw source survives companion-only refusal");
+        noUniform(out, expected);
+    }
+    auto afterSubpass = uniformFixture();
+    require(afterSubpass->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE)
+            && afterSubpass->tracker.draw(device, cb, &uniformLimits)
+            && afterSubpass->tracker.nextSubpass(device, cb, VK_SUBPASS_CONTENTS_INLINE), "select then invalidate at subpass edge");
+    require(!afterSubpass->tracker.draw(device, cb, &uniformLimits), "new final target in the next inline subpass is observed independently");
+    Candidate out; require(afterSubpass->tracker.endRenderPass(device, cb, out) && out.uniformFinalDraw
+            && out.uniformDrawOrdinal == 2, "a newly observed final target may restore the companion after a subpass");
+    auto unknown = uniformFixture();
+    require(unknown->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE)
+            && unknown->tracker.draw(device, cb, &uniformLimits), "target before existing unknown/indirect/secondary gate");
+    require(!unknown->tracker.unknownCommand(device, cb) && !unknown->tracker.draw(device, cb, &uniformLimits)
+            && !unknown->tracker.endRenderPass(device, cb, out) && !out.uniformFinalDraw,
+            "unknown/indirect/secondary paths keep the original whole-recording refusal and cannot reselect");
+}
+void uniformProfileAndCurrentness() {
+    for (unsigned wrong = 0; wrong < 4; ++wrong) {
+        auto f = uniformFixture();
+        require(f->tracker.destroyPipeline(device, pipeline), "retire prior test pipeline before new observed creation");
+        if (wrong == 0) TestAccess::wrongSyntheticVertexBytes(f->tracker, device, vs);
+        if (wrong == 1) TestAccess::wrongSyntheticVertexHash(f->tracker, device, vs);
+        if (wrong == 2) TestAccess::wrongSyntheticVertexBytes(f->tracker, device, fs);
+        f->makePipeline(pipeline, pl, "PS_DISTORT", wrong == 3 ? "VS_OTHER" : "VS_DISTORT"); f->bind();
+        noUniform(f->finishPass(true, &uniformLimits), UniformRefusal::NativeStages);
+    }
+    auto invalidLimits = uniformLimits; invalidLimits.minUniformBufferOffsetAlignment = 0;
+    auto f = uniformFixture(); noUniform(f->finishPass(true, &invalidLimits), UniformRefusal::Limits); f.reset();
+    auto incomplete = std::make_unique<Fixture>();
+    const auto missing = incomplete->finishPass(true, &uniformLimits);
+    // This fixture also has a non-native vertex stage; no complete raw-only
+    // fixture may accidentally inherit the new profile/range assumptions.
+    noUniform(missing, UniformRefusal::NativeStages); incomplete.reset();
+    auto noBuffers = std::make_unique<Fixture>();
+    require(noBuffers->tracker.destroyPipeline(device, pipeline), "replace raw-only pipeline with exact paired stage facts");
+    TestAccess::pinSyntheticNativePair(noBuffers->tracker, device, vs, fs);
+    noBuffers->makePipeline(pipeline, pl, "PS_DISTORT"); noBuffers->bind();
+    const auto noUniformBindings = noBuffers->finishPass(true, &uniformLimits);
+    noUniform(noUniformBindings, UniformRefusal::Metadata);
+    require(noUniformBindings.uniformContractRefusal == frame_pixel_uniform::Refusal::Descriptor
+            && noUniformBindings.uniformOffendingBinding == 0,
+            "known stage pair still requires every complete native UBO binding and retains the exact typed failure");
+    noBuffers.reset();
+    for (bool rebind : {false, true}) {
+        auto current = uniformFixture();
+        require(current->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE)
+                && current->tracker.draw(device, cb, &uniformLimits), "select before later binding-only change");
+        if (rebind) current->bind(ds2);
+        else {
+            const auto another = h<VkPipeline>(112); current->makePipeline(another, pl, "PS_DISTORT");
+            current->bind(ds, another);
+        }
+        Candidate out; require(current->tracker.endRenderPass(device, cb, out), "binding-only change leaves raw source intact");
+        noUniform(out, rebind ? UniformRefusal::Metadata : UniformRefusal::PipelineChanged);
+        if (rebind) require(out.uniformContractRefusal == frame_pixel_uniform::Refusal::SnapshotChanged,
+                            "typed contract refusal identifies descriptor-binding revision change");
+    }
+    auto stale = uniformFixture();
+    require(stale->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE)
+            && stale->tracker.draw(device, cb, &uniformLimits), "select before current whole metadata becomes incomplete");
+    require(stale->tracker.observe([&](auto& core) { core.destroyBuffer(device, stale->uniformBuffers[0]); }),
+            "adversarial source retirement is observed without changing the raw sampled image");
+    Candidate staleOut; require(stale->tracker.endRenderPass(device, cb, staleOut), "raw image remains independently current");
+    noUniform(staleOut, UniformRefusal::Metadata);
+    require(staleOut.uniformContractRefusal == frame_pixel_uniform::Refusal::SnapshotIncomplete
+            && staleOut.uniformOffendingBinding == UINT32_MAX,
+            "incomplete whole-state metadata is not falsely attributed to sampled-image binding9");
+    auto overflow = uniformFixture(); TestAccess::exhaustDrawOrdinal(overflow->tracker, device, cb);
+    noUniform(overflow->finishPass(true, &uniformLimits), UniformRefusal::DrawOrdinalOverflow);
+}
+void uniformSourceAndAliasGuards() {
+    auto changed = uniformFixture();
+    require(changed->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE)
+            && changed->tracker.draw(device, cb, &uniformLimits), "select original image before later target uses another source");
+    const auto otherImage = h<VkImage>(71); const auto otherMemory = h<VkDeviceMemory>(81); const auto otherView = h<VkImageView>(91);
+    require(changed->tracker.observe([&](auto& core) {
+        core.createImage(device, otherImage, changed->imageInfo);
+        auto allocation = info<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO); allocation.allocationSize = 32 * 1024 * 1024;
+        core.allocateMemory(device, otherMemory, allocation); core.bindImageMemory(device, otherImage, otherMemory, 0);
+        auto create = changed->viewInfo; create.image = otherImage; core.createView(device, otherView, create);
+    }), "observe second complete native sampled resource without aliasing UBO memory");
+    changed->write(ds2, otherView); changed->bind(ds2);
+    require(!changed->tracker.draw(device, cb, &uniformLimits), "later target has an independent source snapshot");
+    Candidate out; require(changed->tracker.endRenderPass(device, cb, out), "legacy raw first image remains independently valid");
+    noUniform(out, UniformRefusal::ChangedSource);
+    require(out.uniformOffendingBinding == 9, "source mismatch telemetry identifies the sampled-image binding");
+    changed.reset();
+    for (unsigned where = 0; where < 3; ++where) {
+        auto f = uniformFixture();
+        if (where == 1) require(f->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE)
+                && f->tracker.draw(device, cb, &uniformLimits), "select before later alias appears");
+        require(f->tracker.observe([&](auto& core) {
+            auto alias = info<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+            alias.size = 128; alias.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; alias.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            const auto buffer = h<VkBuffer>(900); core.createBuffer(device, buffer, alias);
+            core.bindBufferMemory(device, buffer, f->uniformMemories[0], 256);
+        }), "create actual observed overlapping writable buffer on first source allocation");
+        Candidate result;
+        if (where != 1) result = f->finishPass(true, where == 2 ? nullptr : &uniformLimits);
+        else require(f->tracker.endRenderPass(device, cb, result), "fresh end-scope guard checks aliases introduced after selection");
+        noUniform(result, where == 2 ? UniformRefusal::Disabled : UniformRefusal::Resources);
+        if (where != 2) require(result.uniformResourceRefusal.reason == frame_bindings::UniformResourceReason::BufferAlias
+                && result.uniformResourceRefusal.binding == 0 && result.uniformOffendingBinding == 0,
+                "exact Core alias reason/binding survives without inferred coherence or partial data");
+    }
+    auto generation = uniformFixture(); require(generation->finishPass(true, &uniformLimits).uniformFinalDraw,
+                                                "first recording has explicit uniform candidate");
+    require(generation->tracker.resetCommand(device, cb) && generation->tracker.beginCommand(device, cb, generation->beginInfo, true),
+            "successful native recording replacement clears optional snapshot and draw ordinal");
+    generation->bind(); noUniform(generation->finishPass(), UniformRefusal::Disabled);
+    const std::array<const char*, 13> names{{"disabled", "none", "no_final_target", "not_direct_nonempty", "native_stages", "limits",
+        "metadata", "changed_source", "pipeline_changed", "resources", "subpass", "unknown_path", "draw_ordinal_overflow"}};
+    for (unsigned i = 0; i < names.size(); ++i)
+        require(!std::strcmp(uniformRefusalName(static_cast<UniformRefusal>(i)), names[i]), "each bounded uniform refusal has a fixed literal status name");
+    require(!std::strcmp(uniformRefusalName(static_cast<UniformRefusal>(255)), "unknown_uniform_refusal"),
+            "unexpected status values do not borrow or format native data");
+}
 }
 
-int main() {
-    baselineAndImmutableDraw(); beginAndPipelineGuards(); sourceCurrentness();
-    sourceShapeGuards(); scopesAndUnknownPaths(); commandReuseAndLoss(); reusableRetirementIdentity();
-    firstFailureTelemetry(); overlappingImageBinding(); reentryAndExceptionRefusal();
-    concurrentFirstRealFailure(); concurrentDrawAndRetirement(); threadedResourceLifecycle();
-    computeStateAdmissionHistory();
+int main(int argc, char** argv) {
+    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "legacy") && std::strcmp(argv[1], "uniform"))) {
+        std::cerr << "Use legacy or uniform (no arguments runs both)\n"; return 2;
+    }
+    if (argc == 1 || !std::strcmp(argv[1], "legacy")) {
+        baselineAndImmutableDraw(); beginAndPipelineGuards(); sourceCurrentness();
+        sourceShapeGuards(); scopesAndUnknownPaths(); commandReuseAndLoss(); reusableRetirementIdentity();
+        firstFailureTelemetry(); overlappingImageBinding(); reentryAndExceptionRefusal();
+        concurrentFirstRealFailure(); concurrentDrawAndRetirement(); threadedResourceLifecycle();
+        computeStateAdmissionHistory();
+    }
+    if (argc == 1 || !std::strcmp(argv[1], "uniform")) {
+        uniformMetadataPositive(); uniformFinalDrawReplacement(); uniformProfileAndCurrentness(); uniformSourceAndAliasGuards();
+    }
     std::cout << "pixel live tracker: " << checks << " checks passed; no GPU/native video association claimed\n";
 }
