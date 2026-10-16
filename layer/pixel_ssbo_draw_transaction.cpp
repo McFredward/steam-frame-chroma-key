@@ -13,7 +13,7 @@ const char* reasonName(Reason value) noexcept {
     NAME(Begin,"begin") NAME(NotArmed,"not_armed") NAME(MissingReset,"missing_reset") NAME(Scope,"scope")
     NAME(Prefix,"prefix") NAME(Pipeline,"pipeline") NAME(Source,"source") NAME(EmptyDraw,"empty_draw")
     NAME(LaterDraw,"later_draw") NAME(Subpass,"subpass") NAME(Secondary,"secondary") NAME(UnknownRoute,"unknown_route")
-    NAME(CommandEnd,"command_end") NAME(SubmitShape,"submit_shape") NAME(UnknownQueue,"unknown_queue")
+    NAME(CommandEnd,"command_end") NAME(SubmitShape,"submit_shape") NAME(SubmitExtension,"submit_extension") NAME(SubmitBounds,"submit_bounds") NAME(UnknownQueue,"unknown_queue")
     NAME(Overlap,"overlap") NAME(NativeSubmit,"native_submit") NAME(MarkerSubmit,"marker_submit")
     NAME(Fence,"fence") NAME(NotRetired,"not_retired") NAME(CohortMismatch,"cohort_mismatch")
     NAME(SourceRetired,"source_retired") NAME(UnsafeRelease,"unsafe_release") NAME(AlreadyArmed,"already_armed")
@@ -130,7 +130,7 @@ bool Transaction::arm(VkCommandBuffer command) noexcept {
     Guard guard(*this);if(!guard)return false;
     if(armed_)return refuse(Reason::AlreadyArmed);
     if(!configured_ || !active(command) || inPass_ || scopeEnded_ || drawOrdinal_ || !cleanHistory_ || selected_ || !generation_)return refuse(Reason::NotArmed);
-    if(!clone_->ready() || !clone_->markReferenced())return refuse(Reason::InvalidConfiguration);
+    if(!clone_->ready() || clone_->referenced() || !clone_->markReferenced())return refuse(Reason::InvalidConfiguration);
     armed_=true;
     // This GPU reset is inside the ORIGINAL reusable recording, before its
     // render pass. It therefore executes on EVERY serial replay; a CPU memset
@@ -201,11 +201,11 @@ DrawResult Transaction::replace(VkCommandBuffer command,std::uint32_t vertices,s
     if(!armed_)return DrawResult::ForwardOriginal;
     if(!reset_){refuse(Reason::MissingReset);return DrawResult::ForwardOriginal;}
     if(!inPass_){refuse(Reason::Scope);return DrawResult::ForwardOriginal;}
-    if(!vertices || !instances){refuse(Reason::EmptyDraw);return DrawResult::ForwardOriginal;}
     // Preceding ordinary unrelated native draws are preserved, including the
     // real receiver target at ordinal 4. Only the exact target profile is
     // replaced; ANY subsequent draw invalidates publication.
     if(current_!=original_ || !matchingPass_)return DrawResult::ForwardOriginal;
+    if(!vertices || !instances){refuse(Reason::EmptyDraw);return DrawResult::ForwardOriginal;}
     if(!currentSet0_ || !prefixValid_){refuse(Reason::Prefix);return DrawResult::ForwardOriginal;}
     if(!same(currentSource_,currentSource_)){refuse(Reason::Source);return DrawResult::ForwardOriginal;}
     if(!clone_->ready() || !clone_->referenced()){refuse(Reason::InvalidConfiguration);return DrawResult::ForwardOriginal;}
@@ -279,11 +279,37 @@ Transaction::SubmitTicket Transaction::beforeSubmit(VkQueue queue,std::uint32_t 
     quiescent_=false; // ANY observed new native submission invalidates an earlier idle observation.
     if(refusal()!=Reason::None)return ticket;
     if(queue!=queue_){refuse(Reason::UnknownQueue);return ticket;}
+    if(!armed_)return ticket;
+    // Inspect the ORIGINAL untouched batch, without allocating/copying its
+    // arrays. Unrelated buffers remain native; only a single occurrence of the
+    // selected original recording can authorize the one owned completion marker.
+    submitObservation_={};submitObservation_.batches=count;
+    if(count>32){refuse(Reason::SubmitBounds);return ticket;}
+    if(count && !submits){refuse(Reason::SubmitShape);return ticket;}
+    std::uint32_t occurrences=0;
+    for(std::uint32_t i=0;i<count;++i){const auto& info=submits[i];
+        submitObservation_.batch=i;submitObservation_.commandCount=info.commandBufferCount;
+        if(info.sType!=VK_STRUCTURE_TYPE_SUBMIT_INFO){refuse(Reason::SubmitShape);return ticket;}
+        if(info.commandBufferCount>64 || info.waitSemaphoreCount>64 || info.signalSemaphoreCount>64){refuse(Reason::SubmitBounds);return ticket;}
+        if((info.commandBufferCount && !info.pCommandBuffers) ||
+           (info.waitSemaphoreCount && (!info.pWaitSemaphores || !info.pWaitDstStageMask)) ||
+           (info.signalSemaphoreCount && !info.pSignalSemaphores)){refuse(Reason::SubmitShape);return ticket;}
+        if(info.pNext){
+            const auto* base=static_cast<const VkBaseInStructure*>(info.pNext);
+            submitObservation_.nextType=static_cast<std::uint32_t>(base->sType);
+            if(base->sType!=VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO || base->pNext){refuse(Reason::SubmitExtension);return ticket;}
+            const auto* timeline=static_cast<const VkTimelineSemaphoreSubmitInfo*>(info.pNext);
+            if(timeline->waitSemaphoreValueCount!=info.waitSemaphoreCount || timeline->signalSemaphoreValueCount!=info.signalSemaphoreCount ||
+               (timeline->waitSemaphoreValueCount && !timeline->pWaitSemaphoreValues) ||
+               (timeline->signalSemaphoreValueCount && !timeline->pSignalSemaphoreValues)){refuse(Reason::SubmitShape);return ticket;}
+        }
+        for(std::uint32_t n=0;n<info.commandBufferCount;++n)if(info.pCommandBuffers[n]==command_){
+            ++occurrences;submitObservation_.selectedOccurrences=occurrences;
+            if(occurrences>1){refuse(Reason::SubmitShape);return ticket;}
+        }
+    }
+    if(!occurrences)return ticket; // A valid unrelated original submit is not optional-work failure.
     if(!executable_ || retired_ || pendingSubmit_ || pendingRetirement_){refuse(Reason::Overlap);return ticket;}
-    // A narrow exact cohort: one ordinary original primary command, no pNext,
-    // no duplicates or other queue routes. Native submit is always untouched.
-    if(count!=1 || !submits || submits[0].sType!=VK_STRUCTURE_TYPE_SUBMIT_INFO || submits[0].pNext ||
-       submits[0].commandBufferCount!=1 || !submits[0].pCommandBuffers || submits[0].pCommandBuffers[0]!=command_){refuse(Reason::SubmitShape);return ticket;}
     if(pending_ && !fenceComplete()){if(refusal()==Reason::None)refuse(Reason::Overlap);return ticket;}
     if(!advance(submitNonce_))return ticket;
     pendingSubmit_=submitNonce_;ticket.owner_=this;ticket.epoch_=epoch_;ticket.generation_=generation_;ticket.nonce_=submitNonce_;return ticket;
@@ -353,6 +379,10 @@ bool Transaction::publish(const SourceReadbackMetadata& readback,RecordView& out
 bool Transaction::release() noexcept {
     Guard guard(*this);if(!guard)return false;
     if(!configured_)return true;
+    // A separately configured observer must never free another recording's
+    // Clone reference. The cold owner is externally synchronized and exclusive;
+    // this check also catches accidental sequential double-controller use.
+    if(!armed_ && clone_->referenced())return false;
     // Error/refusal never loosens lifetime. A completed marker alone leaves the
     // reusable recording referencing owned objects. Device idle alone does too.
     if(armed_ && (!retired_ || (!quiescent_ && !deviceLost_)))return false;

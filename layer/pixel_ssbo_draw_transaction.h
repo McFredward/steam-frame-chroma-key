@@ -18,7 +18,7 @@ struct Cohort {
 enum class Reason : std::uint8_t {
     None, NotConfigured, InvalidConfiguration, Contention, Identity, GenerationWrap,
     Begin, NotArmed, MissingReset, Scope, Prefix, Pipeline, Source, EmptyDraw,
-    LaterDraw, Subpass, Secondary, UnknownRoute, CommandEnd, SubmitShape,
+    LaterDraw, Subpass, Secondary, UnknownRoute, CommandEnd, SubmitShape, SubmitExtension, SubmitBounds,
     UnknownQueue, Overlap, NativeSubmit, MarkerSubmit, Fence, NotRetired,
     CohortMismatch, SourceRetired, UnsafeRelease, AlreadyArmed
 };
@@ -50,6 +50,7 @@ struct Configuration { Dispatch dispatch{}; };
 // object handles alone do not identify which reusable execution produced bytes.
 struct SourceReadbackMetadata {Cohort source{};VkCommandBuffer command=VK_NULL_HANDLE;VkCommandPool pool=VK_NULL_HANDLE;
     std::uint64_t commandGeneration=0,poolGeneration=0,execution=0;};
+struct SubmitObservation {std::uint32_t batches=0,batch=UINT32_MAX,commandCount=0,nextType=UINT32_MAX,selectedOccurrences=0;};
 struct RecordView {const void* record=nullptr; VkDeviceSize bytes=0; Cohort source{};
     std::uint64_t commandGeneration=0, execution=0;
     // Diagnostic command/resource cohort only: never video frame/eye authority.
@@ -147,6 +148,8 @@ public:
     bool armed() const noexcept {return armed_;}
     VkCommandBuffer command() const noexcept {return command_;}
     VkCommandPool pool() const noexcept {return pool_;}
+    VkDescriptorSet descriptorSet() const noexcept {return currentSet0_;}
+    SubmitObservation submitObservation() const noexcept {return submitObservation_;}
     std::uint64_t drawOrdinal() const noexcept {return drawOrdinal_;}
     std::uint64_t selectedOrdinal() const noexcept {return selectedOrdinal_;}
     std::uint64_t execution() const noexcept {return serial_;}
@@ -177,7 +180,7 @@ private:
     VkPipeline original_=VK_NULL_HANDLE,current_=VK_NULL_HANDLE;
     VkPipelineLayout originalLayout_=VK_NULL_HANDLE; VkRenderPass pass_=VK_NULL_HANDLE;
     VkDescriptorSet currentSet0_=VK_NULL_HANDLE;
-    Cohort currentSource_{},selectedSource_{};Id setIdentity_{};
+    Cohort currentSource_{},selectedSource_{};Id setIdentity_{};SubmitObservation submitObservation_{};
     std::uint64_t epoch_=0,generation_=0,poolGeneration_=0,serial_=0,submitNonce_=0,retireNonce_=0;
     std::uint64_t pendingSubmit_=0,pendingRetirement_=0,drawOrdinal_=0,selectedOrdinal_=0;
     bool configured_=false,recording_=false,armed_=false,reset_=false,inPass_=false;

@@ -49,6 +49,7 @@ struct Recorder {
     enum class Op {Barrier,Fill,Sets,Pipeline,Draw,DrawIndexed};
     struct Command {Op op;std::uint64_t object=0;std::array<std::uint32_t,5> args{};};
     std::vector<Command> commands;
+    std::set<std::uint64_t> fences;
     unsigned fenceCreates=0,fenceDestroys=0,fenceResets=0,markerSubmits=0,invalidates=0,polls=0;
     VkResult createResult=VK_SUCCESS,resetResult=VK_SUCCESS,markerResult=VK_SUCCESS,status=VK_NOT_READY,invalidateResult=VK_SUCCESS;
     bool reenter=false,block=false,entered=false,continueCall=false;
@@ -101,21 +102,22 @@ VKAPI_ATTR void VKAPI_CALL drawIndexed(VkCommandBuffer cb,std::uint32_t n,std::u
 }
 VKAPI_ATTR VkResult VKAPI_CALL createFence(VkDevice device,const VkFenceCreateInfo* ci,const VkAllocationCallbacks* allocator,VkFence* result){
     require(device==recorder->device && ci->sType==VK_STRUCTURE_TYPE_FENCE_CREATE_INFO && !ci->pNext && !ci->flags && !allocator,"cold unsignaled owned fence");
-    ++recorder->fenceCreates;*result=recorder->createResult==VK_SUCCESS?recorder->fence:obj<VkFence>(0xbad);return recorder->createResult;
+    *result=recorder->createResult==VK_SUCCESS?obj<VkFence>(3+recorder->fenceCreates):obj<VkFence>(0xbad);
+    ++recorder->fenceCreates;if(recorder->createResult==VK_SUCCESS)recorder->fences.insert(frame_pixel_ssbo_clone::handle(*result));return recorder->createResult;
 }
 VKAPI_ATTR void VKAPI_CALL destroyFence(VkDevice device,VkFence fence,const VkAllocationCallbacks* allocator){
-    require(device==recorder->device && fence==recorder->fence && !allocator,"destroy only owned fence");++recorder->fenceDestroys;
+    require(device==recorder->device && recorder->fences.erase(frame_pixel_ssbo_clone::handle(fence))==1 && !allocator,"destroy only owned fence");++recorder->fenceDestroys;
 }
 VKAPI_ATTR VkResult VKAPI_CALL resetFence(VkDevice device,std::uint32_t count,const VkFence* fences){
-    require(device==recorder->device && count==1 && fences[0]==recorder->fence,"reset own fence only");++recorder->fenceResets;return recorder->resetResult;
+    require(device==recorder->device && count==1 && recorder->fences.count(frame_pixel_ssbo_clone::handle(fences[0]))==1,"reset own fence only");++recorder->fenceResets;return recorder->resetResult;
 }
 VKAPI_ATTR VkResult VKAPI_CALL fenceStatus(VkDevice device,VkFence fence){
-    require(device==recorder->device && fence==recorder->fence,"query own fence only");++recorder->polls;return recorder->status;
+    require(device==recorder->device && recorder->fences.count(frame_pixel_ssbo_clone::handle(fence))==1,"query own fence only");++recorder->polls;return recorder->status;
 }
 VKAPI_ATTR VkResult VKAPI_CALL submit(VkQueue queue,std::uint32_t count,const VkSubmitInfo* infos,VkFence fence){
     require(queue==recorder->queue && count==1 && infos && infos[0].sType==VK_STRUCTURE_TYPE_SUBMIT_INFO && !infos[0].pNext &&
         !infos[0].commandBufferCount && !infos[0].pCommandBuffers && !infos[0].waitSemaphoreCount && !infos[0].signalSemaphoreCount &&
-        fence==recorder->fence,"only empty completion marker after untouched native submit, no duplicate native draw/CB");
+        recorder->fences.count(frame_pixel_ssbo_clone::handle(fence))==1,"only empty completion marker after untouched native submit, no duplicate native draw/CB");
     ++recorder->markerSubmits;return recorder->markerResult;
 }
 VKAPI_ATTR VkResult VKAPI_CALL invalidate(VkDevice device,std::uint32_t count,const VkMappedMemoryRange* ranges){
@@ -255,6 +257,37 @@ void ticketsAndFences(){
     recorder=&first.driver;owned_fixture::driver=&first.ownerDriver;
     require(first.transaction.afterSubmit(firstTicket,VK_SUCCESS),"first owner token retained");first.release();
 }
+void boundedNativeBatches(){
+    for(unsigned mode=0;mode<10;++mode){Fixture f;f.record();
+        VkCommandBuffer commands[3]{obj<VkCommandBuffer>(100),f.driver.command,obj<VkCommandBuffer>(101)};
+        VkSemaphore semaphores[2]{obj<VkSemaphore>(102),obj<VkSemaphore>(103)};
+        VkPipelineStageFlags stage=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;std::uint64_t values[2]{7,9};
+        VkTimelineSemaphoreSubmitInfo timeline{};timeline.sType=VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline.waitSemaphoreValueCount=timeline.signalSemaphoreValueCount=1;timeline.pWaitSemaphoreValues=&values[0];timeline.pSignalSemaphoreValues=&values[1];
+        VkSubmitInfo infos[3]{};for(unsigned i=0;i<3;++i){infos[i].sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;infos[i].commandBufferCount=1;infos[i].pCommandBuffers=&commands[i];}
+        infos[1].pNext=&timeline;infos[1].waitSemaphoreCount=1;infos[1].pWaitSemaphores=&semaphores[0];infos[1].pWaitDstStageMask=&stage;
+        infos[1].signalSemaphoreCount=1;infos[1].pSignalSemaphores=&semaphores[1];
+        if(mode==1)commands[2]=f.driver.command;
+        if(mode==2)timeline.signalSemaphoreValueCount=0;
+        if(mode==3)timeline.pWaitSemaphoreValues=nullptr;
+        if(mode==4)timeline.pNext=&infos[0];
+        if(mode==5)timeline.sType=VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO;
+        if(mode==6)infos[1].commandBufferCount=65;
+        if(mode==7)infos[1].pCommandBuffers=nullptr;
+        if(mode==8)commands[1]=obj<VkCommandBuffer>(111);
+        const auto before=infos[1];const auto beforeTimeline=timeline;const auto token=f.transaction.beforeSubmit(f.driver.queue,mode==9?33:3,infos);
+        require(infos[1].pNext==before.pNext && infos[1].pCommandBuffers==before.pCommandBuffers && infos[1].commandBufferCount==before.commandBufferCount &&
+            timeline.waitSemaphoreValueCount==beforeTimeline.waitSemaphoreValueCount && timeline.signalSemaphoreValueCount==beforeTimeline.signalSemaphoreValueCount &&
+            timeline.pWaitSemaphoreValues==beforeTimeline.pWaitSemaphoreValues && timeline.pSignalSemaphoreValues==beforeTimeline.pSignalSemaphoreValues && timeline.pNext==beforeTimeline.pNext,"no original batch, semaphore values, arrays or pNext changed");
+        if(mode==0){require(f.transaction.afterSubmit(token,VK_SUCCESS) && f.driver.markerSubmits==1,"original bounded multi-CB/multi-info canonical timeline submit accepted once");
+            require(f.transaction.submitObservation().selectedOccurrences==1,"exact selected occurrence reported");}
+        else if(mode==8){require(!f.transaction.afterSubmit(token,VK_SUCCESS) && f.transaction.refusal()==Reason::None && !f.driver.markerSubmits,"unrelated valid native batch does not poison capture or create marker");
+            f.submitOriginal();}
+        else require(!f.transaction.afterSubmit(token,VK_SUCCESS) && f.transaction.refusal()!=Reason::None && !f.driver.markerSubmits,
+            "duplicate, unknown extension, inconsistent counts, null arrays or bounds fail closed without modifying original");
+        f.release();
+    }
+}
 void transactionEpochReuse(){
     alignas(Transaction) std::array<std::byte,sizeof(Transaction)> memory{};
     auto* first=new(memory.data())Transaction;
@@ -263,6 +296,19 @@ void transactionEpochReuse(){
     const auto secondEpoch=TransactionTestAccess::epoch(*second);
     require(firstEpoch && secondEpoch && firstEpoch!=secondEpoch,"reused controller address cannot reuse private token authority epoch");
     second->~Transaction();
+}
+void rejectSharedReferencedOwner(){
+    Fixture f;f.initialize();Transaction second;
+    float priority=1;VkDeviceQueueCreateInfo queue{};queue.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queue.queueFamilyIndex=7;queue.queueCount=1;queue.pQueuePriorities=&priority;
+    VkDeviceCreateInfo device{};device.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;device.queueCreateInfoCount=1;device.pQueueCreateInfos=&queue;
+    require(second.deviceCreated(f.driver.device,device,VK_SUCCESS) && second.queueRetrieved(f.driver.device,7,0,f.driver.queue),"second observed cold controller");
+    require(second.configure(f.clone,f.config()),"second observer configured while Clone still unreferenced");
+    require(second.adoptRecording(TransactionTestAccess::recording()),"second observer has its own known original generation");
+    f.arm();const auto commands=f.driver.commands.size();
+    require(!second.arm(obj<VkCommandBuffer>(44)) && f.driver.commands.size()==commands,"second controller cannot record using an already referenced Clone");
+    require(!second.release() && f.clone.ready() && f.clone.referenced(),"unarmed observer cannot certify retirement of another controller's recorded resources");
+    f.release();require(second.release() && f.driver.fences.empty(),"after actual owner release second cold fence is independently disposable");
 }
 void sourceCohortMismatch(){
     for(unsigned mode=0;mode<9;++mode){Fixture f;f.record();f.submitOriginal();f.retire();f.driver.status=VK_SUCCESS;
@@ -336,7 +382,7 @@ void precedingNativeDraws(){
     Fixture f;f.initialize();f.arm();
     require(!f.transaction.beginRenderPass(f.driver.command,obj<VkRenderPass>(999),VK_SUBPASS_CONTENTS_INLINE),"unrelated preceding original pass remains native");
     f.transaction.pipelineBound(f.driver.command,obj<VkPipeline>(999));
-    require(f.transaction.draw(f.driver.command,3,1,0,0)==DrawResult::ForwardOriginal,"first unrelated original draw forwarded");
+    require(f.transaction.draw(f.driver.command,0,1,0,0)==DrawResult::ForwardOriginal && f.transaction.refusal()==Reason::None,"first unrelated empty original draw forwarded without optional poison");
     require(f.transaction.drawIndexed(f.driver.command,6,1,0,0,0)==DrawResult::ForwardOriginal,"second unrelated original indexed draw forwarded");
     f.transaction.endRenderPass(f.driver.command);
     require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE),"later actual target-compatible pass");
@@ -374,5 +420,5 @@ void reentryAndConcurrency(){
     }
 }
 }
-int main(){serial(true);serial(false);boundedRefusals();ticketsAndFences();transactionEpochReuse();sourceCohortMismatch();adoptionAndQueueHistory();precedingNativeDraws();retirementOperations();reentryAndConcurrency();
+int main(){serial(true);serial(false);boundedRefusals();ticketsAndFences();boundedNativeBatches();transactionEpochReuse();rejectSharedReferencedOwner();sourceCohortMismatch();adoptionAndQueueHistory();precedingNativeDraws();retirementOperations();reentryAndConcurrency();
     std::cout<<"ssbo_draw_transaction checks="<<checks<<" owned_fixture_checks="<<owned_fixture::checks<<'\n';}

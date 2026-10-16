@@ -58,9 +58,14 @@ beforeSubmit -> untouched native submit -> afterSubmit. Only then is an empty
 owned-fence marker submitted. A reusable recording may execute serially again
 only after the previous marker actually signaled; concurrent/pending reuse or
 unknown queues fails closed. No queue or device wait is issued by this code.
-The initial native-submit profile is intentionally strict: one ordinary submit
-containing exactly one selected original command buffer. Other real shapes are
-`submit_shape` refusals, not an implicit claim of native readiness.
+The bounded native-submit profile accepts at most 32 ordinary submit infos,
+64 commands/waits/signals per info and exactly one occurrence of the selected
+command across the entire original call. Other original commands stay untouched.
+A single canonical `VkTimelineSemaphoreSubmitInfo` is supported when its counts
+match the original semaphore counts; unknown, chained, device-group or protected
+extensions fail closed with the observed batch/count/type recorded as scalars.
+Valid unrelated batches create no marker and do not poison optional capture.
+Submit2 still requires an explicit adapter or unknown-route refusal.
 
 Publication requires the actual owned fence's success **and** successful native
 retirement of the saved old reusable generation. The independently completed
@@ -73,7 +78,9 @@ ticket cannot consume another admission or retire a newer generation.
 
 The Clone and owned fence release only after referenced recordings retired and
 an actual original DeviceWaitIdle success or terminal device loss was observed.
-A marker fence alone and idle alone are each insufficient. Refusal/error never
+A marker fence alone and idle alone are each insufficient. One Clone has one
+externally synchronized cold owner. Sequential accidental second-controller
+arming or release of another controller's referenced Clone is refused. Refusal/error never
 loosens this requirement. Destruction performs no Vulkan calls or waits.
 
 ## Focused evidence
@@ -88,7 +95,7 @@ mismatches cover command/pool/serial/image/view/memory/extent independently.
 
 Final local focused results:
 
-- 1,675 transaction checks and 4,637 invoked owned-factory fixture checks pass.
+- 2,019 transaction checks and 5,473 invoked owned-factory fixture checks pass.
 - The same checks pass under ASan + UBSan with leak detection.
 - AArch64 C++17 cross-build succeeds (ELF64 AArch64); not executed on Frame.
 - `-Wall -Wextra -Werror -pedantic` passes for all three builds.
