@@ -22,11 +22,50 @@ def mapping():
         "coverage": [.3, -.05, .55, .08, .5, .1]}
 
 
+def packed_mapping():
+    original = mapping()
+    return {"schema": reader.PACKED_MAPPING_SCHEMA, "scope": reader.PACKED_MAPPING_SCOPE,
+            "B": original["W"], "color": original["color"], "coverage": original["coverage"]}
+
+
 def apply(matrix, point):
     return [matrix[0]*point[0]+matrix[1]*point[1]+matrix[2], matrix[3]*point[0]+matrix[4]*point[1]+matrix[5]]
 
 
 class OwnedControls(unittest.TestCase):
+    def test_packed_chart_is_distinct_and_conjugates_original_u(self):
+        definition = packed_mapping(); pc, pa = reader.packed_mapping_contract(definition)
+        b = [reader.f32(v) for v in definition["B"]]
+        for point in ((0., 0.), (.2, .7), (1., 1.), (-.8, 2.)):
+            x, y = point[0]-b[2], point[1]-b[5]
+            det = b[0]*b[4]-b[1]*b[3]
+            source = [(b[4]*x-b[1]*y)/det, (b[0]*y-b[3]*x)/det]
+            for panel, matrix in (("color", pc), ("coverage", pa)):
+                expected = apply(b, apply([reader.f32(v) for v in definition[panel]], source))
+                for actual, value in zip(apply(matrix, point), expected):
+                    self.assertAlmostEqual(actual, value, delta=2e-7)
+        with self.assertRaises(reader.probe.ProbeError): reader.mapping_contract(definition)
+        with self.assertRaises(reader.probe.ProbeError): reader.packed_mapping_contract(mapping())
+        for name, value in (("scope", reader.MAPPING_SCOPE), ("B", [0.]*6), ("color", [True]*6),
+                            ("coverage", [1., 0., math.nan, 0., 1., 0.])):
+            invalid = packed_mapping(); invalid[name] = value
+            with self.subTest(name=name), self.assertRaises(reader.probe.ProbeError): reader.packed_mapping_contract(invalid)
+        with self.assertRaises(reader.probe.ProbeError): reader.transform_packed(b"", definition, 1)
+
+    def test_packed_and_q_routes_equivalent_for_different_same_invocation_r1(self):
+        # Independent chart equation N(q)=R1.min+R1.span*q. This is algebra
+        # testing, not a CPU metadata join or a native mapping assertion.
+        original = mapping(); mc, ma = reader.mapping_contract(original)
+        for r1 in ((.125, .25, .875, 1.), (.25, .0625, 1., .9375), (-.5, .125, 1.5, .625)):
+            n = [r1[2]-r1[0], 0., r1[0], 0., r1[3]-r1[1], r1[1]]
+            packed = packed_mapping(); packed["B"] = reader.compose(n, original["W"])
+            pc, pa = reader.packed_mapping_contract(packed)
+            for q in ((.2, .7), (.91, .03), (-.1, 1.1)):
+                u = apply(n, q)
+                for mapped_u, mapped_q in ((pc, mc), (pa, ma)):
+                    for a, b in zip(apply(mapped_u, u), apply(n, apply(mapped_q, q))):
+                        self.assertAlmostEqual(a, b, delta=1e-6)
+
     def test_conjugation_against_independent_pointwise_solve(self):
         definition = mapping(); mc, ma = reader.mapping_contract(definition)
         w = [reader.f32(value) for value in definition["W"]]
@@ -128,6 +167,50 @@ class PrivateControls(unittest.TestCase):
             linked = root/"linked"; linked.symlink_to(root, target_is_directory=True)
             args[1] = str(linked/original.name)
             self.assertEqual(reader.main(args), 2); self.assertFalse(output.exists())
+
+    def test_packed_original_stream_and_direct_u_dependency(self):
+        patched, record = reader.transform_packed(self.original, packed_mapping())
+        header, original = reader.ssa.parse_module(self.original)
+        _, changed = reader.ssa.parse_module(patched)
+        cursor = 0
+        for item in changed:
+            if item.opcode == 15: item = reader.ssa.Instruction(15, item.operands[:-4])
+            if cursor < len(original) and item == original[cursor]: cursor += 1
+        self.assertEqual(cursor, len(original))
+        for opcode in (61, 65):
+            self.assertEqual(sum(i.opcode == opcode for i in changed), sum(i.opcode == opcode for i in original))
+        added = [i for i in changed if reader.result_id(i) is not None and reader.result_id(i) >= header[3]]
+        extracts = [i.operands[2:] for i in added if i.opcode == 81]
+        self.assertIn((538, 0), extracts); self.assertIn((538, 1), extracts)
+        self.assertNotIn((883, 0), extracts); self.assertNotIn((883, 1), extracts)
+        self.assertEqual(sum(i.opcode == 87 for i in changed), 6)
+        ids = record["new_ssa_ids"]
+        for u in (ids["mapped_uc"], ids["mapped_ua"]):
+            self.assertTrue(any(i.opcode == 80 and i.operands[1] == u for i in added))
+        self.assertFalse(record["copied_r1_or_cpu_uniform_join_used"])
+        self.assertNotIn("Mc", record); self.assertNotIn("Ma", record)
+        self.assertEqual(record["schema"], "native-fragment-packed-atlas-probe-v1")
+        self.assertEqual(record["Pc"], reader.packed_mapping_contract(packed_mapping())[0])
+        for key in ("runtime_or_pipeline_activation", "native_draw_coherence_proven", "native_frame_association_proven",
+                    "application_ray_mapping_proven", "physical_eye_proven", "native_sampler_equivalence_proven",
+                    "linear_game_alpha_proven", "alpha_composition_authorized", "passthrough_authorized"):
+            self.assertIs(record[key], False)
+        disabled, _ = reader.transform_packed(self.original, packed_mapping(), False)
+        _, instructions = reader.ssa.parse_module(disabled)
+        output = next(i.operands[0] for i in instructions if i.opcode == 71 and i.operands[0] >= header[3] and i.operands[1:] == (30, 1))
+        self.assertIn(reader.ssa.Instruction(62, (output, 994)), instructions)
+
+    def test_packed_cli_requires_explicit_route_and_validates(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            root = Path(temporary)
+            original, definition, output, record = (root/name for name in ("private.spv", "mapping.json", "probe.spv", "record.json"))
+            original.write_bytes(self.original); definition.write_text(json.dumps(packed_mapping()))
+            args = ["--original", str(original), "--mapping", str(definition), "--output", str(output), "--record", str(record)]
+            self.assertEqual(reader.main(args), 2); self.assertFalse(output.exists())
+            self.assertEqual(reader.main(args+["--packed"]), 0)
+            self.assertEqual(json.loads(record.read_bytes())["schema"], "native-fragment-packed-atlas-probe-v1")
+            output.unlink(); record.unlink()
+            self.assertEqual(reader.main(args+["--packed", "--disabled"]), 0)
 
 
 if __name__ == "__main__":

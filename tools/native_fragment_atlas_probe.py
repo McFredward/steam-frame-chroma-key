@@ -19,6 +19,8 @@ import native_fragment_ssa_probe as ssa
 probe, recovery, require = ssa.probe, ssa.recovery, ssa.require
 MAPPING_SCHEMA = "native-fragment-atlas-mapping-v1"
 MAPPING_SCOPE = "EXPLICIT_DIAGNOSTIC_AFFINES_ONLY"
+PACKED_MAPPING_SCHEMA = "native-fragment-packed-atlas-mapping-v1"
+PACKED_MAPPING_SCOPE = "EXPLICIT_DIAGNOSTIC_PACKED_AFFINES_ONLY"
 OUTPUTS = [
     {"location": 0, "format": "R32G32B32A32_SFLOAT", "meaning": "unchanged original RGBA"},
     {"location": 1, "format": "R32G32B32A32_SFLOAT", "meaning": "retargeted native decoded RGB times original-q aperture/tint once; independently reconstructed raw component-G"},
@@ -54,7 +56,19 @@ def mapping_contract(mapping):
     require(type(mapping) is dict and set(mapping) == {"schema", "scope", "W", "color", "coverage"}
             and mapping["schema"] == MAPPING_SCHEMA and mapping["scope"] == MAPPING_SCOPE,
             "explicit pinned diagnostic affine schema required")
-    w, color, coverage = (affine(mapping[key]) for key in ("W", "color", "coverage"))
+    return conjugated_panels(mapping, "W")
+
+
+def packed_mapping_contract(mapping):
+    """B is an explicit chart into original packed-u, never a discovered W."""
+    require(type(mapping) is dict and set(mapping) == {"schema", "scope", "B", "color", "coverage"}
+            and mapping["schema"] == PACKED_MAPPING_SCHEMA and mapping["scope"] == PACKED_MAPPING_SCOPE,
+            "explicit pinned diagnostic packed affine schema required")
+    return conjugated_panels(mapping, "B")
+
+
+def conjugated_panels(mapping, chart):
+    w, color, coverage = (affine(mapping[key]) for key in (chart, "color", "coverage"))
     determinant = w[0]*w[4]-w[1]*w[3]
     inverse = [w[4]/determinant, -w[1]/determinant, (w[1]*w[5]-w[4]*w[2])/determinant,
                -w[3]/determinant, w[0]/determinant, (w[3]*w[2]-w[0]*w[5])/determinant]
@@ -111,8 +125,17 @@ def renamed(item, replacements):
 
 
 def transform(original, mapping, enabled=True):
+    return _transform(original, mapping, enabled, packed=False)
+
+
+def transform_packed(original, mapping, enabled=True):
+    """Retarget original u538 directly, using only same-invocation metadata."""
+    return _transform(original, mapping, enabled, packed=True)
+
+
+def _transform(original, mapping, enabled, packed):
     require(type(enabled) is bool, "enabled must be an explicit boolean")
-    mc, ma = mapping_contract(mapping)
+    mc, ma = (packed_mapping_contract if packed else mapping_contract)(mapping)
     header, instructions = ssa.parse_module(original)
     require(len(original) == ssa.ORIGINAL_BYTES and probe.digest(original) == ssa.ORIGINAL_SHA256,
             "unknown original native shader profile")
@@ -132,7 +155,8 @@ def transform(original, mapping, enabled=True):
         return constants[bits]
     def emit(target, op, typ, *values):
         ident = allocate(); target.append(make(op, typ, ident, *values)); return ident
-    qx = emit(prefix, 81, 8, 883, 0); qy = emit(prefix, 81, 8, 883, 1)
+    source = 538 if packed else 883
+    qx = emit(prefix, 81, 8, source, 0); qy = emit(prefix, 81, 8, source, 1)
     minimum = emit(prefix, 79, 39, 871, 871, 0, 1)
     maximum = emit(prefix, 79, 39, 871, 871, 2, 3)
     span = emit(prefix, 131, 39, maximum, minimum)
@@ -142,8 +166,15 @@ def transform(original, mapping, enabled=True):
             x = emit(prefix, 133, 8, constant(matrix[row]), qx)
             y = emit(prefix, 133, 8, constant(matrix[row+1]), qy)
             xy.append(emit(prefix, 129, 8, emit(prefix, 129, 8, x, y), constant(matrix[row+2])))
-        q = emit(prefix, 80, 39, *xy)
-        u = emit(prefix, 129, 39, minimum, emit(prefix, 133, 39, span, q))
+        mapped = emit(prefix, 80, 39, *xy)
+        if packed:
+            u = mapped
+            # Diagnostic normalization only. Both cloned native cones consume
+            # mapped u directly; R1 is the original value in this invocation.
+            q = emit(prefix, 136, 39, emit(prefix, 131, 39, u, minimum), span)
+        else:
+            q = mapped
+            u = emit(prefix, 129, 39, minimum, emit(prefix, 133, 39, span, q))
         return q, u
     qc, uc = target_coordinate(mc); qa, ua = target_coordinate(ma)
     def clone(u):
@@ -208,6 +239,15 @@ def transform(original, mapping, enabled=True):
         "physical_eye_proven": False, "native_sampler_equivalence_proven": False,
         "linear_game_alpha_proven": False, "alpha_composition_authorized": False,
         "opaque_fallback_required": True, "passthrough_authorized": False}
+    if packed:
+        record.update(schema="native-fragment-packed-atlas-probe-v1",
+            scope="INERT_OFFLINE_EXPLICIT_PACKED_AFFINE_PROBE_ONLY",
+            Pc=record.pop("Mc"), Pa=record.pop("Ma"),
+            coordinate_policy="Pc=B color B^-1 and Pa=B coverage B^-1 transform original u538 directly; target-q is diagnostic only",
+            coverage_meaning="raw sampled RGB_IDENTITY component-G reconstructed with its own Pa weight; no decoder, tint or aperture; not proven linear game alpha",
+            color_policy="native decoded Pc reconstruction multiplied by ORIGINAL-q aperture and ORIGINAL tint exactly once",
+            copied_r1_or_cpu_uniform_join_used=False)
+        record["new_ssa_ids"].update(mapped_uc=uc, mapped_ua=ua)
     return patched, record
 
 
@@ -216,10 +256,12 @@ def main(argv=None):
     for name in ("original", "mapping", "output", "record"):
         parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--disabled", action="store_true")
+    parser.add_argument("--packed", action="store_true", help="require the distinct explicit packed-B schema")
     args = parser.parse_args(argv)
     try:
         mapping, mapping_sha = recovery.load_json(args.mapping)
-        patched, record = transform(recovery.read_owned(args.original, ssa.MAX_BYTES), mapping, not args.disabled)
+        builder = transform_packed if args.packed else transform
+        patched, record = builder(recovery.read_owned(args.original, ssa.MAX_BYTES), mapping, not args.disabled)
         with tempfile.TemporaryDirectory(prefix="private-native-atlas-") as temporary:
             candidate = Path(temporary)/"instrumented.spv"; candidate.write_bytes(patched)
             result = subprocess.run(["spirv-val", "--target-env", "vulkan1.1", str(candidate)],
