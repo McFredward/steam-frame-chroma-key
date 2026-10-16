@@ -16,6 +16,8 @@ class StreamPreflightTests(unittest.TestCase):
         self.events = [
             {"event": "prepared", "sampler_ready": True, "uniform_companion_enabled": False, "mask_enabled": False},
             {"event": "ssbo_definition_feature", "initialized": True, "observed": True, "enabled": True, "raw": 1, "contract_reason": "none"},
+            {"event": "ssbo_definition_owned", "pipeline_generation": 7, "current_at_cold_lookup": True,
+             "native_lifetime_lease": False, "native_compatibility_proven": False, "pipeline_changed": False, "mask_enabled": False},
             {"event": "ssbo_transaction_state", "reason": "none", "transaction_reason": 0, "profile": False, "ready": False, "queue_retrieved": True}]
 
     def assess(self, **kwargs):
@@ -50,6 +52,14 @@ class StreamPreflightTests(unittest.TestCase):
     def test_unrelated_native_definition_rejections_are_not_device_failure(self):
         self.events.append({"event": "ssbo_definition_refusals", "first_reason": "contract", "first_contract_reason": "shader_pin"})
         self.assertTrue(self.assess()["ready"])
+
+    def test_profile_without_any_complete_recipe_cannot_arm(self):
+        self.events[-1]["profile"] = True
+        self.events = [event for event in self.events if event["event"] != "ssbo_definition_owned"]
+        result = self.assess(require_profile=True)
+        self.assertFalse(result["ready"])
+        self.assertIn("no_complete_pipeline_definition_observed", result["reasons"])
+        self.assertNotIn("original_output_clone_not_ready", result["reasons"])
 
     def test_real_failure_domains_remain_independent(self):
         original = copy.deepcopy((self.status, self.health, self.events))

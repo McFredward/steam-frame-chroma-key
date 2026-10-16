@@ -57,6 +57,17 @@ def assess(status, native_health, events, *, definitions=False, transaction=Fals
                 reasons.append("original_output_profile_not_ready")
             if require_profile and states[-1].get("queue_retrieved") is not True:
                 reasons.append("original_queue_not_observed")
+            if require_profile:
+                # This is admission evidence only, never a lease on a reported
+                # native pipeline. Exact candidate lookup happens after arm.
+                recipes = [event for event in events if event["event"] == "ssbo_definition_owned"]
+                if not any(type(event.get("pipeline_generation")) is int and event["pipeline_generation"] > 0
+                           and event.get("current_at_cold_lookup") is True
+                           and event.get("native_lifetime_lease") is False
+                           and event.get("native_compatibility_proven") is False
+                           and event.get("pipeline_changed") is False
+                           and event.get("mask_enabled") is False for event in recipes):
+                    reasons.append("no_complete_pipeline_definition_observed")
             if require_clone and states[-1].get("ready") is not True:
                 reasons.append("original_output_clone_not_ready")
     return {"ready": not reasons, "reasons": reasons,
