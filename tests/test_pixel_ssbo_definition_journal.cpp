@@ -119,7 +119,7 @@ void publicInventory(){
     require(j.createRenderPass(f.graphics.renderPass,f.pass,VK_SUCCESS),"full render pass retained");
     auto pass=f.pass;pass.pNext=reinterpret_cast<const void*>(std::uintptr_t(1));
     require(!j.createRenderPass(object<VkRenderPass>(0x31),pass,VK_SUCCESS,&event),"RP extension named without reading pNext");require(event.contract.reason==clone::Reason::Extension,"RP extension cause");
-    require(!j.unsupported(journal::ObjectKind::RenderPass,0x99,VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,&event),"RP2 stays explicit unsupported");reason(event,journal::Reason::UnsupportedRoute);
+    require(!j.unsupported(journal::ObjectKind::RenderPass,0x99,VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,&event),"explicit caller unsupported route remains a refusal");reason(event,journal::Reason::UnsupportedRoute);
     require(event.contract.type==VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,"unsupported public route type retained");
     auto shader=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);shader.codeSize=4;shader.pCode=reinterpret_cast<const std::uint32_t*>(std::uintptr_t(1));
     require(!j.createShader(object<VkShaderModule>(0x40),shader,VK_SUCCESS,&event),"nonprofile shader filtered without code read");require(event.contract.reason==clone::Reason::ShaderProfile,"shader profile cause");
@@ -137,6 +137,24 @@ void publicInventory(){
     journal::Journal last(UINT64_MAX);f.initialize(last);require(last.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.generation==UINT64_MAX,"last nonzero serial is exact");require(last.destroySet(f.nativeSet),"retire final serial");
     require(!last.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"wrap cannot alias old generation");reason(event,journal::Reason::GenerationExhausted);
     journal::Journal zero(0);f.initialize(zero);require(!zero.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"invalid zero seed always refuses");reason(event,journal::Reason::GenerationExhausted);
+}
+void refusalContexts(){
+    Fixture f;journal::Journal j;f.initialize(j);journal::Ready ready;journal::Event event;
+    require(!j.takeReady(ready),"initial noReady");
+    for(unsigned i=0;i<3;++i)require(!j.unsupported(journal::ObjectKind::RenderPass,0x100+i,1000109004,&event),"same context repeated with distinct values");
+    require(!j.unsupported(journal::ObjectKind::Layout,0x200,1000109004),"different kind not hidden");
+    for(unsigned i=0;i<70;++i)require(!j.unsupported(journal::ObjectKind::Layout,0x300+i,2000+i),"bounded distinct context input");
+    const auto stats=j.inspectStats();require(stats.firstRefusal.reason==journal::Reason::NoReady,"global historical first refusal preserved");
+    require(stats.contextCount==64 && stats.contextOverflow==9,"context inventory saturates explicitly without losing first entries");
+    const auto& context=stats.contexts[1];require(context.count==3 && context.first.value==0x100 && context.last.value==0x102 && context.first.kind==journal::ObjectKind::RenderPass,"kind+cause dedup retains first and latest exact event");
+    require(stats.live[0]==1 && stats.live[1]==0 && stats.capacity[2]==journal::LayoutCapacity,"occupancy copied under journal lock");
+    require(j.createSet(f.nativeSet,f.set,VK_SUCCESS),"inventory observation source");require(j.inspectStats().live[1]==1,"live occupancy increments");require(j.destroySet(f.nativeSet),"inventory retirement");require(j.inspectStats().live[1]==0,"live occupancy retires");
+    auto attachment=info<VkAttachmentDescription2>(VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2);attachment.format=f.attachment.format;attachment.samples=f.attachment.samples;attachment.loadOp=f.attachment.loadOp;attachment.storeOp=f.attachment.storeOp;attachment.initialLayout=f.attachment.initialLayout;attachment.finalLayout=f.attachment.finalLayout;
+    VkAttachmentReference2 color{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,nullptr,0,f.color.layout,VK_IMAGE_ASPECT_COLOR_BIT};auto sub=info<VkSubpassDescription2>(VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2);sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=1;sub.pColorAttachments=&color;
+    auto ci=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);ci.attachmentCount=1;ci.pAttachments=&attachment;ci.subpassCount=1;ci.pSubpasses=&sub;
+    require(j.createRenderPass2(f.graphics.renderPass,ci,VK_SUCCESS,&event) && event.generation,"actual successful RP2 receives generation");require(j.inspectStats().live[3]==1,"RP2 shares exact legacy pass inventory");
+    require(!j.createRenderPass(f.graphics.renderPass,f.pass,VK_SUCCESS,&event) && event.reason==journal::Reason::DuplicateHandle,"RP routes cannot alias same live object");
+    require(j.destroyRenderPass(f.graphics.renderPass),"RP2 exact destroy uses common namespace");
 }
 void publicConcurrency(){
     Fixture f;journal::Journal j;f.initialize(j);Gate start;std::array<std::thread,4> threads;
@@ -320,11 +338,12 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
 }
 }
 int main(int argc,char** argv){
+    if(argc==2 && std::strcmp(argv[1],"--refusal-contexts-only")==0){refusalContexts();std::cout<<"{\"scope\":\"journal-context-rp2-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     if(argc==4 && std::strcmp(argv[1],"--variants-only")==0){privateVariants(readShader(argv[2]),readShader(argv[3]));std::cout<<"{\"scope\":\"private-pipeline-variants-subset\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)<<",\"native_authority\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--layout-flags-only")==0){layoutFlags();std::cout<<"{\"scope\":\"layout-flags-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--metadata-facts-only")==0){metadataDespiteRefusal();std::cout<<"{\"scope\":\"metadata-facts-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     require(argc==1 || argc==3 || argc==4,"optional private VS/PS [count1 probe] arguments only");
-    deviceControls();publicInventory();publicConcurrency();layoutFlags();metadataDespiteRefusal();
+    deviceControls();publicInventory();publicConcurrency();refusalContexts();layoutFlags();metadataDespiteRefusal();
     if(argc>=3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);privateVariants(vs,ps);}
     if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-definition-journal-controls-v1\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)

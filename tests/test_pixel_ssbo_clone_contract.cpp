@@ -509,6 +509,38 @@ void definitions(){
     bad.color[0].attachment=UINT32_MAX-1;require(!captureRenderPass(&bad.pass,rp,why),"invalid attachment index");reason(why,Reason::AttachmentIndex);
     bad.pass.attachmentCount=MaxAttachments+1;bad.pass.pAttachments=reinterpret_cast<const VkAttachmentDescription*>(std::uintptr_t(1));require(!captureRenderPass(&bad.pass,rp,why),"attachment count cap before dereference");reason(why,Reason::Bounds);
 }
+void renderPass2(){
+    Fixture f;RenderPassDefinition expected,out;Refusal why;
+    require(captureRenderPass(&f.pass,expected,why),"legacy RP oracle valid");
+    std::array<VkAttachmentDescription2,2> attachments{};
+    for(unsigned i=0;i<attachments.size();++i){const auto& a=f.attachments[i];attachments[i]={VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,nullptr,a.flags,a.format,a.samples,a.loadOp,a.storeOp,a.stencilLoadOp,a.stencilStoreOp,a.initialLayout,a.finalLayout};}
+    VkAttachmentReference2 color{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,nullptr,0,f.color[0].layout,VK_IMAGE_ASPECT_COLOR_BIT};
+    VkAttachmentReference2 depth{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,nullptr,1,f.depthRef.layout,VK_IMAGE_ASPECT_DEPTH_BIT};
+    auto sub=info<VkSubpassDescription2>(VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2);sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=1;sub.pColorAttachments=&color;sub.pDepthStencilAttachment=&depth;
+    const auto& d=f.dependency;VkSubpassDependency2 dependency{VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,nullptr,d.srcSubpass,d.dstSubpass,d.srcStageMask,d.dstStageMask,d.srcAccessMask,d.dstAccessMask,d.dependencyFlags,0};
+    auto ci=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);ci.attachmentCount=attachments.size();ci.pAttachments=attachments.data();ci.subpassCount=1;ci.pSubpasses=&sub;ci.dependencyCount=1;ci.pDependencies=&dependency;
+    const auto matches=[&]{require(captureRenderPass2(&ci,out,why),"ordinary RP2 losslessly decoded");require(out.complete && out.attachmentCount==expected.attachmentCount && out.colorCount==expected.colorCount && out.hasDepth && out.dependencyCount==expected.dependencyCount,"RP2 complete legacy shape preserved");require(out.attachments[1].format==expected.attachments[1].format && out.depth.layout==expected.depth.layout && out.colors[0].attachment==0 && out.dependencies[0].dstAccessMask==expected.dependencies[0].dstAccessMask,"RP2 exact color/depth/dependency fields");};
+    matches();color.aspectMask=0xffffffffu;depth.aspectMask=0xffffffffu;matches(); // Explicitly ignored non-input fields.
+    VkAttachmentReference2 resolve=color;sub.pResolveAttachments=&resolve;require(captureRenderPass2(&ci,out,why) && out.hasResolves,"resolve reference remains exact");sub.pResolveAttachments=nullptr;
+    std::uint32_t preserve=1;sub.preserveAttachmentCount=1;sub.pPreserveAttachments=&preserve;require(captureRenderPass2(&ci,out,why) && out.preserves[0]==1,"preserve attachment exact");sub.preserveAttachmentCount=0;
+    const void* poison=reinterpret_cast<const void*>(std::uintptr_t(1));
+    const auto rejected=[&]{require(!captureRenderPass2(&ci,out,why) && !out.complete,"unsupported RP2 refuses incomplete output");};
+    ci.pNext=poison;rejected();reason(why,Reason::Extension);ci.pNext=nullptr;
+    attachments[0].pNext=poison;rejected();attachments[0].pNext=nullptr;
+    sub.pNext=poison;rejected();sub.pNext=nullptr;color.pNext=poison;rejected();color.pNext=nullptr;
+    depth.pNext=poison;rejected();depth.pNext=nullptr;dependency.pNext=poison;rejected();dependency.pNext=nullptr;
+    ci.correlatedViewMaskCount=1;ci.pCorrelatedViewMasks=reinterpret_cast<const std::uint32_t*>(poison);rejected();ci.correlatedViewMaskCount=0;
+    sub.viewMask=1;rejected();sub.viewMask=0;dependency.viewOffset=1;rejected();dependency.viewOffset=0;
+    dependency.dependencyFlags=VK_DEPENDENCY_VIEW_LOCAL_BIT;rejected();dependency.dependencyFlags=d.dependencyFlags;
+    sub.inputAttachmentCount=1;sub.pInputAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);rejected();sub.inputAttachmentCount=0;
+    ci.attachmentCount=MaxAttachments+1;ci.pAttachments=reinterpret_cast<const VkAttachmentDescription2*>(poison);rejected();reason(why,Reason::Bounds);ci.attachmentCount=2;ci.pAttachments=attachments.data();
+    ci.dependencyCount=MaxDependencies+1;ci.pDependencies=reinterpret_cast<const VkSubpassDependency2*>(poison);rejected();ci.dependencyCount=1;ci.pDependencies=&dependency;
+    sub.colorAttachmentCount=MaxAttachments+1;sub.pColorAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);rejected();sub.colorAttachmentCount=1;sub.pColorAttachments=&color;
+    color.attachment=VK_ATTACHMENT_UNUSED;sub.pResolveAttachments=reinterpret_cast<const VkAttachmentReference2*>(poison);rejected();reason(why,Reason::RenderPassShape);color.attachment=0;sub.pResolveAttachments=nullptr;
+    color.attachment=2;rejected();reason(why,Reason::AttachmentIndex);color.attachment=0;
+    color.sType=VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;rejected();reason(why,Reason::Type);color.sType=VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
+    require(!captureRenderPass2(nullptr,out,why),"missing RP2 input refuses");reason(why,Reason::RenderPassMissing);matches();
+}
 void unusedColor(){
     Fixture unused;RenderPassDefinition rp;Refusal why;
     unused.color[0].attachment=VK_ATTACHMENT_UNUSED;unused.sub.pResolveAttachments=reinterpret_cast<const VkAttachmentReference*>(std::uintptr_t(1));
@@ -562,8 +594,9 @@ void privateComplete(const char* vsPath,const char* psPath){
 }
 int main(int argc,char** argv){
     if(argc==2 && std::strcmp(argv[1],"--native-device-chain-only")==0){features();nativeDeviceChain();std::cout<<"{\"scope\":\"native-device-chain-subset\",\"checks\":"<<checks<<",\"native_payload_bits_replayed\":false,\"native_authority\":false}\n";return 0;}
+    if(argc==2 && std::strcmp(argv[1],"--renderpass2-only")==0){renderPass2();std::cout<<"{\"scope\":\"renderpass2-subset\",\"checks\":"<<checks<<"}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--unused-color-only")==0){unusedColor();std::cout<<"{\"scope\":\"unused-color-subset\",\"checks\":"<<checks<<"}\n";return 0;}
-    require(argc==1 || argc==3 || argc==4,"optional private VS PS [count1 probe] paths only");features();nativeDeviceChain();layouts();definitions();unusedColor();
+    require(argc==1 || argc==3 || argc==4,"optional private VS PS [count1 probe] paths only");features();nativeDeviceChain();layouts();definitions();unusedColor();renderPass2();
     const bool privateInput=argc>=3;if(privateInput)privateComplete(argv[1],argv[2]);
     if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-clone-definition-controls-v1\",\"checks\":"<<checks<<",\"private_native_pins_tested\":"<<(privateInput?"true":"false")<<",\"recipe_bytes\":"<<sizeof(Recipe)<<",\"native_compatibility_proven\":false,\"runtime_activation_authorized\":false}\n";

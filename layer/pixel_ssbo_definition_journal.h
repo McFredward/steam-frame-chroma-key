@@ -58,6 +58,11 @@ struct Stats {
     std::array<std::uint64_t,static_cast<std::size_t>(Reason::Count)> refusals{};
     std::uint64_t seenReasons=0;
     Event firstRefusal{};
+    struct Context {Event first{},last{};std::uint64_t count=0;};
+    std::array<Context,64> contexts{};
+    std::uint32_t contextCount=0;
+    std::uint64_t contextOverflow=0;
+    std::array<std::uint32_t,6> live{},capacity{};
     clone::FeatureFacts feature{};
     clone::Refusal deviceRefusal{};
     bool initialized=false;
@@ -148,6 +153,13 @@ public:
         if(!beginCreate(passes_,value,result,ObjectKind::RenderPass,out))return false;
         clone::RenderPassDefinition definition;clone::Refusal why;
         if(!clone::captureRenderPass(&ci,definition,why))return fail(out,Reason::Contract,ObjectKind::RenderPass,value,0,why);
+        return insert(passes_,value,definition,ObjectKind::RenderPass,out);
+    }
+    bool createRenderPass2(VkRenderPass object,const VkRenderPassCreateInfo2& ci,VkResult result,Event* out=nullptr) {
+        std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
+        if(!beginCreate(passes_,value,result,ObjectKind::RenderPass,out))return false;
+        clone::RenderPassDefinition definition;clone::Refusal why;
+        if(!clone::captureRenderPass2(&ci,definition,why))return fail(out,Reason::Contract,ObjectKind::RenderPass,value,0,why);
         return insert(passes_,value,definition,ObjectKind::RenderPass,out);
     }
     bool createShader(VkShaderModule object,const VkShaderModuleCreateInfo& ci,VkResult result,Event* out=nullptr) {
@@ -248,13 +260,18 @@ public:
             return fail(out,Reason::StalePipeline,ObjectKind::Pipeline,token.value,token.generation);
         return true;
     }
-    // E.g. RenderPass2 has no full-definition decoder in this profile. This only
+    // Unsupported routes outside the explicit ordinary profiles only
     // records a refusal; it never alters the successful original Vulkan create.
     bool unsupported(ObjectKind kind,std::uint64_t value,std::uint32_t type,Event* out=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);
         return fail(out,Reason::UnsupportedRoute,kind,value,0,{clone::Reason::Extension,UINT32_MAX,type});
     }
-    Stats inspectStats() const {std::lock_guard<std::mutex> lock(mutex_);return stats_;}
+    Stats inspectStats() const {
+        std::lock_guard<std::mutex> lock(mutex_);auto out=stats_;
+        out.capacity={1,SetCapacity,LayoutCapacity,PassCapacity,ShaderCapacity,PipelineCapacity};
+        out.live={stats_.initialized&&!retired_?1u:0u,liveCount(sets_),liveCount(layouts_),liveCount(passes_),liveCount(shaders_),liveCount(pipelines_)};
+        return out;
+    }
     frame_pixel_definition_facts::Facts inspectFacts() const {std::lock_guard<std::mutex> lock(mutex_);return facts_;}
 
 private:
@@ -289,6 +306,15 @@ private:
         const auto index=static_cast<std::size_t>(reason);
         if(index<stats_.refusals.size()){increment(stats_.refusals[index]);stats_.seenReasons|=std::uint64_t(1)<<index;}
         if(stats_.firstRefusal.reason==Reason::None)stats_.firstRefusal=event;
+        for(std::size_t i=0;i<stats_.contextCount;++i){
+            auto& context=stats_.contexts[i];const auto& first=context.first;
+            if(first.reason==reason && first.kind==kind && first.contract.reason==contract.reason &&
+               first.contract.index==contract.index && first.contract.type==contract.type){
+                context.last=event;increment(context.count);return false;
+            }
+        }
+        if(stats_.contextCount<stats_.contexts.size())stats_.contexts[stats_.contextCount++]={event,event,1};
+        else increment(stats_.contextOverflow);
         return false;
     }
     bool deviceEligible(Event* out,ObjectKind kind,std::uint64_t value) noexcept {
@@ -300,6 +326,9 @@ private:
     template<class T,std::size_t N> static Slot<T>* find(std::array<Slot<T>,N>& inventory,std::uint64_t value) noexcept {
         for(auto& slot:inventory)if(slot.live && slot.identity.value==value)return &slot;
         return nullptr;
+    }
+    template<class T,std::size_t N> static std::uint32_t liveCount(const std::array<Slot<T>,N>& inventory) noexcept {
+        std::uint32_t count=0;for(const auto& slot:inventory)count+=slot.live?1u:0u;return count;
     }
     template<class T,std::size_t N> static Slot<T>* empty(std::array<Slot<T>,N>& inventory) noexcept {
         for(auto& slot:inventory)if(!slot.live)return &slot;
