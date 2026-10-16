@@ -21,6 +21,7 @@ import pixel_sampler_recovery as paired
 registration, probe, recovery = discovery.registration, discovery.probe, discovery.recovery
 require = registration.require
 MAX_HITS, MAX_BANDS, MAX_TRIPLES = 256, 32, 32
+MAX_HEADER_CACHE = 128
 MIN_SCALE, MAX_SCALE, EDGE_ERROR = .75, 4., 1.3
 MAGIC_LEVELS = tuple(side for byte in probe.MAGIC for bit in range(7, -1, -1)
                      for side in ((byte >> bit) & 1, 1 - ((byte >> bit) & 1)))
@@ -33,13 +34,14 @@ SOURCE_FILES = ("tests/steamlink-registration-source/Program.cs", "src/Gloomhave
 LOCATED_FIELDS = frozenset(("parameters", "candidate_tuple", "header_sha256", "accepted_grid_points",
     "tested_grid_points", "parameter_grid_step", "header_only_edge_fit", "accepted_parameter_ranges", "uncertainty_scope",
     "schema", "scope", "receiver_extent", "mapped_input_rgb_sha256", "magic_row_hits", "magic_bands", "attempts",
-    "supported_profile", "outer_band_proven", "decoded_content_epoch_proven", *registration.authorities()))
+    "supported_profile", "header_cache", "outer_band_proven", "decoded_content_epoch_proven", *registration.authorities()))
 
 
 def supported_profile():
     return {"positive_scale_range": [MIN_SCALE, MAX_SCALE], "row_edge_error_limit": EDGE_ERROR,
         "maximum_row_hits": MAX_HITS, "maximum_bands": MAX_BANDS, "maximum_triples": MAX_TRIPLES,
         "maximum_grid_evaluations": MAX_TRIPLES*1250, "maximum_image_pixels":probe.MAX_PIXELS,
+        "maximum_exact_header_cache_entries":MAX_HEADER_CACHE,"maximum_exact_header_cache_key_bytes":MAX_HEADER_CACHE*3*512*68,
         "uniqueness_scope": "only tested bounded positive axis-aligned hypotheses"}
 
 
@@ -155,7 +157,7 @@ def header_edge_fit(green, width, height, seed, packet):
     return [result[0][0],result[1][0],result[0][1],result[1][1]],statistics
 
 
-def refine(green, width, height, base, session, eye):
+def refine(green, width, height, base, session, eye, cache, cache_stats):
     accepted, first_failure = [], None
     def scan(origin,units,pivot):
         nonlocal first_failure
@@ -168,7 +170,21 @@ def refine(green, width, height, base, session, eye):
             fields=probe.HEADER_STRUCT.unpack(packet[:-4])
             if fields[3].hex()!=session or fields[5]!=(0 if eye=="left" else 1):continue
             try:
-                recovered=discovery.discover_mapped(remap(green,width,height,params,True),mapped_contract(),session,eye)
+                mapped=remap(green,width,height,params,True)
+                # Gray is proven replicated before searching. These complete three
+                # green strips therefore identify every RGB pixel the unchanged
+                # whole-cell parser reads. Store bytes, not only CRC/tuple/hash.
+                key=b"".join(mapped.rgb[(y*688+16)*3+1:(y*688+528)*3:3]
+                    for copy in range(3) for y in range(16+copy*76,84+copy*76))
+                if key in cache:
+                    recovered=cache[key];cache_stats["hits"]+=1
+                else:
+                    cache_stats["parser_calls"]+=1
+                    try:recovered=discovery.discover_mapped(mapped,mapped_contract(),session,eye)
+                    except probe.ProbeError as error:recovered=str(error)
+                    if len(cache)==MAX_HEADER_CACHE:cache.pop(next(iter(cache)))
+                    cache[key]=recovered
+                if isinstance(recovered,str):raise probe.ProbeError(recovered)
                 accepted.append((params,recovered))
             except probe.ProbeError as error:
                 if first_failure is None:first_failure=str(error)
@@ -195,7 +211,8 @@ def locate(image, session, eye):
     require(type(image.rgb) is bytes and image.rgb[::3] == image.rgb[1::3] == image.rgb[2::3], "exact sampled-G grayscale required")
     require(image.width >= 516 and image.height >= 411, "image too small for supported complete canvas profile")
     green = image.rgb[1::3]; bands, hit_count = magic_bands(green, image.width, image.height)
-    candidates, attempts = [], []
+    candidates, attempts, cache = [], [], {}
+    cache_stats={"hits":0,"parser_calls":0,"scope":"one immutable locate call/session/eye; exact complete three header strips only"}
     for group in combinations(bands, 3):
         centres = [(band[0][0]+band[-1][0]+1)/2 for band in group]
         sy = (centres[2]-centres[0])/152
@@ -206,7 +223,7 @@ def locate(image, session, eye):
         base = [sum(item[1] for item in rows)/len(rows), sy, sum(item[2] for item in rows)/len(rows),
                 sum(y-(18+i*76)*sy for i, y in enumerate(centres))/3]
         require(len(attempts) < MAX_TRIPLES, "header-triple work budget exhausted")
-        candidate, failure = refine(green, image.width, image.height, base, session, eye)
+        candidate, failure = refine(green, image.width, image.height, base, session, eye, cache, cache_stats)
         attempts.append({"coarse_parameters": base, "first_full_cell_failure": failure, "accepted": candidate is not None})
         if candidate: candidates.append(candidate)
     require(len(candidates) == 1, "no unique complete source canvas in bounded profile: %d candidates" % len(candidates))
@@ -214,7 +231,7 @@ def locate(image, session, eye):
     result.update(schema="registration-canvas-locator-v1", scope="UNTRUSTED_BOUNDED_AXIS_ALIGNED_CANDIDATE",
         receiver_extent=[image.width, image.height], mapped_input_rgb_sha256=probe.digest(image.rgb),
         magic_row_hits=hit_count, magic_bands=len(bands), attempts=attempts,
-        supported_profile=supported_profile(),
+        supported_profile=supported_profile(),header_cache=cache_stats,
         outer_band_proven=False, decoded_content_epoch_proven=False, **registration.authorities())
     return result
 
