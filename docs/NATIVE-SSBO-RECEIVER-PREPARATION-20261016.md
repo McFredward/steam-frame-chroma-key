@@ -1,5 +1,73 @@
 # Same-invocation receiver integration
 
+## Complete startup repair after r2
+
+The reviewed repair separates native layout instances from shared immutable
+Set0 facts. Explicit budgets retain128 Set handles,256 layouts and256 ordinary
+renderpasses; the384-entry fact bank follows the mathematical maximum of Set
+plus Layout references. Shader/pipeline inventories remain16 for the retained
+12 pinned modules/six variants. No live object is evicted or granted a lifetime
+lease. The Journal occupies1,066,816 bytes. The archived107-layout count informs
+the budget; it does not prove all107 originals satisfy the supported profile.
+
+A pressure model retains107 qualifying layouts and107 RP2 passes, then admits
+all six late pinned targets among108 modeled pipeline attempts. It also covers
+source-Set destruction/reuse, pending count1 promotion and384 unique fact
+definitions. This is a synthetic full-startup model, not a replay of missing
+native creation payloads. Restoring the old16-slot limits makes that model fail.
+The complete affected Journal passes2,883 checks normally and under ASan/UBSan;
+the new strict RP2 decoder passes42 each, and both compile for ARM.
+
+The RP2 subset copies all supported legacy-equivalent fields and rejects
+extensions, inputs and multiview semantics it cannot represent. Non-input
+reference aspectMask is ignored as specified by
+[Vulkan](https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentReference2.html). Actual original
+core/KHR Create/Begin/End2 calls remain unchanged and execute once; unknown
+recording paths invalidate the observation instead of suppressing native calls.
+The [owned GPU proof](../tests/native-fragment-renderpass2-gpu/README.md) executes
+the production checked lowering/view with a distinct legacy observer pass during
+an original RP2 pass. Intel and lavapipe each pass197 checks, two cases and six
+indexed draws, bit-identical original/observer/restored color and zero active
+Vulkan/synchronization-validation errors. It does not use the native pinned VS
+or prove the unknown native RP/pipeline payload.
+
+The actual Snapshot translation unit's exported core/KHR hooks additionally pass
+99 public checks and989 checks with private pins, normally and with ASan/UBSan.
+These are fake-dispatch callback tests, separate from the GPU proof. They verify
+argument/result forwarding, indexed replacement/restoration, original End2
+before the host barrier, extension/Next2 refusals and caught observer failure.
+Review also found a pre-existing gap after a lost definition callback: the
+Boundary refused its history but did not poison Bridge admission. The new sticky
+DefinitionHistory reason closes preparation, later intervention and publication
+while retaining ordinary retirement/release. Its five targeted failure phases
+pass219 checks normally and sanitized; this was not the recorded r2 cause.
+
+Keyed rejection contexts now retain object kind, nested cause and instance/fact
+occupancy instead of only global firstRefusal=NoReady. Bounded creation-shape
+receipts independently observe top-level route/flags/counts/pNext headers.
+Repeated ordinary failures do not grow the log. The cold reader accepts at most
+256 events/256 KiB of progress; ordinary JSON remains16 KiB. Its conservative
+source-format budget is140 events/245,416 bytes. Eleven preflight and32 session
+tests pass, including the exact preserved r2 refusal. Prestream UI/sampler/device
+readiness remains separate from poststream canonical-profile/queue/recipe
+admission: requiring a streamed distortion recipe before a stream would create
+a cycle. Neither phase grants a native lifetime or frame/eye authority.
+
+All runtime changes are pushed on fork dev. The exact442,936-byte ARM library
+SHA256 is146dc3e5da9b9e208442dc15b69888bb1207f0f060a3f4050467fde9915c89e3,
+with the same79 imports and exactly three private exports. Three actual host
+loader controls and exact-artifact isolated prepare/idempotence/unarmed/rollback
+pass. Private evidence lives under
+`build/private-native-definition-repair-integration-20261016/` and the three
+worker evidence directories recorded there. No further Frame access occurred;
+the device remains restored and user-confirmed usable. Exact hosted
+CI38968827113 succeeds for b609bde:125 CTests/98.87 seconds, both optional
+diagnostic builds, Windows and8,482 protocol sanitizer controls. The r3 plan remains inactive until
+fresh explicit installation permission and actual restart readiness; a successful
+software gate does not prove native admission or streamed passthrough.
+
+## Recorded attempts
+
 The corrected r2 candidate also completed native loading and startup, including
 the full12-header device contract, but was refused before arming. After the
 maintainer confirmed the moving PC-VR pattern, canonical profile and native queue
