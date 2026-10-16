@@ -58,6 +58,28 @@ struct TestAccess {
 };
 }
 
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+namespace frame_pixel_ssbo_transaction {
+struct TransactionTestAccess {
+    static bool recording(const Transaction::RecordingTicket& t, std::uint64_t device,
+                          VkCommandBuffer command, VkCommandPool pool) {
+        return t.tracker_ && t.device_ == device && t.command_ == command && t.pool_ == pool &&
+            t.commandGeneration_ && t.poolGeneration_ && t.family_ == 3;
+    }
+    static std::uint64_t generation(const Transaction::RecordingTicket& t) { return t.commandGeneration_; }
+    static bool target(const Transaction::TargetTicket& t, std::uint64_t device, std::uint64_t ordinal) {
+        return t.tracker_ && t.device_ == device && t.ordinal_ == ordinal && t.commandGeneration_ &&
+            t.poolGeneration_ && t.source_.image.device == device && t.source_.image.value == 70 &&
+            t.source_.view.value == 90 && t.source_.memory.value == 80 && t.set0_.value == 40 &&
+            t.pipeline_.value == 110 && t.pipeline_.generation == 905 &&
+            t.layout_.generation == 901 && t.source_.extent.width == 1152 &&
+            t.source_.extent.height == 4608;
+    }
+    static bool empty(const Transaction::TargetTicket& t) { return !t.tracker_ && !t.device_ && !t.ordinal_; }
+};
+}
+#endif
+
 namespace {
 using namespace frame_pixel_capture;
 std::atomic<unsigned> checks{0};
@@ -1062,9 +1084,112 @@ void uniformSourceAndAliasGuards() {
     require(!std::strcmp(uniformRefusalName(static_cast<UniformRefusal>(255)), "unknown_uniform_refusal"),
             "unexpected status values do not borrow or format native data");
 }
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+void ssboNativeTickets() {
+    using Transaction = frame_pixel_ssbo_transaction::Transaction;
+    using Access = frame_pixel_ssbo_transaction::TransactionTestAccess;
+    constexpr std::uint64_t nativeId = 0x510;
+    const auto nativeDevice = h<VkDevice>(nativeId);
+    const auto recipe = [] {
+        frame_pixel_ssbo_clone::Recipe r;
+        r.definitionComplete = true;
+        const std::array<std::uint64_t, 6> values{{10, 20, 2000, 100, 101, 110}};
+        for (unsigned i = 0; i < values.size(); ++i) r.provenance[i] = {nativeId, values[i], 900 + i};
+        return r;
+    }();
+    auto f = uniformFixture();
+    Transaction::RecordingTicket recording, next;
+    Transaction::TargetTicket target;
+    require(!f->tracker.ssboRecordingTicket(device, cb, recording), "unmapped device mints no recording proof");
+    require(f->tracker.ssboDeviceCreated(device, nativeDevice), "retain actual original device mapping");
+    require(!f->tracker.ssboDeviceCreated(device, h<VkDevice>(nativeId + 1)) &&
+            !f->tracker.ssboDeviceCreated(device + 1, nativeDevice), "duplicate native/tag mappings never overwrite identity");
+    require(f->tracker.ssboPipelineCreated(device, pipeline, recipe.provenance[5]),
+            "same original pipeline-create observation associates two generation namespaces");
+    require(!f->tracker.ssboPipelineCreated(device, pipeline, recipe.provenance[5]),
+            "a later caller cannot overwrite the original creation association");
+    require(f->tracker.ssboRecordingTicket(device, cb, recording) &&
+            Access::recording(recording, nativeId, cb, pool), "actual observed primary begin mints exact recording token");
+    require(!f->tracker.ssboTargetTicket(device, cb, recipe, target) && Access::empty(target),
+            "no target token outside original rendering scope");
+    require(f->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE), "start observed native scope");
+    require(!f->tracker.ssboRecordingTicket(device, cb, next), "cannot adopt a recording after entering its pass");
+    // Actual archived compositor recordings contain two preceding UI draws and
+    // an indexed target; no invented one-draw command-buffer restriction.
+    f->tracker.bindPipeline(device, cb, VK_PIPELINE_BIND_POINT_GRAPHICS, uiPipeline);
+    f->tracker.draw(device, cb);
+    require(!f->tracker.ssboTargetTicket(device, cb, recipe, target), "ordinary UI draw is not native distortion");
+    f->tracker.draw(device, cb);
+    f->bind();
+    require(f->tracker.draw(device, cb), "observe actual target after preceding UI draws");
+    require(f->tracker.ssboTargetTicket(device, cb, recipe, target) && Access::target(target, nativeId, 3),
+            "live target uses actual Core source/set generations and separate owned recipe generations");
+    for (unsigned changed = 0; changed < 5; ++changed) {
+        auto wrong = recipe;
+        if (changed < 3) ++wrong.provenance[std::array<unsigned, 3>{{0, 1, 5}}[changed]].value;
+        else if (changed == 3) ++wrong.provenance[5].device;
+        else ++wrong.provenance[5].generation;
+        require(!f->tracker.ssboTargetTicket(device, cb, wrong, target) && Access::empty(target),
+                "wrong exact set layout/pipeline layout/pipeline/device never produces a partial target");
+    }
+    require(f->tracker.observe([&](auto& core) { core.destroyView(device, view); }), "observe source destruction before draw boundary");
+    require(!f->tracker.ssboTargetTicket(device, cb, recipe, target), "stale current resource cannot mint a target");
+    require(f->tracker.resetCommand(device, cb) && f->tracker.beginCommand(device, cb, f->beginInfo, true),
+            "observe native reusable handle replacement");
+    require(f->tracker.ssboRecordingTicket(device, cb, next) &&
+            Access::generation(next) > Access::generation(recording), "equal raw CB handles carry distinct original recording generations");
+    require(!f->tracker.beginCommand(device, cb, f->beginInfo, false) &&
+            !f->tracker.ssboRecordingTicket(device, cb, next), "failed native begin never revives its prior token");
+    for (unsigned invalid = 0; invalid < 4; ++invalid) {
+        const VkCommandBufferUsageFlags flags = invalid == 0 ? VkCommandBufferUsageFlags(VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) : 0u;
+        auto bad = std::make_unique<Fixture>(true, flags,
+            invalid == 1 ? VK_COMMAND_BUFFER_LEVEL_SECONDARY : VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            invalid == 2 ? VkCommandPoolCreateFlags(VK_COMMAND_POOL_CREATE_PROTECTED_BIT) : 0u, true);
+        bad->tracker.ssboDeviceCreated(device, nativeDevice);
+        if (invalid == 3) bad->tracker.freeCommands(device, pool, 1, &cb);
+        require(!bad->tracker.ssboRecordingTicket(device, cb, next),
+                "simultaneous, secondary, protected and retired original recordings cannot be adopted");
+        require(!bad->tracker.poisoned(), "optional refusal does not poison ordinary state tracking");
+    }
+    for (unsigned changed = 0; changed < 2; ++changed) {
+        auto reused = uniformFixture();
+        require(reused->tracker.ssboDeviceCreated(device, nativeDevice) &&
+                reused->tracker.ssboPipelineCreated(device, pipeline, recipe.provenance[5]),
+                "associate original native object before handle reuse");
+        if (!changed) {
+            require(reused->tracker.destroyPipeline(device, pipeline), "retire original native pipeline generation");
+            reused->makePipeline(pipeline, pl, "PS_DISTORT");
+        } else {
+            require(reused->tracker.observe([&](auto& core) {
+                core.destroyPipelineLayout(device, pl);
+                auto layout = info<VkPipelineLayoutCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+                layout.setLayoutCount = 1; layout.pSetLayouts = &sl;
+                core.createPipelineLayout(device, pl, layout);
+            }), "retire and reuse original layout handle while pipeline remains alive");
+        }
+        reused->bind();
+        require(reused->tracker.beginRenderPass(device, cb, VK_SUBPASS_CONTENTS_INLINE), "enter original render scope after handle reuse");
+        reused->tracker.draw(device, cb);
+        require(!reused->tracker.ssboTargetTicket(device, cb, recipe, target) && Access::empty(target),
+                "same raw native pipeline/layout cannot substitute a new creation for owned clone provenance");
+    }
+    auto retiredDevice = uniformFixture();
+    require(retiredDevice->tracker.ssboDeviceCreated(device, nativeDevice) &&
+            retiredDevice->tracker.ssboDeviceDestroyed(device) &&
+            !retiredDevice->tracker.ssboRecordingTicket(device, cb, next),
+            "native device destruction removes its original mapping before reuse");
+}
+#endif
 }
 
 int main(int argc, char** argv) {
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if (argc == 2 && !std::strcmp(argv[1], "ssbo")) {
+        ssboNativeTickets();
+        std::cout << "pixel SSBO live tracker bridge: " << checks << " checks passed; no GPU/frame/eye authority\n";
+        return 0;
+    }
+#endif
     if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "legacy") && std::strcmp(argv[1], "uniform"))) {
         std::cerr << "Use legacy or uniform (no arguments runs both)\n"; return 2;
     }

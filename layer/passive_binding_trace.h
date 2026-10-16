@@ -1088,6 +1088,19 @@ public:
         if (kind == TrackedResourceKind::Memory) { const auto* p = find(memories_, device, value); return p ? p->id : Identity{}; }
         return {};
     }
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    // Original creation-time prefix identity for the optional SSBO observer.
+    // A later equal raw layout handle is not the prefix baked into a pipeline.
+    bool pipelinePrefixIdentity(std::uint64_t device, VkPipelineLayout value,
+                                Identity& layout, Identity& set0) noexcept {
+        layout = {}; set0 = {};
+        auto lock = acquire(); if (!lock.owns_lock()) return false;
+        const auto* entry = find(pipelineLayouts_, device, handle(value));
+        if (!entry || !entry->complete || entry->count != 1) return false;
+        layout = entry->id; set0 = entry->sets[0];
+        return layout.handle && layout.generation && set0.handle && set0.generation;
+    }
+#endif
     void deviceDestroyed(std::uint64_t device) noexcept {
         auto lock = acquire(); if (!lock.owns_lock()) return;
         eraseDevice(layouts_, device); eraseDevice(pipelineLayouts_, device); eraseDevice(pools_, device); eraseDevice(sets_, device);

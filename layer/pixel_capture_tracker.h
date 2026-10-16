@@ -10,6 +10,9 @@
 // again until retirement. The owner never changes native recording flags.
 #include "passive_pipeline_trace.h"
 #include "pixel_uniform_contract.h"
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+#include "pixel_ssbo_draw_transaction.h"
+#endif
 
 #include <pthread.h>
 #include <utility>
@@ -122,6 +125,10 @@ class LiveTracker {
     struct Pipeline : Base {
         VkPipelineLayout layout = VK_NULL_HANDLE;
         bool supported = false;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+        frame_pixel_ssbo_clone::Identity ssboJournalIdentity{};
+        Identity ssboCreationLayout{}, ssboCreationSet0{};
+#endif
         // Pipeline creation consumes shader modules. These facts remain valid
         // when Vulkan legally destroys/reuses the original module handles.
         frame_pixel_uniform::NativeStages stages{};
@@ -155,6 +162,119 @@ class LiveTracker {
     };
 
 public:
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    // Original successful CreateDevice identity, not an inferred dispatch key.
+    // This optional mapping never changes ordinary capture eligibility.
+    bool ssboDeviceCreated(std::uint64_t tag, VkDevice nativeDevice) noexcept {
+        return locked("ssboDeviceCreated", [&] {
+            if (!tag || !nativeDevice) return false;
+            for (const auto& entry : ssboDevices_)
+                if (entry.tag == tag || entry.nativeDevice == nativeDevice) return false;
+            for (auto& entry : ssboDevices_) if (!entry.tag) {
+                entry.tag = tag; entry.nativeDevice = nativeDevice; return true;
+            }
+            return false;
+        });
+    }
+    bool ssboDeviceDestroyed(std::uint64_t tag) noexcept {
+        return locked("ssboDeviceDestroyed", [&] {
+            for (auto& entry : ssboDevices_) if (entry.tag == tag) { entry = {}; return true; }
+            return false;
+        });
+    }
+    // Call in the SAME original successful pipeline-create callback, after
+    // both creation observers consumed the original inputs. This associates
+    // their separate generation namespaces without comparing their counters.
+    bool ssboPipelineCreated(std::uint64_t device, VkPipeline value,
+                            frame_pixel_ssbo_clone::Identity journalIdentity) noexcept {
+        return locked("ssboPipelineCreated", [&] {
+            auto* pipeline = pipelines_.find(device, frame_bindings::handle(value));
+            VkDevice nativeDevice = VK_NULL_HANDLE;
+            for (const auto& entry : ssboDevices_) if (entry.tag == device) nativeDevice = entry.nativeDevice;
+            if (!nativeDevice || !pipeline || pipeline->ssboJournalIdentity.value ||
+                journalIdentity.device != frame_pixel_ssbo_clone::handle(nativeDevice) ||
+                journalIdentity.value != pipeline->id.handle || !journalIdentity.generation) return false;
+            Identity layout, set0;
+            if (!bindings_.pipelinePrefixIdentity(device, pipeline->layout, layout, set0) || !coreHealthy()) return false;
+            pipeline->ssboCreationLayout = layout; pipeline->ssboCreationSet0 = set0;
+            pipeline->ssboJournalIdentity = journalIdentity;
+            return true;
+        });
+    }
+    // Consume only in the synchronous original successful Begin callback. The
+    // tracker retains ALL observed pools/CBs, so adoption cannot mistake the
+    // first compositor allocation for the later distortion command buffer.
+    bool ssboRecordingTicket(std::uint64_t device, VkCommandBuffer value,
+            frame_pixel_ssbo_transaction::Transaction::RecordingTicket& out) noexcept {
+        out = {};
+        return locked("ssboRecordingTicket", [&] {
+            const auto* command = commands_.find(device, frame_bindings::handle(value));
+            const auto* pool = command ? pools_.find(device, command->pool.handle) : nullptr;
+            VkDevice nativeDevice = VK_NULL_HANDLE;
+            for (const auto& entry : ssboDevices_) if (entry.tag == device) nativeDevice = entry.nativeDevice;
+            if (!nativeDevice || !command || !pool || !pool->supported || !command->supported ||
+                !frame_bindings::same(pool->id, command->pool) || !command->recording ||
+                command->scope != Scope::None || command->drawOrdinal || command->issued ||
+                command->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
+                (command->beginFlags & ~VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)) return false;
+            out.tracker_ = this; out.device_ = frame_pixel_ssbo_clone::handle(nativeDevice);
+            out.command_ = value; out.pool_ = native<VkCommandPool>(pool->id.handle);
+            out.commandGeneration_ = command->id.generation; out.poolGeneration_ = pool->id.generation;
+            out.family_ = command->family; out.flags_ = command->beginFlags;
+            return true;
+        });
+    }
+    // Call immediately after observing this actual direct/indexed draw and
+    // before forwarding it. Recipe identities come from the separately owned
+    // prepared clone; Core identities deliberately use a different generation
+    // namespace. Do NOT compare their generation numbers with one another.
+    bool ssboTargetTicket(std::uint64_t device, VkCommandBuffer value,
+            const frame_pixel_ssbo_clone::Recipe& recipe,
+            frame_pixel_ssbo_transaction::Transaction::TargetTicket& out) noexcept {
+        out = {};
+        return locked("ssboTargetTicket", [&] {
+            const auto* command = commands_.find(device, frame_bindings::handle(value));
+            const auto* pool = command ? pools_.find(device, command->pool.handle) : nullptr;
+            const auto* pipeline = command ? pipelines_.find(device, command->pipeline.handle) : nullptr;
+            VkDevice nativeDevice = VK_NULL_HANDLE;
+            for (const auto& entry : ssboDevices_) if (entry.tag == device) nativeDevice = entry.nativeDevice;
+            const auto nativeId = frame_pixel_ssbo_clone::handle(nativeDevice);
+            if (!nativeId || !command || !pool || !pipeline || !recipe.definitionComplete ||
+                !command->supported || !command->recording || command->scope != Scope::RenderPass ||
+                !command->drawOrdinal || !pipeline->supported ||
+                !frame_bindings::same(command->pool, pool->id) ||
+                !frame_bindings::same(command->pipeline, pipeline->id) ||
+                !frame_pixel_uniform::nativeStagesMatch(pipeline->stages) ||
+                recipe.provenance[5].device != nativeId || recipe.provenance[1].device != nativeId ||
+                recipe.provenance[0].device != nativeId ||
+                recipe.provenance[5].value != pipeline->ssboJournalIdentity.value ||
+                recipe.provenance[5].generation != pipeline->ssboJournalIdentity.generation ||
+                recipe.provenance[5].device != pipeline->ssboJournalIdentity.device ||
+                recipe.provenance[1].value != frame_bindings::handle(pipeline->layout)) return false;
+            const auto state = bindings_.snapshot(device, value, pipeline->layout);
+            const auto* source = imageSource(state);
+            if (!coreHealthy() || !state.sourceComplete || !state.set.handle || !state.set.generation ||
+                !frame_bindings::same(state.pipelineLayout, pipeline->ssboCreationLayout) ||
+                !frame_bindings::same(state.setLayout, pipeline->ssboCreationSet0) ||
+                state.setLayout.handle != recipe.provenance[0].value || !source || !eligible(*source) ||
+                !bindings_.validateBindingResources(*source) || !coreHealthy()) return false;
+            const auto identity = [nativeId](Identity id) noexcept {
+                return frame_pixel_ssbo_clone::Identity{nativeId, id.handle, id.generation};
+            };
+            out.tracker_ = this; out.device_ = nativeId; out.command_ = value;
+            out.pool_ = native<VkCommandPool>(pool->id.handle);
+            out.commandGeneration_ = command->id.generation; out.poolGeneration_ = pool->id.generation;
+            out.ordinal_ = command->drawOrdinal; out.pipeline_ = recipe.provenance[5];
+            out.layout_ = recipe.provenance[1]; out.set0_ = identity(state.set);
+            out.source_.image = identity(source->image.identity);
+            out.source_.view = identity(source->view.identity);
+            out.source_.memory = identity(source->image.memory);
+            out.source_.layout = source->imageLayout;
+            out.source_.extent = {source->image.extent.width, source->image.extent.height};
+            return true;
+        });
+    }
+#endif
     bool poisoned() const noexcept { return failure_.load(std::memory_order_acquire) != Failure::None; }
     Failure failure() const noexcept { return failure_.load(std::memory_order_acquire); }
 
@@ -801,6 +921,10 @@ private:
     std::array<std::atomic<std::uint64_t>, CoreReasonCount> firstCoreReasons_{};
     std::array<std::atomic<std::uint64_t>, CoreTableCount> firstCoreCapacities_{};
     std::uint64_t serial_ = 0;
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    struct SsboDevice { std::uint64_t tag = 0; VkDevice nativeDevice = VK_NULL_HANDLE; };
+    std::array<SsboDevice, 16> ssboDevices_{};
+#endif
     frame_bindings::Core bindings_{};
     frame_bindings::ObjectTable<Pool, PoolCapacity> pools_{};
     frame_bindings::ObjectTable<Shader, ShaderCapacity> shaders_{};
