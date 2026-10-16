@@ -1,5 +1,24 @@
 # Same-invocation receiver integration
 
+The corrected r2 candidate also completed native loading and startup, including
+the full12-header device contract, but was refused before arming. After the
+maintainer confirmed the moving PC-VR pattern, canonical profile and native queue
+were present but no complete pipeline definition was retained. Final refusal
+bits1152 identify Capacity and UnknownLayout. The aggregate created19 does not
+identify which inventory was exhausted; global firstRefusal=NoReady also masks
+later nested causes. Source plus the archived107 distinct pipeline-layout handles
+shows why retaining just16 qualifying layouts is insufficient for full startup,
+even though the six target variants themselves fit. RP2 create/recording routes
+also remain blanket refusals; actual target usage is not established by that
+archive. No observer was bound, arm created, or image/SSBO acquired.
+
+The r2 attempt is fully restored and user-confirmed normally visible/usable.
+Its consumed plan and exact results are retained privately in
+`build/private-native-ssbo-run-20261016-r2/`. Further work is offline until the
+complete cold-definition route, bounded refusal reporting and startup fixtures
+are repaired and reviewed. Native shader compatibility and live passthrough
+remain unproven; a successful UI start is not receiver admission.
+
 The first assembled ARM candidate was tested and fully restored without arming:
 native imports, isolated load and UI health passed, while the device-definition
 contract refused HostQueryReset at index5. That attempt first supplies the full
