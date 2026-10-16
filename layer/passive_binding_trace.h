@@ -166,6 +166,43 @@ struct Snapshot {
 static_assert(std::is_trivially_copyable_v<Snapshot>, "Snapshots must be safe bounded event payloads");
 static_assert(sizeof(Snapshot) <= 16384, "Snapshot exceeds the bounded trace event budget");
 
+// Optional uniform-companion admission only. These fixed scalar refusals do not
+// alter ordinary snapshots, public buffer metadata or the existing trace schema.
+enum class UniformResourceReason : std::uint8_t {
+    None, CoreUnavailable, SnapshotIncomplete, SnapshotChanged, BindingMissing,
+    BindingDuplicate, Descriptor, BindingChanged, BufferStale, Sharing,
+    MemoryStale, UnsupportedMemory, SourceUsage, SourceBounds, BufferAlias, UnknownAllocationAliasSpan,
+    AmbiguousBufferAlias, ImageAlias, AmbiguousImageAlias,
+};
+struct UniformResourceRefusal {
+    UniformResourceReason reason = UniformResourceReason::None;
+    std::uint32_t binding = UINT32_MAX;
+};
+inline const char* uniformResourceReasonName(UniformResourceReason reason) noexcept {
+    switch (reason) {
+    case UniformResourceReason::None: return "none";
+    case UniformResourceReason::CoreUnavailable: return "core_unavailable";
+    case UniformResourceReason::SnapshotIncomplete: return "snapshot_incomplete";
+    case UniformResourceReason::SnapshotChanged: return "snapshot_changed";
+    case UniformResourceReason::BindingMissing: return "binding_missing";
+    case UniformResourceReason::BindingDuplicate: return "binding_duplicate";
+    case UniformResourceReason::Descriptor: return "descriptor";
+    case UniformResourceReason::BindingChanged: return "binding_changed";
+    case UniformResourceReason::BufferStale: return "buffer_stale";
+    case UniformResourceReason::Sharing: return "sharing";
+    case UniformResourceReason::MemoryStale: return "memory_stale";
+    case UniformResourceReason::UnsupportedMemory: return "unsupported_memory";
+    case UniformResourceReason::SourceUsage: return "source_usage";
+    case UniformResourceReason::SourceBounds: return "source_bounds";
+    case UniformResourceReason::BufferAlias: return "buffer_alias";
+    case UniformResourceReason::UnknownAllocationAliasSpan: return "unknown_allocation_alias_span";
+    case UniformResourceReason::AmbiguousBufferAlias: return "ambiguous_buffer_alias";
+    case UniformResourceReason::ImageAlias: return "image_alias";
+    case UniformResourceReason::AmbiguousImageAlias: return "ambiguous_image_alias";
+    }
+    return "unknown_uniform_resource_reason";
+}
+
 // A receipt is an owned CPU lifecycle observation, not accepted native import,
 // source video, cross-process namespace or GPU-consumption proof. The tag and
 // cookie are supplied only after the adapter verifies the live native invocation.
@@ -337,7 +374,12 @@ class Core {
         std::uint64_t revision = 0;
         std::array<Value, BindingCapacity> values{};
     };
-    struct Buffer : Base { BufferMetadata metadata{}; };
+    struct Buffer : Base {
+        BufferMetadata metadata{};
+        // Only the original observed create input supplies this private fact.
+        // Public BufferMetadata/serialization deliberately remains unchanged.
+        VkSharingMode observedSharing = VK_SHARING_MODE_MAX_ENUM;
+    };
     struct Image : Base { ImageMetadata metadata{}; std::uint64_t invocationTag = 0; };
     struct View : Base { ViewMetadata metadata{}; std::uint64_t invocationTag = 0; };
     struct ImportTag {
@@ -503,6 +545,8 @@ public:
         auto* out = insert(buffers_, device, handle(value)); if (!out) return;
         out->complete = info.sType == VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO && !info.pNext && info.flags == 0;
         out->metadata.identity = out->id; out->metadata.size = info.size; out->metadata.usage = info.usage;
+        if (out->complete && (info.sharingMode == VK_SHARING_MODE_EXCLUSIVE || info.sharingMode == VK_SHARING_MODE_CONCURRENT))
+            out->observedSharing = info.sharingMode;
     }
     void destroyBuffer(std::uint64_t device, VkBuffer value) noexcept { eraseGuarded(buffers_, device, handle(value)); }
     void createImage(std::uint64_t device, VkImage value, const VkImageCreateInfo& info) noexcept {
@@ -731,6 +775,105 @@ public:
             same(previous.set, current.set) && same(previous.setLayout, current.setLayout) && previous.setRevision == current.setRevision &&
             previous.commandBindingRevision == current.commandBindingRevision;
     }
+    // One bounded CPU graph check for the OPTIONAL read-only uniform companion.
+    // It is not a GPU barrier, content-coherence claim or resource lifetime lease.
+    // The live owner must separately prove the same primary's final native draw,
+    // same-queue ownership, synchronization, valid native lifetime and retirement.
+    bool validateUnaliasedUniformResources(const Snapshot& previous, UniformResourceRefusal* refusal = nullptr) noexcept {
+        if (refusal) *refusal = {};
+        const auto reject = [&](UniformResourceReason reason, std::uint32_t binding = UINT32_MAX) noexcept {
+            if (refusal) *refusal = {reason, binding};
+            return false;
+        };
+        auto lock = acquire();
+        if (!lock.owns_lock() || lostState()) return reject(UniformResourceReason::CoreUnavailable);
+        if (!previous.device || !previous.sourceComplete || previous.reason != Reason::None || previous.gpuConsumedCoherent)
+            return reject(UniformResourceReason::SnapshotIncomplete);
+        const auto current = snapshotLocked(previous.device, previous.command.handle, previous.pipelineLayout.handle);
+        if (!same(previous.command, current.command) || !same(previous.pipelineLayout, current.pipelineLayout) ||
+            !same(previous.set, current.set) || !same(previous.setLayout, current.setLayout) ||
+            previous.setRevision != current.setRevision || previous.commandBindingRevision != current.commandBindingRevision ||
+            previous.layout_has_binding31 != current.layout_has_binding31)
+            return reject(UniformResourceReason::SnapshotChanged);
+        constexpr std::array<std::uint32_t, 5> numbers{{0, 2, 3, 4, 6}};
+        for (const auto number : numbers) {
+            const Binding* old = nullptr; const Binding* now = nullptr;
+            for (const auto& binding : previous.bindings) if (binding.binding == number) {
+                if (old) return reject(UniformResourceReason::BindingDuplicate, number);
+                old = &binding;
+            }
+            for (const auto& binding : current.bindings) if (binding.binding == number) now = &binding;
+            if (!old || !now || old->state == BindingState::Absent || now->state == BindingState::Absent)
+                return reject(UniformResourceReason::BindingMissing, number);
+            const auto visibility = number <= 3 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+            if (!old->complete || old->state != BindingState::Written || old->descriptorCount != 1 ||
+                (old->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && old->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) ||
+                !(old->stages & visibility) || !old->revision || old->revision > previous.setRevision)
+                return reject(UniformResourceReason::Descriptor, number);
+            const auto* source = lookup(buffers_, previous.device, old->buffer.identity);
+            if (!source || !source->complete || !old->buffer.complete)
+                return reject(UniformResourceReason::BufferStale, number);
+            if (source->observedSharing != VK_SHARING_MODE_EXCLUSIVE)
+                return reject(UniformResourceReason::Sharing, number);
+            const auto* memory = lookup(memories_, previous.device, source->metadata.memory);
+            if (!memory || !memory->complete || !same(old->buffer.memory, memory->id) ||
+                !same(old->buffer.allocation.identity, memory->id))
+                return reject(UniformResourceReason::MemoryStale, number);
+            const auto allocationNow = allocation(previous.device, memory->id);
+            if (!ordinaryUniformAllocation(allocationNow) || !ordinaryUniformAllocation(old->buffer.allocation))
+                return reject(UniformResourceReason::UnsupportedMemory, number);
+            if (!now->complete || now->state != BindingState::Written || now->descriptorCount != old->descriptorCount ||
+                now->type != old->type || now->stages != old->stages || now->revision != old->revision ||
+                now->bufferOffset != old->bufferOffset || now->bufferRange != old->bufferRange ||
+                now->dynamicOffset != old->dynamicOffset || now->effectiveOffset != old->effectiveOffset ||
+                now->effectiveRange != old->effectiveRange || !same(now->buffer.identity, old->buffer.identity) ||
+                now->buffer.size != old->buffer.size || now->buffer.usage != old->buffer.usage ||
+                !same(now->buffer.memory, old->buffer.memory) || now->buffer.memoryOffset != old->buffer.memoryOffset ||
+                now->buffer.allocation.allocationSize != old->buffer.allocation.allocationSize ||
+                now->buffer.allocation.memoryTypeIndex != old->buffer.allocation.memoryTypeIndex)
+                return reject(UniformResourceReason::BindingChanged, number);
+            const auto& buffer = source->metadata;
+            constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            constexpr auto maximum = std::numeric_limits<VkDeviceSize>::max();
+            if ((buffer.usage & usage) != usage) return reject(UniformResourceReason::SourceUsage, number);
+            if (!buffer.size || !old->effectiveRange ||
+                buffer.memoryOffset > allocationNow.allocationSize || buffer.size > allocationNow.allocationSize - buffer.memoryOffset ||
+                old->bufferOffset > maximum - old->dynamicOffset ||
+                old->effectiveOffset != old->bufferOffset + old->dynamicOffset ||
+                (old->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && old->dynamicOffset) ||
+                old->effectiveOffset >= buffer.size || old->effectiveRange > buffer.size - old->effectiveOffset)
+                return reject(UniformResourceReason::SourceBounds, number);
+            const auto begin = buffer.memoryOffset + old->effectiveOffset;
+            const auto end = begin + old->effectiveRange; // Both sums are bounded by the live allocation above.
+            for (const auto& image : images_) {
+                if (!image.id.generation || image.device != previous.device || image.metadata.memory.handle != memory->id.handle) continue;
+                if (!image.complete || !same(image.metadata.memory, memory->id))
+                    return reject(UniformResourceReason::AmbiguousImageAlias, number);
+                // No complete image memory-requirements envelope is retained.
+                // Even an apparently distant offset cannot prove disjointness.
+                return reject(UniformResourceReason::ImageAlias, number);
+            }
+            for (const auto& other : buffers_) {
+                if (!other.id.generation || other.device != previous.device || same(other.id, source->id) ||
+                    other.metadata.memory.handle != memory->id.handle) continue;
+                const auto& alias = other.metadata;
+                if (!other.complete || !same(alias.memory, memory->id) || !alias.size ||
+                    (other.observedSharing != VK_SHARING_MODE_EXCLUSIVE && other.observedSharing != VK_SHARING_MODE_CONCURRENT) ||
+                    alias.memoryOffset > allocationNow.allocationSize || alias.size > allocationNow.allocationSize - alias.memoryOffset)
+                    return reject(UniformResourceReason::AmbiguousBufferAlias, number);
+                const auto aliasEnd = alias.memoryOffset + alias.size;
+                if (begin < aliasEnd && alias.memoryOffset < end) return reject(UniformResourceReason::BufferAlias, number);
+                // VkBufferCreateInfo.size is only the logical byte extent.
+                // The full bound span comes from VkMemoryRequirements.size,
+                // which this Core never observes. Logical disjointness cannot
+                // therefore establish a safe distinct-buffer alias envelope.
+                return reject(UniformResourceReason::UnknownAllocationAliasSpan, number);
+            }
+        }
+        if (!current.sourceComplete || current.reason != Reason::None) return reject(UniformResourceReason::SnapshotIncomplete);
+        if (lostState()) return reject(UniformResourceReason::CoreUnavailable);
+        return true;
+    }
     // Live-owner resource check for an immutable previously observed image
     // binding. Descriptor rebinding is deliberately irrelevant: a later UI
     // draw must not replace the original sampled source. This is an instant
@@ -952,6 +1095,15 @@ public:
         eraseDevice(memories_, device); eraseDevice(commands_, device); eraseDevice(conversions_, device);
     }
 private:
+    static bool ordinaryUniformAllocation(const MemoryMetadata& memory) noexcept {
+        const auto& ext = memory.extensions;
+        return memory.complete && memory.identity.handle && memory.identity.generation && memory.allocationSize &&
+            ext.chain.complete && !ext.chain.count && ext.chain.error == extensions::ChainError::None && !ext.chain.errorFlags &&
+            !ext.hasImport && !ext.hasExport && !ext.hasDedicated && !ext.importType && !ext.exportTypes && ext.inputFD == -1 &&
+            !ext.dedicatedImageHandle && !ext.dedicatedBufferHandle &&
+            !memory.dedicatedImage.handle && !memory.dedicatedImage.generation &&
+            !memory.dedicatedBuffer.handle && !memory.dedicatedBuffer.generation;
+    }
     ImportTag* importTag(std::uint64_t value, std::uint64_t device, bool create) noexcept {
         if (!value) return nullptr;
         ImportTag* available = nullptr;
