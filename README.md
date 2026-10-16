@@ -57,6 +57,10 @@ The next [inert fragment observation](docs/NATIVE-FRAGMENT-SSA-PROBE-20261016.md
 exports original shader values only in an owned offscreen GPU fixture. Native
 temporal association, application-ray registration and actual game-alpha
 composition remain unproven; no live replacement shader is activated.
+The subsequent [dual-panel reconstruction](docs/ATLAS-RECONSTRUCTION-20261016.md)
+checks separate color/coverage reads with explicit diagnostic transforms and
+the actual original fragment on two host Vulkan drivers. It remains offline;
+it does not calibrate a live stream or enable passthrough.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
