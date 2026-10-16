@@ -418,6 +418,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_refusal_status.py)
         add_test(NAME pixel_snapshot_session COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_snapshot_session.py)
+        add_test(NAME pixel_stream_preflight COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_stream_preflight.py)
         if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
             set(pixel_definition_test_args)
             if(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL)
