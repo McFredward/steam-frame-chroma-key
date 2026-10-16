@@ -13,6 +13,8 @@
 namespace {
 namespace journal=frame_pixel_ssbo_journal;
 namespace clone=frame_pixel_ssbo_clone;
+// Journals own finite startup banks; multiple independent controls must not
+// combine those heap-sized objects on an ordinary8-MiB test-thread stack.
 std::atomic<unsigned> checks{0};
 void require(bool value,const char* text){++checks;if(!value){std::cerr<<"FAIL: "<<text<<'\n';std::exit(1);}}
 template<class T>T info(VkStructureType type){T out{};out.sType=type;return out;}
@@ -76,7 +78,7 @@ struct Gate {
     void wait(unsigned count){std::unique_lock<std::mutex> lock(mutex);++arrived;if(arrived==count){open=true;condition.notify_all();}else condition.wait(lock,[&]{return open;});}
 };
 void deviceControls(){
-    Fixture f;journal::Journal j;journal::Event event;
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>();auto& j=*jOwner;journal::Event event;
     require(!j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"uninitialized journal refuses");reason(event,journal::Reason::NotInitialized);
     auto broken=f.device;broken.pNext=reinterpret_cast<const void*>(std::uintptr_t(1));
     require(!j.createDevice(object<VkDevice>(1),broken,VK_ERROR_INITIALIZATION_FAILED,&event),"failed native create never reads pointers");reason(event,journal::Reason::NativeCreationFailed);
@@ -87,18 +89,18 @@ void deviceControls(){
     require(!j.createDevice(object<VkDevice>(2),f.device,VK_SUCCESS,&event),"cannot replace initialized device");reason(event,journal::Reason::AlreadyInitialized);
     j.destroyDevice();require(!j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"destroyed device cannot accept children");reason(event,journal::Reason::DeviceIneligible);
     require(!j.createDevice(object<VkDevice>(1),f.device,VK_SUCCESS,&event),"retired journal never resets generations");reason(event,journal::Reason::AlreadyInitialized);
-    journal::Journal disabled;require(!disabled.createDevice(object<VkDevice>(1),f.device,VK_SUCCESS,&event),"supported but disabled feature refuses");reason(event,journal::Reason::DeviceIneligible);
+    auto disabledOwner=std::make_unique<journal::Journal>();auto& disabled=*disabledOwner;require(!disabled.createDevice(object<VkDevice>(1),f.device,VK_SUCCESS,&event),"supported but disabled feature refuses");reason(event,journal::Reason::DeviceIneligible);
     require(event.contract.reason==clone::Reason::FeatureDisabled && disabled.inspectStats().feature.observed,"feature refusal and observation retained");
-    f.features.fragmentStoresAndAtomics=2;journal::Journal malformed;require(!malformed.createDevice(object<VkDevice>(1),f.device,VK_SUCCESS,&event),"noncanonical enabled feature refuses");
+    f.features.fragmentStoresAndAtomics=2;auto malformedOwner=std::make_unique<journal::Journal>();auto& malformed=*malformedOwner;require(!malformed.createDevice(object<VkDevice>(1),f.device,VK_SUCCESS,&event),"noncanonical enabled feature refuses");
     require(event.contract.reason==clone::Reason::FeatureValue,"canonical feature cause exact");
-    f.device.pEnabledFeatures=nullptr;journal::Journal absent;require(!absent.createDevice(object<VkDevice>(1),f.device,VK_SUCCESS,&event),"capability-only/absent fact refuses");
+    f.device.pEnabledFeatures=nullptr;auto absentOwner=std::make_unique<journal::Journal>();auto& absent=*absentOwner;require(!absent.createDevice(object<VkDevice>(1),f.device,VK_SUCCESS,&event),"capability-only/absent fact refuses");
     require(!absent.inspectStats().feature.observed && event.contract.reason==clone::Reason::FeatureAbsent,"absence distinguished from false");
     auto feature2=info<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);feature2.features.fragmentStoresAndAtomics=VK_TRUE;f.device.pNext=&feature2;
-    journal::Journal second;f.initialize(second);require(second.inspectStats().feature.source==clone::FeatureSource::Features2,"Features2 actual enabled source retained");
+    auto secondOwner=std::make_unique<journal::Journal>();auto& second=*secondOwner;f.initialize(second);require(second.inspectStats().feature.source==clone::FeatureSource::Features2,"Features2 actual enabled source retained");
     require(stats.journalEpoch!=second.inspectStats().journalEpoch,"new journal has different token namespace");
 }
 void publicInventory(){
-    Fixture f;journal::Journal j;journal::Event event;f.initialize(j);
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>();auto& j=*jOwner;journal::Event event;f.initialize(j);
     auto bad=f.set;bad.bindingCount=clone::MaxBindings+1;bad.pBindings=reinterpret_cast<const VkDescriptorSetLayoutBinding*>(std::uintptr_t(1));
     require(!j.createSet(f.nativeSet,bad,VK_SUCCESS,&event),"unsupported original set never dereferences oversized array");reason(event,journal::Reason::Contract);require(event.contract.reason==clone::Reason::Bounds,"first nested cause exact");
     const auto first=j.inspectStats().firstRefusal;
@@ -138,12 +140,12 @@ void publicInventory(){
     const auto stats=j.inspectStats();require(stats.firstRefusal.reason==first.reason && stats.firstRefusal.contract.reason==first.contract.reason,"later failures never overwrite first refusal");
     require(stats.refusals[static_cast<std::size_t>(journal::Reason::Contract)]>=4 && (stats.seenReasons&(1ull<<static_cast<unsigned>(journal::Reason::Capacity))),"fixed counters and deduplicated reason mask");
     journal::Ready ready;require(!j.takeReady(ready,&event) && !ready.recipe.definitionComplete,"no invented ready recipe");reason(event,journal::Reason::NoReady);
-    journal::Journal last(UINT64_MAX);f.initialize(last);require(last.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.generation==UINT64_MAX,"last nonzero serial is exact");require(last.destroySet(f.nativeSet),"retire final serial");
+    auto lastOwner=std::make_unique<journal::Journal>(UINT64_MAX);auto& last=*lastOwner;f.initialize(last);require(last.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.generation==UINT64_MAX,"last nonzero serial is exact");require(last.destroySet(f.nativeSet),"retire final serial");
     require(!last.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"wrap cannot alias old generation");reason(event,journal::Reason::GenerationExhausted);
-    journal::Journal zero(0);f.initialize(zero);require(!zero.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"invalid zero seed always refuses");reason(event,journal::Reason::GenerationExhausted);
+    auto zeroOwner=std::make_unique<journal::Journal>(0);auto& zero=*zeroOwner;f.initialize(zero);require(!zero.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"invalid zero seed always refuses");reason(event,journal::Reason::GenerationExhausted);
 }
 void refusalContexts(){
-    Fixture f;journal::Journal j;f.initialize(j);journal::Ready ready;journal::Event event;
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>();auto& j=*jOwner;f.initialize(j);journal::Ready ready;journal::Event event;
     require(!j.takeReady(ready),"initial noReady");
     for(unsigned i=0;i<3;++i)require(!j.unsupported(journal::ObjectKind::RenderPass,0x100+i,1000109004,&event),"same context repeated with distinct values");
     require(!j.unsupported(journal::ObjectKind::Layout,0x200,1000109004),"different kind not hidden");
@@ -161,7 +163,7 @@ void refusalContexts(){
     require(j.destroyRenderPass(f.graphics.renderPass),"RP2 exact destroy uses common namespace");
 }
 void publicConcurrency(){
-    Fixture f;journal::Journal j;f.initialize(j);Gate start;std::array<std::thread,4> threads;
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>();auto& j=*jOwner;f.initialize(j);Gate start;std::array<std::thread,4> threads;
     for(unsigned t=0;t<threads.size();++t)threads[t]=std::thread([&,t]{
         Fixture local;start.wait(4);
         for(unsigned i=0;i<24;++i){
@@ -180,14 +182,14 @@ void publicConcurrency(){
     require(stats.refusals[static_cast<std::size_t>(journal::Reason::Capacity)]==0,"ordinary metadata concurrency never poisons capacity");
 }
 void layoutFlags(){
-    Fixture f;journal::Journal j;f.initialize(j);journal::Event event;
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>();auto& j=*jOwner;f.initialize(j);journal::Event event;
     f.layout.flags=VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
     f.layout.pSetLayouts=reinterpret_cast<const VkDescriptorSetLayout*>(std::uintptr_t(1));
     require(!j.createLayout(f.graphics.layout,f.layout,VK_SUCCESS,&event),"unsupported layout flags refuse before any potentially ignored array");
     reason(event,journal::Reason::Contract);require(event.contract.reason==clone::Reason::Bounds,"layout flags preserve contract reason");
 }
 void metadataDespiteRefusal(){
-    Fixture f;journal::Journal j;journal::Event event;
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>();auto& j=*jOwner;journal::Event event;
     auto core=info<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
     auto timeline=info<VkPhysicalDeviceTimelineSemaphoreFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
     auto future=info<VkBaseInStructure>(static_cast<VkStructureType>(0x6fffffff));
@@ -246,7 +248,7 @@ void loadShaders(journal::Journal& j,const std::vector<std::uint32_t>& vs,const 
     require(j.createShader(object<VkShaderModule>(0x50),ci,VK_SUCCESS),"exact private PS definition captured");
 }
 void privateRecipes(const std::vector<std::uint32_t>& sourceVs,const std::vector<std::uint32_t>& sourcePs){
-    Fixture f;journal::Journal j;journal::Event event;f.initialize(j);
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>();auto& j=*jOwner;journal::Event event;f.initialize(j);
     require(j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.generation==1,"first set identity");
     require(j.createLayout(f.graphics.layout,f.layout,VK_SUCCESS),"layout snapshots original Set0");
     require(j.destroySet(f.nativeSet),"SetLayout may legally die before graphics create");f.binding.descriptorCount=4;
@@ -284,12 +286,12 @@ void privateRecipes(const std::vector<std::uint32_t>& sourceVs,const std::vector
     require(j.takeReady(empty) && empty.pipeline.value==0x63,"next FIFO generation");
     for(unsigned i=4;i<journal::PipelineCapacity;++i)require(j.takeReady(empty)&&empty.pipeline.value==0x60+i,"remaining expanded FIFO variants independently retained");
     require(!j.takeReady(empty),"cancelled pending recipe never delivered");
-    journal::Journal replacement;fresh.initialize(replacement);fresh.definitions(replacement);loadShaders(replacement,sourceVs,sourcePs);require(replacement.createPipeline(object<VkPipeline>(0x60),fresh.graphics,VK_SUCCESS),"new journal can see identical device/pipeline handles");
+    auto replacementOwner=std::make_unique<journal::Journal>();auto& replacement=*replacementOwner;fresh.initialize(replacement);fresh.definitions(replacement);loadShaders(replacement,sourceVs,sourcePs);require(replacement.createPipeline(object<VkPipeline>(0x60),fresh.graphics,VK_SUCCESS),"new journal can see identical device/pipeline handles");
     require(!replacement.current(newer.pipeline),"old device lifetime token cannot alias replacement journal");
     j.destroyDevice();require(!j.current(newer.pipeline),"device destruction cancels all current tokens");
 }
 void privateConcurrency(const std::vector<std::uint32_t>& vs,const std::vector<std::uint32_t>& ps){
-    Fixture f;journal::Journal j;f.initialize(j);f.definitions(j);loadShaders(j,vs,ps);
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>();auto& j=*jOwner;f.initialize(j);f.definitions(j);loadShaders(j,vs,ps);
     Gate begin,consumed;std::atomic<bool> published{false};std::atomic<unsigned> taken{0};std::array<journal::PipelineToken,4> tokens{};
     std::array<std::thread,4> producers;
     for(unsigned t=0;t<producers.size();++t)producers[t]=std::thread([&,t]{
@@ -311,7 +313,7 @@ void privateConcurrency(const std::vector<std::uint32_t>& vs,const std::vector<s
     require(j.inspectStats().taken==4 && j.inspectStats().created==9,"bounded inventory retains every successful causal event");
 }
 void privateVariants(const std::vector<std::uint32_t>& vs,const std::vector<std::uint32_t>& ps){
-    Fixture f;journal::Journal j(1,{},journal::PendingCount1::RetainFacts);f.initialize(j);
+    Fixture f;auto jOwner=std::make_unique<journal::Journal>(1,clone::ProbeInterface{},journal::PendingCount1::RetainFacts);auto& j=*jOwner;f.initialize(j);
     std::array<VkDescriptorSetLayoutBinding,29> bindings{};
     for(unsigned i=0;i<bindings.size();++i)bindings[i]={i,i<8?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:i==8?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i<25?VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_ALL,nullptr};
     f.set.bindingCount=bindings.size();f.set.pBindings=bindings.data();
@@ -408,16 +410,16 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
     require(bytes==std::streamoff(clone::ProbeInterface::Count1Bytes) || bytes==std::streamoff(clone::ProbeInterface::FirstCoveredBytes) || bytes==std::streamoff(clone::ProbeInterface::Sparse32Bytes),"canonical count1 probe extent");std::vector<std::uint32_t> probe(static_cast<std::size_t>(bytes)/4);input.seekg(0);
     require(bool(input.read(reinterpret_cast<char*>(probe.data()),bytes)),"complete canonical count1 probe");
     clone::ProbeInterface profile;clone::Refusal why;require(clone::ProbeInterface::count1(probe.data(),probe.size()*4,profile,why),"actual-byte verified cold count1 interface");
-    Fixture f;f.binding.descriptorCount=1;journal::Journal original;f.initialize(original);journal::Event event;
+    Fixture f;f.binding.descriptorCount=1;auto originalOwner=std::make_unique<journal::Journal>();auto& original=*originalOwner;f.initialize(original);journal::Event event;
     require(!original.createSet(f.nativeSet,f.set,VK_SUCCESS,&event) && event.contract.reason==clone::Reason::Image9Extent,"existing journal API rejects unchanged original array3 against count1");
-    journal::Journal specialized(1,profile);f.initialize(specialized);f.definitions(specialized);
+    auto specializedOwner=std::make_unique<journal::Journal>(1,profile);auto& specialized=*specializedOwner;f.initialize(specialized);f.definitions(specialized);
     auto module=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);module.codeSize=vs.size()*4;module.pCode=vs.data();
     require(specialized.createShader(f.stages[0].module,module,VK_SUCCESS),"count1 still requires exact original vertex");
     module.codeSize=ps.size()*4;module.pCode=ps.data();require(specialized.createShader(f.stages[1].module,module,VK_SUCCESS),"count1 still requires exact original fragment");
     require(specialized.createPipeline(object<VkPipeline>(0x80),f.graphics,VK_SUCCESS),"count1 recipe assembled with separately verified original-invocation probe profile");
     journal::Ready ready;require(specialized.takeReady(ready) && ready.recipe.set0.bindings[0].descriptorCount==1 && ready.recipe.set0.probeInterface.specializedCount1(),"journal retains exact count1 definition and verified profile");
     require(!ready.nativeAuthority && !ready.recipe.nativeCompatibilityProven && !ready.recipe.runtimeActivationAuthorized,"cold profile grants no native lease or activation");
-    journal::Journal pending(1,{},journal::PendingCount1::RetainFacts);f.initialize(pending);
+    auto pendingOwner=std::make_unique<journal::Journal>(1,clone::ProbeInterface{},journal::PendingCount1::RetainFacts);auto& pending=*pendingOwner;f.initialize(pending);
     require(pending.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"explicit observational mode retains early successful count1 set callback");const auto setGeneration=event.generation;
     require(pending.createLayout(f.graphics.layout,f.layout,VK_SUCCESS,&event),"early native layout retains owned pending set shape");const auto layoutGeneration=event.generation;
     require(pending.createRenderPass(f.graphics.renderPass,f.pass,VK_SUCCESS),"pending profile does not lose other native definitions");

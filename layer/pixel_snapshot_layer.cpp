@@ -14,6 +14,7 @@
 #include "pixel_sampler_routes.h"
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 #include "pixel_ssbo_definition_journal.h"
+#include "pixel_definition_report.h"
 #include "pixel_observation_boundary.h"
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
 #include "pixel_ssbo_receiver_bridge.h"
@@ -364,7 +365,8 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
 }
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& reportedReasons,unsigned& reportedRecipes,
-                      unsigned& reportedSets,std::uint32_t& reportedSetSkips,unsigned& reportedContexts,unsigned& reportedCreations,bool& reportedOverflow) {
+                      unsigned& reportedSets,std::uint32_t& reportedSetSkips,unsigned& reportedContexts,unsigned& reportedCreations,
+                      unsigned& reportedGraphics,bool& reportedOverflow) {
     namespace journal=frame_pixel_ssbo_journal;
     static_assert(unsigned(journal::Reason::Count)<63,"bit63 is the sticky observer-failure receipt");
     if(d.definitionBoundary.failed()){
@@ -423,8 +425,17 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
         out<<"],\"admission_proven\":false,\"native_frame_association_proven\":false,\"mask_enabled\":false}\n";
         const auto text=out.str();if(text.size()<=2048)frame_pixel_io::writeAll(fd,text.data(),text.size());
     }
+    while(reportedGraphics<observed.graphicsCount){
+        const auto index=reportedGraphics++;std::string text;
+        if(frame_pixel_definition_report::graphics(observed.graphics[index],index,text))
+            frame_pixel_io::writeAll(fd,text.data(),text.size());
+        else{
+            constexpr char failure[]="{\"event\":\"ssbo_definition_graphics_reporting_failed\",\"mask_enabled\":false}\n";
+            frame_pixel_io::writeAll(fd,failure,sizeof(failure)-1);
+        }
+    }
     auto newReasons=facts.seenReasons&~reportedReasons;
-    const bool overflow=observed.creationOverflow||facts.contextOverflow;
+    const bool overflow=observed.creationOverflow||observed.graphicsOverflow||facts.contextOverflow;
     // New keyed contexts are grouped, never one report per native create or
     // repeated failure. NoReady cannot hide later Contract/Layout evidence.
     while(newReasons||reportedContexts<facts.contextCount||(overflow&&!reportedOverflow)){
@@ -435,7 +446,7 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
             out<<"{\"context_index\":"<<index<<",\"reason\":\""<<journal::reasonName(first.reason)<<"\",\"kind\":"<<unsigned(first.kind)<<",\"contract_reason\":\""<<frame_pixel_ssbo_clone::reasonName(first.contract.reason)<<"\",\"contract_index\":"<<first.contract.index<<",\"contract_structure_type\":"<<first.contract.type<<",\"first_object\":"<<first.value<<",\"first_generation\":"<<first.generation<<",\"last_object\":"<<last.value<<",\"last_generation\":"<<last.generation<<",\"count\":"<<context.count<<'}';
         }
         out<<"],\"inventory\":[";for(unsigned kind=0;kind<6;++kind){if(kind)out<<',';out<<"{\"kind\":"<<kind<<",\"live\":"<<facts.live[kind]<<",\"capacity\":"<<facts.capacity[kind]<<'}';}
-        out<<"],\"set_fact_count\":"<<facts.setFactCount<<",\"set_fact_capacity\":"<<facts.setFactCapacity<<",\"context_overflow\":"<<facts.contextOverflow<<",\"creation_shape_overflow\":"<<(observed.creationOverflow?"true":"false")<<",\"created\":"<<facts.created<<",\"cancelled\":"<<facts.cancelled<<",\"native_frame_association_proven\":false,\"mask_enabled\":false}\n";
+        out<<"],\"set_fact_count\":"<<facts.setFactCount<<",\"set_fact_capacity\":"<<facts.setFactCapacity<<",\"context_overflow\":"<<facts.contextOverflow<<",\"creation_shape_overflow\":"<<(observed.creationOverflow?"true":"false")<<",\"graphics_observation_overflow\":"<<(observed.graphicsOverflow?"true":"false")<<",\"created\":"<<facts.created<<",\"cancelled\":"<<facts.cancelled<<",\"native_frame_association_proven\":false,\"mask_enabled\":false}\n";
         const auto text=out.str();if(text.size()<=8192)frame_pixel_io::writeAll(fd,text.data(),text.size());
         reportedContexts=stop;reportedReasons|=newReasons;newReasons=0;reportedOverflow=overflow;
     }
@@ -454,7 +465,10 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
         out<<"{\"binding\":"<<binding.binding<<",\"type\":"<<unsigned(binding.descriptorType)
            <<",\"count\":"<<binding.descriptorCount<<",\"stages\":"<<binding.stageFlags<<'}';
     }
-    out<<"],\"push_range_count\":"<<ready.recipe.layout.count<<",\"color_attachment_count\":"<<ready.recipe.renderPass.colorCount
+    const auto* selected=ready.recipe.renderPass.subpass(ready.recipe.graphics.info.subpass);
+    out<<"],\"push_range_count\":"<<ready.recipe.layout.count<<",\"color_attachment_count\":"<<(selected?selected->colorCount:0)
+       <<",\"subpass_count\":"<<ready.recipe.renderPass.subpassCount<<",\"selected_subpass\":"<<ready.recipe.graphics.info.subpass
+       <<",\"renderpass2_route\":"<<(ready.recipe.renderPass.route2?"true":"false")
        <<",\"vertex_bytes\":"<<ready.recipe.vertex.bytes<<",\"fragment_bytes\":"<<ready.recipe.fragment.bytes
        <<",\"native_lifetime_lease\":false,\"native_compatibility_proven\":false,\"pipeline_changed\":false,\"mask_enabled\":false}\n";
     const auto text=out.str();
@@ -525,11 +539,11 @@ void writer(Device* d) noexcept {
 #endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     bool definitionFeatureReported=false;std::uint64_t definitionReasons=0;unsigned definitionRecipes=0,definitionSets=0;
-    std::uint32_t definitionSetSkips=0;unsigned definitionContexts=0,definitionCreations=0;bool definitionOverflow=false;
+    std::uint32_t definitionSetSkips=0;unsigned definitionContexts=0,definitionCreations=0,definitionGraphics=0;bool definitionOverflow=false;
 #endif
     try { while (!d->stop.load(std::memory_order_acquire)) {
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-        definitionStatus(*d,progress,definitionFeatureReported,definitionReasons,definitionRecipes,definitionSets,definitionSetSkips,definitionContexts,definitionCreations,definitionOverflow);
+        definitionStatus(*d,progress,definitionFeatureReported,definitionReasons,definitionRecipes,definitionSets,definitionSetSkips,definitionContexts,definitionCreations,definitionGraphics,definitionOverflow);
 #endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
         d->bridge.tick(d->definitions);

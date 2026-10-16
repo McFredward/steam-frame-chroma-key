@@ -238,7 +238,7 @@ public:
         clone::Recipe recipe;clone::Refusal why;
         if(!clone::captureGraphics(ci,ci.layout,ci.renderPass,ci.pStages[ci.pStages[0].stage==VK_SHADER_STAGE_VERTEX_BIT?0:1].module,
                                   ci.pStages[ci.pStages[0].stage==VK_SHADER_STAGE_FRAGMENT_BIT?0:1].module,
-                                  pass->definition,recipe.graphics,why))
+                                  pass->definition,recipe.graphics,why,&stats_.feature))
             return fail(out,Reason::Contract,ObjectKind::Pipeline,value,0,why);
         recipe.feature=stats_.feature;recipe.set0=set0;recipe.layout=layout->definition.layout;
         recipe.renderPass=pass->definition;recipe.vertex=vertex->definition.shader;recipe.fragment=fragment->definition.shader;
