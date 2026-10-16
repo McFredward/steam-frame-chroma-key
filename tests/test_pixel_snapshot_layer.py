@@ -97,12 +97,16 @@ def main():
                         help="Optional checkout containing scripts/town_run_retention.py")
     parser.add_argument("--ssbo-definitions", action="store_true",
                         help="Expect the explicitly enabled cold definition observer; no pipeline override")
+    parser.add_argument("--ssbo-transaction", action="store_true",
+                        help="Expect bounded inert transaction state; this smoke has no pinned target shader")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--case", action="append", choices=ORIGINAL_CASES + STATISTICS_CASES,
                            help="Run only this named case; may be repeated")
     selection.add_argument("--statistics-only", action="store_true",
                            help="Run only enabled pipeline-statistics/query-wrapper controls")
     args = parser.parse_args()
+    if args.ssbo_transaction and not args.ssbo_definitions:
+        parser.error("The optional transaction requires the definition observer")
     if args.case and len(set(args.case)) != len(args.case):
         parser.error("A selected case must not be repeated")
     selected = set(args.case or (STATISTICS_CASES if args.statistics_only else ORIGINAL_CASES))
@@ -195,7 +199,8 @@ def main():
                 active = invalid is None and enabled and not unrelated_exe
                 command = [str(unrelated if unrelated_exe else program), mode, str(layer)]
                 if active:
-                    command += [str(output / "status.jsonl"), '"event":"armed"' if armed else '"event":"prepared"']
+                    expected_event = "armed" if armed else ("ssbo_transaction_state" if args.ssbo_transaction else "prepared")
+                    command += [str(output / "status.jsonl"), '"event":"' + expected_event + '"']
                 result = execute(command, env)
                 # Preserve the actual native facts/status before assertions so
                 # an older-library negative control exposes its causal refusal.
@@ -214,6 +219,19 @@ def main():
                     records = [json.loads(line) for line in (output / "status.jsonl").read_text().splitlines()]
                     result["status"] = records
                     assert records and records[0]["event"] == "prepared", (label, records)
+                    transactions = [r for r in records if r["event"] == "ssbo_transaction_state"]
+                    if args.ssbo_transaction:
+                        assert 1 <= len(transactions) <= 2, (label, transactions)
+                        for state in transactions:
+                            assert state["reason"] == "none" and state["transaction_reason"] == 0, (label, state)
+                            for key in ("profile", "ready", "learned", "adopted", "replaced", "copy",
+                                        "native_visual_result_verified", "native_frame_association_proven", "mask_enabled"):
+                                assert state[key] is False, (label, key, state)
+                            assert state["queue_create_infos"] == 1 and state["queue_count"] == 1, (label, state)
+                            assert state["draw_kind"] == 0 and state["source_executions"] == 0, (label, state)
+                    else:
+                        assert not transactions, (label, "unexpected optional transaction", transactions)
+                    records = [r for r in records if r["event"] != "ssbo_transaction_state"]
                     definitions = [r for r in records if r["event"].startswith("ssbo_definition_")]
                     if args.ssbo_definitions:
                         features = [r for r in definitions if r["event"] == "ssbo_definition_feature"]

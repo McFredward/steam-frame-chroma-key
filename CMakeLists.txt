@@ -11,11 +11,17 @@ option(FRAME_PIXEL_UNIFORM_COMPANION
     "Require a bounded same-command native uniform companion in the uninstalled diagnostic" OFF)
 option(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     "Observe bounded cold native creation definitions without changing pipelines" OFF)
+option(FRAME_PIXEL_SSBO_TRANSACTION
+    "Build the uninstalled original-output same-invocation SSBO diagnostic" OFF)
 if(FRAME_PIXEL_UNIFORM_COMPANION AND NOT FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
     message(FATAL_ERROR "Native uniform companion requires the uninstalled pixel snapshot target")
 endif()
 if(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL AND NOT FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
     message(FATAL_ERROR "Cold SSBO definition observation requires the uninstalled pixel snapshot target")
+endif()
+if(FRAME_PIXEL_SSBO_TRANSACTION AND
+   (NOT FRAME_MASK_BUILD_PIXEL_SNAPSHOT OR NOT FRAME_PIXEL_SSBO_DEFINITION_JOURNAL OR FRAME_PIXEL_UNIFORM_COMPANION))
+    message(FATAL_ERROR "SSBO transaction requires the snapshot and definition journal, without the older uniform-copy companion")
 endif()
 option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
@@ -219,6 +225,11 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
     if(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL)
         target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_SSBO_DEFINITION_JOURNAL=1)
     endif()
+    if(FRAME_PIXEL_SSBO_TRANSACTION)
+        target_sources(VkLayer_frame_pixel_snapshot PRIVATE layer/pixel_ssbo_owned_clone.cpp
+            layer/pixel_ssbo_draw_transaction.cpp layer/pixel_ssbo_receiver_bridge.cpp)
+        target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_SSBO_TRANSACTION=1)
+    endif()
     target_include_directories(VkLayer_frame_pixel_snapshot PRIVATE ${Vulkan_INCLUDE_DIRS})
     target_compile_options(VkLayer_frame_pixel_snapshot PRIVATE
         -Wall -Wextra -Wpedantic -Werror -fvisibility=hidden)
@@ -256,6 +267,29 @@ if(BUILD_TESTING AND UNIX)
     target_include_directories(test_pixel_ssbo_owned_clone PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_ssbo_owned_clone PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME pixel_ssbo_owned_clone COMMAND test_pixel_ssbo_owned_clone)
+    add_executable(test_pixel_ssbo_profile_transform tests/test_pixel_ssbo_profile_transform.cpp)
+    target_include_directories(test_pixel_ssbo_profile_transform PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_ssbo_profile_transform PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME pixel_ssbo_profile_transform COMMAND test_pixel_ssbo_profile_transform)
+    add_executable(test_pixel_ssbo_draw_transaction tests/test_pixel_ssbo_draw_transaction.cpp
+        layer/pixel_ssbo_draw_transaction.cpp layer/pixel_ssbo_owned_clone.cpp)
+    target_include_directories(test_pixel_ssbo_draw_transaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_pixel_ssbo_draw_transaction PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_ssbo_draw_transaction PRIVATE Threads::Threads)
+    add_test(NAME pixel_ssbo_draw_transaction COMMAND test_pixel_ssbo_draw_transaction)
+    add_executable(test_pixel_ssbo_tracker_bridge tests/test_pixel_capture_tracker.cpp)
+    target_include_directories(test_pixel_ssbo_tracker_bridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_definitions(test_pixel_ssbo_tracker_bridge PRIVATE FRAME_PIXEL_SSBO_TRANSACTION=1)
+    target_compile_options(test_pixel_ssbo_tracker_bridge PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_ssbo_tracker_bridge PRIVATE Threads::Threads)
+    add_test(NAME pixel_ssbo_tracker_bridge COMMAND test_pixel_ssbo_tracker_bridge ssbo)
+    add_executable(test_pixel_ssbo_receiver_bridge tests/test_pixel_ssbo_receiver_bridge.cpp
+        layer/pixel_ssbo_receiver_bridge.cpp layer/pixel_ssbo_draw_transaction.cpp layer/pixel_ssbo_owned_clone.cpp)
+    target_include_directories(test_pixel_ssbo_receiver_bridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_definitions(test_pixel_ssbo_receiver_bridge PRIVATE FRAME_PIXEL_SSBO_TRANSACTION=1)
+    target_compile_options(test_pixel_ssbo_receiver_bridge PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_pixel_ssbo_receiver_bridge PRIVATE Threads::Threads)
+    add_test(NAME pixel_ssbo_receiver_bridge COMMAND test_pixel_ssbo_receiver_bridge)
     # The native companion is an explicit, uninstalled diagnostic build option.
     # Its contracts remain independently testable without a headset or capture.
     add_executable(test_pixel_uniform_resources tests/test_pixel_uniform_resources.cpp)
@@ -363,6 +397,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_atlas_probe.py)
         add_test(NAME native_fragment_ssbo_probe COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_ssbo_probe.py)
+        add_test(NAME native_fragment_ssbo_profile COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_ssbo_profile.py)
         add_test(NAME native_fragment_packed_output COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_packed_output.py)
         add_test(NAME pixel_uniform_metadata_bridge COMMAND ${Python3_EXECUTABLE} -B
@@ -386,6 +422,9 @@ if(BUILD_TESTING)
             set(pixel_definition_test_args)
             if(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL)
                 set(pixel_definition_test_args --ssbo-definitions)
+            endif()
+            if(FRAME_PIXEL_SSBO_TRANSACTION)
+                list(APPEND pixel_definition_test_args --ssbo-transaction)
             endif()
             add_executable(test_pixel_snapshot_layer tests/test_pixel_snapshot_layer.cpp)
             target_include_directories(test_pixel_snapshot_layer PRIVATE ${Vulkan_INCLUDE_DIRS})

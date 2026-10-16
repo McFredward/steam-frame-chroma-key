@@ -32,6 +32,10 @@ jobs:
         run: |
           cmake -S . -B build/uniform -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=OFF -DFRAME_MASK_BUILD_PIXEL_SNAPSHOT=ON -DFRAME_PIXEL_UNIFORM_COMPANION=ON -DFRAME_PIXEL_SSBO_DEFINITION_JOURNAL=ON
           cmake --build build/uniform --target VkLayer_frame_pixel_snapshot --parallel 2
+      - name: Compile optional original-output SSBO receiver transaction
+        run: |
+          cmake -S . -B build/ssbo -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=OFF -DFRAME_MASK_BUILD_PIXEL_SNAPSHOT=ON -DFRAME_PIXEL_SSBO_DEFINITION_JOURNAL=ON -DFRAME_PIXEL_SSBO_TRANSACTION=ON
+          cmake --build build/ssbo --target VkLayer_frame_pixel_snapshot --parallel 2
       - name: Windows sender cross-build
         run: x86_64-w64-mingw32-g++-win32 -std=c++17 -O2 -Wall -Wextra -Werror -static-libgcc -static-libstdc++ -I. tools/mask_endpoint.cpp mask/mask_protocol.cpp -lws2_32 -o build/mask_endpoint.exe
       - name: Protocol memory and undefined-behavior checks
