@@ -73,10 +73,13 @@ Transaction::ContextScope::~ContextScope(){
     context_.after=owner_.refusal();context_.rejected|=context_.before==Reason::None&&context_.after!=Reason::None;
     owner_.retainContext(context_);
 }
-void Transaction::firstContext(const RecordingContext& context) noexcept {
+void Transaction::firstContext(const RecordingContext& context,bool ownsContention) noexcept {
     // A later event that merely observes an earlier sticky reason is not its
     // cause. Leave the first-context slot explicitly unavailable in that case.
-    if(!context.rejected||context.before!=Reason::None||context.after==Reason::None)return;
+    // A Guard owner can observe concurrent Contention at scope exit, but only
+    // the losing Guard that won that refusal CAS owns its causal context.
+    if(!context.rejected||context.before!=Reason::None||context.after==Reason::None||
+       (context.after==Reason::Contention&&!ownsContention))return;
     unsigned empty=0;if(!firstContextState_.compare_exchange_strong(empty,1,std::memory_order_acq_rel))return;
     firstContext_=context;firstContextState_.store(2,std::memory_order_release);
 }
@@ -86,7 +89,7 @@ void Transaction::contextContention(VkCommandBuffer command,const CommandContext
     // No plain mutable transaction state is read without Guard. Incomplete
     // generation/phase is explicit, never assembled from unrelated atomics.
     context.after=Reason::Contention;context.rejected=true;context.metadataTruncated=true;normalizeContext(context);
-    if(firstRefusal&&refusal()==Reason::Contention)firstContext(context);
+    if(firstRefusal&&refusal()==Reason::Contention)firstContext(context,true);
 }
 namespace {
 bool sameContext(const RecordingContext& a,const RecordingContext& b) noexcept {

@@ -1,7 +1,7 @@
 #pragma once
 
-// OFFLINE foundation only. Not linked to the receiver and not an activation
-// policy. Callbacks below represent synchronously intercepted public API events;
+// Optional manually armed receiver diagnostic foundation; never a production
+// presenter or activation authority. Callbacks are synchronous public API events;
 // an asynchronously replayed Candidate/Recipe is never a native lifetime lease.
 #include "pixel_ssbo_owned_clone.h"
 #include <atomic>
@@ -224,7 +224,7 @@ private:
         ~ContextScope();
     };
     void retainContext(RecordingContext) noexcept;
-    void firstContext(const RecordingContext&) noexcept;
+    void firstContext(const RecordingContext&,bool ownsContention=false) noexcept;
     void contextContention(VkCommandBuffer,const CommandContextInput&,bool firstRefusal) noexcept;
     RecordingPhase contextPhase() const noexcept;
     DrawResult replace(VkCommandBuffer,std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t,std::int32_t,bool) noexcept;

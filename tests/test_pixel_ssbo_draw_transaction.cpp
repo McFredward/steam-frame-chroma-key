@@ -26,6 +26,30 @@ namespace frame_pixel_ssbo_transaction {
 // have no public factory and can only be minted by the actual LiveTracker.
 struct TransactionTestAccess {
     static std::uint64_t epoch(const Transaction& t){return t.epoch_;}
+    // Metadata-only fixture: no token, original callback or GPU authority.
+    static void contextSeed(Transaction& t){
+        t.device_=owned_fixture::object<VkDevice>(1);t.command_=owned_fixture::object<VkCommandBuffer>(44);
+        t.pool_=owned_fixture::object<VkCommandPool>(55);t.generation_=41;t.poolGeneration_=17;
+        t.recording_=true;t.armed_=true;t.subpassCount_=3;t.targetSubpass_=1;
+    }
+    static void phase(Transaction& t,bool pass,bool target,std::uint32_t subpass,bool selected=false){
+        t.inPass_=pass;t.targetPass_=target;t.currentSubpass_=subpass;t.selected_=selected;
+    }
+    static void ordinal(Transaction& t,std::uint64_t value){t.drawOrdinal_=value;}
+    static void retireContext(Transaction& t){t.retired_=true;t.generation_=42;}
+    static void unscopedRefusal(Transaction& t,Reason r){t.refuse(r);}
+    static bool delayedContention(Transaction& t,const CommandContextInput& owner,const CommandContextInput& contender){
+        Transaction::Guard guard(t);bool winner=false;
+        {Transaction::ContextScope scope(t,t.command_,owner,Operation::CmdDraw);
+            Transaction::Guard loser(t);winner=loser.firstRefusal();}
+        // The owner completed before the winning contender publishes metadata.
+        const bool unavailable=!t.recordingContexts().firstRefusalAvailable;
+        t.contextContention(t.command_,contender,winner);return unavailable&&winner;
+    }
+    static void contention(Transaction& t,const CommandContextInput& input){
+        Transaction::Guard guard(t);Transaction::Guard loser(t);t.contextContention(t.command_,input,loser.firstRefusal());
+    }
+
     static Transaction::RecordingTicket recording(std::uint64_t generation=41,std::uint64_t poolGeneration=17){
         Transaction::RecordingTicket t;t.tracker_=reinterpret_cast<const frame_pixel_capture::LiveTracker*>(std::uintptr_t(0x111));
         t.device_=1;t.command_=owned_fixture::object<VkCommandBuffer>(44);t.pool_=owned_fixture::object<VkCommandPool>(55);
@@ -507,6 +531,72 @@ void multipleSubpassRecordings(){
         require(f.transaction.adoptTargetState(TransactionTestAccess::target(f.source,1,correct?1:0))==correct,"opaque ticket must prove same actual target and current subpass, never caller-selected index");f.release();
     }
 }
+CommandContextInput contextInput(Operation operation,std::uint32_t detail=0){
+    CommandContextInput c;c.operation=operation;c.source=ContextSource::Wrapper;c.detailReason=detail;
+    c.structureType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;c.index=2;c.chain=1;c.contents=VK_SUBPASS_CONTENTS_INLINE;c.object=111;
+    for(unsigned i=0;i<c.chains.size();++i){c.chains[i].rootType=100+i;c.chains[i].count=2;c.chains[i].types[0]=200+i;c.chains[i].types[1]=300+i;c.chains[i].termination=1;}
+    return c;
+}
+void recordingContexts(){
+    const auto command=obj<VkCommandBuffer>(44);const auto seed=[](Transaction& t){TransactionTestAccess::contextSeed(t);};
+    {
+        Transaction t;seed(t);auto c=contextInput(Operation::CmdBeginRenderPass2KHR);const auto original=c;
+        t.observe(command,c);c.chains[0].types[0]=0;c.object=222;t.observe(command,c);
+        auto first=t.recordingContexts();require(first.count==2&&first.entries[0].first.input.chains[0].types[0]==original.chains[0].types[0],"owned header census survives caller mutation and distinct header shapes remain separate");
+        require(first.entries[0].first.commandGeneration==41&&first.entries[0].first.poolGeneration==17&&first.entries[0].first.phase==RecordingPhase::RecordingOutsidePass,"generation and phase copied coherently under existing guard");
+        const auto before=first.attempts;t.observe(obj<VkCommandBuffer>(999),original);require(t.recordingContexts().attempts==before,"unrelated raw command cannot contaminate selected generation");
+        TransactionTestAccess::phase(t,true,true,0);t.observe(command,original);
+        TransactionTestAccess::phase(t,true,true,1);t.observe(command,original);
+        TransactionTestAccess::phase(t,true,true,1,true);t.observe(command,original);
+        TransactionTestAccess::phase(t,true,true,2,true);t.observe(command,original);
+        const auto phases=t.recordingContexts();require(phases.entries[2].first.phase==RecordingPhase::BeforeTargetSubpass&&phases.entries[3].first.phase==RecordingPhase::TargetSubpassBeforeDraw&&phases.entries[4].first.phase==RecordingPhase::TargetSubpassAfterDraw&&phases.entries[5].first.phase==RecordingPhase::AfterTargetSubpass,"complete target-subpass route retains exact phase distinctions");
+        auto rejected=contextInput(Operation::CmdDispatchBaseKHR,13);t.unknownRoute(command,rejected);const auto failure=t.recordingContexts();
+        require(t.refusal()==Reason::UnknownRoute&&failure.firstRefusalAvailable&&failure.firstRefusal.input.operation==Operation::CmdDispatchBaseKHR&&failure.firstRefusal.before==Reason::None&&failure.firstRefusal.after==Reason::UnknownRoute,"first actual rejected callback records stable precise cause");
+        t.unknownRoute(command,contextInput(Operation::CmdBeginQuery));const auto later=t.recordingContexts();
+        require(later.firstRefusal.input.operation==Operation::CmdDispatchBaseKHR&&later.count==failure.count+1&&later.entries[later.count-1].first.before==Reason::UnknownRoute,"later distinct callback survives sticky refusal without replacing first cause");
+        TransactionTestAccess::retireContext(t);const auto count=later.attempts;t.observe(command,original);t.unknownRoute(command,original);require(t.recordingContexts().attempts==count,"closed old generation ignores reused raw handle observations");
+    }
+    {
+        Transaction t;seed(t);auto c=contextInput(Operation::CmdDrawIndexed);const auto firstObject=c.object;
+        for(unsigned i=0;i<5000;++i){c.object=1000+i;TransactionTestAccess::ordinal(t,i);t.observe(command,c);}
+        auto repeat=t.recordingContexts();require(repeat.count==1&&repeat.entries[0].count==5000&&repeat.entries[0].first.input.object==1000&&repeat.entries[0].first.drawOrdinal==0,"per-draw objects and ordinals cannot exhaust finite context bank");
+        (void)firstObject;c.targetPipeline=true;t.observe(command,c);require(t.recordingContexts().count==2,"target pipeline encounter stays distinct from unrelated pipeline observations");
+        for(unsigned i=0;i<80;++i)t.observe(command,contextInput(Operation::CmdDraw,100+i));
+        const auto full=t.recordingContexts();require(full.count==RecordingContextCapacity&&full.overflow==18,"distinct overflow is explicit with no eviction");
+        t.unknownRoute(command,contextInput(Operation::CmdExecuteCommands,999));const auto failed=t.recordingContexts();
+        require(failed.count==64&&failed.overflow==19&&failed.firstRefusalAvailable&&failed.firstRefusal.input.operation==Operation::CmdExecuteCommands,"independent first refusal survives a full accepted-context bank");
+        require(failed.entries[0].count==5000&&failed.entries[0].first.sequence==1,"overflow preserves earliest immutable payload and repeat count");
+    }
+    {
+        Transaction t;seed(t);auto bad=contextInput(static_cast<Operation>(UINT16_MAX));bad.source=static_cast<ContextSource>(255);for(auto& chain:bad.chains)chain.count=UINT32_MAX;
+        t.observe(command,bad);const auto normal=t.recordingContexts().entries[0].first;
+        require(normal.metadataTruncated&&normal.input.operation==Operation::Unspecified&&normal.input.source==ContextSource::Unspecified,"malformed enum metadata is normalized on guarded path");
+        for(const auto& chain:normal.input.chains)require(chain.count==16,"guarded path never publishes an out-of-bounds header count");
+        Transaction contended;seed(contended);TransactionTestAccess::contention(contended,bad);const auto first=contended.recordingContexts();
+        require(first.contended&&first.firstRefusalAvailable&&first.firstRefusal.after==Reason::Contention&&first.firstRefusal.phase==RecordingPhase::Unavailable&&!first.firstRefusal.commandGeneration,"contended first cause never fabricates unlocked generation/phase");
+        require(first.firstRefusal.input.operation==Operation::Unspecified&&first.firstRefusal.input.source==ContextSource::Unspecified,"contention uses same bounded enum normalization");
+        for(const auto& chain:first.firstRefusal.input.chains)require(chain.count==16,"contention first record also bounds every chain");
+    }
+    {
+        Transaction t;seed(t);require(TransactionTestAccess::delayedContention(t,contextInput(Operation::CmdDraw),contextInput(Operation::CmdDispatch)),"guard owner cannot steal Contention cause before winning loser publishes");
+        const auto first=t.recordingContexts();require(first.firstRefusalAvailable&&first.firstRefusal.input.operation==Operation::CmdDispatch,"winning loser owns the exact first Contention callback");
+        Transaction previous;seed(previous);previous.unknownRoute(command,contextInput(Operation::CmdBeginQuery));TransactionTestAccess::contention(previous,contextInput(Operation::CmdDispatch));
+        require(previous.recordingContexts().firstRefusal.input.operation==Operation::CmdBeginQuery&&previous.refusal()==Reason::UnknownRoute,"losing Contention CAS cannot steal prior UnknownRoute context");
+        Transaction unavailable;seed(unavailable);TransactionTestAccess::unscopedRefusal(unavailable,Reason::Identity);unavailable.unknownRoute(command,contextInput(Operation::CmdDispatch));
+        require(!unavailable.recordingContexts().firstRefusalAvailable&&unavailable.refusal()==Reason::Identity,"unobserved earlier cause remains unavailable rather than falsely attributed later");
+    }
+    {
+        Transaction t;seed(t);std::atomic<bool> done{false},valid{true};
+        std::thread reader([&]{while(!done.load(std::memory_order_acquire)){const auto view=t.recordingContexts();if(view.count>64)valid=false;for(unsigned i=0;i<view.count;++i){const auto& entry=view.entries[i];if(!entry.count||!entry.first.sequence||entry.first.commandGeneration!=41||entry.first.input.chains[2].count!=2||entry.first.input.chains[2].types[1]!=302)valid=false;}}});
+        for(unsigned i=0;i<30000;++i)t.observe(command,contextInput(Operation::CmdDraw,i%8));
+        done.store(true,std::memory_order_release);reader.join();const auto final=t.recordingContexts();
+        require(valid&&final.count==8&&final.attempts==30000&&!final.contended&&!final.overflow,"concurrent cold reader observes only fully published immutable bounded payloads without contending on transaction");
+        for(unsigned i=0;i<final.count;++i)require(final.entries[i].count==3750,"repeat counters remain complete after reader and producer join");
+    }
+    for(unsigned i=0;i<static_cast<unsigned>(Operation::Count);++i)require(std::strcmp(operationName(static_cast<Operation>(i)),"InvalidOperation"),"every finite operation has a diagnostic name");
+    for(unsigned i=0;i<=static_cast<unsigned>(RecordingPhase::Retired);++i)require(std::strcmp(phaseName(static_cast<RecordingPhase>(i)),"InvalidPhase"),"every finite phase has a diagnostic name");
+}
+
 void reentryAndConcurrency(){
     for(bool threaded:{false,true}){
         Fixture f;f.initialize();f.arm();require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE),"test pass");f.prefix();
@@ -522,6 +612,7 @@ void reentryAndConcurrency(){
 }
 }
 int main(int argc,char** argv){
+    if(argc==2 && !std::strcmp(argv[1],"contexts")){recordingContexts();std::cout<<"recording context checks="<<checks<<'\n';return 0;}
     if(argc==2 && !std::strcmp(argv[1],"subpasses")){multipleSubpassRecordings();std::cout<<"subpass transaction checks="<<checks<<'\n';return 0;}
     if(argc==2 && !std::strcmp(argv[1],"priorities")){originalQueuePriorities();std::cout<<"queue priority checks="<<checks<<'\n';return 0;}
     if(argc!=1)return 2;

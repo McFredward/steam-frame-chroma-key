@@ -159,6 +159,25 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     native->tracker.draw(device,cb);require(!b.draw(native->tracker,device,cb,3,1,0,0,0,false),"preceding UI draw remains native and uninstrumented");
     if(subpasses>1){require(native->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"original inline transition to configured subpass1");b.nextPass(cb,VK_SUBPASS_CONTENTS_INLINE);}
     native->bind();b.pipeline(cb,pipeline);native->tracker.draw(device,cb);
+    if(mode==10){
+        tx::CommandContextInput unsupported;unsupported.operation=tx::Operation::CmdDispatchBaseKHR;unsupported.source=tx::ContextSource::Wrapper;
+        unsupported.structureType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;unsupported.detailReason=12;unsupported.index=3;unsupported.chain=1;
+        unsupported.chains[0].rootType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;unsupported.chains[0].count=2;unsupported.chains[0].types[0]=1005000001;unsupported.chains[0].types[1]=1005000002;
+        const auto initial=b.snapshot().recordingContexts.attempts;b.observe(h<VkCommandBuffer>(999),unsupported);require(b.snapshot().recordingContexts.attempts==initial,"unrelated wrapper metadata cannot contaminate adopted native generation");
+        b.unknown(cb,unsupported);unsupported.chains[0].types[0]=0;
+        b.pipeline(cb,pipeline);
+        require(!b.draw(native->tracker,device,cb,6,1,0,0,-3,true)&&!calls.indexed&&!calls.draws,"post-refusal target encounter never mints replacement permission or emits original draw");
+        const auto observed=b.snapshot();const auto& contexts=observed.recordingContexts;
+        require(observed.transaction==static_cast<unsigned>(tx::Reason::UnknownRoute)&&!observed.replaced,"exact UnknownRoute reason preserved without replacement");
+        require(contexts.firstRefusalAvailable&&contexts.firstRefusal.input.operation==tx::Operation::CmdDispatchBaseKHR&&contexts.firstRefusal.input.chains[0].types[0]==1005000001,"bridge preserves first exact alias and owned headers of rejected original callback");
+        require(contexts.firstRefusal.commandGeneration==observed.commandGeneration&&contexts.firstRefusal.poolGeneration==observed.poolGeneration&&contexts.firstRefusal.phase==tx::RecordingPhase::TargetSubpassBeforeDraw,"first rejection refers to exact adopted generation and target phase");
+        bool laterTarget=false;for(unsigned i=0;i<contexts.count;++i){const auto& c=contexts.entries[i].first;if(c.input.operation==tx::Operation::CmdDrawIndexed&&c.input.targetPipeline&&c.input.object==frame_pixel_ssbo_clone::handle(pipeline)&&c.before==tx::Reason::UnknownRoute)laterTarget=true;}
+        require(laterTarget,"actual target draw remains visible as evidence after earlier refusal without pretending it caused that refusal");
+        const auto retired=b.beforeRetirement(tx::Retirement::ResetCommand,cb);b.afterRetirement(retired,VK_SUCCESS);const auto closed=b.snapshot().recordingContexts.attempts;
+        require(native->tracker.beginCommand(device,cb,native->beginInfo,true),"original same-handle next generation remains independently valid");b.observe(cb,unsupported);b.unknown(cb,unsupported);b.pipeline(cb,pipeline);
+        require(b.snapshot().recordingContexts.attempts==closed&&!b.tracks(cb),"old bridge cannot mix metadata from reused raw command handle after exact retirement");
+        require(b.release(VK_SUCCESS)&&driver.live.empty()&&!calls.fences,"metadata refusal preserves explicit retirement and safe owned-child release");return;
+    }
     if(mode==7){
         b.definitionObservationFailed();
         require(!b.draw(native->tracker,device,cb,6,1,0,0,-3,true) && !calls.indexed && !calls.draws,"history loss after adoption leaves target draw to original caller");
@@ -269,6 +288,7 @@ void privateVariantSelection(const char* vertexPath,const char* fragmentPath,uns
 }
 }
 int main(int argc,char** argv){
+    if(argc==4&&std::strcmp(argv[1],"--contexts-only")==0){privateCallbacks(argv[2],argv[3],10);std::cout<<"{\"scope\":\"recording provenance subset; fake dispatch and private original shader definitions only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     if(argc==4&&std::strcmp(argv[1],"--subpasses-only")==0){privateCallbacks(argv[2],argv[3],0,2);privateCallbacks(argv[2],argv[3],0,3);std::cout<<"{\"scope\":\"private multi-subpass callback subset, fake dispatch only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     if(argc==4&&std::strcmp(argv[1],"--history-only")==0){historyGuards();for(unsigned mode=5;mode<=9;++mode)privateCallbacks(argv[2],argv[3],mode);std::cout<<"{\"scope\":\"definition-history-cancellation-subset,fake-dispatch\",\"checks\":"<<checks.load()<<",\"native_authority\":false,\"actual_r2_cause\":false}\n";return 0;}
     if(argc==4&&std::strcmp(argv[1],"--variants-only")==0){privateVariantSelection(argv[2],argv[3],4,false);privateVariantSelection(argv[2],argv[3],5,false);privateVariantSelection(argv[2],argv[3],5,true);std::cout<<"{\"scope\":\"private-pipeline-selection-subset, fake dispatch only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
