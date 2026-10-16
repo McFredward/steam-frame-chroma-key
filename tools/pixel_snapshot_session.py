@@ -18,7 +18,7 @@ MAX_LIBRARY = 8 * 1024 * 1024
 MAX_JSON = 16 * 1024
 # Bounded cold diagnostic groups can exceed one small JSON document. Ordinary
 # configuration/audit JSON keeps its independent strict16KiB limit.
-MAX_PROGRESS = 256 * 1024
+MAX_PROGRESS = 512 * 1024
 MAX_MAP = 1024 * 1024
 MAX_MAP_TOTAL = 64 * MAX_MAP
 MAX_PROCESSES = 4096

@@ -58,9 +58,10 @@ def _definition_context(events):
         if type(amount) is not int or not 0 <= amount <= (1 << 64) - 1:
             raise ValueError("invalid overflow")
         shape_overflow = event.get("creation_shape_overflow", False)
-        if type(shape_overflow) is not bool:
+        graphics_overflow = event.get("graphics_observation_overflow", False)
+        if type(shape_overflow) is not bool or type(graphics_overflow) is not bool:
             raise ValueError("invalid shape overflow")
-        overflow |= bool(amount) or shape_overflow
+        overflow |= bool(amount) or shape_overflow or graphics_overflow
     return {"reasons": sorted(reasons), "contexts": [contexts[key] for key in sorted(contexts)],
             "inventory": inventory, "set_facts": set_facts, "context_available": bool(contexts), "overflow": overflow}
 

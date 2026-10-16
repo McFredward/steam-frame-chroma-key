@@ -115,6 +115,13 @@ class StreamPreflightTests(unittest.TestCase):
         self.events.append({"event": "bounded_cold_metadata"})
         self.assertEqual(self.assess()["reasons"], ["invalid_events"])
 
+    def test_target_graphics_overflow_is_explicit_without_authorizing_a_recipe(self):
+        self.events = [event for event in self.events if event["event"] != "ssbo_definition_owned"]
+        self.events.append({"event": "ssbo_definition_refusals", "graphics_observation_overflow": True})
+        self.assertIn("definition_evidence_truncated", self.assess()["reasons"])
+        self.events[-1]["graphics_observation_overflow"] = 1
+        self.assertEqual(self.assess()["reasons"], ["invalid_definition_context"])
+
     def test_real_failure_domains_remain_independent(self):
         original = copy.deepcopy((self.status, self.health, self.events))
         for domain in ("health", "mapping", "sampler", "feature", "transaction", "failure"):

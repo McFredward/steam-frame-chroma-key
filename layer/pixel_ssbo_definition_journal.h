@@ -195,7 +195,22 @@ public:
     }
     bool createPipeline(VkPipeline object,const VkGraphicsPipelineCreateInfo& ci,VkResult result,Event* out=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
-        if(!retired_)frame_pixel_definition_facts::graphics(facts_,ci,result,value);
+        if(!retired_){
+            namespace facts=frame_pixel_definition_facts;
+            facts::graphics(facts_,ci,result,value);
+            facts::GraphicsScope scope;
+            // Resolve only owned facts from this exact original pass/subpass.
+            // An unknown pass permits safe top-level observations, never reads
+            // of ignored/possibly invalid depth or blend state pointers.
+            if(ci.sType==VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO){
+                const auto* pass=find(passes_,clone::handle(ci.renderPass));
+                if(pass && pass->definition.complete){
+                    const auto* subpass=pass->definition.subpass(ci.subpass);
+                    if(subpass)scope={true,subpass->colorCount,subpass->hasDepth};
+                }
+            }
+            facts::graphicsDetails(facts_,ci,result,value,scope);
+        }
         if(!beginCreate(pipelines_,value,result,ObjectKind::Pipeline,out))return false;
         if(ci.sType!=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
             return fail(out,Reason::Contract,ObjectKind::Pipeline,value,0,{clone::Reason::Type});

@@ -277,6 +277,17 @@ class SessionTests(unittest.TestCase):
         self.assertLess(len(mod.encoded(result)), 10000)
         self.assertEqual(raw.read_bytes(), self.source.read_bytes())
 
+    def test_full_exact_target_receipts_fit_progress_without_enlarging_small_json(self):
+        self.prepare()
+        # Prior bounded creation/context receipts plus eight worst-case16KiB
+        # target-state lines; the legacy256KiB reader would lose this evidence.
+        payload = b" " * (245416 + 8 * 16 * 1024)
+        self.assertGreater(len(payload), 256 * 1024)
+        self.assertLess(len(payload), mod.MAX_PROGRESS)
+        self.write(self.run / "status.jsonl", payload)
+        self.assertEqual(self.session.status()["progress"], payload.decode())
+        self.assertEqual(mod.MAX_JSON, 16 * 1024)
+
     def test_changed_arm_disarm_or_complete_records_are_preserved(self):
         self.prepare()
         self.write(self.session.arm_file, b"foreign arm")

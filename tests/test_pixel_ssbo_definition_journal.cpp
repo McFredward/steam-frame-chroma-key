@@ -204,6 +204,37 @@ void metadataDespiteRefusal(){
     f.binding.descriptorCount=3;j.destroyDevice();
     require(!j.createSet(f.nativeSet,f.set,VK_SUCCESS) && j.inspectFacts().setCount==1,"retired device cannot acquire more diagnostic shapes");
 }
+void graphicsObservations(){
+    namespace facts=frame_pixel_definition_facts;
+    Fixture f;auto journal=std::make_unique<journal::Journal>();f.initialize(*journal);
+    journal::Event event;
+    const auto unreadable=reinterpret_cast<const VkPipelineDepthStencilStateCreateInfo*>(std::uintptr_t(1));
+    f.graphics.pDepthStencilState=unreadable;
+    f.graphics.pColorBlendState=reinterpret_cast<const VkPipelineColorBlendStateCreateInfo*>(std::uintptr_t(1));
+    require(!journal->createPipeline(object<VkPipeline>(100),f.graphics,VK_SUCCESS,&event),"unknown layout still refuses pipeline admission");
+    auto observed=journal->inspectFacts();
+    require(observed.graphicsCount==1 && !observed.graphics[0].scope.known,"safe exact target metadata precedes early layout rejection");
+    require(observed.graphics[0].states[unsigned(facts::GraphicsState::DepthStencil)].read==facts::GraphicsRead::UnknownScope &&
+            observed.graphics[0].states[unsigned(facts::GraphicsState::ColorBlend)].read==facts::GraphicsRead::UnknownScope,"missing pass does not follow possibly ignored depth/blend pointers");
+    std::array<VkSubpassDescription,2> subpasses{};
+    subpasses[0].pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;subpasses[1]=f.sub;
+    f.pass.subpassCount=2;f.pass.pSubpasses=subpasses.data();
+    require(journal->createRenderPass(f.graphics.renderPass,f.pass,VK_SUCCESS),"exact original two-subpass definition retained");
+    f.graphics.subpass=1;f.graphics.pColorBlendState=&f.blend;
+    require(!journal->createPipeline(object<VkPipeline>(101),f.graphics,VK_SUCCESS,&event),"observed child scope cannot invent missing layout authority");
+    observed=journal->inspectFacts();const auto& known=observed.graphics[1];
+    require(known.scope.known && known.scope.colorCount==1 && !known.scope.hasDepth && known.subpass==1,"child read scope comes from selected subpass1 rather than empty subpass0");
+    require(known.states[unsigned(facts::GraphicsState::ColorBlend)].read==facts::GraphicsRead::Complete &&
+            known.states[unsigned(facts::GraphicsState::DepthStencil)].read==facts::GraphicsRead::Ignored,"known no-depth pass ignores invalid depth pointer while reporting actual color state");
+    f.graphics.subpass=2;f.graphics.pColorBlendState=reinterpret_cast<const VkPipelineColorBlendStateCreateInfo*>(std::uintptr_t(1));
+    require(!journal->createPipeline(object<VkPipeline>(102),f.graphics,VK_SUCCESS),"out-of-range subpass cannot authorize recipe");
+    require(!journal->inspectFacts().graphics[2].scope.known,"out-of-range subpass returns to unknown-safe metadata scope");
+    const auto before=journal->inspectFacts().graphicsCount;
+    require(!journal->createPipeline(object<VkPipeline>(103),f.graphics,VK_ERROR_INITIALIZATION_FAILED),"failed native pipeline does not contribute a success observation");
+    require(journal->inspectFacts().graphicsCount==before,"failed native create leaves target bank unchanged");
+    journal->destroyDevice();journal->createPipeline(object<VkPipeline>(104),f.graphics,VK_SUCCESS);
+    require(journal->inspectFacts().graphicsCount==before,"retired journal cannot acquire new target observations");
+}
 std::vector<std::uint32_t> readShader(const char* path){
     std::ifstream input(path,std::ios::binary|std::ios::ate);require(bool(input),"private input readable");const auto size=input.tellg();
     require(size>0 && size<=static_cast<std::streamoff>(clone::ShaderBytes) && size%4==0,"bounded private input size");
@@ -404,13 +435,14 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
 }
 }
 int main(int argc,char** argv){
+    if(argc==2 && std::strcmp(argv[1],"--graphics-observations-only")==0){graphicsObservations();std::cout<<"{\"scope\":\"exact-target-graphics-observation-subset\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     if(argc==4 && std::strcmp(argv[1],"--startup-only")==0){semanticFactPressure();privateStartup(readShader(argv[2]),readShader(argv[3]));std::cout<<"{\"scope\":\"startup-pressure-model-subset\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)<<",\"exact_native_payload_replay\":false,\"native_authority\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--refusal-contexts-only")==0){refusalContexts();std::cout<<"{\"scope\":\"journal-context-rp2-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     if(argc==4 && std::strcmp(argv[1],"--variants-only")==0){privateVariants(readShader(argv[2]),readShader(argv[3]));std::cout<<"{\"scope\":\"private-pipeline-variants-subset\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)<<",\"native_authority\":false}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--layout-flags-only")==0){layoutFlags();std::cout<<"{\"scope\":\"layout-flags-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     if(argc==2 && std::strcmp(argv[1],"--metadata-facts-only")==0){metadataDespiteRefusal();std::cout<<"{\"scope\":\"metadata-facts-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     require(argc==1 || argc==3 || argc==4,"optional private VS/PS [count1 probe] arguments only");
-    deviceControls();publicInventory();publicConcurrency();refusalContexts();layoutFlags();metadataDespiteRefusal();semanticFactPressure();
+    deviceControls();publicInventory();publicConcurrency();refusalContexts();layoutFlags();metadataDespiteRefusal();graphicsObservations();semanticFactPressure();
     if(argc>=3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);privateVariants(vs,ps);privateStartup(vs,ps);}
     if(argc==4)count1Profile(argv[1],argv[2],argv[3]);
     std::cout<<"{\"schema\":\"ssbo-definition-journal-controls-v1\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)
