@@ -15,10 +15,18 @@ const char* refusalName(Refusal r) noexcept {
     NAME(Recording,"recording") NAME(Target,"target") NAME(CopyCohort,"copy_cohort")
     NAME(SubmitShape,"submit_shape") NAME(Execution,"execution") NAME(DescriptorMutation,"descriptor_mutation")
     NAME(Selection,"selection") NAME(UnknownRoute,"unknown_route") NAME(Release,"release") NAME(Record,"invalid_original_invocation_record")
+    NAME(DefinitionHistory,"definition_history")
 #undef NAME
     }return "unknown_bridge_refusal";
 }
 void Bridge::refuse(Refusal r) noexcept {unsigned empty=0;reason_.compare_exchange_strong(empty,unsigned(r),std::memory_order_acq_rel);}
+void Bridge::definitionObservationFailed() noexcept {
+    unsigned empty=0;
+    if(reason_.compare_exchange_strong(empty,unsigned(Refusal::DefinitionHistory),std::memory_order_acq_rel))
+        cancellationEpoch_.fetch_add(1,std::memory_order_acq_rel);
+    // Existing refusals already block admission; repeated observations do not
+    // restart a generation, overwrite its first cause, or call the driver.
+}
 bool Bridge::usable() const noexcept {return !reason_.load(std::memory_order_acquire)&&ready_.load(std::memory_order_acquire);}
 bool Bridge::matches(VkCommandBuffer c) const noexcept {return c&&!retired_.load(std::memory_order_acquire)&&adopted_.load(std::memory_order_acquire)&&adoptedCommand_.load(std::memory_order_relaxed)==clone::handle(c);}
 void Bridge::deviceCreated(VkDevice d,const VkDeviceCreateInfo& ci,PFN_vkGetDeviceProcAddr g,
@@ -213,7 +221,9 @@ bool Bridge::publish(const frame_pixels::View& view,tx::RecordView& out) noexcep
     if(!transaction_.publish(metadata,out))return false;
     std::array<std::uint32_t,4> header{};if(out.bytes!=128||!out.record){refuse(Refusal::Record);out={};return false;}
     std::memcpy(header.data(),out.record,16);
-    if(header!=std::array<std::uint32_t,4>{1,UINT32_C(0x5353424f),1,32}){refuse(Refusal::Record);out={};return false;}return true;
+    if(header!=std::array<std::uint32_t,4>{1,UINT32_C(0x5353424f),1,32}){refuse(Refusal::Record);out={};return false;}
+    if(!usable()){out={};return false;} // A concurrent cold-history failure cannot publish a record.
+    return true;
 }
 bool Bridge::release(VkResult result) noexcept {
     transaction_.afterDeviceWaitIdle(result);

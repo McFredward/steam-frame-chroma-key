@@ -12,7 +12,7 @@ namespace frame_pixel_capture { class LiveTracker; struct Candidate; }
 namespace frame_pixel_ssbo_receiver {
 namespace tx=frame_pixel_ssbo_transaction;
 enum class Refusal : unsigned {None,Device,Queue,Shader,Clone,Configure,ColdCancelled,
-    Recording,Target,CopyCohort,SubmitShape,Execution,DescriptorMutation,UnknownRoute,Release,Record,Selection};
+    Recording,Target,CopyCohort,SubmitShape,Execution,DescriptorMutation,UnknownRoute,Release,Record,Selection,DefinitionHistory};
 const char* refusalName(Refusal) noexcept;
 struct Snapshot {
     Refusal refusal=Refusal::None;
@@ -36,6 +36,10 @@ public:
     void queueRetrieved(std::uint32_t,std::uint32_t,VkQueue,bool ordinary=true) noexcept;
     void shaderCreated(const VkShaderModuleCreateInfo&,frame_pixel_ssbo_journal::Journal&) noexcept;
     void tick(frame_pixel_ssbo_journal::Journal&) noexcept;
+    // A missed cold callback invalidates the entire definition history. This
+    // only closes admission/publication; retained GPU children still require
+    // the ordinary explicit retirement and device-idle release path.
+    void definitionObservationFailed() noexcept;
     // Cancellation at original native destroy ENTRY, including cold preparation.
     void definitionRetiring(frame_pixel_ssbo_journal::ObjectKind,std::uint64_t) noexcept;
     void resourceRetiring(tx::Resource,std::uint64_t) noexcept;
