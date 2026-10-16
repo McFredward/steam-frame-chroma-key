@@ -23,15 +23,19 @@ identified an internal metadata lock refusal before arming; the original runtime
 was restored again. The targeted repair now also permits the
 [first complete native pixel snapshot](docs/PIXEL-SNAPSHOT-CAPTURE-20261015.md).
 The exact image and metadata are secured, and the diagnostic was fully removed.
-Source-payload recovery and native frame/eye/UV association remain open.
+That raw-copy representation did not recover the source payload; native
+frame/eye/UV association remained open.
 The [same-image sampler comparison](docs/PIXEL-SAMPLER-PREPARATION-20261016.md)
 checks the raw-copy interpretation against native converted-view sampling.
 Its [first device attempt](docs/PIXEL-SAMPLER-ATTEMPT-20261016.md) reached normal
 startup but refused cold admission before a stream or image acquisition. The
-original Frame runtime was completely restored; the exact input refusal needs
-more precise telemetry. A local follow-up adds exact refusal reasons and uses
-actual query history instead of blanket rejection of an enabled idle feature.
-This does not enable streamed passthrough.
+original Frame runtime was completely restored. A follow-up adds exact refusal
+reasons and uses actual query history instead of blanket rejection of an enabled
+idle feature. Its [successful native paired capture](docs/PIXEL-SAMPLER-CAPTURE-20261016.md)
+now recovers all six original static source headers and measured fractional
+coverage codes through native GPU sampling. The diagnostic was fully removed.
+Native spatial/temporal association and live alpha composition remain open;
+this does not enable streamed passthrough.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR

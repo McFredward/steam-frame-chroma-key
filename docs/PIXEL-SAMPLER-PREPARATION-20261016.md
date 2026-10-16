@@ -103,7 +103,10 @@ fork-only diagnostic. PC source build676 remains unchanged.
 
 The first package was subsequently installed, refused cold admission and was
 [completely restored](PIXEL-SAMPLER-ATTEMPT-20261016.md). The query-history and
-exact-reason repair is local and has not been installed. Request fresh readiness
+exact-reason repair subsequently completed a [real paired capture and strict
+static source recovery](PIXEL-SAMPLER-CAPTURE-20261016.md), followed by verified
+restoration. The procedure below records that experiment's approved scope;
+any future device run requires a fresh agreement. Request fresh readiness
 and approval only after the complete local package, rollback, review and hosted
 checks are ready. The new scope includes the paired component output. Exact
 current native-provider imports/isolated loading and native UI health must pass;
