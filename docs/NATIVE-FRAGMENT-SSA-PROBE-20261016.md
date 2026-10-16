@@ -72,6 +72,10 @@ type/dominance mutations and exact reconstruction of the original instruction
 stream. CI runs the three owned-only methods and skips the private-input class.
 CMake compiles the inert host fixture and validates only the owned vertex shader;
 it never acquires or downloads Valve modules.
+The integrated source checkpoint931c99e also passes all109 hosted CTest entries,
+the optional native-uniform build, Windows cross-build and protocol sanitizer
+step in [CI38896812394](https://github.com/McFredward/steam-frame-chroma-key/actions/runs/38896812394).
+That hosted result does not replace the explicit private-input GPU evidence.
 
 For an explicit private GPU run:
 
