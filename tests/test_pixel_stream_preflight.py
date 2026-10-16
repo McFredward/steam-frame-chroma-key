@@ -16,7 +16,7 @@ class StreamPreflightTests(unittest.TestCase):
         self.events = [
             {"event": "prepared", "sampler_ready": True, "uniform_companion_enabled": False, "mask_enabled": False},
             {"event": "ssbo_definition_feature", "initialized": True, "observed": True, "enabled": True, "raw": 1, "contract_reason": "none"},
-            {"event": "ssbo_transaction_state", "reason": "none", "transaction_reason": 0, "profile": False, "ready": False}]
+            {"event": "ssbo_transaction_state", "reason": "none", "transaction_reason": 0, "profile": False, "ready": False, "queue_retrieved": True}]
 
     def assess(self, **kwargs):
         return gate.assess(self.status, self.health, self.events, definitions=True, transaction=True, **kwargs)
@@ -30,14 +30,22 @@ class StreamPreflightTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertIn("device_definition_not_admitted", result["reasons"])
 
-    def test_cold_clone_may_wait_for_stream_but_arm_requires_it(self):
+    def test_actual_candidate_clone_can_wait_for_manual_arm(self):
         self.assertTrue(self.assess()["ready"])
+        self.assertFalse(self.assess(require_profile=True)["ready"])
+        self.assertFalse(self.assess(require_clone=True)["ready"])
+        self.events[-1]["profile"] = True
+        # Arm permits metadata-only selection of the actual streamed candidate.
+        # Requiring its clone beforehand would make selection impossible.
+        self.assertTrue(self.assess(require_profile=True)["ready"])
         self.assertFalse(self.assess(require_clone=True)["ready"])
         self.events[-1].update(profile=True, ready=True)
         result = self.assess(require_clone=True)
         self.assertTrue(result["ready"])
         self.assertFalse(result["passthrough_authorized"])
         self.assertFalse(result["native_frame_association_proven"])
+        self.events[-1]["queue_retrieved"] = False
+        self.assertFalse(self.assess(require_profile=True)["ready"])
 
     def test_unrelated_native_definition_rejections_are_not_device_failure(self):
         self.events.append({"event": "ssbo_definition_refusals", "first_reason": "contract", "first_contract_reason": "shader_pin"})

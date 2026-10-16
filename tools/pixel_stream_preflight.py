@@ -8,7 +8,7 @@ bounded public diagnostic receipts; it never contacts or changes a device.
 
 
 def assess(status, native_health, events, *, definitions=False, transaction=False,
-           require_clone=False):
+           require_profile=False, require_clone=False):
     reasons = []
     if not isinstance(status, dict) or not isinstance(native_health, dict):
         return {"ready": False, "reasons": ["invalid_status"]}
@@ -16,7 +16,7 @@ def assess(status, native_health, events, *, definitions=False, transaction=Fals
             not isinstance(event, dict) or not isinstance(event.get("event"), str)
             for event in events):
         return {"ready": False, "reasons": ["invalid_events"]}
-    if transaction and not definitions or require_clone and not transaction:
+    if (transaction and not definitions) or ((require_profile or require_clone) and not transaction):
         reasons.append("invalid_profile")
     mapping = status.get("active_mappings", {})
     identities = native_health.get("process_identities", {})
@@ -52,8 +52,13 @@ def assess(status, native_health, events, *, definitions=False, transaction=Fals
         elif any(event.get("reason") != "none" or type(event.get("transaction_reason")) is not int
                  or event.get("transaction_reason") != 0 for event in states):
             reasons.append("transaction_refused")
-        elif require_clone and (states[-1].get("profile") is not True or states[-1].get("ready") is not True):
-            reasons.append("original_output_clone_not_ready")
+        else:
+            if (require_profile or require_clone) and states[-1].get("profile") is not True:
+                reasons.append("original_output_profile_not_ready")
+            if require_profile and states[-1].get("queue_retrieved") is not True:
+                reasons.append("original_queue_not_observed")
+            if require_clone and states[-1].get("ready") is not True:
+                reasons.append("original_output_clone_not_ready")
     return {"ready": not reasons, "reasons": reasons,
             "requires_maintainer_visible_ui_confirmation": True,
             "native_frame_association_proven": False, "passthrough_authorized": False}
