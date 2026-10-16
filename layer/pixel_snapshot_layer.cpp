@@ -1,6 +1,8 @@
-// Temporary explicit-pattern carriage diagnostic. Only public Vulkan calls,
-// with one owned raw P010 copy. No shader change, native executable detour,
-// private memory read, PC sender modification or passthrough activation.
+// Temporary explicit-pattern carriage diagnostic using public Vulkan calls
+// and one owned raw P010 copy. The optional SSBO observer changes only a
+// manually armed selected draw, preserves original color, then restores the
+// original pipeline. No executable detour, private memory read, PC sender
+// modification or passthrough presentation is enabled.
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 #include "pixel_capture_tracker.h"

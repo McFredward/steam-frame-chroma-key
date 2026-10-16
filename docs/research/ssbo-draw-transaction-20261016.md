@@ -45,8 +45,15 @@ namespaces; the adapter must not numerically equate them.
 
 After forwarding original EndRenderPass, `endRenderPass()` emits the owned
 shader-write/transfer-write to HOST_READ buffer barrier outside the render pass.
-Later draws, another target render scope, subpasses, secondary execution,
+Later draws, another target render scope, unsupported subpasses, secondary execution,
 unknown routes or retirement of a matching resource invalidate publication.
+The complete captured pass now supports up to8 inline subpasses. The original
+pipeline creation and immutable prepared recipe select the target index; opaque
+tracker tickets must agree with the actual current command-buffer subpass.
+Reset precedes the whole pass, and HOST/source-copy work follows its final
+original End, never an intermediate NextSubpass. Core/KHR command names retain
+their own original downstream dispatch. See the
+[native admission repair](native-renderpass-graphics-admission-20261016.md).
 Typed retirement avoids confusing different Vulkan object kinds with the same
 raw handle bits. Consumed shader-module/layout provenance is definition history,
 not a reason to retain or resurrect those original objects.
