@@ -85,6 +85,14 @@ void features(){
     f.device.pEnabledFeatures=nullptr;require(!enabledFeature(f.device,true,result,why) && !result.observed,"absent feature distinguished");reason(why,Reason::FeatureAbsent);
     auto core=info<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);core.features.fragmentStoresAndAtomics=VK_TRUE;f.device.pNext=&core;
     require(enabledFeature(f.device,true,result,why) && result.source==FeatureSource::Features2,"Features2 enablement exact");
+    auto timeline=info<VkPhysicalDeviceTimelineSemaphoreFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
+    timeline.timelineSemaphore=VK_TRUE;core.pNext=&timeline;
+    require(enabledFeature(f.device,true,result,why) && result.enabled,"independent native timeline feature preserves enabled fragment stores");
+    timeline.timelineSemaphore=VK_FALSE;require(enabledFeature(f.device,true,result,why),"disabled timeline feature does not disable fragment stores");
+    timeline.timelineSemaphore=2;require(!enabledFeature(f.device,true,result,why) && why.type==1000207000,"invalid public timeline scalar refused precisely");reason(why,Reason::FeatureValue);
+    timeline.timelineSemaphore=VK_TRUE;core.features.fragmentStoresAndAtomics=VK_FALSE;
+    require(!enabledFeature(f.device,true,result,why) && !result.enabled,"timeline cannot stand in for required fragment storage");reason(why,Reason::FeatureDisabled);
+    core.features.fragmentStoresAndAtomics=VK_TRUE;core.pNext=nullptr;
     f.device.pEnabledFeatures=&f.features;require(!enabledFeature(f.device,true,result,why),"legacy and Features2 conflict");reason(why,Reason::FeatureValue); // First malformed legacy input wins.
     f.features.fragmentStoresAndAtomics=VK_TRUE;require(!enabledFeature(f.device,true,result,why),"canonical duplicate declaration refused");reason(why,Reason::FeatureConflict);
     f.device.pEnabledFeatures=nullptr;core.pNext=&core;require(!enabledFeature(f.device,true,result,why),"feature chain cycle");reason(why,Reason::ChainCycle);core.pNext=nullptr;
@@ -102,7 +110,9 @@ void layouts(){
     require(captureSet0(f.set0,set,why) && set.bindings[5].descriptorCount==3,"full array[3] retained");
     require(captureLayout(f.layout,f.nativeSet,layout,why),"complete ordered push ranges captured");
     require(layout.ranges[0].stageFlags==VK_SHADER_STAGE_FRAGMENT_BIT && layout.ranges[0].offset==64,"push order preserved");
-    f.bindings[5].descriptorCount=1;require(set.bindings[5].descriptorCount==3,"owned array independent of overwrite");require(!captureSet0(f.set0,set,why),"native scalar binding never silently expanded");reason(why,Reason::Image9Extent);require(f.bindings[5].descriptorCount==1,"source declaration untouched");
+    f.bindings[5].descriptorCount=1;require(set.bindings[5].descriptorCount==3,"owned array independent of overwrite");
+    require(captureSet0(f.set0,set,why) && set.bindings[5].descriptorCount==1,"actual native scalar binding retained without expansion");require(f.bindings[5].descriptorCount==1,"source declaration untouched");
+    f.bindings[5].descriptorCount=0;require(!captureSet0(f.set0,set,why),"missing statically used descriptor0 refused");reason(why,Reason::Image9Extent);
     f.bindings[5].descriptorCount=3;VkSampler immutable=object<VkSampler>(8);f.bindings[6].pImmutableSamplers=&immutable;require(!captureSet0(f.set0,set,why),"immutable handles not async authority");reason(why,Reason::ImmutableSampler);f.bindings[6].pImmutableSamplers=nullptr;
     f.bindings[5].binding=8;require(!captureSet0(f.set0,set,why),"missing image9");reason(why,Reason::MissingImage9);f.bindings[5].binding=9;
     f.set0.bindingCount=MaxBindings+1;f.set0.pBindings=reinterpret_cast<const VkDescriptorSetLayoutBinding*>(std::uintptr_t(1));require(!captureSet0(f.set0,set,why),"oversize binding count refuses before dereference");reason(why,Reason::Bounds);

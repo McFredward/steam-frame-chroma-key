@@ -109,6 +109,12 @@ inline bool enabledFeature(const VkDeviceCreateInfo& in,bool successfulCreate,
             if(in.pEnabledFeatures)return refuse(why,Reason::FeatureConflict,index,static_cast<std::uint32_t>(node->sType));
             if(!observe(reinterpret_cast<const VkPhysicalDeviceFeatures2*>(node)->features.fragmentStoresAndAtomics,
                         FeatureSource::Features2))return false;
+        }else if(node->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES){
+            // This independent synchronization feature neither supplies nor
+            // disables fragment storage. Inspect the public scalar, preserving
+            // the original chain and the separately observed core feature.
+            if(!boolean(reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures*>(node)->timelineSemaphore))
+                return refuse(why,Reason::FeatureValue,index,static_cast<std::uint32_t>(node->sType));
         }else if(node->sType!=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES &&
                  node->sType!=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES &&
                  node->sType!=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES &&
@@ -144,7 +150,12 @@ inline bool captureSet0(const VkDescriptorSetLayoutCreateInfo& in,Set0Definition
             found9=true;
             if(binding.descriptorType!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || !(binding.stageFlags&VK_SHADER_STAGE_FRAGMENT_BIT))
                 return refuse(why,Reason::Descriptor,i);
-            if(binding.descriptorCount<3)return refuse(why,Reason::Image9Extent,i);
+            // The exact pinned PS declares an array of three but BOTH original
+            // image access chains use the constant index0. The successfully
+            // observed native layout contains one descriptor. Keep that exact
+            // count; expanding it would break layout compatibility. Unknown
+            // modules still refuse the independent full shader pin below.
+            if(!binding.descriptorCount)return refuse(why,Reason::Image9Extent,i);
         }
         out.bindings[i]=binding; // Immutable pointers were rejected, never retained.
     }

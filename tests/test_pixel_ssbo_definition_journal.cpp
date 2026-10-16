@@ -163,6 +163,24 @@ void layoutFlags(){
     require(!j.createLayout(f.graphics.layout,f.layout,VK_SUCCESS,&event),"unsupported layout flags refuse before any potentially ignored array");
     reason(event,journal::Reason::Contract);require(event.contract.reason==clone::Reason::Bounds,"layout flags preserve contract reason");
 }
+void metadataDespiteRefusal(){
+    Fixture f;journal::Journal j;journal::Event event;
+    auto core=info<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+    auto timeline=info<VkPhysicalDeviceTimelineSemaphoreFeatures>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
+    auto future=info<VkBaseInStructure>(static_cast<VkStructureType>(0x6fffffff));
+    core.features.fragmentStoresAndAtomics=VK_TRUE;core.pNext=&timeline;timeline.pNext=&future;
+    f.device.pEnabledFeatures=nullptr;f.device.pNext=&core;f.binding.descriptorCount=1;
+    require(!j.createDevice(object<VkDevice>(1),f.device,VK_SUCCESS,&event),"actual unknown chain still refuses clone eligibility");
+    require(event.contract.reason==clone::Reason::Extension && event.contract.type==0x6fffffff,"first still-unknown feature retains exact refusal context");
+    require(!j.createSet(f.nativeSet,f.set,VK_SUCCESS,&event),"metadata discovery never bypasses ineligible device admission");
+    auto observed=j.inspectFacts();
+    require(observed.deviceObserved && observed.chainCount==3 && observed.chainTypes[2]==0x6fffffff,"all later public headers observed despite first strict refusal");
+    require(observed.setCount==1 && observed.sets[0].bindings[0].count==1,"successful native layout observed despite ineligible clone profile");
+    const auto stats=j.inspectStats();journal::Ready ready;
+    require(!stats.feature.complete && stats.feature.enabled && stats.created==0 && !j.takeReady(ready),"raw diagnostic metadata grants no recipe or native authority");
+    f.binding.descriptorCount=3;j.destroyDevice();
+    require(!j.createSet(f.nativeSet,f.set,VK_SUCCESS) && j.inspectFacts().setCount==1,"retired device cannot acquire more diagnostic shapes");
+}
 std::vector<std::uint32_t> readShader(const char* path){
     std::ifstream input(path,std::ios::binary|std::ios::ate);require(bool(input),"private input readable");const auto size=input.tellg();
     require(size>0 && size<=static_cast<std::streamoff>(clone::ShaderBytes) && size%4==0,"bounded private input size");
@@ -240,8 +258,9 @@ void privateConcurrency(const std::vector<std::uint32_t>& vs,const std::vector<s
 }
 int main(int argc,char** argv){
     if(argc==2 && std::strcmp(argv[1],"--layout-flags-only")==0){layoutFlags();std::cout<<"{\"scope\":\"layout-flags-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
+    if(argc==2 && std::strcmp(argv[1],"--metadata-facts-only")==0){metadataDespiteRefusal();std::cout<<"{\"scope\":\"metadata-facts-subset\",\"checks\":"<<checks.load()<<"}\n";return 0;}
     require(argc==1 || argc==3,"optional private VS/PS arguments only");
-    deviceControls();publicInventory();publicConcurrency();layoutFlags();
+    deviceControls();publicInventory();publicConcurrency();layoutFlags();metadataDespiteRefusal();
     if(argc==3){const auto vs=readShader(argv[1]),ps=readShader(argv[2]);privateRecipes(vs,ps);privateConcurrency(vs,ps);}
     std::cout<<"{\"schema\":\"ssbo-definition-journal-controls-v1\",\"checks\":"<<checks.load()<<",\"journal_bytes\":"<<sizeof(journal::Journal)
              <<",\"event_bytes\":"<<sizeof(journal::Event)<<",\"private_native_pins_tested\":"<<(argc==3?"true":"false")

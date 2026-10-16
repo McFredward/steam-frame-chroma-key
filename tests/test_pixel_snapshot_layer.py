@@ -227,9 +227,13 @@ def main():
                         for key in ("contract_index", "contract_structure_type"):
                             assert type(feature[key]) is int and 0 <= feature[key] <= 0xffffffff, (label, feature)
                         assert feature["native_compatibility_proven"] is False, (label, feature)
-                        assert all(r["event"] in ("ssbo_definition_feature", "ssbo_definition_refusals")
+                        shapes = [r for r in definitions if r["event"] == "ssbo_definition_device_shape"]
+                        assert len(shapes) == 1 and shapes[0]["observed"] is True, (label, shapes)
+                        assert shapes[0]["chain_end"] == "complete" and len(shapes[0]["chain_types"]) <= 32, (label, shapes)
+                        assert shapes[0]["clone_admission_changed"] is False, (label, shapes)
+                        assert all(r["event"] in ("ssbo_definition_feature", "ssbo_definition_refusals", "ssbo_definition_device_shape")
                                    and r["mask_enabled"] is False for r in definitions), (label, definitions)
-                        assert len(definitions) <= 3, (label, definitions)
+                        assert len(definitions) <= 4, (label, definitions)
                     else:
                         assert not definitions, (label, "unexpected optional definition observer", definitions)
                     records = [r for r in records if not r["event"].startswith("ssbo_definition_")]

@@ -6,6 +6,7 @@
 // and mutex scheduling can be expensive. No Vulkan calls, callbacks, allocation,
 // I/O or logging occur under its mutex. Finite work is not an elapsed-time bound.
 #include "pixel_ssbo_clone_contract.h"
+#include "pixel_definition_facts.h"
 #include <limits>
 #include <mutex>
 
@@ -76,6 +77,7 @@ public:
         // Even ineligible successful devices are initialized exactly once. The
         // fact/refusal remains inspectable; a failed original create initializes nothing.
         stats_.initialized=true;stats_.device=value;
+        frame_pixel_definition_facts::device(facts_,ci,result);
         if(!clone::enabledFeature(ci,true,stats_.feature,stats_.deviceRefusal))
             return fail(out,Reason::DeviceIneligible,ObjectKind::Device,value,0,stats_.deviceRefusal);
         return true;
@@ -83,6 +85,7 @@ public:
 
     bool createSet(VkDescriptorSetLayout object,const VkDescriptorSetLayoutCreateInfo& ci,VkResult result,Event* out=nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);const auto value=clone::handle(object);
+        if(!retired_)frame_pixel_definition_facts::set(facts_,ci,result);
         if(!beginCreate(sets_,value,result,ObjectKind::Set,out))return false;
         clone::Set0Definition definition;clone::Refusal why;
         if(!clone::captureSet0(ci,definition,why))return fail(out,Reason::Contract,ObjectKind::Set,value,0,why);
@@ -205,6 +208,7 @@ public:
         return fail(out,Reason::UnsupportedRoute,kind,value,0,{clone::Reason::Extension,UINT32_MAX,type});
     }
     Stats inspectStats() const {std::lock_guard<std::mutex> lock(mutex_);return stats_;}
+    frame_pixel_definition_facts::Facts inspectFacts() const {std::lock_guard<std::mutex> lock(mutex_);return facts_;}
 
 private:
     struct LayoutSnapshot {clone::Set0Definition set0{};clone::LayoutDefinition layout{};clone::Identity setIdentity{};};
@@ -214,6 +218,7 @@ private:
     std::uint64_t nextGeneration_=1;
     bool retired_=false;
     Stats stats_{};
+    frame_pixel_definition_facts::Facts facts_{};
     std::array<Slot<clone::Set0Definition>,SetCapacity> sets_{};
     std::array<Slot<LayoutSnapshot>,LayoutCapacity> layouts_{};
     std::array<Slot<clone::RenderPassDefinition>,PassCapacity> passes_{};

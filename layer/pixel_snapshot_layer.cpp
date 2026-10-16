@@ -324,7 +324,8 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
     close(meta); status(progress,good ? "complete" : "metadata_failed");
 }
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& reportedReasons,unsigned& reportedRecipes) {
+void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& reportedReasons,unsigned& reportedRecipes,
+                      unsigned& reportedSets,std::uint32_t& reportedSetSkips) {
     namespace journal=frame_pixel_ssbo_journal;
     static_assert(unsigned(journal::Reason::Count)<63,"bit63 is the sticky observer-failure receipt");
     if(d.definitionBoundary.failed()){
@@ -335,6 +336,7 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
         return;
     }
     const auto facts=d.definitions.inspectStats();
+    const auto observed=d.definitions.inspectFacts();
     if(!featureReported){
         char report[768]{};
         const auto count=std::snprintf(report,sizeof(report),
@@ -345,7 +347,34 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
             facts.feature.raw,unsigned(facts.feature.source),frame_pixel_ssbo_clone::reasonName(facts.deviceRefusal.reason),
             facts.deviceRefusal.index,facts.deviceRefusal.type);
         if(count>0 && static_cast<std::size_t>(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,static_cast<std::size_t>(count));
+        // Report every bounded header together, even when clone admission stops
+        // at the first unknown extension. This is observation, never a bypass.
+        std::ostringstream shape;
+        shape<<"{\"event\":\"ssbo_definition_device_shape\",\"observed\":"<<(observed.deviceObserved?"true":"false")
+             <<",\"chain_end\":\""<<frame_pixel_definition_facts::chainEndName(observed.chainEnd)<<"\",\"chain_types\":[";
+        for(std::uint32_t i=0;i<observed.chainCount;++i){if(i)shape<<',';shape<<observed.chainTypes[i];}
+        shape<<"],\"clone_admission_changed\":false,\"mask_enabled\":false}\n";
+        const auto text=shape.str();
+        if(text.size()<=1024)frame_pixel_io::writeAll(fd,text.data(),text.size());
         featureReported=true;
+    }
+    while(reportedSets<observed.setCount){
+        const auto index=reportedSets++;const auto& set=observed.sets[index];std::ostringstream shape;
+        shape<<"{\"event\":\"ssbo_definition_set_shape\",\"shape_index\":"<<index<<",\"bindings\":[";
+        for(std::uint32_t i=0;i<set.count;++i){if(i)shape<<',';const auto& binding=set.bindings[i];
+            shape<<"{\"binding\":"<<binding.binding<<",\"type\":"<<binding.type<<",\"count\":"<<binding.count
+                 <<",\"stages\":"<<binding.stages<<",\"immutable_sampler_present\":"<<(binding.immutableSampler?"true":"false")<<'}';
+        }
+        shape<<"],\"native_pipeline_association_proven\":false,\"clone_admission_changed\":false,\"mask_enabled\":false}\n";
+        const auto text=shape.str();
+        if(text.size()<=8192)frame_pixel_io::writeAll(fd,text.data(),text.size());
+    }
+    const auto newSkips=observed.setSkipReasons&~reportedSetSkips;
+    if(newSkips){
+        char report[256]{};const auto count=std::snprintf(report,sizeof(report),
+            "{\"event\":\"ssbo_definition_set_shape_skipped\",\"new_reasons\":%u,\"mask_enabled\":false}\n",newSkips);
+        if(count>0 && static_cast<std::size_t>(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,static_cast<std::size_t>(count));
+        reportedSetSkips|=newSkips;
     }
     const auto newReasons=facts.seenReasons&~reportedReasons;
     if(newReasons){
@@ -421,11 +450,12 @@ void writer(Device* d) noexcept {
 #endif
     unsigned announcedQueryRoutes=0;
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-    bool definitionFeatureReported=false;std::uint64_t definitionReasons=0;unsigned definitionRecipes=0;
+    bool definitionFeatureReported=false;std::uint64_t definitionReasons=0;unsigned definitionRecipes=0,definitionSets=0;
+    std::uint32_t definitionSetSkips=0;
 #endif
     try { while (!d->stop.load(std::memory_order_acquire)) {
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-        definitionStatus(*d,progress,definitionFeatureReported,definitionReasons,definitionRecipes);
+        definitionStatus(*d,progress,definitionFeatureReported,definitionReasons,definitionRecipes,definitionSets,definitionSetSkips);
 #endif
         const auto queryRoutes=d->queryRoutesUsed.load(std::memory_order_relaxed);
         if(queryRoutes!=announcedQueryRoutes) {
