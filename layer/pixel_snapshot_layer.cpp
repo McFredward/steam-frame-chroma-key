@@ -466,7 +466,7 @@ void bridgeStatus(Device& d,int fd,std::uint64_t& seen) {
         "\"queue_create_infos\":%u,\"queue_count\":%u,\"queue_family\":%u,\"queue_retrieved\":%s,\"retrieved_family\":%u,\"retrieved_index\":%u,\"retrieved_queue\":%llu,\"clone_status\":%u,\"clone_stage\":%u,"
         "\"clone_vk_result\":%d,\"draw_kind\":%u,\"draw_ordinal\":%llu,\"draw_args\":[%u,%u,%u,%u,%u],"
         "\"submit_route\":%u,\"submit_batches\":%u,\"submit_batch\":%u,\"submit_commands\":%u,\"submit_next_type\":%u,\"submit_occurrences\":%u,"
-        "\"command_generation\":%llu,\"pool_generation\":%llu,\"source_executions\":%llu,\"paired_execution\":%llu,\"original_color_expression_preserved\":true,\"native_visual_result_verified\":false,\"mask_enabled\":false}\n",
+        "\"command_generation\":%llu,\"pool_generation\":%llu,\"source_executions\":%llu,\"paired_execution\":%llu,\"original_color_expression_preserved\":true,\"native_visual_result_verified\":false,\"native_frame_association_proven\":false,\"mask_enabled\":false}\n",
         frame_pixel_ssbo_receiver::refusalName(s.refusal),s.transaction,s.profile?"true":"false",s.ready?"true":"false",
         s.learned?"true":"false",s.adopted?"true":"false",s.replaced?"true":"false",s.copy?"true":"false",
         s.queueCreateInfos,s.queueCount,s.queueFamily,s.queueKnown?"true":"false",s.retrievedFamily,s.retrievedIndex,static_cast<unsigned long long>(s.retrievedQueue),s.cloneStatus,s.cloneStage,s.cloneDriver,s.drawKind,static_cast<unsigned long long>(s.drawOrdinal),
