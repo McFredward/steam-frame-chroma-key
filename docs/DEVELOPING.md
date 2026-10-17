@@ -1,7 +1,7 @@
-# Developing Steam Frame Native Passthrough
+# Developing Steam Link Native Passthrough
 
-This is the current implementation guide. The [README](../README.md) covers
-installation and the [compatibility page](COMPATIBILITY.md) separates the visible
+This is the current implementation guide. The [installation guide](INSTALL.md) covers
+setup and the [compatibility page](COMPATIBILITY.md) separates the visible
 headset result from software-only checks. Dated research pages describe their
 own historical checkpoints; a statement there that a later feature is missing
 does not override the current implementation.
@@ -101,7 +101,9 @@ The optional receiver is built through the historical
 `FRAME_PIXEL_SYNTHETIC_PRESENTER` switch. Its name and existing internal
 `GHVR`/`MRMASK` signatures are compatibility identifiers, not a promise that the
 current game path is a synthetic pattern. Renaming the public repository must
-not change those frozen bytes accidentally.
+not change those frozen bytes accidentally. The installed
+`SteamFrameNativePassthrough` directory name also stays stable across branding
+changes so existing installations remain manageable.
 
 At an original successful `vkCreateGraphicsPipelines` callback, the receiver has
 the actual still-live creation inputs. It verifies the original shader pins,

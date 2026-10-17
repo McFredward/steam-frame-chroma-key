@@ -1,4 +1,4 @@
-# Install and use Steam Frame Native Passthrough
+# Install and use Steam Link Native Passthrough
 
 Installation runs **on the Steam Frame**, either directly in Desktop Mode or
 from a PC over SSH. Both methods install the same files in your home directory.

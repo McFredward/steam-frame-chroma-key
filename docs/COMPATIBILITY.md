@@ -1,6 +1,6 @@
 # Compatibility and current limits
 
-Steam Frame Native Passthrough currently targets one combination: a supported
+Steam Link Native Passthrough currently targets one combination: a supported
 PC game integration, ordinary Steam Link PC VR streaming, and a Steam Frame
 runtime accepted by the local compatibility checks. It is not a universal
 transparency switch for any streamed game.

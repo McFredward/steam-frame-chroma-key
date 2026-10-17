@@ -1,4 +1,4 @@
-# Working on Steam Frame Native Passthrough
+# Working on Steam Link Native Passthrough
 
 - Integrate on `dev`; publish the validated final development state to `main`
   when requested. The maintainer explicitly authorized that publication on
