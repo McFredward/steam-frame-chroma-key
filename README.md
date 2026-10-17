@@ -4,11 +4,26 @@ This fork is adding **real per-eye opacity masks** for PC streaming. Scene color
 will remain independent of transparency, and the passthrough camera remains on
 the headset.
 
-The receiver has now visibly blended a synthetic GloomhavenVR source with the
-Frame's native camera over an unchanged PC Steam Link sender. **Real game-scene
-coverage and the final mod integration are still in development; this is not a
-finished installable passthrough feature.** The default build remains inactive.
-The following checkpoints retain their historical scopes.
+**Real GloomhavenVR game imagery has now been visibly blended with the Frame's
+native camera over an unchanged PC Steam Link sender.** The maintainer confirmed
+the Build686 test on 2026-10-17; paired application logs show both 4040×4040
+MultiPass/MSAA8 eyes using the scene-contribution profile. Menu-video opacity
+and some boundary rendering still need corrections. This is a development
+checkpoint, not a general-purpose or permanently installed release.
+
+The current explicit-mask receiver is a manually approved, one-compositor-process
+installation. A SteamVR restart does not re-arm it, and its separately saved
+camera override needs explicit restoration. The original `install.sh` below
+installs the original chroma-key implementation, **not** this new receiver.
+See [the real-game result and limitations](docs/research/real-game-visible-run-20261017.md).
+The default build remains inactive. The following checkpoints are historical.
+
+The explicit-mask producer, atlas decoder, source/lifetime guards and deployment
+experiments are new work in this fork. The upstream chroma-key implementation,
+its investigation of the native compositor/camera setting and its public OpenVR
+settings helper remain credited to
+[spyjacob's original project](https://github.com/spyjacob/steam-frame-chroma-key).
+Its original [MIT license](LICENSE) and history are retained.
 
 Development branch: [`dev`](https://github.com/McFredward/steam-frame-chroma-key/tree/dev).
 See [mask implementation and tests](docs/MASK-TRANSPORT.md) and
