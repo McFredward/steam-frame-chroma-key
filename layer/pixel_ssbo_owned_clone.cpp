@@ -194,7 +194,7 @@ Result Clone::prepare(const Preparation& input) noexcept {
 bool Clone::compatibleSet0Mirror() const noexcept {return ready_&&recipe_.set0.probeInterface.compatibleSet0Mirror();}
 Result Clone::populateMirror(VkDescriptorSet originalSet0) noexcept {
     if(!compatibleSet0Mirror()||!originalSet0||originalSet0==set_)return {Status::InvalidInput,Stage::Set,VK_SUCCESS};
-    if(mirrorPopulated_)return {Status::AlreadyPrepared,Stage::Set,VK_SUCCESS};
+    if(mirrorPopulated_||mirrorBound_)return {Status::AlreadyPrepared,Stage::Set,VK_SUCCESS};
     std::array<VkCopyDescriptorSet,frame_pixel_ssbo_clone::ProbeInterface::MirrorBindings.size()> copies{};
     for(unsigned i=0;i<copies.size();++i){auto& copy=copies[i];copy.sType=VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
         copy.srcSet=originalSet0;copy.srcBinding=frame_pixel_ssbo_clone::ProbeInterface::MirrorBindings[i];
@@ -219,7 +219,7 @@ void Clone::destroyUnreferenced() noexcept {
     device_=VK_NULL_HANDLE;set0_=set1_=VK_NULL_HANDLE;layout_=VK_NULL_HANDLE;renderPass_=VK_NULL_HANDLE;
     vertex_=fragment_=VK_NULL_HANDLE;pipeline_=VK_NULL_HANDLE;pool_=VK_NULL_HANDLE;set_=VK_NULL_HANDLE;
     buffer_=VK_NULL_HANDLE;memory_=VK_NULL_HANDLE;mapped_=nullptr;allocationBytes_=0;
-    ready_=referenced_=coherent_=mirrorPopulated_=false;procs_={};recipe_={};
+    ready_=referenced_=coherent_=mirrorPopulated_=mirrorBound_=false;procs_={};recipe_={};
 }
 Result Clone::release(ReleaseProof proof) noexcept {
     if(referenced_ && !(proof.allRecordingsRetired && proof.deviceQuiescentOrLost))

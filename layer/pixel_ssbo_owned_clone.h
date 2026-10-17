@@ -43,7 +43,10 @@ public:
     // mirror once, before its first bind. No original descriptor is modified.
     bool compatibleSet0Mirror() const noexcept;
     Result populateMirror(VkDescriptorSet originalSet0) noexcept;
-    VkDescriptorSet mirrorSet() const noexcept{return ready_&&compatibleSet0Mirror()?set_:VK_NULL_HANDLE;}
+    // Buffer reset references precede mirror population. The descriptor lease
+    // begins separately and must be sealed immediately before its first bind.
+    bool markMirrorBound() noexcept {if(!compatibleSet0Mirror()||!mirrorPopulated_)return false;mirrorBound_=true;referenced_=true;return true;}
+    VkDescriptorSet mirrorSet() const noexcept{return ready_&&mirrorBound_?set_:VK_NULL_HANDLE;}
     bool mirrorPopulated() const noexcept{return ready_&&mirrorPopulated_;}
     bool markReferenced() noexcept {if(!ready_)return false;referenced_=true;return true;}
     bool ready() const noexcept{return ready_;}
@@ -88,6 +91,6 @@ private:
     VkDeviceMemory memory_=VK_NULL_HANDLE;
     void* mapped_=nullptr;
     VkDeviceSize allocationBytes_=0;
-    bool ready_=false,referenced_=false,coherent_=false,mirrorPopulated_=false;
+    bool ready_=false,referenced_=false,coherent_=false,mirrorPopulated_=false,mirrorBound_=false;
 };
 } // namespace frame_pixel_ssbo_owned

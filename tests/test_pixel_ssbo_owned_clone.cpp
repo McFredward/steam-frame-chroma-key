@@ -17,7 +17,7 @@ struct Driver {
     unsigned calls=0,failAt=0,destroys=0,flushes=0,updates=0;
     bool noncoherent=false,partialPipeline=false,missing=false,wrongRequirements=false;
     bool refuseMemoryType=false,oversize=false,missingPass2=false,aliasPass2=false,missingKhr2=false;
-    bool mappedLive=false;
+    bool mappedLive=false,mirror=false;unsigned copies=0;
     unsigned expectedCount=3,expectedFragmentBytes=20,expectedSubpasses=1,expectedSubpass=UINT32_MAX,pass2Calls=0,corePass2Calls=0,khrPass2Calls=0,corePassLookups=0,khrPassLookups=0;
     std::uint64_t next=100;
     std::set<std::uint64_t> live;
@@ -43,7 +43,8 @@ void common(VkDevice d,const VkAllocationCallbacks* a){demand(d==driver->device 
 VKAPI_ATTR VkResult VKAPI_CALL createSet(VkDevice d,const VkDescriptorSetLayoutCreateInfo* ci,const VkAllocationCallbacks* a,VkDescriptorSetLayout* out){
     common(d,a);demand(ci && ci->sType==VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO && !ci->pNext && !ci->flags,"ordinary owned set layout");
     const bool first=!driver->set0;
-    if(first)demand(ci->bindingCount==3 && ci->pBindings[2].binding==9 && ci->pBindings[2].descriptorCount==driver->expectedCount,"original Set0 descriptor count retained without native expansion");
+    if(first){if(driver->mirror)demand(ci->bindingCount==29 && ci->pBindings[8].binding==8 && ci->pBindings[8].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,"mirror uses complete identical original29 layout");
+        else demand(ci->bindingCount==3 && ci->pBindings[2].binding==9 && ci->pBindings[2].descriptorCount==driver->expectedCount,"original Set0 descriptor count retained without native expansion");}
     else demand(ci->bindingCount==1 && ci->pBindings[0].binding==0 && ci->pBindings[0].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,"owned Set1 record binding");
     auto result=driver->create(first?Stage::Set0:Stage::Set1,out);
     if(result==VK_SUCCESS)(first?driver->set0:driver->set1)=*out;
@@ -51,7 +52,7 @@ VKAPI_ATTR VkResult VKAPI_CALL createSet(VkDevice d,const VkDescriptorSetLayoutC
 }
 VKAPI_ATTR void VKAPI_CALL destroySet(VkDevice d,VkDescriptorSetLayout obj,const VkAllocationCallbacks* a){common(d,a);driver->destroy(obj);}
 VKAPI_ATTR VkResult VKAPI_CALL createLayout(VkDevice d,const VkPipelineLayoutCreateInfo* ci,const VkAllocationCallbacks* a,VkPipelineLayout* out){
-    common(d,a);demand(ci->setLayoutCount==2 && ci->pSetLayouts[0]==driver->set0 && ci->pSetLayouts[1]==driver->set1,"layout uses own Set0/Set1 only");
+    common(d,a);demand(ci->setLayoutCount==(driver->mirror?1u:2u) && ci->pSetLayouts[0]==driver->set0 && (driver->mirror || ci->pSetLayouts[1]==driver->set1),"layout uses exact one-set mirror or legacy two-set prefix");
     demand(ci->pushConstantRangeCount==1 && ci->pPushConstantRanges[0].size==16 && ci->pPushConstantRanges[0].stageFlags==VK_SHADER_STAGE_VERTEX_BIT,"original complete push range retained");
     auto result=driver->create(Stage::Layout,out);if(result==VK_SUCCESS)driver->layout=*out;return result;
 }
@@ -112,16 +113,23 @@ VKAPI_ATTR VkResult VKAPI_CALL flush(VkDevice d,std::uint32_t count,const VkMapp
     ++driver->flushes;return driver->step(Stage::Flush);
 }
 VKAPI_ATTR VkResult VKAPI_CALL createPool(VkDevice d,const VkDescriptorPoolCreateInfo* ci,const VkAllocationCallbacks* a,VkDescriptorPool* out){
-    common(d,a);demand(ci->maxSets==1 && ci->poolSizeCount==1 && ci->pPoolSizes[0].descriptorCount==1,"one owned storage descriptor");
+    common(d,a);demand(ci->maxSets==1,"one owned descriptor set");
+    if(driver->mirror){unsigned total=0;for(unsigned i=0;i<ci->poolSizeCount;++i)total+=ci->pPoolSizes[i].descriptorCount;demand(total==29,"mirror pool budgets full original layout including undefined unused entries");}
+    else demand(ci->poolSizeCount==1 && ci->pPoolSizes[0].descriptorCount==1,"one owned storage descriptor");
     auto result=driver->create(Stage::Pool,out);if(result==VK_SUCCESS)driver->pool=*out;return result;
 }
 VKAPI_ATTR void VKAPI_CALL destroyPool(VkDevice d,VkDescriptorPool obj,const VkAllocationCallbacks* a){common(d,a);driver->destroy(obj);}
 VKAPI_ATTR VkResult VKAPI_CALL allocateSet(VkDevice d,const VkDescriptorSetAllocateInfo* ci,VkDescriptorSet* out){
-    demand(d==driver->device && ci->descriptorPool==driver->pool && ci->descriptorSetCount==1 && ci->pSetLayouts[0]==driver->set1,"allocate only own Set1");
+    demand(d==driver->device && ci->descriptorPool==driver->pool && ci->descriptorSetCount==1 && ci->pSetLayouts[0]==(driver->mirror?driver->set0:driver->set1),"allocate only own mirror or legacy Set1");
     const auto result=driver->step(Stage::Set);*out=result==VK_SUCCESS?object<VkDescriptorSet>(900):VK_NULL_HANDLE;return result;
 }
-VKAPI_ATTR void VKAPI_CALL update(VkDevice d,std::uint32_t count,const VkWriteDescriptorSet* writes,std::uint32_t copyCount,const VkCopyDescriptorSet*){
-    demand(d==driver->device && count==1 && !copyCount && writes->dstSet==object<VkDescriptorSet>(900) && writes->descriptorCount==1 && writes->pBufferInfo->buffer==driver->buffer && writes->pBufferInfo->range==128 && !writes->pBufferInfo->offset,"write exact own128B descriptor, no native updates");++driver->updates;
+VKAPI_ATTR void VKAPI_CALL update(VkDevice d,std::uint32_t count,const VkWriteDescriptorSet* writes,std::uint32_t copyCount,const VkCopyDescriptorSet* copies){
+    demand(d==driver->device,"descriptor updates use exact owned device");
+    if(copyCount){demand(driver->mirror && !count && !writes && copyCount==7 && copies && !driver->copies,"immutable mirror copied once before recording bind");
+        for(unsigned i=0;i<copyCount;++i){const auto& c=copies[i];demand(c.sType==VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET && !c.pNext && c.srcSet==object<VkDescriptorSet>(901) && c.dstSet==object<VkDescriptorSet>(900) && c.srcBinding==frame_pixel_ssbo_clone::ProbeInterface::MirrorBindings[i] && c.dstBinding==c.srcBinding && !c.srcArrayElement && !c.dstArrayElement && c.descriptorCount==1,"only statically attested original descriptors copied into owned set, never native writes");}
+        ++driver->copies;return;
+    }
+    demand(count==1 && writes && writes->dstSet==object<VkDescriptorSet>(900) && writes->dstBinding==(driver->mirror?8u:0u) && writes->descriptorCount==1 && writes->pBufferInfo->buffer==driver->buffer && writes->pBufferInfo->range==128 && !writes->pBufferInfo->offset,"write exact own128B descriptor at profile binding, no native updates");++driver->updates;
 }
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL getProc(VkDevice d,const char* name){
     demand(d==driver->device,"resolve only downstream own device");if(driver->missing)return nullptr;
@@ -270,5 +278,29 @@ void count1Profile(const char* vsPath,const char* psPath,const char* probePath){
         else demand(result.status==Status::InvalidInput && !state.calls && !clone.ready(),"source/interface/descriptor mismatch refuses before every driver call");
     }
 }
+void mirrorProfile(const char* vsPath,const char* psPath,const char* probePath){
+    namespace c=frame_pixel_ssbo_clone;const auto vs=readShader(vsPath),ps=readShader(psPath),probe=readShader(probePath);
+    for(bool dynamic:{false,true}){Driver state;driver=&state;state.mirror=true;state.expectedFragmentBytes=unsigned(probe.size()*4);Fixture f;Clone clone;c::Refusal why;c::ProbeInterface profile;
+        demand(c::ProbeInterface::set0Mirror(vs.data(),vs.size()*4,ps.data(),ps.size()*4,probe.data(),probe.size()*4,profile,why),"both original pins authorize distinct exact mirror profile");
+        std::array<VkDescriptorSetLayoutBinding,29> bindings{};for(unsigned i=0;i<29;++i)bindings[i]={i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr};
+        for(unsigned i:{0u,2u,3u,4u,6u})bindings[i].descriptorType=dynamic?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[9].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;bindings[25].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLER;
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};ci.bindingCount=bindings.size();ci.pBindings=bindings.data();
+        demand(c::captureSet0(ci,f.recipe.set0,why,profile),"full29 original set definition captured without native expansion");
+        std::copy(vs.begin(),vs.end(),f.recipe.vertex.words.begin());std::copy(ps.begin(),ps.end(),f.recipe.fragment.words.begin());
+        f.p.fragment=probe.data();f.p.fragmentBytes=probe.size()*4;frame_receiver::Sha256 hash;hash.update(f.p.fragment,f.p.fragmentBytes);f.p.fragmentSha256=hash.finish();
+        f.p.limits.maxBoundDescriptorSets=1;f.p.limits.maxDescriptorSetStorageBuffers=64;f.p.limits.maxPerStageDescriptorStorageBuffers=64;
+        demand(clone.prepare(f.p).status==Status::Ok && clone.compatibleSet0Mirror() && !clone.mirrorSet() && !clone.set1() && !clone.mirrorPopulated(),"mirror owns one compatible original set, no unsafe extra Set1");
+        demand(!clone.markMirrorBound() && !clone.mirrorSet(),"unpopulated descriptor cannot be exposed or bound");
+        demand(clone.markReferenced(),"GPU reset acquires buffer lease before target set is known");
+        demand(clone.populateMirror(VK_NULL_HANDLE).status==Status::InvalidInput && clone.populateMirror(object<VkDescriptorSet>(900)).status==Status::InvalidInput && !state.copies,"invalid native source cannot populate mirror");
+        demand(clone.populateMirror(object<VkDescriptorSet>(901)).status==Status::Ok && clone.mirrorPopulated() && state.copies==1,"populate seven originals once, preserving own record8");
+        demand(clone.markMirrorBound() && clone.mirrorSet(),"only populated immutable descriptor obtains bind lease");
+        demand(clone.populateMirror(object<VkDescriptorSet>(901)).status==Status::AlreadyPrepared && state.copies==1,"reusable recording never observes descriptor updates after first copy");
+        demand(clone.markReferenced() && clone.release().status==Status::UnsafeToRelease,"mirror follows exact reusable-generation ownership");
+        demand(clone.release({true,true}).status==Status::Ok && state.live.empty() && !clone.mirrorPopulated() && !clone.mirrorSet(),"mirror teardown only after recording retirement and quiescence");
+    }
 }
-int main(int argc,char** argv){if(argc==2 && !std::strcmp(argv[1],"--renderpass-cohort-only")){renderPassCohorts();std::cout<<"{\"scope\":\"owned-renderpass-cohort-fake-dispatch\",\"checks\":"<<checks<<"}\n";return 0;}demand(argc==1 || argc==4,"optional private VS PS count1-probe paths");happy(false);happy(true);failures(false);failures(true);refusals();renderPassCohorts();if(argc==4)count1Profile(argv[1],argv[2],argv[3]);std::cout<<"owned cold-clone lifecycle: "<<checks<<" checks\n";}
+
+}
+int main(int argc,char** argv){if(argc==5 && !std::strcmp(argv[1],"--mirror-only")){mirrorProfile(argv[2],argv[3],argv[4]);std::cout<<"mirror clone: "<<checks<<" checks\n";return 0;}if(argc==2 && !std::strcmp(argv[1],"--renderpass-cohort-only")){renderPassCohorts();std::cout<<"{\"scope\":\"owned-renderpass-cohort-fake-dispatch\",\"checks\":"<<checks<<"}\n";return 0;}demand(argc==1 || argc==4,"optional private VS PS count1-probe paths");happy(false);happy(true);failures(false);failures(true);refusals();renderPassCohorts();if(argc==4)count1Profile(argv[1],argv[2],argv[3]);std::cout<<"owned cold-clone lifecycle: "<<checks<<" checks\n";}
