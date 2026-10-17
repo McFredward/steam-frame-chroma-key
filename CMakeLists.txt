@@ -296,6 +296,7 @@ if(BUILD_TESTING AND UNIX)
     target_compile_options(test_pixel_ssbo_tracker_bridge PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_link_libraries(test_pixel_ssbo_tracker_bridge PRIVATE Threads::Threads)
     add_test(NAME pixel_ssbo_tracker_bridge COMMAND test_pixel_ssbo_tracker_bridge ssbo)
+    add_test(NAME pixel_ssbo_restore_snapshot COMMAND test_pixel_ssbo_tracker_bridge ssbo-restore)
     add_executable(test_pixel_ssbo_receiver_bridge tests/test_pixel_ssbo_receiver_bridge.cpp
         layer/pixel_ssbo_receiver_bridge.cpp layer/pixel_ssbo_draw_transaction.cpp layer/pixel_ssbo_owned_clone.cpp)
     target_include_directories(test_pixel_ssbo_receiver_bridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
