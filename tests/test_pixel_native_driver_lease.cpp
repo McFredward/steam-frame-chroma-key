@@ -11,6 +11,11 @@
 #include <vector>
 #include <sys/mman.h>
 using namespace frame_pixel_native_driver;
+#if defined(__aarch64__)
+constexpr std::uint16_t FixtureMachine=EM_AARCH64;
+#else
+constexpr std::uint16_t FixtureMachine=EM_X86_64;
+#endif
 namespace {
 unsigned checks=0;
 void check(bool value,const char* what) {++checks;if(!value){std::cerr<<"FAILED: "<<what<<"\n";std::exit(1);}}
@@ -66,7 +71,7 @@ void ownedDso(const char* path) {
     check(begin&&next&&wrapper,"owned exports");Dl_info info{};check(dladdr(reinterpret_cast<void*>(begin),&info)!=0,"owned module base");const auto base=reinterpret_cast<std::uintptr_t>(info.dli_fbase);
     const int fd=open(path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);check(fd>=0,"owned file");struct stat st{};check(fstat(fd,&st)==0,"owned stat");std::array<std::uint8_t,32> sha{};check(hashFileRange(fd,0,st.st_size,sha),"owned hash");const auto shaText=toHex(sha.data(),sha.size()),id=buildIdOf(fd);close(fd);check(id.size()==40,"owned SHA1 build ID");
     const auto beginRva=reinterpret_cast<std::uintptr_t>(begin)-base,nextRva=reinterpret_cast<std::uintptr_t>(next)-base;
-    Profile profile{path,shaText.c_str(),id.c_str(),static_cast<std::uint64_t>(st.st_size),EM_X86_64,static_cast<std::uint32_t>(getuid()),false,{{beginRva,nextRva},{beginRva+1,nextRva+1},{beginRva+2,nextRva+2}}};
+    Profile profile{path,shaText.c_str(),id.c_str(),static_cast<std::uint64_t>(st.st_size),FixtureMachine,static_cast<std::uint32_t>(getuid()),false,{{beginRva,nextRva},{beginRva+1,nextRva+1},{beginRva+2,nextRva+2}}};
     Inputs input{reinterpret_cast<VkDevice>(0xfeed),begin,begin,next,next};
     Lease lease;check(detail::Preparation::run(lease,input,profile),"real owned file/maps/loader/RX verification");check(lease.status().state==State::Ready&&lease.status().chip==6&&lease.status().routeMask==15,"owned verifier exact metadata");
     for(unsigned i=0;i<4;++i){auto permit=lease.acquire(input.device,static_cast<Route>(i),function(input,i));check(authorizeValveSrgb(permit,i>=2),"all four owned exact routes");}
@@ -83,7 +88,7 @@ void ownedDso(const char* path) {
     Profile bad=profile;bad.bytes=MaximumFileBytes+1;reject(input,bad,Refusal::FileBounds,"oversize expected file refused");
     std::string zeros(64,'0');bad=profile;bad.sha=zeros.c_str();reject(input,bad,Refusal::FileHash,"changed bytes hash refused");
     std::string wrongId(40,'0');bad=profile;bad.buildId=wrongId.c_str();reject(input,bad,Refusal::Elf,"wrong build ID refused");
-    bad=profile;bad.machine=EM_AARCH64;reject(input,bad,Refusal::Elf,"wrong ELF architecture refused");
+    bad=profile;bad.machine=FixtureMachine==EM_AARCH64?EM_X86_64:EM_AARCH64;reject(input,bad,Refusal::Elf,"wrong ELF architecture refused");
     bad=profile;bad.owner=static_cast<std::uint32_t>(getuid()+1);reject(input,bad,Refusal::FileIdentity,"wrong owner refused");
     // Actual file metadata change is observed independently of its content hash.
     File observed;check(verifyFile(profile,observed)==Refusal::None,"observe owned file stable");struct stat prior=observed.identity;check(chmod(path,0744)==0,"mutate file mode");struct stat after{};check(fstat(observed.fd,&after)==0&&!sameStat(prior,after),"changed identity rejected");check(chmod(path,0755)==0,"restore mode");close(observed.fd);
