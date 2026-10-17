@@ -79,6 +79,11 @@ validates that saved image without a fitted map, while the
 [single-output candidate](docs/research/native-r1-presenter-20261017.md) is checked
 on owned host GPU resources. Neither component is installed as a presenter;
 actual streaming passthrough and real game coverage remain unimplemented.
+The new [synthetic format guard](docs/research/native-guarded-presenter-20261017.md)
+also passes same-recorded-command ON/OFF/ON and partial-alpha composition on owned
+GPUs, with its additional cost measured separately. The
+[creation-scoped primitive](docs/research/native-presenter-creation-20261017.md)
+prepares a simpler native integration but is not hooked or installed.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR

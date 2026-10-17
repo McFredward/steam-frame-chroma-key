@@ -295,6 +295,10 @@ if(BUILD_TESTING AND UNIX)
     target_include_directories(test_pixel_ssbo_owned_clone PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_ssbo_owned_clone PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME pixel_ssbo_owned_clone COMMAND test_pixel_ssbo_owned_clone)
+    add_executable(test_native_presenter_pipeline tests/test_native_presenter_pipeline.cpp)
+    target_include_directories(test_native_presenter_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_options(test_native_presenter_pipeline PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME native_presenter_pipeline COMMAND test_native_presenter_pipeline)
     add_executable(test_pixel_ssbo_profile_transform tests/test_pixel_ssbo_profile_transform.cpp)
     target_include_directories(test_pixel_ssbo_profile_transform PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_ssbo_profile_transform PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -445,6 +449,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_packed_output.py)
         add_test(NAME native_fragment_r1_presenter COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_r1_presenter.py)
+        add_test(NAME native_fragment_guarded_presenter COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_guarded_presenter.py)
         add_test(NAME pixel_uniform_metadata_bridge COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_metadata.py
             --fixture $<TARGET_FILE:test_pixel_uniform_metadata>)
@@ -941,6 +947,9 @@ if(BUILD_TESTING)
             add_executable(test_native_fragment_r1_presenter_gpu tests/native-fragment-r1-presenter-gpu/fixture.cpp)
             target_link_libraries(test_native_fragment_r1_presenter_gpu PRIVATE Vulkan::Vulkan)
             target_compile_options(test_native_fragment_r1_presenter_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
+            add_executable(test_native_fragment_guarded_presenter_gpu tests/native-fragment-guarded-presenter-gpu/fixture.cpp)
+            target_link_libraries(test_native_fragment_guarded_presenter_gpu PRIVATE Vulkan::Vulkan)
+            target_compile_options(test_native_fragment_guarded_presenter_gpu PRIVATE -Wall -Wextra -Wpedantic -Werror)
             add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/native_fragment_ssa_fixture.vert.spv
                 COMMAND ${GLSLC} --target-env=vulkan1.1
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/native-fragment-ssa-gpu/fixture.vert
