@@ -7,6 +7,8 @@ include(CTest)
 option(FRAME_MASK_BUILD_TRACE "Build the opt-in passive compositor diagnostic layer" OFF)
 option(FRAME_MASK_BUILD_PIXEL_SNAPSHOT
     "Build an uninstalled one-shot explicit-pattern GPU pixel diagnostic" OFF)
+option(FRAME_PIXEL_SYNTHETIC_PRESENTER
+    "Build the uninstalled explicitly opted-in synthetic-v2 output replacement" OFF)
 option(FRAME_PIXEL_UNIFORM_COMPANION
     "Require a bounded same-command native uniform companion in the uninstalled diagnostic" OFF)
 option(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
@@ -22,6 +24,12 @@ endif()
 if(FRAME_PIXEL_SSBO_TRANSACTION AND
    (NOT FRAME_MASK_BUILD_PIXEL_SNAPSHOT OR NOT FRAME_PIXEL_SSBO_DEFINITION_JOURNAL OR FRAME_PIXEL_UNIFORM_COMPANION))
     message(FATAL_ERROR "SSBO transaction requires the snapshot and definition journal, without the older uniform-copy companion")
+endif()
+if(FRAME_PIXEL_SYNTHETIC_PRESENTER)
+    if(NOT FRAME_MASK_BUILD_PIXEL_SNAPSHOT OR FRAME_PIXEL_SSBO_TRANSACTION OR FRAME_PIXEL_UNIFORM_COMPANION)
+        message(FATAL_ERROR "Synthetic output replacement requires the snapshot loader, without SSBO/uniform capture modes")
+    endif()
+    set(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL ON)
 endif()
 option(FRAME_MASK_BUILD_RECEIVER_OBSERVER
     "Build the opt-in, version-pinned receiver scalar diagnostic (not installed)" OFF)
@@ -226,6 +234,10 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
     if(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL)
         target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_SSBO_DEFINITION_JOURNAL=1)
     endif()
+    if(FRAME_PIXEL_SYNTHETIC_PRESENTER)
+        target_sources(VkLayer_frame_pixel_snapshot PRIVATE layer/native_presenter_receiver.cpp)
+        target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_SYNTHETIC_PRESENTER=1)
+    endif()
     if(FRAME_PIXEL_SSBO_TRANSACTION)
         target_sources(VkLayer_frame_pixel_snapshot PRIVATE layer/pixel_ssbo_owned_clone.cpp
             layer/pixel_ssbo_draw_transaction.cpp layer/pixel_ssbo_receiver_bridge.cpp)
@@ -299,6 +311,14 @@ if(BUILD_TESTING AND UNIX)
     target_include_directories(test_native_presenter_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_native_presenter_pipeline PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME native_presenter_pipeline COMMAND test_native_presenter_pipeline)
+    add_executable(test_native_presenter_receiver tests/test_native_presenter_receiver.cpp
+        layer/native_presenter_receiver.cpp layer/pixel_readback.cpp layer/pixel_sampler_probe.cpp
+        layer/pixel_native_driver_lease.cpp)
+    target_include_directories(test_native_presenter_receiver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
+    target_compile_definitions(test_native_presenter_receiver PRIVATE FRAME_PIXEL_SYNTHETIC_PRESENTER=1 FRAME_PIXEL_SSBO_DEFINITION_JOURNAL=1)
+    target_compile_options(test_native_presenter_receiver PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(test_native_presenter_receiver PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME native_presenter_receiver COMMAND test_native_presenter_receiver)
     add_executable(test_pixel_ssbo_profile_transform tests/test_pixel_ssbo_profile_transform.cpp)
     target_include_directories(test_pixel_ssbo_profile_transform PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_ssbo_profile_transform PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -451,6 +471,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_r1_presenter.py)
         add_test(NAME native_fragment_guarded_presenter COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_guarded_presenter.py)
+        add_test(NAME synthetic_presenter_session COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_synthetic_presenter_session.py)
+        add_test(NAME steamvr_camera_alpha COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_steamvr_camera_alpha.py)
         add_test(NAME pixel_uniform_metadata_bridge COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_metadata.py
             --fixture $<TARGET_FILE:test_pixel_uniform_metadata>)
