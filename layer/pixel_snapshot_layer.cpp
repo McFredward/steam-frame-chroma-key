@@ -603,7 +603,7 @@ void writer(Device* d) noexcept {
         "\"offending_index\":%u,\"offending_structure_type\":%u,\"offending_loader_function\":%u,"
         "\"pipeline_statistics_query_observed\":%s,\"pipeline_statistics_query_enabled\":%s,"
         "\"pipeline_statistics_query_source\":%u,\"pipeline_statistics_query_value\":%u,"
-        "\"instance_api_version\":%u,\"unreviewed_extension\":\"%s\",\"format_queries_complete\":%s,"
+        "\"instance_api_version\":%u,\"native_device\":%llu,\"unreviewed_extension\":\"%s\",\"format_queries_complete\":%s,"
         "\"format_routes\":%u,\"pool_descriptor_count\":%u,\"native_compute_queue\":%s,"
         "\"uniform_companion_enabled\":%s,\"uniform_companion_ready\":%s,"
         "\"mask_enabled\":false,\"native_frame_association_proven\":false}\n",
@@ -616,7 +616,7 @@ void writer(Device* d) noexcept {
         d->samplerEligibility.offendingStructureType,d->samplerEligibility.offendingLoaderFunction,
         d->samplerEligibility.pipelineStatisticsObserved?"true":"false",d->samplerEligibility.pipelineStatisticsEnabled?"true":"false",
         unsigned(d->samplerEligibility.pipelineStatisticsSource),d->samplerEligibility.pipelineStatisticsValue,
-        d->instanceApiVersion,d->unreviewedExtension,
+        d->instanceApiVersion,static_cast<unsigned long long>(frame_bindings::handle(d->native)),d->unreviewedExtension,
         d->samplerFormats.complete?"true":"false",d->samplerFormats.routeCount,d->samplerFormats.poolDescriptorCount,d->nativeComputeQueue?"true":"false",
         uniformCompanionEnabled()?"true":"false",uniformCompanionReady(*d)?"true":"false");
     if(preparedCount>0 && static_cast<std::size_t>(preparedCount)<sizeof(preparation))
