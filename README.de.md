@@ -1,3 +1,5 @@
+# Steam Link Native Passthrough
+
 <p align="center">
   <img src="docs/img/steam-link-icon.png" width="56" height="56" alt="Steam Link">
   &nbsp;&nbsp;
@@ -15,8 +17,6 @@
 
 > [!IMPORTANT]
 > **Unterstütztes SteamVR auf der Frame: 2.18.2 · Build 1791331621**
-
-# Steam Link Native Passthrough
 
 **Für Steam Frame.** Hole unterstützte PC-VR-Spiele über Steam Link in dein Zimmer.
 

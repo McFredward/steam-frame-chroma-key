@@ -55,6 +55,30 @@ current network address in the Frame's settings. Valve's
 [developer setup](https://partner.steamgames.com/doc/steamhardware/steamframe/setup)
 describes device access; menu locations can change with SteamOS updates.
 
+### Keep SSH enabled after a restart
+
+In the Frame's **Desktop Mode**, open a terminal and run:
+
+```bash
+sudo systemctl enable --now sshd.service
+```
+
+Enter the user password you set in the Frame's Developer settings when prompted.
+This starts SSH now and enables it for future boots; no separate autostart script
+is needed. Keep Developer Mode enabled.
+
+Check the service, including after restarting the Frame:
+
+```bash
+systemctl is-enabled sshd.service
+systemctl is-active sshd.service
+```
+
+The results should be `enabled` and `active`. Use the Frame's current Wi-Fi
+address when connecting; it can change after a restart.
+
+### Connect and install
+
 1. Save your game and stop the PC VR stream. Open PowerShell or a terminal on
    the PC and connect:
 
