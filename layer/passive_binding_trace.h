@@ -43,6 +43,14 @@ inline bool same(Identity a, Identity b) noexcept {
     return a.handle == b.handle && a.generation == b.generation && a.generation != 0;
 }
 
+// Bounded live CPU restore facts, not command/lifetime authority. Only the
+// full live tracker can place these in the private same-callback target ticket.
+struct Set0RestoreSnapshot {
+    Identity command{},layout{},set{},setLayout{};
+    std::uint64_t bindingRevision=0,setRevision=0;
+    std::array<std::uint32_t,BindingCapacity> offsets{};
+    std::uint32_t count=0;
+};
 enum class Presence : std::uint8_t { Unknown, Absent, Present };
 enum class BindingState : std::uint8_t { Unknown, Absent, Unwritten, Written };
 enum class Reason : std::uint8_t { None, Capacity, Contention, Unknown, Unsupported, Stale, Bounds, LayoutMismatch };
@@ -1097,6 +1105,27 @@ public:
         const auto* set = find(sets_, device, handle(selected));
         if (!pool || !pool->complete || !set || !set->complete) return false;
         contains = same(pool->id, set->pool); return true;
+    }
+    // Read every dynamic offset from the actual original bind, including
+    // bindings outside the sampled source snapshot. Do not infer absence of
+    // higher sets from this Core's conservative layout-change clearing policy.
+    bool set0Restore(const Snapshot& previous,Set0RestoreSnapshot& out) noexcept {
+        out={};auto lock=acquire();if(!lock.owns_lock()||lostState()||!previous.sourceComplete)return false;
+        const auto current=snapshotLocked(previous.device,previous.command.handle,previous.pipelineLayout.handle);
+        if(!current.sourceComplete||!same(previous.command,current.command)||!same(previous.pipelineLayout,current.pipelineLayout)||
+           !same(previous.set,current.set)||!same(previous.setLayout,current.setLayout)||
+           previous.setRevision!=current.setRevision||previous.commandBindingRevision!=current.commandBindingRevision)return false;
+        const auto* command=find(commands_,previous.device,previous.command.handle);
+        const auto* layout=find(pipelineLayouts_,previous.device,previous.pipelineLayout.handle);
+        const auto* setLayout=layout&&layout->count==1?lookup(layouts_,previous.device,layout->sets[0]):nullptr;
+        if(!command||!layout||!setLayout||!command->complete||!layout->complete||!setLayout->complete||!command->sets[0].complete)return false;
+        Set0RestoreSnapshot result;result.command=command->id;result.layout=layout->id;result.set=command->sets[0].set;result.setLayout=setLayout->id;
+        result.bindingRevision=command->bindingRevision;result.setRevision=current.setRevision;
+        for(std::uint32_t i=0;i<setLayout->count;++i)if(dynamic(setLayout->bindings[i].type)){
+            if(setLayout->bindings[i].count!=1||result.count>=result.offsets.size())return false;
+            result.offsets[result.count++]=command->sets[0].offsets[i];
+        }
+        if(lostState())return false;out=result;return true;
     }
     // Original creation-time prefix identity for the optional SSBO observer.
     // A later equal raw layout handle is not the prefix baked into a pipeline.

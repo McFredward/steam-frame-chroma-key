@@ -39,12 +39,18 @@ public:
     ~Clone()=default; // Explicit release with the required lifetime proof.
     Result prepare(const Preparation&) noexcept;
     Result release(ReleaseProof={}) noexcept;
+    // Checked compatible one-set profile only. Populate the privately owned
+    // mirror once, before its first bind. No original descriptor is modified.
+    bool compatibleSet0Mirror() const noexcept;
+    Result populateMirror(VkDescriptorSet originalSet0) noexcept;
+    VkDescriptorSet mirrorSet() const noexcept{return ready_&&compatibleSet0Mirror()?set_:VK_NULL_HANDLE;}
+    bool mirrorPopulated() const noexcept{return ready_&&mirrorPopulated_;}
     bool markReferenced() noexcept {if(!ready_)return false;referenced_=true;return true;}
     bool ready() const noexcept{return ready_;}
     bool referenced() const noexcept{return referenced_;}
     VkPipeline pipeline() const noexcept{return ready_?pipeline_:VK_NULL_HANDLE;}
     VkPipelineLayout layout() const noexcept{return ready_?layout_:VK_NULL_HANDLE;}
-    VkDescriptorSet set1() const noexcept{return ready_?set_:VK_NULL_HANDLE;}
+    VkDescriptorSet set1() const noexcept{return ready_&&!compatibleSet0Mirror()?set_:VK_NULL_HANDLE;}
     VkBuffer recordBuffer() const noexcept{return ready_?buffer_:VK_NULL_HANDLE;}
     const void* mappedRecord() const noexcept{return ready_?mapped_:nullptr;}
     bool hostCoherent() const noexcept{return ready_ && coherent_;}
@@ -82,6 +88,6 @@ private:
     VkDeviceMemory memory_=VK_NULL_HANDLE;
     void* mapped_=nullptr;
     VkDeviceSize allocationBytes_=0;
-    bool ready_=false,referenced_=false,coherent_=false;
+    bool ready_=false,referenced_=false,coherent_=false,mirrorPopulated_=false;
 };
 } // namespace frame_pixel_ssbo_owned

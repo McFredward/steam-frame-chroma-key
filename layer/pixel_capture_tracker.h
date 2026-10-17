@@ -278,6 +278,8 @@ public:
                 !frame_bindings::same(state.setLayout, pipeline->ssboCreationSet0) ||
                 state.setLayout.handle != recipe.provenance[0].value || !source || !eligible(*source) ||
                 !bindings_.validateBindingResources(*source) || !coreHealthy()) return false;
+            frame_bindings::Set0RestoreSnapshot restore;
+            if(!bindings_.set0Restore(state,restore)||!coreHealthy())return false;
             const auto identity = [nativeId](Identity id) noexcept {
                 return frame_pixel_ssbo_clone::Identity{nativeId, id.handle, id.generation};
             };
@@ -287,6 +289,7 @@ public:
             out.ordinal_ = command->drawOrdinal; out.pipeline_ = recipe.provenance[5];
             out.subpass_ = command->ssboSubpass;
             out.layout_ = recipe.provenance[1]; out.set0_ = identity(state.set);
+            out.restoreLayout_=identity(restore.layout);out.restoreCount_=restore.count;out.restoreOffsets_=restore.offsets;
             out.source_.image = identity(source->image.identity);
             out.source_.view = identity(source->view.identity);
             out.source_.memory = identity(source->image.memory);

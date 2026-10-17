@@ -122,7 +122,9 @@ public:
         std::uint64_t device_=0,commandGeneration_=0,poolGeneration_=0,ordinal_=0;
         std::uint32_t subpass_=0;
         VkCommandBuffer command_=VK_NULL_HANDLE;VkCommandPool pool_=VK_NULL_HANDLE;
-        Id pipeline_{},layout_{},set0_{};Cohort source_{};
+        Id pipeline_{},layout_{},set0_{},restoreLayout_{};Cohort source_{};
+        std::array<std::uint32_t,frame_pixel_ssbo_clone::MaxBindings> restoreOffsets_{};
+        std::uint32_t restoreCount_=0;
     public: TargetTicket() noexcept=default;
     };
     // Tokens are minted BEFORE the original API call. Their private contents
