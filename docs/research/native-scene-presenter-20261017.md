@@ -48,3 +48,24 @@ mutants fail their intended numerical oracle on both drivers. Every module
 passes `spirv-val --target-env vulkan1.1`; active Khronos/sync validation reports
 zero errors. No old suite or headset run was repeated. Small source/results,
 including the first strict-compile failure, are retained privately.
+
+The new fixture also passes its complete146-case Intel path under ASan/UBSan
+and leak detection with validation enabled; its standalone ARM64 compilation
+passes strict warnings. Eight new generator tests check exact profile admission,
+original-prefix/descriptor preservation, clamp and tile SSA arithmetic, inclusive
+windows, contribution/alpha separation, exact OFF, and CLI validation before
+exclusive publication. This is additional new-fixture evidence, not a repeated
+whole-project gate.
+
+The existing internal session tool has a new explicit
+`--profile scene-contribution-atlas-v1` selector. It freezes a fixed descriptor
+before its first operation/write, verifies the separately marked read-only
+library and exact scene candidate, reserves a distinct receipt before staging,
+and writes `scene-presenter.enable` last. Scene and historical synthetic markers,
+modules, consumed markers and receipts cannot be mixed or adopted across profiles.
+Rollback consumes the group, removes only the exact owned enable marker, and
+retains a loaded library until a separate manual process restart/unload. A failed
+foreign-file scan cannot skip the owned rollback. No automatic restart, timer,
+capture arm, network access or device approval is added. Fourteen new scene-session
+tests and the existing20-session-test suite pass; after a final narrow rollback
+hardening only three affected historical checks were repeated.
