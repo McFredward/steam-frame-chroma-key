@@ -1,0 +1,103 @@
+{
+  "canvas": [
+    2112,
+    2752
+  ],
+  "coordinates": "top-down source texel centers; current original R1 chart",
+  "coverage": {
+    "data_origins": [
+      [
+        16,
+        48
+      ],
+      [
+        1072,
+        48
+      ],
+      [
+        16,
+        2448
+      ],
+      [
+        1072,
+        2448
+      ]
+    ],
+    "downsample": "average four scene-grid samples before global bilinear reconstruction",
+    "global_halo_continuation": true,
+    "halo": 16,
+    "numeric_component": "G",
+    "outer_origins": [
+      [
+        0,
+        32
+      ],
+      [
+        1056,
+        32
+      ],
+      [
+        0,
+        2432
+      ],
+      [
+        1056,
+        2432
+      ]
+    ],
+    "outer_size": [
+      1056,
+      288
+    ],
+    "size": [
+      1024,
+      1024
+    ],
+    "tile_rows": 256
+  },
+  "guard": {
+    "code_tolerance": 2,
+    "codes": [
+      111,
+      208,
+      128,
+      104,
+      227,
+      251,
+      255,
+      193,
+      102,
+      168,
+      15,
+      90
+    ],
+    "count": 12,
+    "meaning": "format recognition only; not body authentication, provenance or liveness",
+    "origin": [
+      64,
+      2400
+    ],
+    "signature_preimage": "GloomhavenVR/SteamLink/scene-contribution-atlas-v1\n{\"canvas\":[2112,2752],\"coordinates\":\"top-down source texel centers; current original R1 chart\",\"coverage\":{\"data_origins\":[[16,48],[1072,48],[16,2448],[1072,2448]],\"downsample\":\"average four scene-grid samples before global bilinear reconstruction\",\"global_halo_continuation\":true,\"halo\":16,\"numeric_component\":\"G\",\"outer_origins\":[[0,32],[1056,32],[0,2432],[1056,2432]],\"outer_size\":[1056,288],\"size\":[1024,1024],\"tile_rows\":256},\"guard\":{\"code_tolerance\":2,\"count\":12,\"meaning\":\"format recognition only; not body authentication, provenance or liveness\",\"origin\":[64,2400],\"size\":[32,32],\"stride\":[160,0]},\"output\":\"RGB contribution times original aperture/tint; A clamp(raw-G,0,1) times original aperture\",\"profile\":\"scene-contribution-atlas-v1\",\"revision\":1,\"rgb_convention\":\"scene contribution; preserve additive RGB at coverage zero; never multiply by coverage again\",\"scene\":[32,352,2048,2048],\"schema\":\"ghvr-steamlink-scene-atlas-v1\",\"source_transfer\":\"initial production scope: Gamma working space, SDR UNorm eye source, no atlas sRGB conversion; retain ordinary native RGB reconstruction\"}\n",
+    "signature_sha256": "6fd08068e3fbffc166a80f5a1044d4c8135b37087441aac85f6223c121fccc5e",
+    "size": [
+      32,
+      32
+    ],
+    "stride": [
+      160,
+      0
+    ]
+  },
+  "output": "RGB contribution times original aperture/tint; A clamp(raw-G,0,1) times original aperture",
+  "profile": "scene-contribution-atlas-v1",
+  "revision": 1,
+  "rgb_convention": "scene contribution; preserve additive RGB at coverage zero; never multiply by coverage again",
+  "scene": [
+    32,
+    352,
+    2048,
+    2048
+  ],
+  "schema": "ghvr-steamlink-scene-atlas-v1",
+  "source_transfer": "initial production scope: Gamma working space, SDR UNorm eye source, no atlas sRGB conversion; retain ordinary native RGB reconstruction"
+}
