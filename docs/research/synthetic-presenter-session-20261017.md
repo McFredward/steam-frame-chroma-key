@@ -77,3 +77,11 @@ private candidate also passes the unchanged production18416-byte hard pin.
 No existing base-helper suite, Vulkan/GPU load, or Frame operation was repeated.
 Private logs, source pins and cleanup receipts remain in
 `build/private-native-presenter-session-worker-20261017/`.
+
+
+The same bounded receiver status also reports `graphics_gate` from the finite
+set none/contract/blend/dynamic/color_write/attachment/format/multisample/stages,
+plus uint32 `attachment_format` and `unsupported_dynamic` (default2147483647).
+These identify a cold graphics refusal; they do not alter admission, whitelist
+or native authority. The Python reader refuses missing/unknown gates and
+non-uint32 scalars without inferring a coherent frame from diagnostic atomics.

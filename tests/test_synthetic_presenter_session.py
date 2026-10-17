@@ -58,7 +58,8 @@ class SyntheticSessionTests(unittest.TestCase):
         value = {'schema': 'frame-synthetic-presenter-receiver-v1', 'mode': 'synthetic_format_guarded_presenter',
             'capture_id': NONCE, 'source_ready': True, 'source_reason': 'ready', 'candidate_sha256': mod.CANDIDATE_SHA256,
             'candidate_bytes': mod.CANDIDATE_BYTES, 'observed_device': 123, 'observed_api': 4198400, 'active_devices': 1, 'pipeline_attempts': 6, 'pipeline_replacements': 2,
-            'last_primitive_reason': 'none', 'definition_history_failed': False, 'revision': 1, 'updates': 1,
+            'last_primitive_reason': 'none', 'graphics_gate': 'none', 'attachment_format': 0,
+            'unsupported_dynamic': 2147483647, 'definition_history_failed': False, 'revision': 1, 'updates': 1,
             'budget_exhausted': False, 'diagnostic_atomics_not_source_cohort': True, 'native_frame_association_proven': False, 'passthrough_authorized': False}
         value.update(overrides); return value
 
@@ -206,6 +207,30 @@ class SyntheticSessionTests(unittest.TestCase):
         self.write(self.session.receiver_status, b' ' * (mod.MAX_RECEIVER_STATUS + 1))
         self.assertFalse(self.session.status()['integrity_valid'])
 
+    def test_graphics_gate_diagnostics_are_bounded_and_not_authority(self):
+        self.prepare()
+        for gate in ('none', 'contract', 'blend', 'dynamic', 'color_write', 'attachment', 'format', 'multisample', 'stages'):
+            value = self.status_value(graphics_gate=gate, attachment_format=37, unsupported_dynamic=2147483647)
+            self.write(self.session.receiver_status, mod.base.encoded(value))
+            result = self.session.status()
+            self.assertTrue(result['integrity_valid'])
+            self.assertFalse(result['native_frame_association_proven'])
+            self.assertFalse(result['passthrough_authorized'])
+            self.assertEqual(result['receiver_status']['value']['graphics_gate'], gate)
+        for key in ('attachment_format', 'unsupported_dynamic'):
+            for accepted in (0, 2147483647, 4294967295):
+                self.write(self.session.receiver_status, mod.base.encoded(self.status_value(**{key: accepted})))
+                self.assertTrue(self.session.status()['integrity_valid'])
+            for rejected in (-1, True, 4294967296, '37', None):
+                self.write(self.session.receiver_status, mod.base.encoded(self.status_value(**{key: rejected})))
+                self.assertFalse(self.session.status()['integrity_valid'])
+        for gate in ('imagined', 0, None, []):
+            self.write(self.session.receiver_status, mod.base.encoded(self.status_value(graphics_gate=gate)))
+            self.assertFalse(self.session.status()['integrity_valid'])
+        value = self.status_value(); del value['graphics_gate']
+        self.write(self.session.receiver_status, mod.base.encoded(value))
+        self.assertFalse(self.session.status()['integrity_valid'])
+
     def test_status_refuses_conflicting_capture_arm_and_uncertain_process_scan(self):
         self.prepare()
         self.write(self.session.base.arm_file, mod.base.ARM_MAGIC)
@@ -265,7 +290,9 @@ def verify_actual_producer(path):
                 self.assertEqual(session._receiver(value['capture_id'])['state'], 'bounded_diagnostic_only')
                 for changed in ({'capture_id': 'f' * 32}, {'candidate_sha256': '0' * 64},
                                 {'observed_api': True}, {'diagnostic_atomics_not_source_cohort': False},
-                                {'passthrough_authorized': True}, {'source_reason': 'not_a_real_reason'}):
+                                {'passthrough_authorized': True}, {'source_reason': 'not_a_real_reason'},
+                                {'graphics_gate': 'imagined'}, {'attachment_format': True},
+                                {'unsupported_dynamic': 4294967296}):
                     bad = dict(value); bad.update(changed)
                     session.receiver_status.write_bytes(mod.base.encoded(bad))
                     self.assertEqual(session._receiver(value['capture_id'])['state'], 'invalid_preserved')

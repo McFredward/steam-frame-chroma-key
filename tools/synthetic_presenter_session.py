@@ -35,9 +35,11 @@ MAX_RECEIVER_STATUS = 1024
 SOURCE_REASONS = {'disabled', 'directory', 'marker', 'module', 'pin', 'ready'}
 PRIMITIVE_REASONS = {'none', 'artifact', 'api_version', 'original', 'identity', 'interface', 'graphics', 'dispatch',
     'native_creation', 'shader_creation', 'pipeline_creation', 'unexpected_handle'}
+GRAPHICS_GATES = {'none', 'contract', 'blend', 'dynamic', 'color_write', 'attachment', 'format', 'multisample', 'stages'}
 RECEIVER_FIELDS = {'schema', 'mode', 'capture_id', 'source_ready', 'source_reason', 'candidate_sha256', 'candidate_bytes',
     'observed_device', 'observed_api', 'active_devices', 'pipeline_attempts', 'pipeline_replacements', 'last_primitive_reason',
     'definition_history_failed', 'revision', 'updates', 'budget_exhausted', 'diagnostic_atomics_not_source_cohort',
+    'graphics_gate', 'attachment_format', 'unsupported_dynamic',
     'native_frame_association_proven', 'passthrough_authorized'}
 
 
@@ -212,6 +214,11 @@ class Session:
                     or result['source_ready'] != (result['source_reason'] == 'ready') or result['updates'] > 32
                     or result['active_devices'] > 0xffffffff or result['observed_api'] > 0xffffffff):
                 raise SafetyError('receiver status reason/budget/API shape invalid')
+            if type(result.get('graphics_gate')) is not str or result['graphics_gate'] not in GRAPHICS_GATES:
+                raise SafetyError('receiver graphics gate name invalid')
+            for key in ('attachment_format', 'unsupported_dynamic'):
+                if type(result.get(key)) is not int or not 0 <= result[key] <= 0xffffffff:
+                    raise SafetyError('receiver graphics diagnostic uint32 invalid')
             if result.get('candidate_sha256') != CANDIDATE_SHA256 or result['candidate_bytes'] != CANDIDATE_BYTES:
                 raise SafetyError('receiver status candidate pin mismatch')
             return {'state': 'bounded_diagnostic_only', 'value': result}
