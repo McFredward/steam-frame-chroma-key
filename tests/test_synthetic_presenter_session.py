@@ -112,6 +112,10 @@ class SyntheticSessionTests(unittest.TestCase):
                 self.write(self.library, raw)
                 with self.assertRaises(mod.SafetyError): self.session.prepare(self.library, mod.base.digest(raw), self.candidate, capture_id=NONCE)
                 self.assertFalse(self.session.receipt.exists())
+        overflow = bytearray(elf()); struct.pack_into('<Q', overflow, 80, 0xfffffffffffffff0)
+        self.write(self.library, overflow)
+        with self.assertRaises(mod.SafetyError): self.session.prepare(self.library, mod.base.digest(overflow), self.candidate)
+        self.assertFalse(self.session.receipt.exists())
         self.write(self.library, elf())
         with self.assertRaises(mod.SafetyError): self.session.prepare(self.library, '0' * 64, self.candidate)
 

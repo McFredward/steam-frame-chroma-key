@@ -58,7 +58,8 @@ def verify_mode(raw):
         kind, flags, start, rva, _, length, _, _ = struct.unpack_from('<IIQQQQQQ', raw, phoff + index * phsize)
         if kind == 1 and start <= offset and offset + len(BUILD_MARKER) <= start + length:
             spans.append((flags, rva + offset - start))
-    if len(spans) != 1 or spans[0][0] not in (4, 5):
+    if (len(spans) != 1 or spans[0][0] not in (4, 5)
+            or not 0 <= spans[0][1] <= 0xffffffffffffffff - len(BUILD_MARKER)):
         raise SafetyError('functional build marker must occupy one read-only file-backed load segment')
     return {'literal': BUILD_MARKER[:-1].decode(), 'rva': spans[0][1], 'bytes': len(BUILD_MARKER)}
 
