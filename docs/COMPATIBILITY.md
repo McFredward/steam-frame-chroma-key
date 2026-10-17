@@ -35,7 +35,8 @@ compositor process. They do **not** establish a newly tested persistent
 installation, every future SteamVR update, every game material or a measured
 end-to-end latency. The persistent installer has a separate software-validation
 scope. See the dated [real-game result](research/real-game-visible-run-20261017.md)
-for the retained observation and its limits.
+for the retained observation and its limits, and the separate
+[persistent-setup validation](research/persistent-user-setup-20261017.md).
 
 ## Picture and performance limits
 

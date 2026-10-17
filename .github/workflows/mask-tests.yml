@@ -1,10 +1,10 @@
-name: Explicit mask checks
+name: Native passthrough checks
 on:
   push:
     branches: [dev]
-    paths-ignore: ['**/*.md', 'docs/**']
+    paths-ignore: ['**/*.md']
   pull_request:
-    paths-ignore: ['**/*.md', 'docs/**']
+    paths-ignore: ['**/*.md']
   workflow_dispatch:
 
 permissions:
@@ -40,6 +40,11 @@ jobs:
         run: |
           cmake -S . -B build/presenter -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=OFF -DFRAME_MASK_BUILD_PIXEL_SNAPSHOT=ON -DFRAME_PIXEL_SYNTHETIC_PRESENTER=ON
           cmake --build build/presenter --target VkLayer_frame_pixel_snapshot --parallel 2
+      - name: Compile installed scene receiver and check user setup
+        run: |
+          cmake -S . -B build/release-receiver -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=OFF -DFRAME_MASK_BUILD_PIXEL_SNAPSHOT=ON -DFRAME_PIXEL_SYNTHETIC_PRESENTER=ON -DFRAME_PIXEL_RELEASE_RECEIVER=ON
+          cmake --build build/release-receiver --target VkLayer_frame_pixel_snapshot --parallel 2
+          python3 -B tests/test_native_passthrough_setup.py
       - name: Windows sender cross-build
         run: x86_64-w64-mingw32-g++-win32 -std=c++17 -O2 -Wall -Wextra -Werror -static-libgcc -static-libstdc++ -I. tools/mask_endpoint.cpp mask/mask_protocol.cpp -lws2_32 -o build/mask_endpoint.exe
       - name: Protocol memory and undefined-behavior checks

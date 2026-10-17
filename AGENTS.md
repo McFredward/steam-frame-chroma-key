@@ -1,7 +1,9 @@
-# Working on the explicit-mask fork
+# Working on Steam Frame Native Passthrough
 
-- Integrate on `dev`; preserve `main` as the upstream baseline. Worker branches
-  stay local. Use separate worktrees and disjoint file ownership.
+- Integrate on `dev`; publish the validated final development state to `main`
+  when requested. The maintainer explicitly authorized that publication on
+  2026-10-17. Keep upstream history and attribution; worker branches stay local.
+  Use separate worktrees and disjoint file ownership.
 - Commit as `McFredward <frederik@lissek.info>`. Speak German to the maintainer;
   source, comments and developer documentation are English.
 - The intended input is real per-eye scene coverage, independent of scene RGB.
@@ -14,7 +16,9 @@
 - Do not redistribute Valve binaries, shader source or disassemblies. Diagnostic
   captures go into ignored `build/` or a private output directory.
 - Run focused tests for bounded changes; report software evidence separately from
-  a headset test. Never describe this foundation as working Steam Link passthrough.
+  a headset test. The maintainer confirmed real GloomhavenVR native passthrough
+  with Build686 on 2026-10-17. That temporary-process hardware result does not
+  establish persistent-installation, update safety or arbitrary-game support.
 - Keep allocations, queued frames, reassembly and logging bounded. No file I/O,
   socket waits or shader compilation on a compositor rendering thread.
 - Clean completed temporary test artifacts after every run (maintainer request,
