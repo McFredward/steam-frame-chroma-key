@@ -140,6 +140,14 @@ class NativeR1Tests(unittest.TestCase):
             raw, sampled, meta, record = self.case; meta = copy.deepcopy(meta); meta["native_ssbo_control"]["source_cohort"][key] = value
             with self.subTest(key=key), self.assertRaises(probe.ProbeError): native.discover(raw, sampled, meta, record)
 
+    def test_unknown_source_layout_refuses(self):
+        for value in (1, 1234, True):
+            raw, sampled, meta, record = self.case
+            meta = copy.deepcopy(meta)
+            meta["native_ssbo_control"]["source_cohort"]["layout"] = value
+            with self.subTest(value=value), self.assertRaises(probe.ProbeError):
+                native.discover(raw, sampled, meta, record)
+
     def test_bytes_and_metadata_changed_after_discovery_refuse(self):
         raw, sampled, meta, record = self.case
         with self.assertRaises(probe.ProbeError): native.discover(raw[:-2], sampled, meta, record)

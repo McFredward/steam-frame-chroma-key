@@ -55,6 +55,7 @@ def _invocation(metadata, record):
     require(type(cohort) is dict, "exact source cohort required")
     for key in ("device", "image", "view", "memory", "image_generation", "view_generation", "memory_generation", "layout"):
         require(recovery.uint(cohort.get(key), key) > 0, "positive source-cohort identity required")
+    require(cohort["layout"] == 5, "source cohort requires the captured SHADER_READ_ONLY_OPTIMAL layout")
     width, height, _ = paired.paired_extent(metadata)
     require(type(cohort.get("extent")) is list and len(cohort["extent"]) == 2
             and all(type(x) is int for x in cohort["extent"]) and cohort["extent"] == [width, height]
