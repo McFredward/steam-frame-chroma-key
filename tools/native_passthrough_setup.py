@@ -351,8 +351,9 @@ class Setup:
     def _collision(self):
         old = self.home / '.local/share/GloomhavenVR/SteamLinkMaskProbe/session.conf'
         old_manifest = self.manifest.with_name('VkLayer_GHVR_pixel_snapshot.json')
-        if exists(old) or exists(old_manifest):
-            raise SafetyError('Existing temporary GloomhavenVR experiment preserved. Roll it back with its original operator/receipt (including camera baseline), then install again; no automatic migration.')
+        legacy_manifest = self.manifest.with_name('mrchroma.json')
+        if exists(old) or exists(old_manifest) or exists(legacy_manifest):
+            raise SafetyError('Existing temporary GloomhavenVR experiment or legacy mrchroma layer preserved. Roll it back with its original operator/receipt (including camera baseline), then install again; no automatic migration.')
         if not exists(self.receipt) and exists(self.manifest):
             raise SafetyError('Unowned native passthrough manifest preserved')
 

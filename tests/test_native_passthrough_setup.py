@@ -494,6 +494,22 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertFalse(self.setup.target.exists())
 
+    def test_legacy_chroma_manifest_refused_but_disabled_library_backup_preserved(self):
+        legacy = self.setup.manifest.with_name('mrchroma.json')
+        os.close(s.directory(legacy.parent, create=True))
+        legacy.write_bytes(b'FOREIGN LEGACY MANIFEST')
+        backup = self.home / '.local/share/mrchroma/libVkLayer_mrchroma.so'
+        os.close(s.directory(backup.parent, create=True))
+        backup.write_bytes(b'DISABLED BACKUP')
+        with self.assertRaisesRegex(s.SafetyError, 'legacy mrchroma'):
+            self.install()
+        self.assertEqual(legacy.read_bytes(), b'FOREIGN LEGACY MANIFEST')
+        self.assertEqual(backup.read_bytes(), b'DISABLED BACKUP')
+        self.assertFalse(self.setup.receipt.exists())
+        legacy.unlink()  # Explicit fixture removal, never a production migration.
+        self.assertEqual(self.install()['reason'], 'installed')
+        self.assertEqual(backup.read_bytes(), b'DISABLED BACKUP')
+
     def test_cli_no_install_and_no_implicit_restart(self):
         result = subprocess.run([sys.executable, '-B', str(ROOT / 'tools/native_passthrough_setup.py'), 'status', '--home', str(self.home)], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
