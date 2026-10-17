@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('owned_setup', ROOT / 'tools/native_passthrough_setup.py')
@@ -55,6 +56,9 @@ class System:
 
 class SetupTests(unittest.TestCase):
     def setUp(self):
+        environment = mock.patch.dict(os.environ, {'VR_CONFIG_PATH': '', 'VR_PATHREG_OVERRIDE': '', 'XDG_CONFIG_HOME': ''})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory(prefix='sfnp-setup-owned-')
         self.root = Path(self.temp.name)
         self.home = self.root / 'home'
@@ -86,10 +90,16 @@ class SetupTests(unittest.TestCase):
                     raise s.SafetyError('artifact hash mismatch')
             return manifest
         self.setup = s.Setup(self.home, system=self.unit, verifier=verify, runtime_factory=lambda: {'openvr': self.root / 'pinned'}, runtime_dir=self.runtime)
-        self.settings = self.home / '.local/share/Steam/config/steamvr.vrsettings'
+        self.settings = self.home / '.config/openvr/config/steamvr.vrsettings'
         os.close(s.directory(self.settings.parent, create=True))
         self.unit.settings = self.settings
         s.put(self.settings, s.encoded({'unrelated': {'keep': 42}, 'camera': {'other': 'keep'}}))
+        self.secondary_settings = self.home / '.local/share/Steam/config/steamvr.vrsettings'
+        os.close(s.directory(self.secondary_settings.parent, create=True))
+        s.put(self.secondary_settings, s.encoded({'second_root_untouched': True, 'camera': {s.KEY: False}}))
+        self.registry = self.home / '.config/openvr/openvrpaths.vrpath'
+        s.put(self.registry, s.encoded({'config': [str(self.settings.parent), str(self.secondary_settings.parent)], 'runtime': ['/opt/steamvr']}))
+        self.registry.chmod(0o755)
         os.close(s.directory(self.setup.config, create=True, private=True))
 
     def tearDown(self):
@@ -532,7 +542,7 @@ class SetupTests(unittest.TestCase):
     def test_steam_mode666_complete_prepare_finish_with_registered0755_path(self):
         registry = self.home / '.config/openvr/openvrpaths.vrpath'
         os.close(s.directory(registry.parent, create=True))
-        s.put(registry, s.encoded({'config': [str(self.settings.parent)]}))
+        s.put(registry, s.encoded({'config': [str(self.settings.parent)]}), s.read(registry))
         registry.chmod(0o755)
         self.settings.chmod(0o666)
         self.install()
@@ -681,6 +691,83 @@ class SetupTests(unittest.TestCase):
         child = subprocess.run([binary, 'verify', '--man=no', '--generators=no', str(unit)], capture_output=True, text=True, timeout=20)
         self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
         self.assertIn('ExecCondition=-/usr/bin/python3', unit.read_text())
+
+    def test_actual_frame_two_config_history_selects_first_and_never_touches_second(self):
+        self.settings.chmod(0o666)
+        self.secondary_settings.chmod(0o666)
+        second = self.secondary_settings.read_bytes()
+        self.assertEqual(s.load(self.registry)['config'], [str(self.home / '.config/openvr/config'), str(self.home / '.local/share/Steam/config')])
+        self.assertEqual(self.setup._settings(), self.settings)
+        self.install()
+        self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+        self.assertEqual(self.setup.finish()['reason'], 'stopped')
+        self.assertNotIn(s.KEY, s.json_bytes(self.settings.read_bytes())['camera'])
+        self.assertEqual(self.secondary_settings.read_bytes(), second)
+        self.assertEqual(self.secondary_settings.stat().st_mode & 0o777, 0o666)
+
+    def test_first_history_missing_data_does_not_fall_back_to_second(self):
+        second = self.secondary_settings.read_bytes()
+        self.settings.unlink()
+        self.assertEqual(self.setup._settings(), self.settings)
+        with self.assertRaises(FileNotFoundError):
+            self.setup._camera_state()
+        self.assertEqual(self.secondary_settings.read_bytes(), second)
+        self.assertFalse(self.setup.camera_receipt.exists())
+
+    def test_config_environment_has_exact_nonempty_priority(self):
+        alternate = self.root / 'owned-config'
+        alternate.mkdir(mode=0o700)
+        target = alternate / 'steamvr.vrsettings'
+        s.put(target, s.encoded({'camera': {'other': 'alternate'}}))
+        target.chmod(0o666)
+        first, second = self.settings.read_bytes(), self.secondary_settings.read_bytes()
+        with mock.patch.dict(os.environ, {'VR_CONFIG_PATH': str(alternate)}):
+            self.assertEqual(self.setup._settings(), target)
+            self.setup._camera(True)
+            self.assertTrue(s.json_bytes(target.read_bytes())['camera'][s.KEY])
+            self.assertTrue(self.setup._camera(False)['restored'])
+        self.assertEqual(self.setup._settings(), self.settings)  # Empty env is ignored, not trimmed/guessed.
+        self.assertEqual(self.settings.read_bytes(), first)
+        self.assertEqual(self.secondary_settings.read_bytes(), second)
+
+    def test_registry_environment_selection_matches_public_openvr_priority(self):
+        alternate = self.root / 'alternate-config'
+        alternate.mkdir(mode=0o700)
+        registry = self.root / 'registered.vrpath'
+        s.put(registry, s.encoded({'config': [str(alternate), str(self.settings.parent)]}))
+        xdg = self.root / 'xdg'
+        os.close(s.directory(xdg / 'openvr', create=True))
+        s.put(xdg / 'openvr/openvrpaths.vrpath', s.encoded({'config': [str(self.settings.parent)]}))
+        with mock.patch.dict(os.environ, {'VR_PATHREG_OVERRIDE': str(registry), 'XDG_CONFIG_HOME': str(xdg)}):
+            self.assertEqual(self.setup._settings(), alternate / 'steamvr.vrsettings')
+        with mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': str(xdg)}):
+            self.assertEqual(self.setup._settings(), self.settings)
+        with mock.patch.dict(os.environ, {'VR_PATHREG_OVERRIDE': 'relative.vrpath'}):
+            with self.assertRaises(s.SafetyError):
+                self.setup._settings()
+
+    def test_missing_malformed_and_foreign_registered_targets_refuse(self):
+        original = s.read(self.registry)
+        for configs in (None, [], '', [None], [''], ['relative'], ['/tmp/../escape'], [str(self.settings.parent)] * 33):
+            with self.subTest(configs=configs):
+                s.put(self.registry, s.encoded({'config': configs}), s.read(self.registry))
+                with self.assertRaises((s.SafetyError, OSError)):
+                    self.setup._settings()
+        s.put(self.registry, original, s.read(self.registry))
+        self.registry.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.setup._settings()  # Never guess the still-existing second Steam config.
+        s.put(self.registry, original)
+        self.settings.parent.chmod(0o777)
+        with self.assertRaises(s.SafetyError):
+            self.setup._settings()
+        self.settings.parent.chmod(0o700)
+        link = self.root / 'foreign-config-link'
+        link.symlink_to(self.settings.parent)
+        s.put(self.registry, s.encoded({'config': [str(link)]}), s.read(self.registry))
+        with self.assertRaises(OSError):
+            self.setup._settings()
+        self.assertFalse(self.setup.camera_receipt.exists())
 
     def test_cli_no_install_and_no_implicit_restart(self):
         result = subprocess.run([sys.executable, '-B', str(ROOT / 'tools/native_passthrough_setup.py'), 'status', '--home', str(self.home)], capture_output=True, text=True, timeout=10)

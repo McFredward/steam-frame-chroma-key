@@ -547,15 +547,25 @@ class Setup:
             read(self.history) if exists(self.history) else None)
 
     def _settings(self):
-        # Registered Steam config is a data-file location, never executable code.
-        registry = self.home / '.config/openvr/openvrpaths.vrpath'
-        if exists(registry):
-            value = load(registry)
-            configs = value.get('config', [])
-            if type(configs) is not list or len(configs) != 1 or type(configs[0]) is not str:
-                raise SafetyError('ambiguous OpenVR settings location')
-            return absolute(Path(configs[0]).resolve()) / 'steamvr.vrsettings'
-        return self.home / '.local/share/Steam/config/steamvr.vrsettings'
+        # Valve CVRPathRegistry_Public::GetPaths gives nonempty VR_CONFIG_PATH
+        # priority; GetConfigPath returns config.front(), not a unique/deduped
+        # path. Later entries are history, never a fallback target to edit.
+        # Public source: openvr/src/vrcore/vrpathregistry_public.cpp (v1.26.7).
+        selected = os.environ.get('VR_CONFIG_PATH', '')
+        if not selected:
+            registry_override = os.environ.get('VR_PATHREG_OVERRIDE', '')
+            config_home = os.environ.get('XDG_CONFIG_HOME', '')
+            registry = (absolute(registry_override) if registry_override else
+                        (absolute(config_home) if config_home else self.home / '.config') / 'openvr/openvrpaths.vrpath')
+            value = load(registry)  # A missing registry cannot authorize a guessed Steam path.
+            configs = value.get('config')
+            if (type(configs) is not list or not 1 <= len(configs) <= 32
+                    or any(type(item) is not str or not item or len(item) > 1024 for item in configs)):
+                raise SafetyError('bounded nonempty OpenVR config path history required')
+            selected = configs[0]
+        root = absolute(selected)
+        os.close(directory(root))  # Pin owned, non-writable, no-follow ancestors.
+        return root / 'steamvr.vrsettings'
 
     def _camera_state(self):
         path = self._settings()
