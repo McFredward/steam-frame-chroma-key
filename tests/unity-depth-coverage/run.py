@@ -27,6 +27,8 @@ def main():
     parser.add_argument('--unity', type=Path, default=Path('/home/claw/unity-2021.3.5/Editor/Unity'))
     parser.add_argument('--backend', choices=('vulkan', 'glcore'), default='vulkan')
     parser.add_argument('--color-space', choices=('gamma', 'linear', 'both'), default='both')
+    parser.add_argument('--case', action='append', choices=('empty','opaque-edges','cutout-edges','over-empty','over-opaque',
+                        'emission','emission-over-opaque','excluded-depthless','alpha-to-coverage','stencil-clipped','stencil-only'))
     args = parser.parse_args()
     root = args.production_root.resolve()
     sys.path.insert(0, str(root / 'scripts'))
@@ -50,7 +52,7 @@ def main():
         if path.suffix in ('.cs', '.shader', '.py'):
             shutil.copyfile(path, run / path.name)
     (run / 'source-pins.json').write_text(json.dumps(pins, indent=2) + '\n')
-    report = {'scope': 'OFFLINE_SAME_TARGET_DEPTH_STAMP', 'production_mutation': False,
+    report = {'scope': 'OFFLINE_SAME_TARGET_DEPTH_STAMP', 'production_mutation': False, 'selected_cases':args.case,
               'xr_executed': False, 'game_wide_coverage_proven': False, 'profiles': {}}
     code = 1
     removed = []
@@ -64,7 +66,10 @@ def main():
             opaque = (copied / families[0]).read_text()
             assert opaque.count('Shader "GloomhavenVR/HeadUnlit"') == 1
             for name, state, statement in (('Depthless', 'ZWrite Off', ''),
-                                            ('Cutout', '', 'clip(owned.a - .5);')):
+                                            ('Cutout', '', 'clip(owned.a - .5);'),
+                                            ('AlphaToCoverage','AlphaToMask On',''),
+                                            ('StencilWrite','ColorMask 0 ZWrite Off Stencil { Ref 1 Comp Always Pass Replace }',''),
+                                            ('StencilRead','Stencil { Ref 1 Comp Equal Pass Keep }','')):
                 changed = opaque.replace('Shader "GloomhavenVR/HeadUnlit"', 'Shader "DepthCoverageFixture/' + name + '"')
                 changed = changed.replace('Cull [_Cull]', 'Cull [_Cull] ' + state)
                 changed = changed.replace('return tex2D(_MainTex, i.uv) * _Color;',
@@ -86,6 +91,7 @@ def main():
             command = ['xvfb-run', '-a', str(args.unity), '-batchmode', '-force-' + args.backend,
                        '-projectPath', str(project), '-executeMethod', 'DepthCoverageFixture.Start',
                        '-depthCoverageResult', str(output), '-logFile', str(run / (color + '.unity.log'))]
+            if args.case:command+=['-depthCoverageCases',','.join(args.case)]
             env = os.environ.copy()
             if args.backend == 'vulkan' and Path('/usr/share/vulkan/icd.d/intel_icd.json').is_file():
                 env['VK_DRIVER_FILES'] = '/usr/share/vulkan/icd.d/intel_icd.json'
