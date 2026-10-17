@@ -21,6 +21,10 @@ namespace journal_fixture {
 }
 #pragma GCC diagnostic pop
 #include "layer/pixel_snapshot_layer.cpp"
+#ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
+#include "pixel_native_driver_lease_fixture.h"
+#include <sys/mman.h>
+#endif
 
 namespace {
 enum class HookEvent {Begin,Next,End,NativeIndexed,OwnedIndexed,OriginalPipeline,OwnedPipeline,HostBarrier,DescriptorSets,DynamicState,OriginalSubmit,MarkerSubmit,Unknown,MirrorSets,RestoreSets};
@@ -41,6 +45,20 @@ struct HookCalls {
 } hookCalls;
 unsigned ownedResets=0,ownedFences=0,availableRP2Routes=3;
 unsigned ownedPassCount=1,ownedTargetSubpass=0,ownedLegacyPasses=0,ownedPasses2=0,ownedPasses2Core=0,ownedPasses2KHR=0;
+#ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
+// Exact header/value extent from the independently pinned provider source.
+struct ValveSubpassNode {VkStructureType sType=VkStructureType(1000109099);const void* pNext=nullptr;std::uint32_t srgbMask=0;};
+static_assert(offsetof(ValveSubpassNode,srgbMask)==16&&sizeof(ValveSubpassNode)==24,"pinned64bit native node extent");
+frame_pixel_native_driver::Lease* observingLease=nullptr;unsigned expectedActivePermit=0;
+bool inspectOriginalMask=false,revokeDuringOriginal=false;std::uint32_t expectedOriginalMask=0;
+void checkOriginalPermit(const VkSubpassBeginInfo* begin){
+    if(observingLease){require(observingLease->status().activePermits==expectedActivePermit,"scoped exact native permit survives through untouched original callback");if(revokeDuringOriginal){observingLease->revoke();revokeDuringOriginal=false;}}
+    if(inspectOriginalMask)require(begin->pNext&&static_cast<const ValveSubpassNode*>(begin->pNext)->srgbMask==expectedOriginalMask,"original private SRGB value forwarded unchanged, never rewritten by adapter/mirror");
+}
+#else
+void checkOriginalPermit(const VkSubpassBeginInfo*){}
+#endif
+
 void emulateShader(){const std::array<std::uint32_t,4> header{{1,0x5353424f,1,32}};std::memcpy(owned_fixture::driver->mapped.data(),header.data(),16);}
 VKAPI_ATTR void VKAPI_CALL hookFill(VkCommandBuffer,VkBuffer,VkDeviceSize,VkDeviceSize,std::uint32_t){++ownedResets;}
 VKAPI_ATTR void VKAPI_CALL hookSets(VkCommandBuffer c,VkPipelineBindPoint point,VkPipelineLayout layout,std::uint32_t first,std::uint32_t count,const VkDescriptorSet* sets,std::uint32_t dynamic,const std::uint32_t* offsets){
@@ -85,12 +103,12 @@ VkResult hookCreatePass2Route(bool khr,VkDevice d,const VkRenderPassCreateInfo2*
     ++hookCalls.creates;if(hookCalls.createResult==VK_SUCCESS)*out=h<VkRenderPass>(29+hookCalls.creates);return hookCalls.createResult;
 }
 void hookBegin2Route(bool khr,VkCommandBuffer c,const VkRenderPassBeginInfo* ci,const VkSubpassBeginInfo* begin){
-    ++(khr?hookCalls.khrRoute:hookCalls.coreRoute)[1];
+    ++(khr?hookCalls.khrRoute:hookCalls.coreRoute)[1];checkOriginalPermit(begin);
     require(c==hookCalls.command&&ci==hookCalls.beginInfo&&begin==hookCalls.subBegin,"original Begin2 arguments forwarded unchanged");
     ++hookCalls.begins;hookCalls.events.push_back(HookEvent::Begin);
 }
 void hookNext2Route(bool khr,VkCommandBuffer c,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end){
-    ++(khr?hookCalls.khrRoute:hookCalls.coreRoute)[2];
+    ++(khr?hookCalls.khrRoute:hookCalls.coreRoute)[2];checkOriginalPermit(begin);
     require(c==hookCalls.command&&begin==hookCalls.subBegin&&end==hookCalls.subEnd,"original Next2 arguments forwarded unchanged");
     ++hookCalls.nexts;hookCalls.events.push_back(HookEvent::Next);
 }
@@ -619,8 +637,70 @@ void multipleSubpassHooks(const char* vertex,const char* fragment,unsigned count
         require(std::find(events.begin(),events.end(),HookEvent::HostBarrier)==events.end(),"unsupported Next2 metadata never produces HOST completion publication");
     }
 }
+#ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
+struct PoisonValveNode {
+    void* pages=nullptr;std::size_t bytes=0;VkBaseInStructure* node=nullptr;
+    PoisonValveNode(){const auto page=std::size_t(sysconf(_SC_PAGESIZE));bytes=page*2;pages=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);require(pages!=MAP_FAILED,"bounded poison fixture pages");require(mprotect(static_cast<char*>(pages)+page,page,PROT_NONE)==0,"private payload deliberately inaccessible");node=reinterpret_cast<VkBaseInStructure*>(static_cast<char*>(pages)+page-sizeof(VkBaseInStructure));node->sType=VkStructureType(recording::ValveSubpassSrgbType);node->pNext=nullptr;}
+    ~PoisonValveNode(){if(pages&&pages!=MAP_FAILED)munmap(pages,bytes);}
+};
+void nativeValveHooks(const char* vertex,const char* fragment,bool khr,unsigned mode){
+    namespace driver=frame_pixel_native_driver;HookFixture fixture(3,1);fixture.preparePrivate(vertex,fragment,khr);
+    auto& lease=fixture.context->nativeSubpassLease;const auto& inputs=fixture.context->nativeSubpassInputs;
+    require(inputs.device==fixture.context->native&&inputs.begin2==reinterpret_cast<PFN_vkVoidFunction>(fixture.context->CmdBeginRenderPass2)&&inputs.begin2KHR==reinterpret_cast<PFN_vkVoidFunction>(fixture.context->CmdBeginRenderPass2KHR)&&inputs.next2==reinterpret_cast<PFN_vkVoidFunction>(fixture.context->CmdNextSubpass2)&&inputs.next2KHR==reinterpret_cast<PFN_vkVoidFunction>(fixture.context->CmdNextSubpass2KHR),"cached provider inputs come from actual saved NEXT routes, no alias fallback");
+    auto modeled=inputs;
+    if(mode==5){if(khr)modeled.next2KHR=nullptr;else modeled.next2=nullptr;}
+    if(mode!=1)require(driver::LeaseTestAccess::fixture(lease,modeled),"explicitly synthetic provider fixture; NOT native identity verification");
+    if(mode==2)fixture.context->native=h<VkDevice>(2);
+    if(mode==3){if(khr)fixture.context->CmdBeginRenderPass2KHR=hookBegin2;else fixture.context->CmdBeginRenderPass2=hookBegin2KHR;}
+    if(mode==4)lease.revoke();
+    auto begin=info<VkRenderPassBeginInfo>(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);begin.renderPass=fixture.shape.graphics.renderPass;begin.framebuffer=h<VkFramebuffer>(300);begin.renderArea={{0,0},{32,32}};
+    auto subBegin=info<VkSubpassBeginInfo>(VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO);subBegin.contents=VK_SUBPASS_CONTENTS_INLINE;auto subEnd=info<VkSubpassEndInfo>(VK_STRUCTURE_TYPE_SUBPASS_END_INFO);ValveSubpassNode value;PoisonValveNode poison;VkBaseInStructure unknown{VK_STRUCTURE_TYPE_APPLICATION_INFO,nullptr};
+    const bool beginNegative=(mode>=1&&mode<=4)||mode==6||mode==7||mode==8;
+    subBegin.pNext=beginNegative&&mode!=6?static_cast<const void*>(poison.node):static_cast<const void*>(&value);
+    if(mode==6)value.srgbMask=1;
+    if(mode==7)poison.node->pNext=&unknown;
+    if(mode==8)subBegin.contents=VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS;
+    hookCalls.beginInfo=&begin;hookCalls.subBegin=&subBegin;hookCalls.subEnd=&subEnd;observingLease=&lease;
+    expectedActivePermit=mode==1||mode==2||mode==3||mode==4?0u:1u;inspectOriginalMask=mode==0||mode==6;expectedOriginalMask=value.srgbMask;
+    hookExport<PFN_vkCmdBeginRenderPass2>(fixture.dispatchDevice,khr?"vkCmdBeginRenderPass2KHR":"vkCmdBeginRenderPass2")(fixture.command,&begin,&subBegin);
+    require(hookCalls.begins==1,"private Begin original forwarded exactly once on every accepted/refused route");
+    require(lease.status().activePermits==0,"Begin permit released at actual callback return");
+    if(beginNegative){
+        const auto state=fixture.context->bridge.snapshot();require(state.recordingContexts.firstRefusalAvailable&&state.refusal==frame_pixel_ssbo_receiver::Refusal::UnknownRoute&&!state.replaced,"unsupported private Begin cannot substitute an observer draw");const auto& first=state.recordingContexts.firstRefusal;
+        require(first.input.privatePayloadObserved==(mode==6),"no payload read without exact live route or with later invalid header/contents");
+        if(mode==6){require(first.input.privateProfile==unsigned(recording::PrivateProfile::ValveSubpassSrgbZeroV1)&&first.input.privateSrgbMask==1&&first.input.detailReason==unsigned(recording::Reason::PrivateValue),"nonzero native SRGB state explicitly refused and retained without rewrite");
+            for(unsigned mask:{2u,3u}){value.srgbMask=expectedOriginalMask=mask;hookExport<PFN_vkCmdNextSubpass2>(fixture.dispatchDevice,khr?"vkCmdNextSubpass2KHR":"vkCmdNextSubpass2")(fixture.command,&subBegin,&subEnd);}
+            const auto later=fixture.context->bridge.snapshot();bool two=false,three=false;for(unsigned i=0;i<later.recordingContexts.count;++i){const auto& c=later.recordingContexts.entries[i].first;two|=c.input.privatePayloadObserved&&c.input.privateSrgbMask==2;three|=c.input.privatePayloadObserved&&c.input.privateSrgbMask==3;}require(two&&three&&later.recordingContexts.firstRefusal.input.privateSrgbMask==1,"distinct later private payloads survive dedup while exact first refusal remains immutable");
+        }else require(!first.input.privateProfile&&!first.input.privateSrgbMask,"header-only refusal never invents private semantics");
+        inspectOriginalMask=false;observingLease=nullptr;return;
+    }
+    if(mode==10){if(khr)fixture.context->CmdNextSubpass2KHR=hookNext2;else fixture.context->CmdNextSubpass2=hookNext2KHR;}
+    subBegin.pNext=mode?static_cast<const void*>(poison.node):static_cast<const void*>(&value);subBegin.contents=VK_SUBPASS_CONTENTS_INLINE;
+    if(mode==11)subEnd.pNext=&unknown;
+    revokeDuringOriginal=mode==9;expectedActivePermit=mode==5||mode==10?0u:1u;inspectOriginalMask=mode==0;expectedOriginalMask=0;
+    hookExport<PFN_vkCmdNextSubpass2>(fixture.dispatchDevice,khr?"vkCmdNextSubpass2KHR":"vkCmdNextSubpass2")(fixture.command,&subBegin,&subEnd);
+    require(hookCalls.nexts==1&&lease.status().activePermits==0,"Next exact original executes once inside permit scope and scope closes at return");
+    const bool nextNegative=mode==5||mode==9||mode==10||mode==11;
+    hookExport<PFN_vkCmdDrawIndexed>(fixture.dispatchDevice,"vkCmdDrawIndexed")(fixture.command,6,1,2,-3,4);
+    if(nextNegative){const auto state=fixture.context->bridge.snapshot();require(!state.replaced&&hookCalls.nativeIndexed==1&&!hookCalls.ownedIndexed&&state.recordingContexts.firstRefusalAvailable,"refused provider/Next child metadata preserves exactly one original draw");require(!state.recordingContexts.firstRefusal.input.privatePayloadObserved,"Next checks provider liveness and all End headers before private payload");}
+    else {const auto state=fixture.context->bridge.snapshot();require(state.replaced&&!state.transaction&&state.refusal==frame_pixel_ssbo_receiver::Refusal::None&&hookCalls.ownedIndexed==1&&hookCalls.mirrorBinds==1&&hookCalls.restoreBinds==1,"source-backed zero private Begin+Next preserves full mirror transaction");bool privateFacts=false;for(unsigned i=0;i<state.recordingContexts.count;++i){const auto& context=state.recordingContexts.entries[i].first;privateFacts|=context.input.privatePayloadObserved&&context.input.privateProfile==unsigned(recording::PrivateProfile::ValveSubpassSrgbZeroV1)&&!context.input.privateSrgbMask;}require(privateFacts,"accepted native private zero profile survives copied context metadata");
+        hookExport<PFN_vkCmdDrawIndexed>(fixture.dispatchDevice,"vkCmdDrawIndexed")(fixture.command,6,1,2,-3,4);require(hookCalls.ownedIndexed==1&&hookCalls.nativeIndexed==1&&hookCalls.mirrorBinds==1&&hookCalls.restoreBinds==1,"later original indexed draw untouched after exact mirror restoration under native SRGB state");
+        hookExport<PFN_vkCmdNextSubpass2>(fixture.dispatchDevice,khr?"vkCmdNextSubpass2KHR":"vkCmdNextSubpass2")(fixture.command,&subBegin,&subEnd);
+        hookExport<PFN_vkCmdEndRenderPass2>(fixture.dispatchDevice,khr?"vkCmdEndRenderPass2KHR":"vkCmdEndRenderPass2")(fixture.command,&subEnd);hookExport<PFN_vkEndCommandBuffer>(fixture.dispatchDevice,"vkEndCommandBuffer")(fixture.command);
+        require(hookCalls.nexts==2&&hookCalls.ends==1&&hookCalls.commandEnds==1&&std::count(hookCalls.events.begin(),hookCalls.events.end(),HookEvent::HostBarrier)==1,"whole private three-subpass pass closes before one HOST barrier");
+        FILE* output=std::tmpfile();require(output,"cold provider report fixture");nativeSubpassStatus(*fixture.context,fileno(output));require(std::ftell(output)>0&&std::ftell(output)<1536,"provider state/refusal/RVA report bounded independently of callbacks");std::fclose(output);
+        auto submit=info<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);submit.commandBufferCount=1;submit.pCommandBuffers=&fixture.command;hookExport<PFN_vkQueueSubmit>(fixture.dispatchDevice,"vkQueueSubmit")(fixture.queueHandle,1,&submit,VK_NULL_HANDLE);require(hookCalls.submits==1&&hookCalls.markers==1&&fixture.context->bridge.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::CopyCohort,"original submit remains unchanged and lack of independent source copy never becomes native frame proof");
+    }
+    inspectOriginalMask=false;observingLease=nullptr;
+}
+#endif
+
 }
 int main(int argc,char** argv){
+#ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
+    if(argc==4&&!std::strcmp(argv[1],"--valve-only")){for(bool khr:{false,true})for(unsigned mode=0;mode<=11;++mode)nativeValveHooks(argv[2],argv[3],khr,mode);recordingSerializationBounds();std::cout<<"{\"scope\":\"actual Snapshot callbacks with synthetic scoped provider, NOT native verification\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
+#endif
+
     if(argc==2&&!std::strcmp(argv[1],"--recording-public")){exactRecordingAliases();recordingSerializationBounds();std::cout<<"{\"scope\":\"exact recording alias forwarding and bounded cold context output\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     if(argc==4&&!std::strcmp(argv[1],"--recording-only")){for(bool khr:{false,true})for(unsigned extensions=0;extensions<4;++extensions)wholeRecording(argv[2],argv[3],khr,extensions);for(bool after:{false,true})wholeUnknownCensus(argv[2],argv[3],after);for(unsigned route=0;route<3;++route)headerFirstFailure(argv[2],argv[3],route);std::cout<<"{\"scope\":\"entire actual recording callback path, fake original dispatch\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
 
