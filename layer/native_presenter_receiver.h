@@ -11,6 +11,7 @@ constexpr unsigned MaximumStatusUpdates = 32;
 enum class SourceReason : std::uint8_t { Disabled, Directory, Marker, Module, Pin, Ready };
 const char* sourceReasonName(SourceReason) noexcept;
 const char* primitiveReasonName(native::Reason) noexcept;
+const char* graphicsGateName(native::GraphicsGate) noexcept;
 
 // Prepare exactly once, on a cold path. The copied artifact then stays immutable
 // for this process session. Removing the opt-in is not a live pipeline switch.
@@ -46,6 +47,9 @@ struct Snapshot {
     std::uint32_t observedApi = 0, activeDevices = 0;
     native::Reason primitiveReason = native::Reason::None;
     bool definitionHistoryFailed = false;
+    native::GraphicsGate graphicsGate = native::GraphicsGate::None;
+    VkFormat attachmentFormat = VK_FORMAT_UNDEFINED;
+    VkDynamicState unsupportedDynamic = VK_DYNAMIC_STATE_MAX_ENUM;
 };
 // Diagnostic atomics, not a coherent native source/frame receipt. All writers
 // are cold device/pipeline lifecycle callbacks; no draw/submit observation.
@@ -61,6 +65,9 @@ private:
     std::atomic<std::uint32_t> api_{0}, devices_{0};
     std::atomic<native::Reason> reason_{native::Reason::None};
     std::atomic<bool> failed_{false};
+    std::atomic<native::GraphicsGate> graphicsGate_{native::GraphicsGate::None};
+    std::atomic<VkFormat> attachmentFormat_{VK_FORMAT_UNDEFINED};
+    std::atomic<VkDynamicState> unsupportedDynamic_{VK_DYNAMIC_STATE_MAX_ENUM};
 };
 // Single prepared background writer only. Uses fixed private filenames, <=1KiB
 // atomic replacements. Caller enforces the 32-update budget and joins the

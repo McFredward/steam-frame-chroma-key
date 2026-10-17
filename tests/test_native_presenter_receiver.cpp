@@ -21,7 +21,7 @@ struct Directory {
     std::string read(const char* name){const int in=openat(fd,name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);require(in>=0,"read owned receipt");char data[2048]{};const auto count=::read(in,data,sizeof(data));close(in);require(count>0&&count<static_cast<ssize_t>(sizeof(data)),"bounded status receipt");return {data,static_cast<std::size_t>(count)};}
 };
 std::string status(bool maximum=false){Directory d;r::Source source;r::Snapshot s;s.observedDevice=17;s.observedApi=VK_API_VERSION_1_1;s.activeDevices=1;
-    if(maximum){s.revision=s.pipelineAttempts=s.pipelineReplacements=s.observedDevice=UINT64_MAX;s.observedApi=s.activeDevices=UINT32_MAX;s.primitiveReason=frame_native_presenter::Reason::UnexpectedHandle;s.definitionHistoryFailed=true;}
+    if(maximum){s.revision=s.pipelineAttempts=s.pipelineReplacements=s.observedDevice=UINT64_MAX;s.observedApi=s.activeDevices=UINT32_MAX;s.primitiveReason=frame_native_presenter::Reason::UnexpectedHandle;s.definitionHistoryFailed=true;s.graphicsGate=frame_native_presenter::GraphicsGate::Multisample;s.attachmentFormat=static_cast<VkFormat>(UINT32_MAX);s.unsupportedDynamic=static_cast<VkDynamicState>(UINT32_MAX);}
     require(r::writeStatusCold(d.fd,Capture,source,s,maximum?32:1,maximum),"actual producer writes bounded JSON");return d.read(r::StatusFile);}
 void publicFiles(){
     {Directory d;r::Source s;require(!s.prepareCold(-1)&&s.reason()==r::SourceReason::Directory,"invalid directory refused");}
@@ -64,7 +64,7 @@ struct Native {
     std::uint64_t nextOriginal=0x600,nextCandidate=0x800;
     unsigned deviceCalls=0,deviceDestroys=0,shaderCalls=0,ownedShaderCalls=0,ownedShaderDestroys=0,nativePipelineCalls=0,ownedPipelineCalls=0,originalDestroys=0,ownedDestroys=0,corePass=0,khrPass=0;
     VkResult nativeResult=VK_SUCCESS,ownedShaderResult=VK_SUCCESS,ownedPipelineResult=VK_SUCCESS;
-    bool partialOwned=false,reuseOriginal=false;
+    bool partialOwned=false,reuseOriginal=false,testNested=false;unsigned nestedChecks=0;
     const VkGraphicsPipelineCreateInfo* expected=nullptr;std::uint32_t expectedCount=0;
     frame_pixel_ssbo_journal::PipelineToken oldToken{};frame_pixel_ssbo_journal::Event reused{};
     std::vector<VkPipeline> originals,candidates;std::vector<VkShaderModule> ownedShaders;
@@ -105,12 +105,17 @@ VKAPI_ATTR VkResult VKAPI_CALL createShader(VkDevice device,const VkShaderModule
     if(ci->codeSize==frame_native_presenter::GuardedFragmentBytes){++active->ownedShaderCalls;*output=object<VkShaderModule>(0x900+active->ownedShaderCalls);active->ownedShaders.push_back(*output);return active->ownedShaderResult;}
     *output=object<VkShaderModule>(active->shaderCalls==1?0x40:0x50);return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL destroyShader(VkDevice device,VkShaderModule shader,const VkAllocationCallbacks* allocator){exact(device,allocator);require(std::find(active->ownedShaders.begin(),active->ownedShaders.end(),shader)!=active->ownedShaders.end(),"only successfully owned candidate shader destroyed");++active->ownedShaderDestroys;}
+VKAPI_ATTR void VKAPI_CALL destroyPipeline(VkDevice,VkPipeline,const VkAllocationCallbacks*);
 VKAPI_ATTR VkResult VKAPI_CALL createPipelines(VkDevice device,VkPipelineCache cache,std::uint32_t count,const VkGraphicsPipelineCreateInfo* cis,const VkAllocationCallbacks* allocator,VkPipeline* output){exact(device,allocator);require(cache==active->cache,"native cache exact");
     if(cis==active->expected){require(count==active->expectedCount,"native batch count preserved");++active->nativePipelineCalls;for(unsigned i=0;i<count;++i){output[i]=object<VkPipeline>(active->nextOriginal++);active->originals.push_back(output[i]);}return active->nativeResult;}
     ++active->ownedPipelineCalls;require(count==1&&cis&&active->expected,"one candidate from current original callback");const auto& a=active->expected[active->ownedPipelineCalls-1<active->expectedCount?active->ownedPipelineCalls-1:0];const auto& b=*cis;
     require(b.pNext==a.pNext&&b.flags==a.flags&&b.layout==a.layout&&b.renderPass==a.renderPass&&b.subpass==a.subpass&&b.pVertexInputState==a.pVertexInputState&&b.pViewportState==a.pViewportState&&b.pRasterizationState==a.pRasterizationState&&b.pMultisampleState==a.pMultisampleState&&b.pDepthStencilState==a.pDepthStencilState&&b.pColorBlendState==a.pColorBlendState&&b.pDynamicState==a.pDynamicState,"candidate preserves original complete fixed-state pointers and identities");
     for(unsigned i=0;i<2;++i)require(b.pStages[i].stage==a.pStages[i].stage&&b.pStages[i].pName==a.pStages[i].pName&&b.pStages[i].pSpecializationInfo==a.pStages[i].pSpecializationInfo&&b.pStages[i].module==(a.pStages[i].stage==VK_SHADER_STAGE_FRAGMENT_BIT?active->ownedShaders.back():a.pStages[i].module),"only exact original fragment module replaced");
     auto ready=std::make_unique<frame_pixel_ssbo_journal::Ready>();bool found=false;for(unsigned attempt=0;attempt<16&&deviceFor(device)->definitions.takeReady(*ready);++attempt){if(ready->pipeline.value==handle(active->originals[active->ownedPipelineCalls-1])){found=true;break;}}require(found,"current original is journaled before optional replacement");active->oldToken=ready->pipeline;
+    if(active->testNested){auto unchanged=object<VkPipeline>(active->oldToken.value);const frame_native_presenter::Dispatch calls{createShader,destroyShader,createPipelines,destroyPipeline};
+        const auto result=r::complete(device,cache,VK_API_VERSION_1_1,VK_SUCCESS,a,allocator,unchanged,ready->recipe,session().presenterSource,calls,{deviceFor(device),retirePresenterOriginal});
+        require(!result.replaced&&result.reason==frame_native_presenter::Reason::Dispatch&&handle(unchanged)==active->oldToken.value,"nested optional replacement cannot borrow outer TLS retirement scope");++active->nestedChecks;}
+
     *output=(active->ownedPipelineResult==VK_SUCCESS||active->partialOwned)?object<VkPipeline>(active->nextCandidate++):VK_NULL_HANDLE;if(*output)active->candidates.push_back(*output);return active->ownedPipelineResult;}
 VKAPI_ATTR void VKAPI_CALL destroyPipeline(VkDevice device,VkPipeline pipeline,const VkAllocationCallbacks* allocator){exact(device,allocator);
     if(std::find(active->originals.begin(),active->originals.end(),pipeline)!=active->originals.end()){
@@ -135,6 +140,46 @@ void publicHooks(){Native d;
     require(d.corePass==1&&d.khrPass==1,"cold core/KHR dispatch preserves exact queried native route");
     d.missing="vkCreateRenderPass2KHR";require(!frame_pixel_vkGetDeviceProcAddr(d.device,"vkCreateRenderPass2KHR"),"missing cold alias never falls back to other nonnull route");d.missing=nullptr;
     session().allowed=false;require(frame_pixel_vkGetDeviceProcAddr(d.device,"vkCreateShaderModule")==gdpa(d.device,"vkCreateShaderModule"),"disabled session leaves native cold API unchanged");session().allowed=true;
+}
+void startupBoundary(){
+    require(!presenterSessionSlot().load()&&!session().allowed&&!session().tracker&&session().config.directoryFd<0,"out-of-order Session access is inert without lazy preparation");
+    require(!frame_pixel_vkGetDeviceProcAddr(VK_NULL_HANDLE,"vkCmdDraw")&&!presenterSessionSlot().load(),"early GPA cannot initiate source/config preparation");
+    VkNegotiateLayerInterface negotiation{};negotiation.sType=LAYER_NEGOTIATE_INTERFACE_STRUCT;negotiation.loaderLayerInterfaceVersion=1;
+    require(frame_pixel_vkNegotiateLoaderLayerInterfaceVersion(&negotiation)==VK_ERROR_INITIALIZATION_FAILED&&!presenterSessionSlot().load(),"invalid negotiation never prepares source");
+    negotiation.loaderLayerInterfaceVersion=2;require(frame_pixel_vkNegotiateLoaderLayerInterfaceVersion(&negotiation)==VK_SUCCESS&&presenterSessionSlot().load(),"successful loader negotiation exclusively publishes cold session");
+    auto* original=presenterSessionSlot().load();require(!original->allowed&&!original->tracker&&original->config.directoryFd<0,"non-vrcompositor test process cannot acquire production opt-in");
+    require(frame_pixel_vkNegotiateLoaderLayerInterfaceVersion(&negotiation)==VK_SUCCESS&&presenterSessionSlot().load()==original,"repeated negotiation never creates a fresh opt-in epoch");
+}
+void deltaHooks(const char* vertexPath,const char* fragmentPath,const char* candidatePath){
+    const auto vs=loadWords(vertexPath),ps=loadWords(fragmentPath),candidate=loadWords(candidatePath);
+    Directory source;source.marker();source.file("synthetic-presenter.spv",candidate.data(),candidate.size()*4);require(session().presenterSource.prepareCold(source.fd),"new private delta prepares pinned source");
+    {Native d(true);d.definitions(vs,ps);d.testNested=true;auto output=d.create(2);require(output==d.candidates&&d.nestedChecks==2&&d.originalDestroys==2,"nested refusal restores parent scope for all later matched views");}
+    for(unsigned variant=0;variant<6;++variant){Native d;d.definitions(vs,ps);
+        if(variant==0){d.fixture.attachments[0].format=VK_FORMAT_R8G8B8_UNORM;deviceFor(d.device)->definitions.destroyRenderPass(d.fixture.graphics.renderPass);require(deviceFor(d.device)->definitions.createRenderPass(d.fixture.graphics.renderPass,d.fixture.pass,VK_SUCCESS),"owned bad-format recipe observed");}
+        if(variant==1)d.fixture.dynamics[0]=VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT;
+        if(variant==2)observeDefinitions(deviceFor(d.device),[](auto&){throw 1;});
+        if(variant==3)session().presenterWriterFailed.store(true);
+        if(variant==4)d.fixture.colorBlend.blendEnable=VK_TRUE;
+        if(variant==5){auto changed=vs;changed.back()^=1;deviceFor(d.device)->definitions.destroyShader(d.fixture.stages[1].module);auto ci=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);ci.pCode=changed.data();ci.codeSize=changed.size()*4;deviceFor(d.device)->definitions.createShader(d.fixture.stages[1].module,ci,VK_SUCCESS);}
+        const auto output=d.create();require(output==d.originals&&!d.ownedPipelineCalls&&!d.originalDestroys,"finite diagnostic/history/pin refusal leaves native pipeline untouched");
+        const auto diagnostic=session().presenterCounters.snapshot();
+        if(variant==0)require(diagnostic.graphicsGate==frame_native_presenter::GraphicsGate::Format&&diagnostic.attachmentFormat==VK_FORMAT_R8G8B8_UNORM,"format gate preserves exact unsupported format");
+        if(variant==1)require(diagnostic.graphicsGate==frame_native_presenter::GraphicsGate::Dynamic&&diagnostic.unsupportedDynamic==VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,"dynamic gate preserves exact unsupported state");
+        if(variant==2)require(diagnostic.definitionHistoryFailed,"missed definition history is visible in cold status");
+        if(variant==4)require(diagnostic.graphicsGate==frame_native_presenter::GraphicsGate::Blend,"blend refusal is distinguishable from format/dynamic");
+    }
+    {Native d;d.definitions(vs,ps);d.fixture.colorBlend.blendEnable=VK_TRUE;auto output=d.create();auto ready=std::make_unique<frame_pixel_ssbo_journal::Ready>();require(deviceFor(d.device)->definitions.takeReady(*ready),"unreplaced current original recipe remains admitted");
+        const frame_native_presenter::Dispatch calls{createShader,destroyShader,createPipelines,destroyPipeline};const auto before=d.shaderCalls;
+        const auto noOwner=r::complete(d.device,d.cache,VK_API_VERSION_1_1,VK_SUCCESS,d.fixture.graphics,&d.allocator,output[0],ready->recipe,session().presenterSource,calls,{});
+        require(noOwner.reason==frame_native_presenter::Reason::Dispatch&&!noOwner.replaced&&d.shaderCalls==before,"caller cannot omit exact retirement owner/callback");
+        const auto foreign=r::complete(object<VkDevice>(7),d.cache,VK_API_VERSION_1_1,VK_SUCCESS,d.fixture.graphics,&d.allocator,output[0],ready->recipe,session().presenterSource,calls,{deviceFor(d.device),retirePresenterOriginal});
+        require(foreign.reason==frame_native_presenter::Reason::Identity&&!foreign.replaced&&d.shaderCalls==before&&!d.originalDestroys,"same numeric pipeline on a foreign device cannot borrow lifecycle authority");}
+    require(!session().presenterWriter.joinable(),"all prior cold writers joined before budget test");
+    session().presenterStatusUpdates=r::MaximumStatusUpdates;
+    {Native d;{std::lock_guard<std::mutex> lock(session().presenterWriterMutex);if(session().presenterWriter.joinable())session().presenterWriter.join();}
+        struct stat file{};require(fstatat(d.directory.fd,r::StatusFile,&file,AT_SYMLINK_NOFOLLOW)&&errno==ENOENT,"new device lifetime cannot restart exhausted process-wide status budget");}
+    require(session().presenterStatusUpdates==r::MaximumStatusUpdates,"status update budget persists across final device destruction");
+    const auto receipt=status(true);require(receipt.find("\"graphics_gate\":\"multisample\"")!=std::string::npos&&receipt.find("\"attachment_format\":4294967295")!=std::string::npos&&receipt.find("\"unsupported_dynamic\":4294967295")!=std::string::npos,"actual maximal diagnostic fields stay inside 1KiB producer envelope");
 }
 void privateHooks(const char* vertexPath,const char* fragmentPath,const char* candidatePath){const auto vs=loadWords(vertexPath),ps=loadWords(fragmentPath),candidate=loadWords(candidatePath);
     Directory source;source.marker();source.file("synthetic-presenter.spv",candidate.data(),candidate.size()*4);require(session().presenterSource.prepareCold(source.fd),"real pinned guarded artifact cold-prepared");
@@ -161,5 +206,6 @@ void privateHooks(const char* vertexPath,const char* fragmentPath,const char* ca
 } // namespace receiver_test
 int main(int argc,char** argv){using namespace receiver_test;
     if(argc==2&&!std::strcmp(argv[1],"--presenter-status-json")){std::cout<<status();return 0;}
-    require(argc==1||argc==4,"optional private VS PS guarded candidate paths");publicFiles();publicHooks();if(argc==4)privateHooks(argv[1],argv[2],argv[3]);std::cout<<"{\"scope\":\"cold-presenter-receiver-public\",\"checks\":"<<checks<<",\"native_provider_verified\":false}\n";
+    if(argc==5&&!std::strcmp(argv[1],"--receiver-delta")){startupBoundary();deltaHooks(argv[2],argv[3],argv[4]);std::cout<<"{\"scope\":\"cold-presenter-receiver-delta\",\"checks\":"<<checks<<",\"headset_result\":false}\n";return 0;}
+    require(argc==1||argc==4,"optional private VS PS guarded candidate paths");startupBoundary();publicFiles();publicHooks();if(argc==4)privateHooks(argv[1],argv[2],argv[3]);std::cout<<"{\"scope\":\"cold-presenter-receiver-public\",\"checks\":"<<checks<<",\"native_provider_verified\":false}\n";
 }

@@ -68,6 +68,8 @@ struct Session {
     std::thread presenterWriter;
     std::atomic<bool> presenterStop{false}, presenterWriterFailed{false};
     std::atomic<unsigned> presenterDevices{0};
+    // Written by the single joined writer across device lifetimes, never reset.
+    unsigned presenterStatusUpdates=0;
 #endif
     bool allowed = false;
     explicit Session(bool inert=false) noexcept {
@@ -101,6 +103,25 @@ struct Session {
         } catch(...) { allowed=false; tracker.reset(); }
     }
 };
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+std::atomic<Session*>& presenterSessionSlot() {
+    static std::atomic<Session*> value{nullptr};return value;
+}
+Session& session() {
+    // Calling a GPA/create callback before negotiation cannot initiate file I/O.
+    // The loader's explicit cold negotiation is the sole preparation boundary.
+    static Session inert(true);
+    auto* value=presenterSessionSlot().load(std::memory_order_acquire);
+    return value?*value:inert;
+}
+void preparePresenterSessionCold() noexcept {
+    static std::once_flag prepared;
+    try{std::call_once(prepared,[]{
+        auto* value=new Session();
+        presenterSessionSlot().store(value,std::memory_order_release);
+    });}catch(...){/* Allocation failure keeps the optional path inert. */}
+}
+#else
 Session& session() {
     // A native process may exit without explicit Vulkan teardown. Keep cold
     // diagnostic state valid until process exit rather than race a live writer
@@ -110,10 +131,12 @@ Session& session() {
     static auto* value = []() noexcept {try{return new Session();}catch(...){return static_cast<Session*>(nullptr);}}();
     return value ? *value : inert;
 }
+#endif
 #ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
 void presenterWriter(Session* s) noexcept {
     std::uint64_t previous=0;
-    for(unsigned updates=0;updates<presenter::MaximumStatusUpdates;){
+    auto& updates=s->presenterStatusUpdates;
+    for(;updates<presenter::MaximumStatusUpdates;){
         const auto state=s->presenterCounters.snapshot();
         if(state.revision!=previous){
             ++updates;
@@ -1839,6 +1862,9 @@ PIXEL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL frame_pixel_vkGetInstanceP
 }
 PIXEL_EXPORT VKAPI_ATTR VkResult VKAPI_CALL frame_pixel_vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* info) {
     if(!info || info->sType!=LAYER_NEGOTIATE_INTERFACE_STRUCT || info->loaderLayerInterfaceVersion<2)return VK_ERROR_INITIALIZATION_FAILED;
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    preparePresenterSessionCold();
+#endif
     info->loaderLayerInterfaceVersion=std::min(2u,info->loaderLayerInterfaceVersion);
     info->pfnGetInstanceProcAddr=frame_pixel_vkGetInstanceProcAddr;info->pfnGetDeviceProcAddr=frame_pixel_vkGetDeviceProcAddr;
     info->pfnGetPhysicalDeviceProcAddr=physicalProc;return VK_SUCCESS;

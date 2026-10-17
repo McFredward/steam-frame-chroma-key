@@ -81,6 +81,15 @@ const char* primitiveReasonName(native::Reason reason) noexcept {
 #undef REASON
     } return "unknown";
 }
+const char* graphicsGateName(native::GraphicsGate gate) noexcept {
+    switch(gate){
+    case native::GraphicsGate::None:return "none"; case native::GraphicsGate::Contract:return "contract";
+    case native::GraphicsGate::Blend:return "blend"; case native::GraphicsGate::Dynamic:return "dynamic";
+    case native::GraphicsGate::ColorWrite:return "color_write"; case native::GraphicsGate::Attachment:return "attachment";
+    case native::GraphicsGate::Format:return "format"; case native::GraphicsGate::Multisample:return "multisample";
+    case native::GraphicsGate::Stages:return "stages";
+    }return "unknown";
+}
 bool Source::prepareCold(int directory) noexcept {
     if (attempted_) return ready();
     attempted_ = true;
@@ -124,14 +133,19 @@ void Counters::deviceDestroyed() noexcept {
 }
 void Counters::attempted(const native::Result& result) noexcept {
     bump(attempts_); if (result.replaced) bump(replacements_);
-    reason_.store(result.reason, std::memory_order_relaxed); bump(revision_);
+    reason_.store(result.reason, std::memory_order_relaxed);
+    graphicsGate_.store(result.graphicsGate, std::memory_order_relaxed);
+    attachmentFormat_.store(result.attachmentFormat, std::memory_order_relaxed);
+    unsupportedDynamic_.store(result.unsupportedDynamic, std::memory_order_relaxed); bump(revision_);
 }
 void Counters::historyFailed() noexcept { failed_.store(true, std::memory_order_relaxed); bump(revision_); }
 Snapshot Counters::snapshot() const noexcept {
     return {revision_.load(std::memory_order_relaxed), attempts_.load(std::memory_order_relaxed),
             replacements_.load(std::memory_order_relaxed), device_.load(std::memory_order_relaxed),
             api_.load(std::memory_order_relaxed), devices_.load(std::memory_order_relaxed),
-            reason_.load(std::memory_order_relaxed), failed_.load(std::memory_order_relaxed)};
+            reason_.load(std::memory_order_relaxed), failed_.load(std::memory_order_relaxed),
+            graphicsGate_.load(std::memory_order_relaxed), attachmentFormat_.load(std::memory_order_relaxed),
+            unsupportedDynamic_.load(std::memory_order_relaxed)};
 }
 bool writeStatusCold(int directory, const char* capture, const Source& source, const Snapshot& s,
                      unsigned update, bool exhausted) noexcept {
@@ -144,12 +158,14 @@ bool writeStatusCold(int directory, const char* capture, const Source& source, c
         "{\"schema\":\"frame-synthetic-presenter-receiver-v1\",\"mode\":\"synthetic_format_guarded_presenter\","
         "\"capture_id\":\"%s\",\"source_ready\":%s,\"source_reason\":\"%s\",\"candidate_sha256\":\"%s\",\"candidate_bytes\":%zu,"
         "\"observed_device\":%llu,\"observed_api\":%u,\"active_devices\":%u,\"pipeline_attempts\":%llu,\"pipeline_replacements\":%llu,"
-        "\"last_primitive_reason\":\"%s\",\"definition_history_failed\":%s,\"revision\":%llu,\"updates\":%u,\"budget_exhausted\":%s,"
+        "\"last_primitive_reason\":\"%s\",\"graphics_gate\":\"%s\",\"attachment_format\":%u,\"unsupported_dynamic\":%u,"
+        "\"definition_history_failed\":%s,\"revision\":%llu,\"updates\":%u,\"budget_exhausted\":%s,"
         "\"diagnostic_atomics_not_source_cohort\":true,\"native_frame_association_proven\":false,\"passthrough_authorized\":false}\n",
         capture, source.ready() ? "true" : "false", sourceReasonName(source.reason()), native::GuardedFragmentSha256,
         native::GuardedFragmentBytes, static_cast<unsigned long long>(s.observedDevice), s.observedApi, s.activeDevices,
         static_cast<unsigned long long>(s.pipelineAttempts), static_cast<unsigned long long>(s.pipelineReplacements),
-        primitiveReasonName(s.primitiveReason), s.definitionHistoryFailed ? "true" : "false",
+        primitiveReasonName(s.primitiveReason), graphicsGateName(s.graphicsGate), unsigned(s.attachmentFormat), unsigned(s.unsupportedDynamic),
+        s.definitionHistoryFailed ? "true" : "false",
         static_cast<unsigned long long>(s.revision), update, exhausted ? "true" : "false");
     if (count <= 0 || static_cast<std::size_t>(count) >= sizeof(text)) return false;
     constexpr const char* temporary = "synthetic-presenter-status.tmp";
