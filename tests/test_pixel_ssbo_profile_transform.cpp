@@ -67,6 +67,8 @@ int main(int argc,char** argv){
     require(argc==1 || argc==4 || argc==5,"optional private originalPS pixelSSBO firstSSBO [sparseSSBO]");
     clone::ShaderDefinition source;profile::Artifact output;clone::Refusal why;
     require(!profile::transform(source,false,output,why) && !output.bytes,"absent source cannot generate artifact");
+    require(!profile::transformMirror(source,source,output,why)&&!output.bytes,"absent both-stage evidence cannot generate mirror profile");
+    clone::ProbeInterface mirrorProfile;require(!clone::ProbeInterface::set0Mirror(nullptr,0,nullptr,0,nullptr,0,mirrorProfile,why)&&!mirrorProfile.compatibleSet0Mirror(),"null stage/artifact evidence cannot mint mirror profile");
     source.complete=true;source.bytes=6620;source.words[0]=0x07230203u;
     require(!profile::transform(source,false,output,why) && !output.bytes,"plausible header without source pin cannot generate artifact");
     if(argc>=4){
