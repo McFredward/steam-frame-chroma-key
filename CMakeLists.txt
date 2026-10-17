@@ -451,6 +451,8 @@ if(BUILD_TESTING)
     add_test(NAME mask_module_guard COMMAND test_mask_module_guard)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(UNIX)
+        add_test(NAME prepare_native_release COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prepare_native_release.py)
         add_test(NAME pixel_uniform_recovery COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pixel_uniform_recovery.py)
         add_test(NAME pixel_uniform_mapping COMMAND ${Python3_EXECUTABLE} -B

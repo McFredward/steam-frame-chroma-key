@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Build the owned receiver and derive its private shader on a compatible Frame.
 
-No install, restart, camera access or device write is performed. Valve input and
+Only requested local build/evidence files are written; there is no installation,
+service/restart action or camera/settings change. Valve input and
 derived SPIR-V stay local. verify_package is also the installer's cold pre-start
 gate; a changed or unknown runtime must not publish its Vulkan manifest.
 """
 from __future__ import annotations
 import argparse
+import ctypes
+import contextlib
 import hashlib
 import json
 import os
@@ -130,6 +133,15 @@ def elf_arm64(raw):
     require(raw.count(BUILD_MARKER) == 1, 'release receiver build marker missing or ambiguous')
 
 
+def package_path(package, name):
+    path = Path(package)
+    for component in Path(name).parts[:-1]:
+        path = path / component; info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700, 'ordinary owned0700 package subdirectory required')
+    return Path(package) / name
+
+
 def verify_package(package, runtime_files=None):
     """Return checked manifest or raise SafetyError/OSError. Never trust its pins.
 
@@ -143,16 +155,16 @@ def verify_package(package, runtime_files=None):
             and stat.S_IMODE(info.st_mode) == 0o700, 'owned0700 ordinary package required')
     profile = verify_runtime(runtime_files)
     manifest = parse_json(read_regular(package / 'package.json', MAX_METADATA, private=True))
-    require(set(manifest) == {'schema', 'profile', 'build_marker', 'files', 'source_snapshot_sha256'}
+    require(type(manifest) is dict and set(manifest) == {'schema', 'profile', 'build_marker', 'files', 'source_snapshot_sha256'}
             and manifest['schema'] == SCHEMA and manifest['profile'] == profile['profile']
             and manifest['build_marker'] == BUILD_MARKER[:-1].decode(), 'exact release manifest schema required')
-    require(set(manifest['files']) == set(ARTIFACTS), 'exact artifact inventory required')
+    require(type(manifest['files']) is dict and set(manifest['files']) == set(ARTIFACTS), 'exact artifact inventory required')
     contents = {}
     for name in ARTIFACTS:
         record = manifest['files'][name]
-        require(set(record) == {'bytes', 'sha256'} and type(record['bytes']) is int
+        require(type(record) is dict and set(record) == {'bytes', 'sha256'} and type(record['bytes']) is int
                 and 0 < record['bytes'] <= 32 * 1024 * 1024, 'bounded artifact record required')
-        contents[name] = read_regular(package / name, record['bytes'], private=True)
+        contents[name] = read_regular(package_path(package, name), record['bytes'], private=True)
         require(len(contents[name]) == record['bytes'] and sha(contents[name]) == record['sha256'], 'artifact hash mismatch: ' + name)
     require(parse_json(contents['compatibility.json']) == profile, 'package cannot change reviewed compatibility')
     require(sha(contents['compatibility.json']) == COMPATIBILITY_SHA256, 'package compatibility bytes differ')
@@ -161,6 +173,7 @@ def verify_package(package, runtime_files=None):
     elf_arm64(contents[LIBRARY])
     require(sha(contents['source-manifest.json']) == manifest['source_snapshot_sha256'], 'source snapshot digest differs')
     sources = parse_json(contents['source-manifest.json'])
+    require(type(sources) is dict, 'source snapshot object required')
     for name in HELPERS:
         require(sources.get(name) == sha(contents[name]) and
                 contents[name] == read_regular(ROOT / name, 2 * 1024 * 1024),
@@ -192,6 +205,56 @@ def source_snapshot():
     return {str(p.relative_to(ROOT)): sha(read_regular(p, 2 * 1024 * 1024)) for p in sorted(set(paths))}
 
 
+def publish_directory(staged, output):
+    # Linux renameat2 is atomic and refuses even an empty concurrently created
+    # output. A check followed by ordinary rename could overwrite that directory.
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, 'renameat2', None)
+    require(function is not None, 'atomic no-replace directory publication unavailable')
+    function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    function.restype = ctypes.c_int
+    if function(-100, os.fsencode(staged), -100, os.fsencode(output), 1):
+        raise OSError(ctypes.get_errno(), 'exclusive package publication refused')
+
+
+@contextlib.contextmanager
+def preparation_run(output, snapshot):
+    evidence = Path(tempfile.mkdtemp(prefix=output.name + '.preparation-', dir=output.parent))
+    os.chmod(evidence, 0o700)
+    cache = evidence / 'cache'; cache.mkdir(mode=0o700)
+    log = evidence / 'prepare.log'; log.touch(mode=0o600)
+    failure = None
+    try:
+        (evidence / 'source-manifest.json').write_bytes(json_bytes(snapshot))
+        for name, expected in snapshot.items():
+            raw = read_regular(ROOT / name, 2 * 1024 * 1024)
+            require(sha(raw) == expected, 'source changed before build: ' + name)
+            path = evidence / 'sources' / name; path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_bytes(raw); path.chmod(0o600)
+        yield cache, log
+    except BaseException as error:
+        failure = str(error)[:16384]
+        if isinstance(error, Exception):
+            raise SafetyError(str(error) + '; retained preparation evidence: ' + str(evidence)) from error
+        raise
+    finally:
+        # The child process groups have already been reaped by run_command.
+        # Keep a bounded final log, exact source snapshot and outcome, but remove
+        # every regenerable compiler/CMake/generated-module cache on all exits.
+        size = log.stat().st_size
+        if size > MAX_METADATA:
+            with log.open('rb') as stream:
+                stream.seek(size - MAX_METADATA); tail = stream.read(MAX_METADATA)
+            log.write_bytes(tail)
+        shutil.rmtree(cache)
+        (evidence / 'result.json').write_bytes(json_bytes({'schema': 'sfnp-local-preparation-result-v1',
+            'success': failure is None, 'failure': failure, 'log_original_bytes': size,
+            'log_retained_bytes': log.stat().st_size, 'processes_reaped': True,
+            'regenerable_cache_removed': True, 'installed': False, 'camera_or_service_changed': False}))
+        for path in (evidence / 'source-manifest.json', evidence / 'result.json'):
+            path.chmod(0o600)
+
+
 def prepare(output, steamvr_root=Path('/opt/steamvr')):
     require(platform.system() == 'Linux' and platform.machine().lower() in ('aarch64', 'arm64'),
             'local Linux AArch64 build required; no package was installed')
@@ -205,9 +268,8 @@ def prepare(output, steamvr_root=Path('/opt/steamvr')):
     before = source_snapshot()
     # All processes are reaped before temporary generated modules/build caches
     # disappear. Originals and the caller's existing files are never modified.
-    with tempfile.TemporaryDirectory(prefix='.sfnp-prepare-', dir=output.parent) as temporary:
-        scratch = Path(temporary); os.chmod(scratch, 0o700)
-        build = scratch / 'build'; log = scratch / 'prepare.log'
+    with preparation_run(output, before) as (scratch, log):
+        build = scratch / 'build'
         run_command(['cmake', '-S', str(ROOT), '-B', str(build), '-DCMAKE_BUILD_TYPE=Release',
             '-DBUILD_TESTING=OFF', '-DFRAME_MASK_BUILD_PIXEL_SNAPSHOT=ON',
             '-DFRAME_PIXEL_SYNTHETIC_PRESENTER=ON', '-DFRAME_PIXEL_RELEASE_RECEIVER=ON'], log)
@@ -236,8 +298,7 @@ def prepare(output, steamvr_root=Path('/opt/steamvr')):
         with path.open('xb') as stream:
             os.chmod(path, 0o600); stream.write(json_bytes(manifest))
         verify_package(staged, files)
-        require(not output.exists() and not output.is_symlink(), 'output appeared during preparation')
-        staged.rename(output)
+        publish_directory(staged, output)
         return manifest
 
 
