@@ -139,10 +139,12 @@ replays an existing command buffer. Missing, invalid or out-of-profile guards
 select the exact original output expression; they do not force a guessed alpha
 or use cached coverage. The first-cell fast path reduces ordinary-image work.
 
-Opening the game options or disabling the source emits ordinary game images.
-Fallback applies when such an image is actually consumed. It cannot revoke a
-previously transmitted image, detect a deliberately copied guard or promise an
-instant change before the next image arrives. Disabling the receiver's installer
+Disabling the game's native source preference or Mixed Reality emits ordinary
+game images. Opening VR Options does not disable the current real-game source;
+settings apply while that menu remains open. Fallback applies when an ordinary
+image is actually consumed. It cannot revoke a previously transmitted image,
+detect a deliberately copied guard or promise an instant change before the next
+image arrives. Disabling the receiver's installer
 activation is different: already created pipelines remain until their process
 exits, so a manual SteamVR restart is needed to unload them.
 
@@ -164,7 +166,8 @@ An integration must establish all of the following:
    rules. Retain additive E at A0. Do not make source texture resolution into a
    claim about the destination or encoded-video resolution.
 4. Bounded ownership of the borrowed source through GPU submission, including
-   disable/menu, camera replacement, unknown eye and renderer teardown. Prepare
+   explicit disable, camera replacement, unknown eye and renderer teardown.
+   Keep menus interactive without implicitly disabling the source. Prepare
    materials/resources outside eye callbacks; do not add a previous-pair delay.
 5. Original-output fallback on every rejected source path. Producer and receiver
    failures must not publish an old mask with a new eye image.
@@ -173,7 +176,7 @@ Conceptual flow, **not a generic API or an admission shortcut**:
 
 ```text
 current actual eye callback:
-    if source is disabled, menu is open, or current coverage is not established:
+    if source is disabled or current coverage is not established:
         submit ordinary current-eye output
     else:
         pack current-eye contribution E and coverage A into the exact v1 atlas

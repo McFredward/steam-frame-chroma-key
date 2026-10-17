@@ -17,6 +17,11 @@ edges and motion still need improvement. See [compatibility and limits](docs/COM
 |---|---|---|
 | Gloomhaven Digital | A [GloomhavenVR](https://github.com/McFredward/GloomhavenVR) build with **Steam Link native passthrough** | Real-game PC VR confirmed with ModBuild686; Windows/D3D11, MultiPass, SDR and Gamma colour space. |
 
+**Supported Frame-side SteamVR: 2.18.2 (build 1791331621, Linux ARM64)**,
+checked on 2026-10-17. The installer also checks the exact runtime files; matching
+the SteamVR or SteamOS version label alone is insufficient. Other Frame runtime
+versions need a compatibility update. This is not a Windows SteamVR version pin.
+
 Unmodified Gloomhaven and other games do not supply this opacity format. Installing
 this receiver alone does not add mixed reality to them. Glass-like transparency
 is supported when the game supplies correct opacity; arbitrary glass, refraction
@@ -96,9 +101,17 @@ use the same files in your home directory and leave the system partition alone.
 
 1. Confirm that `bash setup.sh status` admits the installed receiver, then start
    the PC VR stream and GloomhavenVR normally.
-2. In VR Options, enable **Mixed Reality**, then **Steam Link native passthrough**.
-3. Close VR Options to see the game in your room. Opening VR Options shows the
-   ordinary image so you can change settings; there is no automatic timeout.
+2. Open **VR Options → World → Scenery**. Choose **Mixed Reality** in the
+   environment selector, then check **Steam Link native passthrough** directly
+   below it. This choice is available only on an identified Steam Frame/Steam
+   Link connection.
+3. Changes apply immediately, including while VR Options stays open. Opening
+   the options does not turn passthrough off; disable the native choice or
+   Mixed Reality to stop it. There is no automatic timeout.
+
+Mixed Reality starts off on a fresh install. The native Steam Link preference
+starts on, but an existing saved off preference is kept. Connection detection
+does not check whether the matching receiver is installed and active.
 
 The game switch controls the current picture. Turning it off restores the
 ordinary source when the next game image reaches the headset; it does not remove

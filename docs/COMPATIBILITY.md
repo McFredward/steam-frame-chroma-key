@@ -13,19 +13,22 @@ transparency switch for any streamed game.
 | Transport | Steam Link PC VR through SteamVR, with the ordinary PC sender. No sender patch or second camera video stream. |
 | Game | Gloomhaven Digital with a GloomhavenVR build containing the native Steam Link integration. Unmodified clients do not supply the format. |
 | PC graphics path | The visible game test used Windows/D3D11, Unity's built-in renderer, MultiPass, Gamma colour space and an SDR alpha-capable source. |
-| Frame software | Exact compositor shader, descriptor/state and driver-provider checks must pass. An OS/SteamVR version label alone is insufficient. |
+| Frame software | SteamVR **2.18.2 (build 1791331621, Linux ARM64)**, checked on 2026-10-17. Exact compositor shader, descriptor/state and driver-provider checks must also pass; a matching SteamVR/SteamOS version label alone is insufficient. |
 | Other games/transports | Not supported by the current game integration. ALVR, Virtual Desktop and other headsets are not established by these tests. |
 
 The receiver is distinct from GloomhavenVR's **Steam Frame standalone**
 passthrough. It processes a PC VR stream; it does not install or configure the
 standalone game.
 
+The Frame-side version above does not establish a particular Windows SteamVR
+version. PC-side stream changes have their own compatibility limits below.
+
 ## What has actually been shown
 
 On 2026-10-17 the maintainer confirmed real GloomhavenVR gameplay composited over
 the Frame's native passthrough camera, using ModBuild686. Application logs record
-both 4040×4040 MultiPass/MSAA8 eyes. Earlier visible tests also showed fractional
-transparency and restoration of the ordinary picture through the game menu.
+both 4040×4040 MultiPass/MSAA8 eyes. Earlier synthetic-source tests also showed
+fractional transparency.
 
 Those headset tests used an explicitly staged, temporary receiver for one
 compositor process. They do **not** establish a newly tested persistent
@@ -53,9 +56,12 @@ for the retained observation and its limits.
   the scene source.
 
 The format guard recognizes the current packed picture. It is not authentication
-or a guarantee that a copied/frozen image is fresh. Opening the menu or turning
-the source off takes effect when a new ordinary image reaches the receiver;
-already transmitted or frozen images cannot be recalled.
+or a guarantee that a copied/frozen image is fresh. Turning off
+**Steam Link native passthrough** or **Mixed Reality** takes effect when a new
+ordinary image reaches the receiver; already transmitted or frozen images cannot
+be recalled.
+Opening VR Options keeps real-game passthrough active, and its settings apply
+while the menu remains open.
 
 ## Persistence, updates and recovery
 
