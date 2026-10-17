@@ -22,8 +22,8 @@ struct PresenterCase {
 static_assert(sizeof(PresenterCase)==4272,"fixed owned current-R1 case");
 struct OutputGpu:Gpu {
     void singleDescriptors(unsigned count){
-        // Count1 is an explicit validation-negative control for the declared
-        // array[3]; valid composed output retains a count3 owned layout.
+        // The explicitly specialized candidate uses count1; unchanged-original
+        // comparison instances retain their declared count3 layout separately.
         vkDestroyPipelineLayout(device,pipelineLayout,nullptr);pipelineLayout={};
         vkDestroyDescriptorPool(device,descriptorPool,nullptr);descriptorPool={};
         vkDestroyDescriptorSetLayout(device,descriptorLayout,nullptr);descriptorLayout={};
