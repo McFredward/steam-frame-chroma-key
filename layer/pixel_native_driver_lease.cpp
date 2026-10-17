@@ -148,6 +148,19 @@ bool exactOption(const char* options,const char* prefix,const char* exact) noexc
     }
     return count==1&&matches;
 }
+bool decodeMountPath(char* text) noexcept {
+    char* destination=text;
+    for(const char* source=text;*source;++source) {
+        if(*source!='\\'){*destination++=*source;continue;}
+        if(std::strncmp(source,"\\040",4)==0)*destination++=' ';
+        else if(std::strncmp(source,"\\011",4)==0)*destination++='\t';
+        else if(std::strncmp(source,"\\012",4)==0)*destination++='\n';
+        else if(std::strncmp(source,"\\134",4)==0)*destination++='\\';
+        else return false;
+        source+=3;
+    }
+    *destination=0;return true;
+}
 bool btrfsMountShape(char* text,const char* path,unsigned mapMajor,unsigned mapMinor) noexcept {
     // Choose the single longest path-prefix mount. A nested bind/subvolume or
     // duplicate mount must never be justified by the less-specific root row.
@@ -156,7 +169,7 @@ bool btrfsMountShape(char* text,const char* path,unsigned mapMajor,unsigned mapM
         char* end=std::strchr(line,'\n');if(end)*end=0;
         unsigned id=0,parent=0,a=0,b=0;char rootName[256]{},point[256]{};
         if(std::sscanf(line,"%u %u %u:%u %255s %255s",&id,&parent,&a,&b,rootName,point)!=6)return false;
-        if(std::strchr(rootName,'\\')||std::strchr(point,'\\'))return false;
+        if(!decodeMountPath(rootName)||!decodeMountPath(point))return false;
         const auto len=std::strlen(point),pathLen=std::strlen(path);
         const bool matches=point[0]=='/' && len<=pathLen && !std::memcmp(point,path,len) && (len==1 || len==pathLen || path[len]=='/');
         if(matches) {

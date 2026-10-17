@@ -46,6 +46,7 @@ void mountControls() {
     const std::string root="32 1 0:29 / / ro - btrfs /dev/nvme rw,subvolid=5,subvol=/\n";
     auto valid=[&](std::string x){std::vector<char> text(x.begin(),x.end());text.push_back(0);return btrfsMountShape(text.data(),DriverPath,0,29);};
     check(valid(root),"exact reviewed Btrfs mount shape");
+    check(valid(root+"33 32 8:1 / /run/media/My\\040Disk rw - ext4 /dev/sda1 rw\n"),"unrelated legal escaped mount does not refuse root driver");
     auto mutate=[&](const char* old,const char* replacement){std::string x=root;x.replace(x.find(old),std::strlen(old),replacement);return x;};
     check(!valid(mutate("subvolid=5","subvolid=50")),"Btrfs subvolid suffix refused");
     check(!valid(mutate("subvol=/","subvol=/other")),"Btrfs subvolume suffix refused");
