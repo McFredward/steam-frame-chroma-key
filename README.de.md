@@ -35,9 +35,9 @@ Die weiterführenden Anleitungen sind auf Englisch.
 
 ## Unterstützte Spiele
 
-| Spiel | Benötigter Mod |
-|---|---|
-| Gloomhaven Digital | [GloomhavenVR](https://github.com/McFredward/GloomhavenVR) mit **Steam Link native passthrough** |
+| Spiel | Benötigter Mod | Mindestversion |
+|---|---|---|
+| Gloomhaven Digital | [GloomhavenVR](https://github.com/McFredward/GloomhavenVR) | **1.2.0** (noch nicht veröffentlicht) |
 
 Andere Spiele benötigen eine eigene Integration. Dieser Patch allein ergänzt
 kein Mixed Reality in einem unveränderten Spiel.

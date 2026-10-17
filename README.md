@@ -33,9 +33,9 @@ partially transparent objects can blend with your real room too.
 
 ## Supported games
 
-| Game | Required mod |
-|---|---|
-| Gloomhaven Digital | [GloomhavenVR](https://github.com/McFredward/GloomhavenVR), with **Steam Link native passthrough** integration |
+| Game | Required mod | Minimum version |
+|---|---|---|
+| Gloomhaven Digital | [GloomhavenVR](https://github.com/McFredward/GloomhavenVR) | **1.2.0** (upcoming) |
 
 Other games need their own integration. Installing this patch alone does not
 add mixed reality to an unmodified game.
