@@ -452,6 +452,8 @@ void recordingSerializationBounds(){
     require(providerLine.find("\"provider_path_truncated\":true")!=std::string::npos&&providerLine.find("\\u0001")!=std::string::npos&&providerLine.find("\"observed_route\":4294967295")!=std::string::npos,"truncated path is explicitly JSON escaped and exact failed route remains available");
     std::memset(provider.providerPath,0,sizeof(provider.providerPath));provider.providerPath[0]='"';provider.providerPath[1]='\\';
     require(nativeSubpassStatusLine(provider,providerLine)&&providerLine.find("\"provider_path\":\"\\\"\\\\\"")!=std::string::npos,"quote and backslash in wrapper path cannot corrupt JSON");
+    std::ostringstream finalProvider;nativeSubpassFinalMetadataJson(finalProvider,provider);require(finalProvider.str().size()<=200,"final provider lifecycle/miss metadata bounded200B even at maximum counters");
+    std::ostringstream finalEnvelope;finalEnvelope<<std::string(8192,' ')<<metadata.str();nativeSubpassFinalMetadataJson(finalEnvelope,provider);require(finalEnvelope.str().size()<=16384,"final provider metadata preserves original16KiB snapshot envelope with maximum64context repeats");
 }
 void wholeRecording(const char* vertex,const char* fragment,bool khr,unsigned extensions){
     HookFixture fixture(2,0);fixture.preparePrivate(vertex,fragment,khr);
@@ -705,6 +707,7 @@ void nativeValveHooks(const char* vertex,const char* fragment,bool khr,unsigned 
 }
 int main(int argc,char** argv){
 #ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
+    if(argc==2&&!std::strcmp(argv[1],"--provider-status-json")){HookFixture fixture;require(frame_pixel_native_driver::LeaseTestAccess::fixture(fixture.context->nativeSubpassLease,fixture.context->nativeSubpassInputs),"synthetic provider fixture only");constexpr char scope[]="{\"event\":\"provider_fixture_scope\",\"scope\":\"synthetic lease; no native verification\",\"native_authority\":false}\n";frame_pixel_io::writeAll(STDOUT_FILENO,scope,sizeof(scope)-1);nativeSubpassStatus(*fixture.context,STDOUT_FILENO);preparationStatus(fixture.context,STDOUT_FILENO);return 0;}
     if(argc==4&&!std::strcmp(argv[1],"--valve-only")){for(bool khr:{false,true})for(unsigned mode=0;mode<=11;++mode)nativeValveHooks(argv[2],argv[3],khr,mode);recordingSerializationBounds();std::cout<<"{\"scope\":\"actual Snapshot callbacks with synthetic scoped provider, NOT native verification\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
 #endif
 

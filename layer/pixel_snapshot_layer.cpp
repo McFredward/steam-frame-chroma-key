@@ -284,6 +284,12 @@ void recordingStatus(const frame_pixel_ssbo_transaction::RecordingContexts& cont
         const auto n=std::snprintf(report,sizeof(report),"{\"event\":\"ssbo_recording_context_overflow\",\"attempts\":%llu,\"overflow\":%llu,\"contended\":%s,\"mask_enabled\":false}\n",static_cast<unsigned long long>(contexts.attempts),static_cast<unsigned long long>(contexts.overflow),contexts.contended?"true":"false");
         if(n>0&&std::size_t(n)<sizeof(report))frame_pixel_io::writeAll(fd,report,std::size_t(n));}
 }
+void nativeSubpassFinalMetadataJson(std::ostream& out,const frame_pixel_native_driver::Status& s) {
+    // Exactly one final cold snapshot; never a repeating callback/frame log.
+    out<<",\"native_subpass_provider_final\":{\"state\":\""<<frame_pixel_native_driver::stateName(s.state)<<"\",\"reason\":\""<<frame_pixel_native_driver::refusalName(s.refusal)<<"\",\"epoch\":"<<s.epoch
+       <<",\"acquire_misses\":"<<s.acquireMisses<<",\"active_permits\":"<<s.activePermits<<'}';
+}
+
 #endif
 void save(Device& d, const frame_pixels::View& view, int progress) {
     const auto& config = session().config;
@@ -415,6 +421,7 @@ void save(Device& d, const frame_pixels::View& view, int progress) {
           <<",\"execution\":"<<invocation.execution<<",\"source_cohort\":{\"device\":"<<invocation.source.image.device<<",\"layout\":"<<unsigned(invocation.source.layout)<<",\"extent\":["<<invocation.source.extent.width<<','<<invocation.source.extent.height<<"],\"image\":"<<invocation.source.image.value<<",\"image_generation\":"<<invocation.source.image.generation
           <<",\"view\":"<<invocation.source.view.value<<",\"view_generation\":"<<invocation.source.view.generation<<",\"memory\":"<<invocation.source.memory.value<<",\"memory_generation\":"<<invocation.source.memory.generation<<'}';
     record<<",\"native_frame_association_proven\":false,\"physical_eye_proven\":false,\"passthrough_authorized\":false}";
+    nativeSubpassFinalMetadataJson(record,d.nativeSubpassLease.status());
 #endif
     record<<",\"source_frame_associated\":false,\"uv_owned\":false,\"passthrough_authorized\":false}\n";
     const int meta = frame_pixel_io::create(config, "snapshot.json");
@@ -584,15 +591,7 @@ void bridgeStatus(Device& d,int fd,std::uint64_t& seen,RecordingReportProgress& 
     if(n>0&&std::size_t(n)<sizeof(report))frame_pixel_io::writeAll(fd,report,std::size_t(n));
 }
 #endif
-void writer(Device* d) noexcept {
-    const int progress = frame_pixel_io::create(session().config,"status.jsonl");
-    if (progress < 0 || flock(progress,LOCK_EX|LOCK_NB)) { if(progress>=0)close(progress); return; }
-#ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    // One cold verification, before manual arming. Never resolve a provider,
-    // hash an ELF, open a file or acquire its loader lease inside Begin/Next.
-    d->nativeSubpassLease.prepareCold(d->nativeSubpassInputs);
-    nativeSubpassStatus(*d,progress);
-#endif
+void preparationStatus(Device* d,int progress) noexcept {
     // One cold background record. It must explain a refused preparation before
     // asking the maintainer to start a stream; never emit per-frame diagnostics.
     char preparation[4096]{};
@@ -621,6 +620,17 @@ void writer(Device* d) noexcept {
         uniformCompanionEnabled()?"true":"false",uniformCompanionReady(*d)?"true":"false");
     if(preparedCount>0 && static_cast<std::size_t>(preparedCount)<sizeof(preparation))
         frame_pixel_io::writeAll(progress,preparation,static_cast<std::size_t>(preparedCount));
+}
+void writer(Device* d) noexcept {
+    const int progress = frame_pixel_io::create(session().config,"status.jsonl");
+    if (progress < 0 || flock(progress,LOCK_EX|LOCK_NB)) { if(progress>=0)close(progress); return; }
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    // One cold verification, before manual arming. Never resolve a provider,
+    // hash an ELF, open a file or acquire its loader lease inside Begin/Next.
+    d->nativeSubpassLease.prepareCold(d->nativeSubpassInputs);
+    nativeSubpassStatus(*d,progress);
+#endif
+    preparationStatus(d,progress);
     bool announced = false, refusalAnnounced = false;
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
     bool uniformRefusalAnnounced = false;
