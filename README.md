@@ -73,8 +73,11 @@ native receiver installation or a live presenter.
 
 The [successful original-invocation capture](docs/research/native-invocation-capture-20261017.md)
 now records actual fragment values together with the selected native image.
-The temporary diagnostic is removed and the Frame is restored. A direct current-R1
-registration and single-output reconstruction are the next offline steps;
+The temporary diagnostic is removed and the Frame is restored. The
+[direct current-R1 registrar](docs/research/native-r1-registration-20261017.md)
+validates that saved image without a fitted map, while the
+[single-output candidate](docs/research/native-r1-presenter-20261017.md) is checked
+on owned host GPU resources. Neither component is installed as a presenter;
 actual streaming passthrough and real game coverage remain unimplemented.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
