@@ -1,4 +1,21 @@
+> **Supported SteamVR on the Frame: 2.18.2 · build 1791331621**
+
+<p align="center">
+  <img src="docs/img/steam-link-icon.png" width="56" height="56" alt="Steam Link">
+  &nbsp;&nbsp;
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/steam-frame-logo-dark.svg">
+    <img src="docs/img/steam-frame-logo.svg" width="240" alt="Steam Frame">
+  </picture>
+</p>
+
 # Steam Link Native Passthrough
+
+<p align="center">
+  <img src="docs/img/flag-en.png" width="24" alt="English">&nbsp;<b>English</b>
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  <a href="README.de.md"><img src="docs/img/flag-de.png" width="24" alt="Deutsch">&nbsp;Deutsch</a>
+</p>
 
 **For Steam Frame.** Bring supported PC VR games into your room over Steam Link.
 
@@ -29,15 +46,15 @@ add mixed reality to an unmodified game.
 | Setup | Steam Frame streaming from a Windows PC through Steam Link |
 | SteamVR on the Frame | **2.18.2 — build 1791331621** |
 
-**Experimental:** real GloomhavenVR gameplay has been confirmed; some edges and
-motion still need improvement. See [known limits and update support](docs/COMPATIBILITY.md).
+**Experimental:** some edges and motion still need improvement.
+See [known limits and update support](docs/COMPATIBILITY.md).
 
 ## Get started
 
 1. Install using [Desktop Mode on the Frame](docs/INSTALL.md#directly-on-the-frame)
    or [SSH from your PC](docs/INSTALL.md#from-a-pc-over-ssh).
-2. In GloomhavenVR, open **VR Options → World → Scenery** and choose **Mixed Reality**.
-3. Enable **Steam Link native passthrough** directly below it. Changes apply immediately.
+2. Start your PC VR stream and enable native passthrough in the supported game or mod.
+   Follow its mixed-reality setup instructions.
 
 The installation stays on the Frame between sessions. You can turn passthrough
 off in the game whenever you want.

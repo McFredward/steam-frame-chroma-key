@@ -85,7 +85,7 @@ an experimental build.
 
 1. Confirm that `bash setup.sh status` accepts the installed receiver, then
    start the PC VR stream and GloomhavenVR normally.
-2. Open **VR Options → World → Scenery**. Choose **Mixed Reality** in the
+2. Open **VR Options → World & sound**. Choose **Mixed Reality** in the
    environment selector, then check **Steam Link native passthrough** directly
    below it. The native choice is available only on an identified Steam Frame
    connection through Steam Link.
