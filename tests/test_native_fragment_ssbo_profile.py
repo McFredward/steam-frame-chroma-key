@@ -122,4 +122,72 @@ class PrivateControls(unittest.TestCase):
         with self.assertRaises(tool.ssbo.probe.ProbeError): tool.transform(self.original, True, "sparse32")
 
 
+@unittest.skipUnless(os.environ.get("FRAME_NATIVE_PS") and os.environ.get("FRAME_NATIVE_VS"),
+                     "both private stage sources are explicit and not distributed")
+class MirrorControls(unittest.TestCase):
+    def setUp(self):
+        self.original = Path(os.environ["FRAME_NATIVE_PS"]).read_bytes()
+        self.vertex = Path(os.environ["FRAME_NATIVE_VS"]).read_bytes()
+
+    def test_exact_both_stage_binding_census_and_canonical_annotation_only_change(self):
+        vs, ps = tool.mirror_original_interfaces(self.vertex, self.original)
+        self.assertEqual(vs, ((0, 0, 2), (0, 2, 2), (0, 3, 2)))
+        self.assertEqual(ps, ((0, 4, 2), (0, 6, 2), (0, 9, 0), (0, 25, 0)))
+        active, record = tool.transform_mirror(self.vertex, self.original)
+        self.assertEqual(len(active), 9888)
+        self.assertEqual(record["output_sha256"], "ec8eaf5e1f0db2f4454320a5b613291e818d9f77b9c6219c683c1211e66333e1")
+        self.assertEqual(record["profile"], tool.MIRROR_PROFILE)
+        self.assertEqual(record["required_original_copy_bindings"], [0, 2, 3, 4, 6, 9, 25])
+        self.assertEqual((record["record_descriptor_set"], record["record_descriptor_binding"]), (0, 8))
+        self.assertTrue(record["compatible_original_set0_mirror"])
+        self.assertFalse(record["additional_set1"])
+        self.assertFalse(record["native_descriptor_set_written"])
+        for key in ("native_descriptor_layout_modified", "native_creation_proven", "runtime_activation_authorized", "passthrough_authorized"):
+            self.assertFalse(record[key])
+        header, changed = tool.parse_ssbo_module(active)
+        canonical, _ = tool.transform(self.original, election="sparse32")
+        old_header, old = tool.parse_ssbo_module(canonical)
+        reversed_annotations = {tool.ssa.Instruction(71, (1014, 34, 0)): tool.ssa.Instruction(71, (1014, 34, 1)),
+                                tool.ssa.Instruction(71, (1014, 33, 8)): tool.ssa.Instruction(71, (1014, 33, 0))}
+        self.assertEqual(header, old_header)
+        self.assertEqual([reversed_annotations.get(item, item) for item in changed], old)
+        # The complete original expression/access stream and all CAS/winner
+        # stores are unchanged from the already validated canonical artifact.
+        self.assertEqual([i for i in changed if i.opcode != 71], [i for i in old if i.opcode != 71])
+        self.assertEqual(sum(i.opcode == 230 for i in changed), 1)
+
+    def test_mutated_original_pins_and_unused_binding_collision_refuse(self):
+        for role in ("vertex", "fragment"):
+            vertex, fragment = bytearray(self.vertex), bytearray(self.original)
+            (vertex if role == "vertex" else fragment)[8] ^= 1
+            with self.assertRaises(tool.ssbo.probe.ProbeError): tool.transform_mirror(bytes(vertex), bytes(fragment))
+        words = list(struct.unpack("<%dI" % (len(self.vertex)//4), self.vertex)); at = 5
+        while at < len(words):
+            count, op = words[at] >> 16, words[at] & 65535
+            if op == 71 and count == 4 and words[at+2] == 33:
+                words[at+3] = 8; break
+            at += count
+        colliding = struct.pack("<%dI" % len(words), *words)
+        self.assertIn((0, 8, 2), tool.descriptor_census(colliding))
+        with self.assertRaisesRegex(tool.ssbo.probe.ProbeError, "vertex mirror pin"):
+            tool.transform_mirror(colliding, self.original)
+        for suffix in (struct.pack("<2I", (2 << 16)|73, 123),
+                       struct.pack("<4I", (4 << 16)|71, 75, 33, 8)):
+            with self.assertRaises(tool.ssbo.probe.ProbeError): tool.descriptor_census(self.vertex+suffix)
+        with self.assertRaises(tool.ssbo.probe.ProbeError): tool.descriptor_census(self.vertex[:-1])
+
+    def test_cli_mirror_requires_both_sources_and_validates_no_native_body_is_published(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            root = Path(directory); source, vertex, output, record = [root/name for name in ("source.spv", "vertex.spv", "mirror.spv", "record.json")]
+            source.write_bytes(self.original); vertex.write_bytes(self.vertex)
+            common = ["--original", str(source), "--output", str(output), "--record", str(record), "--mirror-set0"]
+            self.assertEqual(tool.main(common), 2)
+            self.assertFalse(output.exists())
+            self.assertEqual(tool.main(common+["--vertex", str(vertex)]), 0)
+            self.assertTrue(json.loads(record.read_bytes())["spirv_val_passed"])
+            previous = output.read_bytes(), record.read_bytes()
+            self.assertEqual(tool.main(common+["--vertex", str(vertex)]), 2)
+            self.assertEqual((output.read_bytes(), record.read_bytes()), previous)
+
+
 if __name__ == "__main__": unittest.main()

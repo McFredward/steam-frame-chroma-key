@@ -48,6 +48,11 @@ void mirror(const char* vertexPath,const char* fragmentPath,const char* artifact
     bindings[8].stageFlags=VK_SHADER_STAGE_VERTEX_BIT;require(!clone::captureSet0(set,definition,why,checked),"record binding must permit fragment writes");bindings[8].stageFlags=VK_SHADER_STAGE_ALL;
     for(const auto number:clone::ProbeInterface::MirrorBindings){const auto saved=bindings[number].descriptorType;bindings[number].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         require(!clone::captureSet0(set,definition,why,checked),"incompatible original copied type refused");bindings[number].descriptorType=saved;}
+    for(unsigned i=0;i<clone::ProbeInterface::MirrorBindings.size();++i){const auto number=clone::ProbeInterface::MirrorBindings[i];bindings[number].stageFlags=i<3?VK_SHADER_STAGE_FRAGMENT_BIT:VK_SHADER_STAGE_VERTEX_BIT;
+        require(!clone::captureSet0(set,definition,why,checked),"each copied binding must permit the exact attested original stage");bindings[number].stageFlags=VK_SHADER_STAGE_ALL;}
+    const auto savedRecord=bindings[8];bindings[8].binding=30;require(!clone::captureSet0(set,definition,why,checked),"missing native record binding cannot fabricate an extended layout");bindings[8]=savedRecord;
+    require(clone::capturePendingCount1Set0(set,definition,why)&&definition.pendingCount1&&!definition.complete,"native pending facts remain nonready before mirror proof");
+    require(clone::promotePendingCount1Set0(definition,checked,why)&&definition.complete&&definition.probeInterface.compatibleSet0Mirror(),"actual checked both-stage profile promotes complete original pending definition");
     require(clone::captureSet0(set,definition,why,checked),"recovered exact full mirror layout");
     clone::Recipe recipe;recipe.definitionComplete=true;recipe.set0=definition;clone::LayoutView layout;
     const auto set0=reinterpret_cast<VkDescriptorSetLayout>(std::uintptr_t(0x123));

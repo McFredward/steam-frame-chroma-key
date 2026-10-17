@@ -61,7 +61,8 @@ inline bool digestMatches(const std::array<std::uint8_t,32>& digest,const char* 
 // count1 profiles are deterministic original-invocation SSBO artifacts built
 // by native_fragment_ssbo_profile.py: Set1, pixel(0,0), first-covered, or first
 // eligible32x32grid invocation, exact original PS pin,
-// two exhaustive B9 constant0 accesses and fresh owned interface types. A caller
+// two exhaustive B9 constant0 accesses and fresh owned interface types. The
+// separate one-set mirror also attests BOTH native stages and unused binding8. A caller
 // boolean/hash cannot attest that interface; admission hashes the actual bytes
 // against this independently pinned transformer result. No native authority.
 class ProbeInterface {

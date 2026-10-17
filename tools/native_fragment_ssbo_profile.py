@@ -213,7 +213,7 @@ def descriptor_census(data):
     for target, values in decorations.items():
         require(set(values) == {33, 34} and target in variables, "complete literal decorated variable required")
         result.append((values[34], values[33], variables[target]))
-    require(len(result) == len(set(result)), "unique native descriptor bindings required")
+    require(len(result) == len({item[:2] for item in result}), "unique native descriptor bindings required")
     return tuple(sorted(result))
 
 
