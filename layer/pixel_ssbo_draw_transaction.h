@@ -53,6 +53,8 @@ struct CommandContextInput {
     std::uint32_t detailReason=0,structureType=UINT32_MAX,index=UINT32_MAX,chain=UINT32_MAX,contents=UINT32_MAX,flags=0;
     std::uint64_t object=0;
     bool targetPipeline=false;
+    // Copied decoder diagnostics only, never a driver/provider capability.
+    std::uint32_t privateProfile=0,privateSrgbMask=0;bool privatePayloadObserved=false;
     std::array<CommandContextChain,CommandContextChains> chains{};
 };
 struct RecordingContext {

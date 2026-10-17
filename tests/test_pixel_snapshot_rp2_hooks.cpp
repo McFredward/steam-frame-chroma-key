@@ -408,9 +408,10 @@ void recordingSerializationBounds(){
     context.phase=tx::RecordingPhase::TargetSubpassBeforeDraw;context.before=context.after=tx::Reason::DeviceDestroying;
     context.sequence=context.transactionEpoch=context.device=context.command=context.pool=context.commandGeneration=context.poolGeneration=context.drawOrdinal=UINT64_MAX;
     context.currentSubpass=context.targetSubpass=context.subpassCount=UINT32_MAX;context.rejected=context.metadataTruncated=true;
-    context.input.detailReason=context.input.structureType=context.input.index=context.input.chain=context.input.contents=context.input.flags=UINT32_MAX;context.input.object=UINT64_MAX;context.input.targetPipeline=true;
+    context.input.detailReason=context.input.structureType=context.input.index=context.input.chain=context.input.contents=context.input.flags=UINT32_MAX;context.input.object=UINT64_MAX;context.input.targetPipeline=true;context.input.privateProfile=context.input.privateSrgbMask=UINT32_MAX;context.input.privatePayloadObserved=true;
     for(auto& chain:context.input.chains){chain.rootType=chain.termination=UINT32_MAX;chain.types.fill(UINT32_MAX);chain.count=chain.types.size();}
     std::string line;require(recordingContextLine(context,UINT32_MAX,UINT64_MAX,UINT64_MAX,true,line)&&line.size()<=2048,"max-width three-chain first-refusal event fits exact 2KiB line guard");
+    require(line.find("\"private_srgb\":[4294967295,true,4294967295]")!=std::string::npos,"private profile/payload/mask tuple survives bounded cold context output");
     require(line.find("4294967295,4294967295")!=std::string::npos&&line.find("ssbo_recording_first_refusal")!=std::string::npos,"all bounded headers and independent first-refusal event serialized");
     tx::RecordingContexts contexts;contexts.count=1;contexts.entries[0].first=context;contexts.entries[0].count=1;contexts.entries[0].lastSequence=context.sequence;
     FILE* output=std::tmpfile();require(output,"cold fixture output opened");RecordingReportProgress progress;

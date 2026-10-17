@@ -96,7 +96,7 @@ bool sameContext(const RecordingContext& a,const RecordingContext& b) noexcept {
     const auto& x=a.input;const auto& y=b.input;
     if(a.transactionEpoch!=b.transactionEpoch||a.command!=b.command||a.pool!=b.pool||a.commandGeneration!=b.commandGeneration||a.poolGeneration!=b.poolGeneration||
        a.phase!=b.phase||a.currentSubpass!=b.currentSubpass||a.targetSubpass!=b.targetSubpass||a.subpassCount!=b.subpassCount||a.before!=b.before||a.after!=b.after||a.rejected!=b.rejected||a.metadataTruncated!=b.metadataTruncated||
-       x.operation!=y.operation||x.source!=y.source||x.detailReason!=y.detailReason||x.structureType!=y.structureType||x.index!=y.index||x.chain!=y.chain||x.contents!=y.contents||x.flags!=y.flags||x.targetPipeline!=y.targetPipeline)return false;
+       x.operation!=y.operation||x.source!=y.source||x.detailReason!=y.detailReason||x.structureType!=y.structureType||x.index!=y.index||x.chain!=y.chain||x.contents!=y.contents||x.flags!=y.flags||x.targetPipeline!=y.targetPipeline||x.privateProfile!=y.privateProfile||x.privateSrgbMask!=y.privateSrgbMask||x.privatePayloadObserved!=y.privatePayloadObserved)return false;
     // Object values and draw ordinals are first-observation payload, not a key:
     // ordinary binds/draws must not starve the independent first refusal.
     for(unsigned i=0;i<x.chains.size();++i){const auto& p=x.chains[i];const auto& q=y.chains[i];if(p.rootType!=q.rootType||p.count!=q.count||p.termination!=q.termination)return false;for(unsigned n=0;n<p.count;++n)if(p.types[n]!=q.types[n])return false;}

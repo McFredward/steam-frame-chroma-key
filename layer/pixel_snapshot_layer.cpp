@@ -248,7 +248,11 @@ void recordingContextJson(std::ostream& out,const frame_pixel_ssbo_transaction::
         out<<"{\"root_type\":"<<chain.rootType<<",\"termination\":"<<chain.termination<<",\"types\":[";
         for(unsigned n=0;n<std::min<std::size_t>(chain.count,chain.types.size());++n){if(n)out<<',';out<<chain.types[n];}
         out<<"]}";}
-    out<<"]}";
+    out<<']';
+    // Finite tuple [profile, payload-observed, SRGB mask]. Omit on public
+    // paths so absent private payload never looks decoded or authorized.
+    if(in.privateProfile||in.privatePayloadObserved)out<<",\"private_srgb\":["<<in.privateProfile<<','<<(in.privatePayloadObserved?"true":"false")<<','<<in.privateSrgbMask<<']';
+    out<<'}';
 }
 bool recordingContextLine(const frame_pixel_ssbo_transaction::RecordingContext& context,unsigned index,std::uint64_t count,std::uint64_t last,bool first,std::string& text) {
     std::ostringstream out;out.imbue(std::locale::classic());
@@ -1030,6 +1034,7 @@ CommandContext passContext(RecordingOperation operation,const recording::Shape& 
     auto out=commandContext(operation,frame_pixel_ssbo_clone::handle(shape.renderPass));
     out.source=frame_pixel_ssbo_receiver::ContextSource::RenderPassDecoder;
     out.detailReason=unsigned(shape.refusal.reason);out.structureType=shape.refusal.type;
+    out.privateProfile=unsigned(shape.privateProfile);out.privatePayloadObserved=shape.privatePayloadObserved;out.privateSrgbMask=shape.privateSrgbMask;
     out.index=shape.refusal.index;out.chain=unsigned(shape.refusal.chain);out.contents=unsigned(shape.contents);
     static_assert(recording::MaxChain==frame_pixel_ssbo_transaction::CommandContextHeaders,"lossless bounded public header census");
     static_assert(unsigned(recording::Chain::Count)==frame_pixel_ssbo_transaction::CommandContextChains,"all public Begin/Next/End roots retained");
