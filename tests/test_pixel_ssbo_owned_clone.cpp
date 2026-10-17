@@ -291,6 +291,8 @@ void mirrorProfile(const char* vsPath,const char* psPath,const char* probePath){
         std::copy(vs.begin(),vs.end(),f.recipe.vertex.words.begin());std::copy(ps.begin(),ps.end(),f.recipe.fragment.words.begin());
         f.p.fragment=probe.data();f.p.fragmentBytes=probe.size()*4;frame_receiver::Sha256 hash;hash.update(f.p.fragment,f.p.fragmentBytes);f.p.fragmentSha256=hash.finish();
         f.p.limits.maxBoundDescriptorSets=1;f.p.limits.maxDescriptorSetStorageBuffers=64;f.p.limits.maxPerStageDescriptorStorageBuffers=64;
+        for(unsigned unused:{1u,5u,7u}){const auto old=f.recipe.set0.bindings[unused].descriptorType;f.recipe.set0.bindings[unused].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;Clone rejected;
+            demand(rejected.prepare(f.p).status==Status::InvalidInput&&!state.calls&&state.live.empty(),"uncopied dynamic1/5/7 refuses before any Vulkan creation or descriptor update");f.recipe.set0.bindings[unused].descriptorType=old;}
         demand(clone.prepare(f.p).status==Status::Ok && clone.compatibleSet0Mirror() && !clone.mirrorSet() && !clone.set1() && !clone.mirrorPopulated(),"mirror owns one compatible original set, no unsafe extra Set1");
         demand(!clone.markMirrorBound() && !clone.mirrorSet(),"unpopulated descriptor cannot be exposed or bound");
         demand(clone.markReferenced(),"GPU reset acquires buffer lease before target set is known");

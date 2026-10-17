@@ -112,7 +112,7 @@ VKAPI_ATTR void VKAPI_CALL bindPipeline(VkCommandBuffer cb,VkPipelineBindPoint p
 VKAPI_ATTR void VKAPI_CALL bindSets(VkCommandBuffer cb,VkPipelineBindPoint point,VkPipelineLayout layout,std::uint32_t first,
     std::uint32_t count,const VkDescriptorSet* sets,std::uint32_t dynamic,const std::uint32_t* offsets){
     if(recorder->mirror){require(cb==recorder->command&&point==VK_PIPELINE_BIND_POINT_GRAPHICS&&!first&&count==1&&sets&&dynamic==5&&offsets,"mirror and restore touch only Set0 with full original dynamic list");
-        require(std::equal(recorder->expectedOffsets.begin(),recorder->expectedOffsets.end(),offsets),"all dynamic offsets restored including unused bindings1/5/7");
+        require(std::equal(recorder->expectedOffsets.begin(),recorder->expectedOffsets.end(),offsets),"all dynamic offsets restored including vertex-stage0/2/3 beyond fragment4/6");
         require(layout==recorder->layout?sets[0]==obj<VkDescriptorSet>(70):sets[0]==obj<VkDescriptorSet>(900),"owned mirror never substitutes original restore set");
     }else require(cb==recorder->command && point==VK_PIPELINE_BIND_POINT_GRAPHICS && layout!=recorder->layout && first==1 && count==1 &&
         sets && sets[0]==recorder->set1 && !dynamic && !offsets,"ONLY owned compatible Set1, native Set0/push/dynamic state not rebound");
@@ -187,8 +187,8 @@ struct Fixture {
             require(c::ProbeInterface::set0Mirror(vertex.data(),vertex.size()*4,fragment.data(),fragment.size()*4,mirrorWords.data(),mirrorWords.size()*4,profile,why),"private mirror requires both exact original source stages");
             std::copy(vertex.begin(),vertex.end(),captured.recipe.vertex.words.begin());std::copy(fragment.begin(),fragment.end(),captured.recipe.fragment.words.begin());
             std::array<VkDescriptorSetLayoutBinding,29> bindings{};for(unsigned i=0;i<29;++i)bindings[i]={i,i<8?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:i==8?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i<25?VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_ALL,nullptr};
-            for(unsigned i:{0u,1u,2u,5u,7u})bindings[i].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-            VkDescriptorSetLayoutCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;ci.bindingCount=bindings.size();ci.pBindings=bindings.data();require(c::captureSet0(ci,captured.recipe.set0,why,profile),"mirror retains every original descriptor including unused dynamic slots");
+            for(unsigned i:{0u,2u,3u,4u,6u})bindings[i].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            VkDescriptorSetLayoutCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;ci.bindingCount=bindings.size();ci.pBindings=bindings.data();require(c::captureSet0(ci,captured.recipe.set0,why,profile),"mirror retains every original descriptor including every attested dynamic stage binding");
             captured.p.fragment=mirrorWords.data();captured.p.fragmentBytes=mirrorWords.size()*4;ownerDriver.expectedFragmentBytes=unsigned(captured.p.fragmentBytes);frame_receiver::Sha256 hash;hash.update(captured.p.fragment,captured.p.fragmentBytes);captured.p.fragmentSha256=hash.finish();
         }
         require(clone.prepare(captured.p).status==frame_pixel_ssbo_owned::Status::Ok,"reuse existing real owned-clone finite creation fixture");
@@ -624,7 +624,7 @@ void compatibleMirror(const char* vs,const char* ps,const char* probe){
             if(mode==2)TransactionTestAccess::restore(fresh,Id{1,20,777},{16,32,64,128,257});
             if(mode==3)TransactionTestAccess::restore(fresh,Id{1,20,778},{16,32,64,128,256});
             if(mode==6)fresh=TransactionTestAccess::target(Cohort{Id{1,1001,2},f.source.view,f.source.memory,f.source.layout,f.source.extent},1,1);
-            if(mode!=8)require(f.transaction.targetStateCurrent(fresh)==(mode!=2&&mode!=3&&mode!=6),"post-copy same-callback proof rejects unused-offset drift/layout generation/source changes");}
+            if(mode!=8)require(f.transaction.targetStateCurrent(fresh)==(mode!=2&&mode!=3&&mode!=6),"post-copy same-callback proof rejects full-offset drift/layout generation/source changes");}
         f.driver.reenter=mode==7;
         const auto result=f.transaction.drawIndexed(f.driver.command,17,2,4,-3,9);const bool replaced=mode==0||mode==7;
         require((result==DrawResult::ReplacedOriginal)==replaced,"no owned command without complete populated immutable mirror and fresh exact target state");
