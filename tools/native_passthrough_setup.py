@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Durable user-only native passthrough setup; never restarts Steam or SteamVR.
 
-Prepare is a fail-closed optional ExecStartPre, not a readiness claim. Every
+Prepare is a fail-closed optional ExecCondition, not a readiness claim. Every
 compositor launch gets a fresh unchanged one-shot GHVR session. Emergency-off
 unpublishes our injection before attempting any independent camera restoration.
 """
@@ -377,8 +377,10 @@ class Setup:
         script = str(self.tools / 'native_passthrough_setup.py')
         def quote(value):
             return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+        # Valve starts vrstartup from its own ExecStartPre. An additive condition
+        # runs before every vendor pre-command; '-' ignores optional helper errors.
         return ('# Owned by SteamFrameNativePassthrough; existing directory lists are not reset.\n[Service]\nRuntimeDirectory=steam-frame-native-passthrough\nRuntimeDirectoryMode=0700\nRuntimeDirectoryPreserve=no\n'
-                'ExecStartPre=-/usr/bin/python3 ' + quote(script) + ' prepare-launch --home ' + quote(str(self.home)) + '\n'
+                'ExecCondition=-/usr/bin/python3 ' + quote(script) + ' prepare-launch --home ' + quote(str(self.home)) + '\n'
                 'ExecStopPost=-/usr/bin/python3 ' + quote(script) + ' finish-launch --home ' + quote(str(self.home)) + '\n').encode()
 
     def install(self, package):

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -110,7 +111,7 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(self.setup.status()['enabled'])
         self.assertIn('OTHER=1', foreign.read_text())
         unit = self.setup.dropin.read_text()
-        for key in ('RuntimeDirectory=steam-frame-native-passthrough', 'RuntimeDirectoryMode=0700', 'RuntimeDirectoryPreserve=no', 'ExecStartPre=-/usr/bin/python3', 'ExecStopPost=-/usr/bin/python3'):
+        for key in ('RuntimeDirectory=steam-frame-native-passthrough', 'RuntimeDirectoryMode=0700', 'RuntimeDirectoryPreserve=no', 'ExecCondition=-/usr/bin/python3', 'ExecStopPost=-/usr/bin/python3'):
             self.assertIn(key, unit)
         self.assertNotIn('Restart=', unit)
         self.assertNotIn('ExecStart=\n', unit)
@@ -617,6 +618,69 @@ class SetupTests(unittest.TestCase):
             self.setup._camera_state()
         self.assertNotEqual(self.settings.read_bytes(), raw)
         self.assertFalse(self.setup.camera_receipt.exists())
+
+    def test_condition_precedes_vendor_startup_and_ignores_optional_failures(self):
+        self.install()
+        consumer = self.root / 'native-startup-consumer.py'
+        consumer.write_text('import json,pathlib,sys\nprint(json.dumps({"saw_layer_at_startup":pathlib.Path(sys.argv[1]).exists()}))\n')
+        native_argv = [sys.executable, str(consumer), str(self.setup.target)]
+        # This small scheduler models the documented public service phase order;
+        # the vendor pre-command is a REAL child consuming the published target.
+        # No systemd service is started and no native driver authority is claimed.
+        def run_phase_order(dropin, helper_exit=None):
+            commands = [('ExecStartPre', native_argv, False)]
+            for line in dropin.splitlines():
+                key, _, value = line.partition('=')
+                if key in ('ExecCondition', 'ExecStartPre'):
+                    ignore = value.startswith('-')
+                    argv = shlex.split(value.lstrip('-'))
+                    self.assertEqual(argv[0], '/usr/bin/python3')
+                    self.assertEqual(argv[2:], ['prepare-launch', '--home', str(self.home)])
+                    commands.append((key, argv, ignore))
+            observed = []
+            for phase in ('ExecCondition', 'ExecStartPre'):
+                for key, argv, ignore in commands:
+                    if key != phase:
+                        continue
+                    if argv == native_argv:
+                        child = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+                        self.assertEqual(child.returncode, 0, child.stderr)
+                        observed.append(json.loads(child.stdout)['saw_layer_at_startup'])
+                    else:
+                        if helper_exit is None:
+                            self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+                            code = 0
+                        else:
+                            child = subprocess.run([sys.executable, '-c', 'raise SystemExit(' + str(helper_exit) + ')'], capture_output=True, timeout=5)
+                            code = child.returncode
+                        if code and not ignore:
+                            return observed
+            return observed
+        dropin = self.setup._unit().decode()
+        self.assertNotIn('ExecStartPre=', dropin)  # No reset/override of Valve argv.
+        self.assertEqual(run_phase_order(dropin), [True])
+        self.setup.finish()
+        # Causal old-hook mutant: late appended StartPre misses native startup.
+        self.assertEqual(run_phase_order(dropin.replace('ExecCondition=', 'ExecStartPre=')), [False])
+        self.setup.finish()
+        for code in (2, 203, 255):
+            with self.subTest(optional_exit=code):
+                self.assertEqual(run_phase_order(dropin, code), [False])
+        # The ignore prefix is essential: a failing ordinary condition skips VR.
+        self.assertEqual(run_phase_order(dropin.replace('ExecCondition=-', 'ExecCondition='), 2), [])
+
+    def test_condition_unit_passes_offline_systemd_analyze_verify(self):
+        binary = shutil.which('systemd-analyze')
+        if binary is None:
+            self.skipTest('systemd-analyze not installed; primary-source ordering controls remain')
+        self.install()
+        unit = self.root / 'sfnp-ordering-fixture.service'
+        unit.write_text('[Unit]\nDescription=Owned offline native passthrough syntax fixture\n'
+                        '[Service]\nType=oneshot\nExecStartPre=/usr/bin/true\nExecStart=/usr/bin/true\n'
+                        + self.setup._unit().decode())
+        child = subprocess.run([binary, 'verify', '--man=no', '--generators=no', str(unit)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+        self.assertIn('ExecCondition=-/usr/bin/python3', unit.read_text())
 
     def test_cli_no_install_and_no_implicit_restart(self):
         result = subprocess.run([sys.executable, '-B', str(ROOT / 'tools/native_passthrough_setup.py'), 'status', '--home', str(self.home)], capture_output=True, text=True, timeout=10)
