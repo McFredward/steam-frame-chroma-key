@@ -23,6 +23,7 @@ struct Status {
     std::uint64_t rvas[4]{};
     std::uint32_t chip{}, routeMask{}, activePermits{};
 };
+namespace detail { struct Preparation; }
 class Lease;
 struct LeaseTestAccess; // Defined only by the owned test fixture, never a runtime issuer.
 class Permit {
@@ -58,6 +59,7 @@ public:
 private:
     friend class Permit;
     friend struct LeaseTestAccess;
+    friend struct detail::Preparation;
     friend bool authorizeValveSrgb(const Permit&, bool) noexcept;
     std::atomic<State> state_{State::Empty};
     std::atomic<Refusal> refusal_{Refusal::None};
