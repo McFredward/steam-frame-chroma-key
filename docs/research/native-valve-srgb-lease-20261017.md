@@ -4,6 +4,15 @@ Status: offline implementation and focused checks complete. The new package has
 not run on the Frame. It preserves original output and does not enable native
 streaming passthrough or establish frame/eye/UV association.
 
+Fork dev16e7372 has successful hosted CI39011995792: all134 CTests pass in
+96.39 seconds, both optional diagnostic builds, Windows cross-build and protocol
+sanitizers pass. The final ARM package and all five remote preflight sites are
+checked locally. Its526280B library plus helpers total648443B for transfer.
+Software readiness does not grant device permission: the Frame remains restored,
+no new device actions have occurred, and fresh explicit install/restart approval
+is required. The next measurement remains an original-invocation observation,
+not a demonstration of streaming mixed reality.
+
 The exact source and binary findings are recorded in
 [the compatible-mirror review](native-compatible-mirror-20261017.md). This adapter
 supports only the compositor's observed zero sRGB-override value, not arbitrary
