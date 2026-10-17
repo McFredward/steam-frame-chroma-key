@@ -286,7 +286,7 @@ void mirrorProfile(const char* vsPath,const char* psPath,const char* probePath){
         std::array<VkDescriptorSetLayoutBinding,29> bindings{};for(unsigned i=0;i<29;++i)bindings[i]={i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr};
         for(unsigned i:{0u,2u,3u,4u,6u})bindings[i].descriptorType=dynamic?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[9].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;bindings[25].descriptorType=VK_DESCRIPTOR_TYPE_SAMPLER;
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};ci.bindingCount=bindings.size();ci.pBindings=bindings.data();
+        VkDescriptorSetLayoutCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;ci.bindingCount=bindings.size();ci.pBindings=bindings.data();
         demand(c::captureSet0(ci,f.recipe.set0,why,profile),"full29 original set definition captured without native expansion");
         std::copy(vs.begin(),vs.end(),f.recipe.vertex.words.begin());std::copy(ps.begin(),ps.end(),f.recipe.fragment.words.begin());
         f.p.fragment=probe.data();f.p.fragmentBytes=probe.size()*4;frame_receiver::Sha256 hash;hash.update(f.p.fragment,f.p.fragmentBytes);f.p.fragmentSha256=hash.finish();
