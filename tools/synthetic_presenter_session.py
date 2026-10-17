@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Cold file staging for explicit SYNTHETIC OUTPUT REPLACEMENT, never passive.
+"""Cold file staging for explicit output replacement, never passive.
+
+The default remains the historical synthetic profile. The explicit scene
+profile uses distinct executable pins, markers, receipts and status semantics.
 
 No device approval, network, service action, restart, capture arm or image read is
 performed here. A separately approved operator owns any eventual device use.
 """
 from __future__ import annotations
 import argparse
+from collections import namedtuple
 import importlib.util
 import json
 import os
@@ -31,6 +35,29 @@ ENABLE = b'GHVR_SYNTHETIC_PRESENTER/1\n'
 CONSUMED = b'GHVR_SYNTHETIC_PRESENTER_CONSUMED/1\n'
 CANDIDATE_BYTES = 18416
 CANDIDATE_SHA256 = '0aaf356d3789473cd32ff0d60cf5971bc1473813241657877db5c147bb1d4364'
+SCENE_PROFILE = 'scene-contribution-atlas-v1'
+SCENE_BUILD_MARKER = b'GHVR_SCENE_PRESENTER_COLD/1\0'
+SCENE_CANDIDATE_BYTES = 19224
+SCENE_CANDIDATE_SHA256 = '57ce6fdaa983765fe12800002a1f3c53be50291586e16a13d5fbcc0bced49cb3'
+_Profile = namedtuple('_Profile', 'name revision scope stem build_marker enable consumed candidate_bytes candidate_sha256 receiver_schema receiver_mode')
+
+
+def _profile_spec(name):
+    # No caller-supplied executable pins, filenames or marker values. A Session
+    # freezes this immutable descriptor at its first operation, before any write.
+    # This also preserves the old module-constant sandbox fixture interface.
+    if type(name) is not str:
+        raise SafetyError('explicit known presenter profile required')
+    if name == PROFILE:
+        return _Profile(PROFILE, 2, SCOPE, 'synthetic-presenter', BUILD_MARKER, ENABLE, CONSUMED,
+            CANDIDATE_BYTES, CANDIDATE_SHA256, 'frame-synthetic-presenter-receiver-v1', 'synthetic_format_guarded_presenter')
+    if name == SCENE_PROFILE:
+        return _Profile(SCENE_PROFILE, 1, 'SCENE_CONTRIBUTION_OUTPUT_REPLACEMENT', 'scene-presenter', SCENE_BUILD_MARKER,
+            b'GHVR_SCENE_PRESENTER/1\n', b'GHVR_SCENE_PRESENTER_CONSUMED/1\n', SCENE_CANDIDATE_BYTES,
+            SCENE_CANDIDATE_SHA256, 'frame-scene-presenter-receiver-v1', 'scene_contribution_guarded_presenter')
+    raise SafetyError('unknown presenter profile refused')
+
+
 MAX_RECEIVER_STATUS = 1024
 SOURCE_REASONS = {'disabled', 'directory', 'marker', 'module', 'pin', 'ready'}
 PRIMITIVE_REASONS = {'none', 'artifact', 'api_version', 'original', 'identity', 'interface', 'graphics', 'dispatch',
@@ -43,13 +70,17 @@ RECEIVER_FIELDS = {'schema', 'mode', 'capture_id', 'source_ready', 'source_reaso
     'native_frame_association_proven', 'passthrough_authorized'}
 
 
-def verify_mode(raw):
+def verify_mode(raw, profile=PROFILE):
+    return _verify_mode(raw, _profile_spec(profile))
+
+
+def _verify_mode(raw, profile):
     """Authenticate literal scope in exactly one read-only file-backed load span.
 
     The explicit whole-library digest and ELF admission must already have passed.
     This never loads the library or substitutes a caller's mode Boolean.
     """
-    locations = [match.start() for match in re.finditer(re.escape(BUILD_MARKER), raw)]
+    locations = [match.start() for match in re.finditer(re.escape(profile.build_marker), raw)]
     if len(locations) != 1:
         raise SafetyError('functional build marker missing or ambiguous; passive artifact refused')
     offset = locations[0]
@@ -58,17 +89,21 @@ def verify_mode(raw):
     spans = []
     for index in range(phnum):
         kind, flags, start, rva, _, length, _, _ = struct.unpack_from('<IIQQQQQQ', raw, phoff + index * phsize)
-        if kind == 1 and start <= offset and offset + len(BUILD_MARKER) <= start + length:
+        if kind == 1 and start <= offset and offset + len(profile.build_marker) <= start + length:
             spans.append((flags, rva + offset - start))
     if (len(spans) != 1 or spans[0][0] not in (4, 5)
-            or not 0 <= spans[0][1] <= 0xffffffffffffffff - len(BUILD_MARKER)):
+            or not 0 <= spans[0][1] <= 0xffffffffffffffff - len(profile.build_marker)):
         raise SafetyError('functional build marker must occupy one read-only file-backed load segment')
-    return {'literal': BUILD_MARKER[:-1].decode(), 'rva': spans[0][1], 'bytes': len(BUILD_MARKER)}
+    return {'literal': profile.build_marker[:-1].decode(), 'rva': spans[0][1], 'bytes': len(profile.build_marker)}
 
 
-def verify_candidate(raw):
-    if (len(raw) != CANDIDATE_BYTES or raw[:4] != b'\x03\x02\x23\x07'
-            or base.digest(raw) != CANDIDATE_SHA256):
+def verify_candidate(raw, profile=PROFILE):
+    return _verify_candidate(raw, _profile_spec(profile))
+
+
+def _verify_candidate(raw, profile):
+    if (len(raw) != profile.candidate_bytes or raw[:4] != b'\x03\x02\x23\x07'
+            or base.digest(raw) != profile.candidate_sha256):
         raise SafetyError('exact private guarded candidate bytes/hash required')
 
 
@@ -87,9 +122,11 @@ def strict_json(path, limit):
 
 class Session:
     def __init__(self, home, run_dir, *, proc_root=Path('/proc'), host_fixture=False,
-                 read_protected_maps=False, protected_map_reader=None):
+                 read_protected_maps=False, protected_map_reader=None, profile=PROFILE):
         if type(host_fixture) is not bool or type(read_protected_maps) is not bool:
             raise SafetyError('explicit Boolean fixture/protected-read policy required')
+        selected = _profile_spec(profile)
+        self._profile_name, self._profile = profile, None
         self.base = base.Session(home, run_dir, proc_root=proc_root, host_fixture=host_fixture,
             read_protected_maps=read_protected_maps, protected_map_reader=protected_map_reader)
         self.run = self.base.run
@@ -98,21 +135,37 @@ class Session:
             raise SafetyError('functional run must be a direct canonical bounded child of runs')
         # Outside run: the unchanged base requires an initially empty run folder.
         # This receipt reserves ownership BEFORE base.prepare can be interrupted.
-        self.receipt = self.runs / (self.run.name + '.synthetic-presenter-session.json')
-        self.enable, self.candidate = self.run / ENABLE_NAME, self.run / CANDIDATE_NAME
-        self.receiver_status, self.consumed = self.run / STATUS_NAME, self.run / CONSUMED_NAME
+        self.receipt = self.runs / (self.run.name + '.' + selected.stem + '-session.json')
+        self.enable, self.candidate = self.run / (selected.stem + '.enable'), self.run / (selected.stem + '.spv')
+        self.receiver_status, self.consumed = self.run / (selected.stem + '-status.json'), self.run / (selected.stem + '.consumed')
+
+    @property
+    def profile(self):
+        if self._profile is None:
+            self._profile = _profile_spec(self._profile_name)
+        return self._profile
+
+    def _foreign_files(self):
+        other = 'synthetic-presenter' if self.profile.name == SCENE_PROFILE else 'scene-presenter'
+        paths = [self.run / (other + suffix) for suffix in ('.enable', '.spv', '-status.json', '.consumed')]
+        paths.append(self.runs / (self.run.name + '.' + other + '-session.json'))
+        return [str(path) for path in paths if base.exists(path)]
+
+    def _reject_foreign(self):
+        if self._foreign_files():
+            raise SafetyError('mixed/cross-profile presenter files preserved')
 
     def _plan(self, capture, wanted, machine, marker):
         original, config, manifest = self.base.plan(capture, wanted, machine)
-        group = base.digest(base.encoded({'base_receipt': original, 'candidate_sha256': CANDIDATE_SHA256,
-            'candidate_bytes': CANDIDATE_BYTES, 'build_marker': marker, 'scope': SCOPE, 'profile': PROFILE}))
-        spent = CONSUMED + group.encode() + b'\n'
-        receipt = {'schema': SCHEMA, 'scope': SCOPE, 'profile': PROFILE, 'profile_revision': 2,
+        group = base.digest(base.encoded({'base_receipt': original, 'candidate_sha256': self.profile.candidate_sha256,
+            'candidate_bytes': self.profile.candidate_bytes, 'build_marker': marker, 'scope': self.profile.scope, 'profile': self.profile.name}))
+        spent = self.profile.consumed + group.encode() + b'\n'
+        receipt = {'schema': 'frame-' + self.profile.stem + '-session-v1', 'scope': self.profile.scope, 'profile': self.profile.name, 'profile_revision': self.profile.revision,
             'base_receipt': original, 'base_receipt_sha256': base.digest(base.encoded(original)),
-            'candidate_file': CANDIDATE_NAME, 'candidate_sha256': CANDIDATE_SHA256, 'candidate_bytes': CANDIDATE_BYTES,
-            'enable_file': ENABLE_NAME, 'enable_sha256': base.digest(ENABLE), 'build_marker': marker,
-            'receiver_status_file': STATUS_NAME, 'receiver_status_max_bytes': MAX_RECEIVER_STATUS,
-            'code_group_sha256': group, 'consumed_file': CONSUMED_NAME, 'consumed_sha256': base.digest(spent),
+            'candidate_file': self.candidate.name, 'candidate_sha256': self.profile.candidate_sha256, 'candidate_bytes': self.profile.candidate_bytes,
+            'enable_file': self.enable.name, 'enable_sha256': base.digest(self.profile.enable), 'build_marker': marker,
+            'receiver_status_file': self.receiver_status.name, 'receiver_status_max_bytes': MAX_RECEIVER_STATUS,
+            'code_group_sha256': group, 'consumed_file': self.consumed.name, 'consumed_sha256': base.digest(spent),
             'initial_files': 'all_absent', 'automatic_restart': False, 'native_frame_association_proven': False,
             'passthrough_authorized': False}
         return receipt, original, config, manifest, spent
@@ -125,9 +178,9 @@ class Session:
         marker = actual.get('build_marker')
         if type(original) is not dict or type(marker) is not dict or set(marker) != {'literal', 'rva', 'bytes'}:
             raise SafetyError('functional receipt shape invalid')
-        if (marker['literal'] != BUILD_MARKER[:-1].decode() or type(marker['rva']) is not int
+        if (marker['literal'] != self.profile.build_marker[:-1].decode() or type(marker['rva']) is not int
                 or not 0 <= marker['rva'] <= 0xffffffffffffffff or type(marker['bytes']) is not int
-                or marker['bytes'] != len(BUILD_MARKER)):
+                or marker['bytes'] != len(self.profile.build_marker)):
             raise SafetyError('functional receipt marker invalid')
         planned = self._plan(original.get('capture_id', ''), original.get('library_sha256'), original.get('library_machine'), marker)
         # Encoding comparison is type sensitive (False must not equal integer0).
@@ -140,15 +193,16 @@ class Session:
 
     def _spent(self):
         return any(base.exists(self.run / name) for name in
-            (CONSUMED_NAME, 'disarmed.marker', 'rollback-complete.json', 'capture.arm', 'launch.claim', STATUS_NAME,
+            (self.consumed.name, 'disarmed.marker', 'rollback-complete.json', 'capture.arm', 'launch.claim', self.receiver_status.name,
              'snapshot.p010', 'snapshot.json', 'ssbo-original-invocation.bin'))
 
     def prepare(self, library, library_sha256, candidate, *, capture_id=None):
         raw = base.read_file(base.absolute(library), base.MAX_LIBRARY)
         machine = base.verify_library(raw, library_sha256, host_fixture=self.base.host_fixture)
-        marker = verify_mode(raw)
-        candidate_raw = base.read_file(base.absolute(candidate), CANDIDATE_BYTES)
-        verify_candidate(candidate_raw)
+        self._reject_foreign()
+        marker = _verify_mode(raw, self.profile)
+        candidate_raw = base.read_file(base.absolute(candidate), self.profile.candidate_bytes)
+        _verify_candidate(candidate_raw, self.profile)
         if base.exists(self.receipt):
             receipt, original, _, _, _ = self._receipt()
             if (original['library_sha256'] != library_sha256 or original['library_machine'] != machine
@@ -175,16 +229,17 @@ class Session:
             if base.digest(base.read_file(path, base.MAX_LIBRARY, mode=0o600)) != expected:
                 raise SafetyError('changed base files prevent functional enable')
         if base.exists(self.candidate):
-            verify_candidate(base.read_file(self.candidate, CANDIDATE_BYTES, mode=0o600))
+            _verify_candidate(base.read_file(self.candidate, self.profile.candidate_bytes, mode=0o600), self.profile)
         else: base.write_new(self.candidate, candidate_raw)
         scan = self.base.active()
         if scan['uncertain'] or scan['owned_mapping_pids'] or scan['foreign_mapping_pids']:
             raise SafetyError('functional enable requires complete scan and no loaded helper')
+        self._reject_foreign()
         # Final file operation: an incomplete stage cannot opt in accidentally.
         if base.exists(self.enable):
-            if base.read_file(self.enable, len(ENABLE), mode=0o600) != ENABLE:
+            if base.read_file(self.enable, len(self.profile.enable), mode=0o600) != self.profile.enable:
                 raise SafetyError('foreign enable marker preserved')
-        else: base.write_new(self.enable, ENABLE)
+        else: base.write_new(self.enable, self.profile.enable)
         return self.status()
 
     @staticmethod
@@ -198,8 +253,8 @@ class Session:
         if not base.exists(self.receiver_status): return {'state': 'absent'}
         try:
             result = strict_json(self.receiver_status, MAX_RECEIVER_STATUS)
-            if (set(result) != RECEIVER_FIELDS or result.get('schema') != 'frame-synthetic-presenter-receiver-v1'
-                    or result.get('mode') != 'synthetic_format_guarded_presenter' or result.get('capture_id') != capture
+            if (set(result) != RECEIVER_FIELDS or result.get('schema') != self.profile.receiver_schema
+                    or result.get('mode') != self.profile.receiver_mode or result.get('capture_id') != capture
                     or result.get('native_frame_association_proven') is not False or result.get('passthrough_authorized') is not False
                     or result.get('diagnostic_atomics_not_source_cohort') is not True):
                 raise SafetyError('receiver status scope/session/authority mismatch')
@@ -219,7 +274,7 @@ class Session:
             for key in ('attachment_format', 'unsupported_dynamic'):
                 if type(result.get(key)) is not int or not 0 <= result[key] <= 0xffffffff:
                     raise SafetyError('receiver graphics diagnostic uint32 invalid')
-            if result.get('candidate_sha256') != CANDIDATE_SHA256 or result['candidate_bytes'] != CANDIDATE_BYTES:
+            if result.get('candidate_sha256') != self.profile.candidate_sha256 or result['candidate_bytes'] != self.profile.candidate_bytes:
                 raise SafetyError('receiver status candidate pin mismatch')
             return {'state': 'bounded_diagnostic_only', 'value': result}
         except (OSError, SafetyError, ValueError, TypeError) as error:
@@ -236,14 +291,14 @@ class Session:
         else:
             ordinary = {'state': 'not_prepared', 'active_mappings': self.base.active(), 'files': {}}
         files = {str(path): self._file(path, wanted, limit) for path, wanted, limit in
-            ((self.enable, receipt['enable_sha256'], len(ENABLE)), (self.candidate, CANDIDATE_SHA256, CANDIDATE_BYTES),
+            ((self.enable, receipt['enable_sha256'], len(self.profile.enable)), (self.candidate, self.profile.candidate_sha256, self.profile.candidate_bytes),
              (self.consumed, base.digest(spent), len(spent)))}
         receiver = self._receiver(original['capture_id'])
         all_files = list(files.values()) + list(ordinary['files'].values())
         valid = not any(value not in ('absent', 'owned_exact') for value in all_files) and receiver['state'] != 'invalid_preserved'
         scan = ordinary['active_mappings']
-        valid = valid and not scan['uncertain'] and not scan['foreign_mapping_pids'] and not base.exists(self.base.arm_file)
-        return {'schema': 'frame-synthetic-presenter-session-status-v1', 'scope': SCOPE, 'profile': PROFILE,
+        valid = valid and not self._foreign_files() and not scan['uncertain'] and not scan['foreign_mapping_pids'] and not base.exists(self.base.arm_file)
+        return {'schema': 'frame-' + self.profile.stem + '-session-status-v1', 'scope': self.profile.scope, 'profile': self.profile.name,
             'capture_id': original['capture_id'], 'code_group_sha256': receipt['code_group_sha256'],
             'files': files, 'base_session': ordinary, 'receiver_status': receiver, 'integrity_valid': valid,
             'consumed': base.exists(self.consumed), 'capture_arm_present': base.exists(self.base.arm_file),
@@ -255,6 +310,12 @@ class Session:
     def rollback(self):
         receipt, original, _, _, spent = self._receipt(validate_base=False)
         errors = []
+        try:
+            if self._foreign_files(): errors.append('foreign profile files preserved')
+        except (OSError, SafetyError) as error:
+            # Unknown foreign state must not block disabling our exact marker
+            # and attempting the independently owned base rollback.
+            errors.append('foreign profile scan failed: ' + str(error)[:256])
         # Consume first: even an interrupted rollback can never restage this code group.
         try:
             if base.exists(self.consumed):
@@ -263,7 +324,7 @@ class Session:
         except (OSError, SafetyError) as error: errors.append(str(error))
         try: base.remove_exact(self.enable, receipt['enable_sha256'])
         except (OSError, SafetyError) as error: errors.append(str(error))
-        candidate_state = self._file(self.candidate, CANDIDATE_SHA256, CANDIDATE_BYTES)
+        candidate_state = self._file(self.candidate, self.profile.candidate_sha256, self.profile.candidate_bytes)
         if candidate_state not in ('absent', 'owned_exact'): errors.append('changed candidate preserved')
         if base.exists(self.base.receipt):
             try:
@@ -279,7 +340,7 @@ class Session:
                 errors.append('base receipt missing; unexpected base files preserved')
             if scan['uncertain'] or scan['owned_mapping_pids'] or scan['foreign_mapping_pids']:
                 errors.append('active or unknown mappings require manual review/restart')
-        return {'schema': 'frame-synthetic-presenter-session-rollback-v1', 'scope': SCOPE,
+        return {'schema': 'frame-' + self.profile.stem + '-session-rollback-v1', 'scope': self.profile.scope,
             'capture_id': original['capture_id'], 'code_group_sha256': receipt['code_group_sha256'],
             'complete': not errors, 'errors': errors, 'base_rollback': ordinary,
             'candidate_status_receipts_preserved': True, 'running_replacements_revoked': False,
@@ -289,6 +350,7 @@ class Session:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('prepare', 'status', 'rollback'))
+    parser.add_argument('--profile', choices=(PROFILE, SCENE_PROFILE), default=PROFILE)
     parser.add_argument('--home', type=Path, default=Path('/home/steamos'))
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--proc-root', type=Path, default=Path('/proc'))
@@ -301,7 +363,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         session = Session(args.home, args.run_dir, proc_root=args.proc_root, host_fixture=args.host_fixture,
-            read_protected_maps=args.read_protected_maps)
+            read_protected_maps=args.read_protected_maps, profile=args.profile)
         if args.command == 'prepare':
             if args.library is None or args.library_sha256 is None or args.candidate is None:
                 raise SafetyError('prepare requires exact library/hash and private candidate')
@@ -313,7 +375,7 @@ def main(argv=None):
         print(json.dumps(result, sort_keys=True, indent=2))
         return 0 if result.get('complete', result.get('integrity_valid', True)) else 2
     except (OSError, SafetyError, ValueError, TypeError, KeyError, struct.error) as error:
-        print('SYNTHETIC OUTPUT REPLACEMENT session: ' + str(error), file=sys.stderr)
+        print('OUTPUT REPLACEMENT session: ' + str(error), file=sys.stderr)
         return 2
 
 
