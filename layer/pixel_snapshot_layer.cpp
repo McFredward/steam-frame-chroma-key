@@ -21,6 +21,7 @@
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
 #include "pixel_ssbo_receiver_bridge.h"
 #include "pixel_renderpass_recording_contract.h"
+#include "pixel_native_driver_lease.h"
 #endif
 #endif
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
@@ -148,6 +149,10 @@ struct Device {
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     frame_pixel_ssbo_journal::Journal definitions{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
     frame_pixel_ssbo_receiver::Bridge bridge;
+    // Immutable NEXT inputs from the actual successful DeviceCreate/load path.
+    // Only the cold writer resolves provider mappings and verifies their bytes.
+    frame_pixel_native_driver::Inputs nativeSubpassInputs{};
+    frame_pixel_native_driver::Lease nativeSubpassLease;
 #else
     frame_pixel_ssbo_journal::Journal definitions;
 #endif
@@ -533,6 +538,15 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
 }
 #endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
+void nativeSubpassStatus(Device& d,int fd) {
+    const auto s=d.nativeSubpassLease.status();char report[1536]{};
+    const auto count=std::snprintf(report,sizeof(report),
+        "{\"event\":\"native_subpass_provider\",\"state\":\"%s\",\"reason\":\"%s\",\"epoch\":%llu,\"device\":%llu,\"module_base\":%llu,\"inode\":%llu,\"device_major\":%llu,\"device_minor\":%llu,\"chip\":%u,\"route_mask\":%u,\"entry_rvas\":[%llu,%llu,%llu,%llu],\"native_frame_association_proven\":false,\"mask_enabled\":false}\n",
+        frame_pixel_native_driver::stateName(s.state),frame_pixel_native_driver::refusalName(s.refusal),
+        static_cast<unsigned long long>(s.epoch),static_cast<unsigned long long>(s.device),static_cast<unsigned long long>(s.moduleBase),static_cast<unsigned long long>(s.inode),static_cast<unsigned long long>(s.deviceMajor),static_cast<unsigned long long>(s.deviceMinor),s.chip,s.routeMask,
+        static_cast<unsigned long long>(s.rvas[0]),static_cast<unsigned long long>(s.rvas[1]),static_cast<unsigned long long>(s.rvas[2]),static_cast<unsigned long long>(s.rvas[3]));
+    if(count>0&&std::size_t(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,std::size_t(count));
+}
 void bridgeStatus(Device& d,int fd,std::uint64_t& seen,RecordingReportProgress& recordingReported) {
     const auto s=d.bridge.snapshot();recordingStatus(s.recordingContexts,fd,recordingReported);
     const std::uint64_t state=1u|std::uint64_t(s.profile)<<1|std::uint64_t(s.ready)<<2|std::uint64_t(s.learned)<<3|
@@ -558,6 +572,12 @@ void bridgeStatus(Device& d,int fd,std::uint64_t& seen,RecordingReportProgress& 
 void writer(Device* d) noexcept {
     const int progress = frame_pixel_io::create(session().config,"status.jsonl");
     if (progress < 0 || flock(progress,LOCK_EX|LOCK_NB)) { if(progress>=0)close(progress); return; }
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    // One cold verification, before manual arming. Never resolve a provider,
+    // hash an ELF, open a file or acquire its loader lease inside Begin/Next.
+    d->nativeSubpassLease.prepareCold(d->nativeSubpassInputs);
+    nativeSubpassStatus(*d,progress);
+#endif
     // One cold background record. It must explain a refused preparation before
     // asking the maintainer to start a stream; never emit per-frame diagnostics.
     char preparation[4096]{};
@@ -835,6 +855,9 @@ void loadRenderPass2Dispatch(Device& d,VkDevice device) {
     LOAD_RP2(CmdNextSubpass2) LOAD_RP2(CmdNextSubpass2KHR)
     LOAD_RP2(CmdEndRenderPass2) LOAD_RP2(CmdEndRenderPass2KHR)
 #undef LOAD_RP2
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    d.nativeSubpassInputs={d.native,reinterpret_cast<PFN_vkVoidFunction>(d.CmdBeginRenderPass2),reinterpret_cast<PFN_vkVoidFunction>(d.CmdBeginRenderPass2KHR),reinterpret_cast<PFN_vkVoidFunction>(d.CmdNextSubpass2),reinterpret_cast<PFN_vkVoidFunction>(d.CmdNextSubpass2KHR)};
+#endif
 }
 void loadRecordingAliasDispatch(Device& d,VkDevice device) {
 #define LOAD_RECORDING(name) d.name=reinterpret_cast<PFN_vk##name>(d.gdpa(device,"vk" #name));
@@ -994,7 +1017,13 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     return result;
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocationCallbacks* alloc) {
-    auto* d=deviceFor(device);d->stop.store(true,std::memory_order_release);if(d->writer.joinable())d->writer.join();
+    auto* d=deviceFor(device);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    // vkDestroyDevice entry externally closes valid device/queue callbacks.
+    // Revoke first so a racing cold verifier cannot republish an old lease.
+    d->nativeSubpassLease.revoke();
+#endif
+    d->stop.store(true,std::memory_order_release);if(d->writer.joinable())d->writer.join();
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     observeDefinitions(d,[&](auto& definitions){definitions.destroyDevice();});
 #endif
@@ -1018,6 +1047,11 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocation
         if(d->bridge.snapshot().ready&&ssboIdle==VK_NOT_READY)ssboIdle=d->DeviceWaitIdle(device);
         d->bridge.release(ssboIdle);session().tracker->ssboDeviceDestroyed(d->id);
     }
+#endif
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    // Original DeviceDestroy synchronization plus the joined cold worker leaves
+    // no valid callback scope. The provider still checks its active permits.
+    d->nativeSubpassLease.releaseCold();
 #endif
     const auto key=dispatchKey(device);d->DestroyDevice(device,alloc);
     auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.devices.erase(key);
@@ -1384,7 +1418,8 @@ void beginRenderPass2(Device* d,PFN_vkCmdBeginRenderPass2 original,bool khr,VkCo
     session().tracker->beginRenderPass(d->id,command,begin->contents);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     const auto operation=khr?RecordingOperation::CmdBeginRenderPass2KHR:RecordingOperation::CmdBeginRenderPass2;
-    recording::Shape shape;recording::begin2(info,begin,shape);recordPassContext(d,command,operation,shape);
+    auto permit=d->nativeSubpassLease.acquire(d->native,khr?frame_pixel_native_driver::Route::Begin2KHR:frame_pixel_native_driver::Route::Begin2,reinterpret_cast<PFN_vkVoidFunction>(original));
+    recording::Shape shape;recording::begin2(info,begin,shape,&permit);recordPassContext(d,command,operation,shape);
     if(shape.supported)d->bridge.beginPass(command,info->renderPass,begin->contents);
 #endif
     (void)khr;original(command,info,begin);
@@ -1397,10 +1432,13 @@ VKAPI_ATTR void VKAPI_CALL traceCmdBeginRenderPass2KHR(VkCommandBuffer command,c
 }
 void nextSubpass2(Device* d,PFN_vkCmdNextSubpass2 original,bool khr,VkCommandBuffer command,const VkSubpassBeginInfo* begin,const VkSubpassEndInfo* end) {
     session().tracker->nextSubpass(d->id,command,begin->contents);
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    auto permit=d->nativeSubpassLease.acquire(d->native,khr?frame_pixel_native_driver::Route::Next2KHR:frame_pixel_native_driver::Route::Next2,reinterpret_cast<PFN_vkVoidFunction>(original));
+#endif
     (void)khr;original(command,begin,end);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     const auto operation=khr?RecordingOperation::CmdNextSubpass2KHR:RecordingOperation::CmdNextSubpass2;
-    recording::Shape shape;recording::next2(begin,end,shape);recordPassContext(d,command,operation,shape);
+    recording::Shape shape;recording::next2(begin,end,shape,&permit);recordPassContext(d,command,operation,shape);
     if(shape.supported)d->bridge.nextPass(command,begin->contents);
 #endif
 }
