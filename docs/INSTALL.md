@@ -29,8 +29,8 @@ state you explicitly disabled. It never restarts SteamVR automatically.
 2. Download and install the project:
 
    ```bash
-   git clone https://github.com/McFredward/steam-frame-native-passthrough.git
-   cd steam-frame-native-passthrough
+   git clone https://github.com/McFredward/steam-link-native-passthrough.git
+   cd steam-link-native-passthrough
    bash setup.sh install
    bash setup.sh status
    ```
@@ -65,8 +65,8 @@ describes device access; menu locations can change with SteamOS updates.
 2. Run the following commands **in that SSH session, on the Frame**:
 
    ```bash
-   git clone https://github.com/McFredward/steam-frame-native-passthrough.git
-   cd steam-frame-native-passthrough
+   git clone https://github.com/McFredward/steam-link-native-passthrough.git
+   cd steam-link-native-passthrough
    bash setup.sh install
    bash setup.sh status
    ```
