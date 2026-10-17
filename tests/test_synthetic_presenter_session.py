@@ -250,4 +250,33 @@ class SyntheticSessionTests(unittest.TestCase):
         self.assertNotIn('import socket', Path(mod.__file__).read_text())
 
 
-if __name__ == '__main__': unittest.main()
+def verify_actual_producer(path):
+    """Only actual writeStatusCold JSON cross-language scope, no modeled schema."""
+    class ActualProducer(unittest.TestCase):
+        def runTest(self):
+            raw = Path(path).read_bytes(); value = json.loads(raw)
+            with tempfile.TemporaryDirectory(prefix='synthetic-producer-') as folder:
+                home = Path(folder) / 'home'; home.mkdir(mode=0o700)
+                proc = Path(folder) / 'proc'; proc.mkdir(mode=0o700)
+                run = home / '.local/share/GloomhavenVR/SteamLinkMaskProbe/runs/producer'
+                session = mod.Session(home, run, proc_root=proc, host_fixture=True)
+                os.close(mod.base.directory(run, create=True, private=True))
+                session.receiver_status.write_bytes(raw); session.receiver_status.chmod(0o600)
+                self.assertEqual(session._receiver(value['capture_id'])['state'], 'bounded_diagnostic_only')
+                for changed in ({'capture_id': 'f' * 32}, {'candidate_sha256': '0' * 64},
+                                {'observed_api': True}, {'diagnostic_atomics_not_source_cohort': False},
+                                {'passthrough_authorized': True}, {'source_reason': 'not_a_real_reason'}):
+                    bad = dict(value); bad.update(changed)
+                    session.receiver_status.write_bytes(mod.base.encoded(bad))
+                    self.assertEqual(session._receiver(value['capture_id'])['state'], 'invalid_preserved')
+                for bad in (b'[]', b'{"schema":1,"schema":2}', b'x' * 1025):
+                    session.receiver_status.write_bytes(bad)
+                    self.assertEqual(session._receiver(value['capture_id'])['state'], 'invalid_preserved')
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite([ActualProducer()]))
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == '--producer-status-json':
+        raise SystemExit(verify_actual_producer(sys.argv[2]))
+    unittest.main()

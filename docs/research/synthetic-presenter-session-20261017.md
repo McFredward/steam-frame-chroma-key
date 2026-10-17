@@ -66,3 +66,14 @@ inside the test process, interrupt each staging phase, prove enable-last and
 idempotent inode preservation, and exercise foreign/passive/mutated files,
 permissions/links, loaded/unknown mappings, terminal rollback, malformed status
 and CLI scope. These are software file-ownership proofs, not live device evidence.
+
+Focused evidence:18 initial new sandbox methods pass. A bounded follow-up runs
+only the3 changed status/marker methods, including one newly added case. The
+initial18-method evidence remains recorded; this is not a fresh complete gate. The actual C++ `writeStatusCold` public producer
+(642 bytes) is accepted by the Python reader, with9 controlled malformed variants
+refused. Use `tests/test_synthetic_presenter_session.py --producer-status-json
+<actual-output>` for that separate cross-language check. The actual retained
+private candidate also passes the unchanged production18416-byte hard pin.
+No existing base-helper suite, Vulkan/GPU load, or Frame operation was repeated.
+Private logs, source pins and cleanup receipts remain in
+`build/private-native-presenter-session-worker-20261017/`.
