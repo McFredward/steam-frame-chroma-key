@@ -445,6 +445,13 @@ void recordingSerializationBounds(){
     std::ostringstream envelope;envelope<<"{\"unchanged_raw_metadata_budget\":\""<<std::string(8192,' ')<<"\",\"native_ssbo_control\":{\"available\":false";recordingMetadataJson(envelope,contexts);envelope<<"}}\n";
     require(envelope.str().size()<=16384,"new worst-case recording metadata preserves 8KiB for unchanged snapshot fields within original 16KiB cap");
     require(metadata.str().find("\"target_pipeline\":true")!=std::string::npos,"exact target-pipeline diagnostic survives first-refusal snapshot output");
+    frame_pixel_native_driver::Status provider;provider.state=frame_pixel_native_driver::State::Refused;provider.refusal=frame_pixel_native_driver::Refusal::LoadedIdentity;
+    provider.epoch=provider.device=provider.moduleBase=provider.inode=provider.deviceMajor=provider.deviceMinor=provider.acquireMisses=UINT64_MAX;provider.chip=provider.routeMask=provider.observedRoute=UINT32_MAX;for(auto& rva:provider.rvas)rva=UINT64_MAX;
+    std::memset(provider.providerPath,1,sizeof(provider.providerPath));std::string providerLine;
+    require(nativeSubpassStatusLine(provider,providerLine)&&providerLine.size()<2048,"max-width provider refusal including256B hostile module path fits2KiB cold event");
+    require(providerLine.find("\"provider_path_truncated\":true")!=std::string::npos&&providerLine.find("\\u0001")!=std::string::npos&&providerLine.find("\"observed_route\":4294967295")!=std::string::npos,"truncated path is explicitly JSON escaped and exact failed route remains available");
+    std::memset(provider.providerPath,0,sizeof(provider.providerPath));provider.providerPath[0]='"';provider.providerPath[1]='\\';
+    require(nativeSubpassStatusLine(provider,providerLine)&&providerLine.find("\"provider_path\":\"\\\"\\\\\"")!=std::string::npos,"quote and backslash in wrapper path cannot corrupt JSON");
 }
 void wholeRecording(const char* vertex,const char* fragment,bool khr,unsigned extensions){
     HookFixture fixture(2,0);fixture.preparePrivate(vertex,fragment,khr);
@@ -688,7 +695,7 @@ void nativeValveHooks(const char* vertex,const char* fragment,bool khr,unsigned 
         hookExport<PFN_vkCmdNextSubpass2>(fixture.dispatchDevice,khr?"vkCmdNextSubpass2KHR":"vkCmdNextSubpass2")(fixture.command,&subBegin,&subEnd);
         hookExport<PFN_vkCmdEndRenderPass2>(fixture.dispatchDevice,khr?"vkCmdEndRenderPass2KHR":"vkCmdEndRenderPass2")(fixture.command,&subEnd);hookExport<PFN_vkEndCommandBuffer>(fixture.dispatchDevice,"vkEndCommandBuffer")(fixture.command);
         require(hookCalls.nexts==2&&hookCalls.ends==1&&hookCalls.commandEnds==1&&std::count(hookCalls.events.begin(),hookCalls.events.end(),HookEvent::HostBarrier)==1,"whole private three-subpass pass closes before one HOST barrier");
-        FILE* output=std::tmpfile();require(output,"cold provider report fixture");nativeSubpassStatus(*fixture.context,fileno(output));require(std::ftell(output)>0&&std::ftell(output)<1536,"provider state/refusal/RVA report bounded independently of callbacks");std::fclose(output);
+        FILE* output=std::tmpfile();require(output,"cold provider report fixture");nativeSubpassStatus(*fixture.context,fileno(output));require(std::ftell(output)>0&&std::ftell(output)<2048,"provider state/refusal/RVA report bounded independently of callbacks");std::fclose(output);
         auto submit=info<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);submit.commandBufferCount=1;submit.pCommandBuffers=&fixture.command;hookExport<PFN_vkQueueSubmit>(fixture.dispatchDevice,"vkQueueSubmit")(fixture.queueHandle,1,&submit,VK_NULL_HANDLE);require(hookCalls.submits==1&&hookCalls.markers==1&&fixture.context->bridge.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::CopyCohort,"original submit remains unchanged and lack of independent source copy never becomes native frame proof");
     }
     inspectOriginalMask=false;observingLease=nullptr;

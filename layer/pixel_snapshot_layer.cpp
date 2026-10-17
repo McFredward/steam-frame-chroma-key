@@ -538,14 +538,29 @@ void definitionStatus(Device& d,int fd,bool& featureReported,std::uint64_t& repo
 }
 #endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-void nativeSubpassStatus(Device& d,int fd) {
-    const auto s=d.nativeSubpassLease.status();char report[1536]{};
+bool nativeSubpassStatusLine(const frame_pixel_native_driver::Status& s,std::string& line) {
+    // Provider paths can be untrusted on refusal. Emit a bounded ASCII/JSON
+    // prefix and explicit truncation, never an unescaped native module string.
+    std::size_t pathBytes=0;while(pathBytes<sizeof(s.providerPath)&&s.providerPath[pathBytes])++pathBytes;
+    constexpr std::size_t PathPrefix=128;char escaped[PathPrefix*6+1]{};std::size_t used=0;
+    constexpr char hex[]="0123456789abcdef";
+    for(std::size_t i=0;i<std::min(pathBytes,PathPrefix);++i){const auto c=static_cast<unsigned char>(s.providerPath[i]);
+        if(c=='"'||c=='\\'){escaped[used++]='\\';escaped[used++]=char(c);}
+        else if(c<0x20||c>0x7e){escaped[used++]='\\';escaped[used++]='u';escaped[used++]='0';escaped[used++]='0';escaped[used++]=hex[c>>4];escaped[used++]=hex[c&15];}
+        else escaped[used++]=char(c);
+    }
+    char report[2048]{};
     const auto count=std::snprintf(report,sizeof(report),
-        "{\"event\":\"native_subpass_provider\",\"state\":\"%s\",\"reason\":\"%s\",\"epoch\":%llu,\"device\":%llu,\"module_base\":%llu,\"inode\":%llu,\"device_major\":%llu,\"device_minor\":%llu,\"chip\":%u,\"route_mask\":%u,\"entry_rvas\":[%llu,%llu,%llu,%llu],\"native_frame_association_proven\":false,\"mask_enabled\":false}\n",
+        "{\"event\":\"native_subpass_provider\",\"state\":\"%s\",\"reason\":\"%s\",\"epoch\":%llu,\"device\":%llu,\"module_base\":%llu,\"inode\":%llu,\"device_major\":%llu,\"device_minor\":%llu,\"chip\":%u,\"route_mask\":%u,\"observed_route\":%u,\"acquire_misses\":%llu,\"entry_rvas\":[%llu,%llu,%llu,%llu],\"provider_path\":\"%s\",\"provider_path_bytes\":%zu,\"provider_path_truncated\":%s,\"native_frame_association_proven\":false,\"mask_enabled\":false}\n",
         frame_pixel_native_driver::stateName(s.state),frame_pixel_native_driver::refusalName(s.refusal),
-        static_cast<unsigned long long>(s.epoch),static_cast<unsigned long long>(s.device),static_cast<unsigned long long>(s.moduleBase),static_cast<unsigned long long>(s.inode),static_cast<unsigned long long>(s.deviceMajor),static_cast<unsigned long long>(s.deviceMinor),s.chip,s.routeMask,
-        static_cast<unsigned long long>(s.rvas[0]),static_cast<unsigned long long>(s.rvas[1]),static_cast<unsigned long long>(s.rvas[2]),static_cast<unsigned long long>(s.rvas[3]));
-    if(count>0&&std::size_t(count)<sizeof(report))frame_pixel_io::writeAll(fd,report,std::size_t(count));
+        static_cast<unsigned long long>(s.epoch),static_cast<unsigned long long>(s.device),static_cast<unsigned long long>(s.moduleBase),static_cast<unsigned long long>(s.inode),static_cast<unsigned long long>(s.deviceMajor),static_cast<unsigned long long>(s.deviceMinor),s.chip,s.routeMask,s.observedRoute,static_cast<unsigned long long>(s.acquireMisses),
+        static_cast<unsigned long long>(s.rvas[0]),static_cast<unsigned long long>(s.rvas[1]),static_cast<unsigned long long>(s.rvas[2]),static_cast<unsigned long long>(s.rvas[3]),escaped,pathBytes,pathBytes>PathPrefix?"true":"false");
+    if(count<=0||std::size_t(count)>=sizeof(report)){line.clear();return false;}
+    line.assign(report,std::size_t(count));return true;
+}
+void nativeSubpassStatus(Device& d,int fd) noexcept {
+    try{std::string line;if(nativeSubpassStatusLine(d.nativeSubpassLease.status(),line))frame_pixel_io::writeAll(fd,line.data(),line.size());}
+    catch(...){constexpr char failure[]="{\"event\":\"native_subpass_provider_reporting_failed\",\"mask_enabled\":false}\n";frame_pixel_io::writeAll(fd,failure,sizeof(failure)-1);}
 }
 void bridgeStatus(Device& d,int fd,std::uint64_t& seen,RecordingReportProgress& recordingReported) {
     const auto s=d.bridge.snapshot();recordingStatus(s.recordingContexts,fd,recordingReported);
@@ -1048,12 +1063,13 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocation
         d->bridge.release(ssboIdle);session().tracker->ssboDeviceDestroyed(d->id);
     }
 #endif
+    const auto key=dispatchKey(device);d->DestroyDevice(device,alloc);
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
-    // Original DeviceDestroy synchronization plus the joined cold worker leaves
-    // no valid callback scope. The provider still checks its active permits.
+    // Keep the provider mapping pinned through the final original device call.
+    // DeviceDestroy synchronization plus the joined cold worker closes callback
+    // entry; release still checks that every scoped permit has returned.
     d->nativeSubpassLease.releaseCold();
 #endif
-    const auto key=dispatchKey(device);d->DestroyDevice(device,alloc);
     auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.devices.erase(key);
 }
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
