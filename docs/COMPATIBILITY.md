@@ -30,13 +30,15 @@ the Frame's native passthrough camera, using ModBuild686. Application logs recor
 both 4040×4040 MultiPass/MSAA8 eyes. Earlier synthetic-source tests also showed
 fractional transparency.
 
-Those headset tests used an explicitly staged, temporary receiver for one
-compositor process. They do **not** establish a newly tested persistent
-installation, every future SteamVR update, every game material or a measured
-end-to-end latency. The persistent installer has a separate software-validation
-scope. See the dated [real-game result](research/real-game-visible-run-20261017.md)
-for the retained observation and its limits, and the separate
-[persistent-setup validation](research/persistent-user-setup-20261017.md).
+Those visible headset tests used an explicitly staged, temporary receiver for
+one compositor process. The public persistent package was subsequently installed
+on the Frame and loaded across two SteamVR service starts with fresh launch
+claims; the second also passed the native UI startup health gate. This does not
+establish a full OS reboot, a new streamed-game picture, every future SteamVR
+update, every material or a measured end-to-end latency. See the dated
+[real-game result](research/real-game-visible-run-20261017.md) and separate
+[persistent-setup validation](research/persistent-user-setup-20261017.md) for
+their respective evidence and limits.
 
 ## Picture and performance limits
 

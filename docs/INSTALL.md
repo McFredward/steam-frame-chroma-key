@@ -212,5 +212,28 @@ If you installed from a ZIP, download and extract the updated project, then run
 `bash setup.sh install` and `bash setup.sh status` from its folder while SteamVR
 is stopped. Keep a copy of the project available for recovery.
 
+### If Steam starts SteamVR again during maintenance
+
+Steam can immediately request another start after a manual stop. If the installer
+still reports that SteamVR is running, use SSH and temporarily block those start
+requests before repeating your update or uninstall:
+
+```bash
+systemctl --user mask --runtime --now steamvr.service
+```
+
+This pauses the Frame's VR interface. After completing the operation, remove the
+temporary block you just created and start SteamVR again:
+
+```bash
+systemctl --user unmask --runtime steamvr.service
+systemctl --user start steamvr.service
+```
+
+Use this only when the service was not already masked; preserve any pre-existing
+mask. `--runtime` does not change the system installation and expires at reboot.
+Do not use `--force` or replace an existing unit file. If the maintenance command
+fails, remove your temporary block and start SteamVR again before investigating.
+
 See [compatibility and recovery limits](COMPATIBILITY.md) for the supported scope
 and [the developer guide](DEVELOPING.md) for architecture and integration details.
