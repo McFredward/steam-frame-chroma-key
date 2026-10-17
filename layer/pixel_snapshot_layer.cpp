@@ -14,6 +14,13 @@
 #include "pixel_sampler_admission.h"
 #include "pixel_sampler_format.h"
 #include "pixel_sampler_routes.h"
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+#if !defined(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL) || defined(FRAME_PIXEL_SSBO_TRANSACTION) || defined(FRAME_PIXEL_UNIFORM_COMPANION)
+#error "Synthetic presenter requires only the definition journal; SSBO/uniform modes are mutually exclusive"
+#endif
+#include "native_presenter_receiver.h"
+#include "pixel_ssbo_profile_transform.h"
+#endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 #include "pixel_ssbo_definition_journal.h"
 #include "pixel_definition_report.h"
@@ -42,6 +49,10 @@
 
 #define PIXEL_EXPORT extern "C" __attribute__((visibility("default")))
 namespace {
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+__attribute__((used)) const char SyntheticPresenterBuildMarker[]="GHVR_SYNTHETIC_PRESENTER_COLD/1";
+namespace presenter=frame_native_presenter_receiver;
+#endif
 using frame_pixel_capture::LiveTracker;
 using frame_pixel_capture::Candidate;
 using frame_pixel_capture::SubmitTicket;
@@ -50,6 +61,14 @@ struct Session {
     frame_pixel_io::Config config;
     std::unique_ptr<LiveTracker> tracker;
     std::atomic<bool> armed{false}, deviceClaimed{false};
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    presenter::Source presenterSource;
+    presenter::Counters presenterCounters;
+    std::mutex presenterWriterMutex;
+    std::thread presenterWriter;
+    std::atomic<bool> presenterStop{false}, presenterWriterFailed{false};
+    std::atomic<unsigned> presenterDevices{0};
+#endif
     bool allowed = false;
     explicit Session(bool inert=false) noexcept {
         if(inert)return;
@@ -64,13 +83,21 @@ struct Session {
         // not add process/service environment or preload/audit libraries.
         const auto* overridePath = std::getenv("GHVR_PIXEL_SNAPSHOT_CONFIG");
         if (!frame_pixel_io::load(overridePath ? overridePath : frame_pixel_io::ConfigPath, config)) return;
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+        // Failure is reportable by the cold status writer, but can never admit
+        // a replacement. No per-frame config, marker or artifact reads exist.
+        presenterSource.prepareCold(config.directoryFd);
+#endif
         // One native process may claim a prepared run. A crash/reboot/restart
         // never re-arms an old capture, even if its temporary manifest remains.
         const int claim=frame_pixel_io::create(config,"launch.claim");
         if(claim<0)return;
         const bool claimed=frame_pixel_io::writeAll(claim,"GHVR_PIXEL_CLAIM/1\n",19);
         close(claim);if(!claimed)return;
-        tracker = std::make_unique<LiveTracker>(); allowed = true;
+#ifndef FRAME_PIXEL_SYNTHETIC_PRESENTER
+        tracker = std::make_unique<LiveTracker>();
+#endif
+        allowed = true;
         } catch(...) { allowed=false; tracker.reset(); }
     }
 };
@@ -83,6 +110,45 @@ Session& session() {
     static auto* value = []() noexcept {try{return new Session();}catch(...){return static_cast<Session*>(nullptr);}}();
     return value ? *value : inert;
 }
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+void presenterWriter(Session* s) noexcept {
+    std::uint64_t previous=0;
+    for(unsigned updates=0;updates<presenter::MaximumStatusUpdates;){
+        const auto state=s->presenterCounters.snapshot();
+        if(state.revision!=previous){
+            ++updates;
+            if(!presenter::writeStatusCold(s->config.directoryFd,s->config.captureId.c_str(),s->presenterSource,
+                    state,updates,updates==presenter::MaximumStatusUpdates)){
+                s->presenterWriterFailed.store(true,std::memory_order_release);return;
+            }
+            previous=state.revision;
+        }
+        if(s->presenterStop.load(std::memory_order_acquire))return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+void presenterDeviceStarted(VkDevice device,std::uint32_t api) noexcept {
+    auto& s=session();s.presenterDevices.fetch_add(1,std::memory_order_acq_rel);
+    s.presenterCounters.deviceCreated(device,api);
+    try{
+        std::lock_guard<std::mutex> lock(s.presenterWriterMutex);
+        if(!s.presenterWriter.joinable()){
+            s.presenterStop.store(false,std::memory_order_release);
+            s.presenterWriter=std::thread(presenterWriter,&s);
+        }
+    }catch(...){s.presenterWriterFailed.store(true,std::memory_order_release);}
+}
+void presenterDeviceStopped() noexcept {
+    auto& s=session();s.presenterCounters.deviceDestroyed();
+    if(s.presenterDevices.fetch_sub(1,std::memory_order_acq_rel)!=1)return;
+    try{
+        std::lock_guard<std::mutex> lock(s.presenterWriterMutex);
+        if(s.presenterDevices.load(std::memory_order_acquire))return;
+        s.presenterStop.store(true,std::memory_order_release);
+        if(s.presenterWriter.joinable())s.presenterWriter.join();
+    }catch(...){s.presenterWriterFailed.store(true,std::memory_order_release);}
+}
+#endif
 template<class T> void* dispatchKey(T value) { return *reinterpret_cast<void**>(value); }
 struct Instance {
     VkInstance native{};
@@ -146,17 +212,23 @@ struct Device {
     std::atomic<unsigned> queryRoutesUsed{0};
     std::atomic<SamplerRefusal> samplerRefusal{SamplerRefusal::None};
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
-#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+#if defined(FRAME_PIXEL_SSBO_TRANSACTION) || defined(FRAME_PIXEL_SYNTHETIC_PRESENTER)
     frame_pixel_ssbo_journal::Journal definitions{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
     frame_pixel_ssbo_receiver::Bridge bridge;
     // Immutable NEXT inputs from the actual successful DeviceCreate/load path.
     // Only the cold writer resolves provider mappings and verifies their bytes.
     frame_pixel_native_driver::Inputs nativeSubpassInputs{};
     frame_pixel_native_driver::Lease nativeSubpassLease;
+#endif
 #else
     frame_pixel_ssbo_journal::Journal definitions;
 #endif
     frame_pixel_observation::Boundary definitionBoundary;
+#endif
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    std::atomic<bool> presenterInterfaceAuthorized{false};
+    bool presenterRegistered=false;
 #endif
 #ifdef FRAME_PIXEL_UNIFORM_COMPANION
     frame_uniform_copy::CopyRecorder uniformCopy;
@@ -175,6 +247,9 @@ template<class F> void observeDefinitions(Device* d,F&& observe) noexcept {
     d->definitionBoundary.observe([&]{observe(d->definitions);});
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     if(d->definitionBoundary.failed())d->bridge.definitionObservationFailed();
+#endif
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    if(d->definitionBoundary.failed())session().presenterCounters.historyFailed();
 #endif
 }
 #endif
@@ -226,7 +301,11 @@ template<class T> Device* deviceFor(T value) {
     return found == c.devices.end() ? nullptr : found->second.get();
 }
 template<class F> void observeBindingsAt(const char* site, F observer) {
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    (void)site;(void)observer;
+#else
     if (session().allowed) session().tracker->observe(observer, site);
+#endif
 }
 void status(int fd, const char* name, int result = 0) {
     if (fd < 0) return;
@@ -921,6 +1000,24 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
     observeDefinitions(d.get(),[&](auto& definitions){definitions.createDevice(*out,*info,result);});
 #endif
     d->instanceApiVersion=i->apiVersion;
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    {
+        // No graphics/compute queue observation, reader, sampler, command
+        // tracker or recording writer is prepared in this functional mode.
+#define LOAD_PRESENT(name) d->name=reinterpret_cast<PFN_vk##name>(d->gdpa(*out,"vk" #name));
+        LOAD_PRESENT(DestroyDevice) LOAD_PRESENT(CreateShaderModule) LOAD_PRESENT(DestroyShaderModule)
+        LOAD_PRESENT(CreateGraphicsPipelines) LOAD_PRESENT(DestroyPipeline)
+        LOAD_PRESENT(CreateDescriptorSetLayout) LOAD_PRESENT(DestroyDescriptorSetLayout)
+        LOAD_PRESENT(CreatePipelineLayout) LOAD_PRESENT(DestroyPipelineLayout)
+        LOAD_PRESENT(CreateRenderPass) LOAD_PRESENT(CreateRenderPass2) LOAD_PRESENT(CreateRenderPass2KHR) LOAD_PRESENT(DestroyRenderPass)
+#undef LOAD_PRESENT
+        auto* published=d.get();const auto destroy=d->DestroyDevice;
+        try{auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.devices.emplace(dispatchKey(*out),std::move(d));}
+        catch(...){destroy(*out,alloc);*out=VK_NULL_HANDLE;return VK_ERROR_OUT_OF_HOST_MEMORY;}
+        if(session().allowed){published->presenterRegistered=true;presenterDeviceStarted(*out,published->instanceApiVersion);}
+        return result;
+    }
+#endif
     frame_pixel_sampler::ReviewedRoutes reviewed;
     reviewed.coreComputeRoutesObserved=VK_API_VERSION_VARIANT(i->apiVersion)==0 &&
         VK_API_VERSION_MAJOR(i->apiVersion)==1 && VK_API_VERSION_MINOR(i->apiVersion)<=4;
@@ -1043,6 +1140,14 @@ VKAPI_ATTR VkResult VKAPI_CALL traceCreateDevice(VkPhysicalDevice physical,const
 }
 VKAPI_ATTR void VKAPI_CALL traceDestroyDevice(VkDevice device,const VkAllocationCallbacks* alloc) {
     auto* d=deviceFor(device);
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    {
+        if(d->presenterRegistered)presenterDeviceStopped();
+        observeDefinitions(d,[&](auto& definitions){definitions.destroyDevice();});
+        const auto key=dispatchKey(device);d->DestroyDevice(device,alloc);
+        auto& c=contexts();std::lock_guard<std::mutex> lock(c.mutex);c.devices.erase(key);return;
+    }
+#endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     // vkDestroyDevice entry externally closes valid device/queue callbacks.
     // Revoke first so a racing cold verifier cannot republish an old lease.
@@ -1135,6 +1240,22 @@ void unknownCommand(Device* d,VkCommandBuffer command,RecordingOperation operati
 #undef observeBindings
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateShaderModule(VkDevice device,const VkShaderModuleCreateInfo* info,const VkAllocationCallbacks* alloc,VkShaderModule* out) {
     auto* d=deviceFor(device);const auto result=d->CreateShaderModule(device,info,alloc,out);
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    if(result==VK_SUCCESS)observeDefinitions(d,[&](auto& definitions){
+        if(!definitions.createShader(*out,*info,result)||!session().presenterSource.ready()||
+           info->codeSize!=6620||d->presenterInterfaceAuthorized.load(std::memory_order_acquire))return;
+        // This cold CPU-only transformer proves the original B9 constant0
+        // accesses for pending count1 definitions. Its SSBO artifact is never
+        // created as a Vulkan object, exposed, bound or dispatched here.
+        auto original=std::make_unique<frame_pixel_ssbo_clone::ShaderDefinition>();
+        auto proof=std::make_unique<frame_pixel_ssbo_profile::Artifact>();
+        frame_pixel_ssbo_clone::Refusal why;
+        if(frame_pixel_ssbo_clone::captureShader(*info,frame_pixel_ssbo_clone::ShaderRole::Fragment,*original,why)&&
+           frame_pixel_ssbo_profile::transform(*original,false,*proof,why)&&definitions.authorizeProbeInterface(proof->profile))
+            d->presenterInterfaceAuthorized.store(true,std::memory_order_release);
+    });
+    return result;
+#endif
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     if(result==VK_SUCCESS)d->bridge.shaderCreated(*info,d->definitions);
@@ -1149,10 +1270,42 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyShaderModule(VkDevice device,VkShaderModu
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
     observeDefinitions(d,[&](auto& definitions){definitions.destroyShader(value);});
 #endif
-    session().tracker->destroyShader(d->id,value);d->DestroyShaderModule(device,value,alloc);
+#ifndef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    session().tracker->destroyShader(d->id,value);
+#endif
+    d->DestroyShaderModule(device,value,alloc);
 }
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+void retirePresenterOriginal(void* owner,VkDevice device,VkPipeline pipeline) noexcept {
+    auto* d=static_cast<Device*>(owner);
+    if(!d||d->native!=device)return;
+    // Retire at destroy ENTRY. The downstream call may allow immediate raw
+    // handle reuse on another thread; never retire that later generation.
+    // This mode allocates no LiveTracker and registers no diagnostic pipeline.
+    observeDefinitions(d,[&](auto& definitions){definitions.destroyPipeline(pipeline);});
+}
+#endif
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateGraphicsPipelines(VkDevice device,VkPipelineCache cache,std::uint32_t count,const VkGraphicsPipelineCreateInfo* info,const VkAllocationCallbacks* alloc,VkPipeline* out) {
     auto* d=deviceFor(device);const auto result=d->CreateGraphicsPipelines(device,cache,count,info,alloc,out);
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    if(result==VK_SUCCESS&&count<=256&&info&&out)for(std::uint32_t n=0;n<count;++n){
+        observeDefinitions(d,[&](auto& definitions){
+            frame_pixel_ssbo_journal::Event event;
+            if(!definitions.createPipeline(out[n],info[n],result,&event)||!session().presenterSource.ready()||
+               session().presenterWriterFailed.load(std::memory_order_acquire))return;
+            auto ready=std::make_unique<frame_pixel_ssbo_journal::Ready>();
+            if(!definitions.lookupPipeline({frame_pixel_ssbo_clone::handle(device),event.value,event.generation},*ready))return;
+            const frame_native_presenter::Dispatch dispatch{d->CreateShaderModule,d->DestroyShaderModule,
+                                                            d->CreateGraphicsPipelines,d->DestroyPipeline};
+            const auto completed=presenter::complete(device,cache,d->instanceApiVersion,result,info[n],alloc,out[n],
+                ready->recipe,session().presenterSource,dispatch,{d,retirePresenterOriginal});
+            session().presenterCounters.attempted(completed);
+            // Success returns a normal app-owned candidate pipeline. It is
+            // deliberately NOT registered as a stock-original-PS pipeline.
+        });
+    }
+    return result;
+#endif
     // Partial success handles are not an admitted diagnostic pipeline.
     if(result==VK_SUCCESS && count<=256)for(std::uint32_t n=0;n<count;++n){
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
@@ -1175,7 +1328,10 @@ VKAPI_ATTR void VKAPI_CALL traceDestroyPipeline(VkDevice device,VkPipeline pipel
 #endif
     observeDefinitions(d,[&](auto& definitions){definitions.destroyPipeline(pipeline);});
 #endif
-    session().tracker->destroyPipeline(d->id,pipeline);d->DestroyPipeline(device,pipeline,alloc);
+#ifndef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    session().tracker->destroyPipeline(d->id,pipeline);
+#endif
+    d->DestroyPipeline(device,pipeline,alloc);
 }
 #ifdef FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateRenderPass(VkDevice device,const VkRenderPassCreateInfo* info,const VkAllocationCallbacks* alloc,VkRenderPass* out) {
@@ -1599,6 +1755,19 @@ VKAPI_ATTR void VKAPI_CALL bridgeDestroyDescriptorPool(VkDevice device,VkDescrip
 #endif
 PFN_vkVoidFunction intercept(const char* name,PFN_vkVoidFunction native) {
     if(!native || !session().allowed)return native;
+#ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
+    // Functional prototype: only cold definition/lifetime callbacks. Returning
+    // the exact NEXT PFN for all recording/draw/submit/resource commands avoids
+    // the diagnostic LiveTracker and its per-frame work entirely.
+#define PRESENT_HOOK(method) if(!std::strcmp(name,"vk" #method))return reinterpret_cast<PFN_vkVoidFunction>(trace##method);
+    PRESENT_HOOK(CreateShaderModule) PRESENT_HOOK(DestroyShaderModule)
+    PRESENT_HOOK(CreateGraphicsPipelines) PRESENT_HOOK(DestroyPipeline)
+    PRESENT_HOOK(CreateDescriptorSetLayout) PRESENT_HOOK(DestroyDescriptorSetLayout)
+    PRESENT_HOOK(CreatePipelineLayout) PRESENT_HOOK(DestroyPipelineLayout)
+    PRESENT_HOOK(CreateRenderPass) PRESENT_HOOK(CreateRenderPass2) PRESENT_HOOK(CreateRenderPass2KHR) PRESENT_HOOK(DestroyRenderPass)
+#undef PRESENT_HOOK
+    return native;
+#endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     if(!std::strcmp(name,"vkDestroyImage"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeDestroyImage);
     if(!std::strcmp(name,"vkDestroyImageView"))return reinterpret_cast<PFN_vkVoidFunction>(bridgeDestroyImageView);
