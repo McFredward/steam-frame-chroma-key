@@ -6,9 +6,11 @@
 // submission, device, source-frame or eye authority. The original arguments must
 // be forwarded verbatim; complete native pass/target tickets remain mandatory.
 #include <vulkan/vulkan.h>
+#include "pixel_native_driver_lease.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace frame_pixel_renderpass_recording {
 constexpr std::size_t MaxChain=16,MaxAttachments=8,MaxLocationEntries=32;
@@ -58,6 +60,10 @@ inline const char* chainName(Chain c) noexcept {
     switch(c){case Chain::RenderPassBegin:return "render_pass_begin";case Chain::SubpassBegin:return "subpass_begin";
         case Chain::SubpassEnd:return "subpass_end";case Chain::Count:break;}return "invalid_chain";
 }
+inline const char* privateProfileName(PrivateProfile p) noexcept {
+    switch(p){case PrivateProfile::None:return "none";case PrivateProfile::ValveSubpassSrgbZeroV1:return "valve_subpass_srgb_zero_v1";}
+    return "invalid_private_profile";
+}
 inline bool refuse(Shape& out,Reason r,Chain chain,std::uint32_t index=UINT32_MAX,std::uint32_t type=UINT32_MAX) noexcept {
     if(out.refusal.reason==Reason::None)out.refusal={r,type,index,chain};
     return false;
@@ -81,6 +87,12 @@ inline bool knownEndType(std::uint32_t type) noexcept {
 }
 namespace detail {
 struct Nodes {std::array<const VkBaseInStructure*,MaxChain> values{};};
+// Owned declaration of the exact provider ABI; no caller pointer escapes the
+// synchronous decoder. memcpy below reads only the attested uint32 field.
+struct ValveSubpassSrgbInfo {VkStructureType sType;const void* pNext;std::uint32_t srgbMask;};
+constexpr bool ValveSrgbLP64=sizeof(void*)==8&&sizeof(VkStructureType)==4&&
+    offsetof(ValveSubpassSrgbInfo,pNext)==8&&offsetof(ValveSubpassSrgbInfo,srgbMask)==16&&sizeof(ValveSubpassSrgbInfo)==24;
+struct PendingPrivate {const void* info=nullptr;const frame_pixel_native_driver::Permit* permit=nullptr;std::uint32_t index=UINT32_MAX;};
 inline Nodes census(const void* input,Chain chain,Shape& out) noexcept {
     Nodes nodes;auto& facts=out.chains[static_cast<unsigned>(chain)];
     auto* current=static_cast<const VkBaseInStructure*>(input);
@@ -97,11 +109,24 @@ inline Nodes census(const void* input,Chain chain,Shape& out) noexcept {
 inline bool area(const VkRect2D& r) noexcept {
     return r.offset.x>=0&&r.offset.y>=0&&r.extent.width&&r.extent.height;
 }
-inline void chainPolicy(const Nodes& nodes,Chain chain,Shape& out) noexcept {
+inline void chainPolicy(const Nodes& nodes,Chain chain,Shape& out,
+                        const frame_pixel_native_driver::Permit* permit=nullptr,PendingPrivate* pending=nullptr) noexcept {
     const auto& facts=out.chains[static_cast<unsigned>(chain)];
     // A complete bounded census precedes decoding. Unknown headers are recorded
     // without interpreting their payload, and do not hide later chain headers.
     for(std::uint32_t i=0;i<facts.count;++i){const auto type=facts.types[i];
+        if(type==ValveSubpassSrgbType){
+            // Public/default decoding stays closed. The opaque permit pins the
+            // exact device, saved NEXT entrypoint and intrinsic recording route;
+            // a numeric tag, source comment or caller boolean cannot authorize
+            // this payload. Do not read it until ALL operation roots pass.
+            const bool allowed=out.refusal.reason==Reason::None&&chain==Chain::SubpassBegin&&
+                out.renderPass2&&out.operation!=Operation::End&&pending&&ValveSrgbLP64&&permit&&
+                frame_pixel_native_driver::authorizeValveSrgb(*permit,out.operation==Operation::Next);
+            if(allowed)*pending={nodes.values[i],permit,i};
+            else refuse(out,Reason::UnknownExtension,chain,i,type);
+            continue;
+        }
         if(chain!=Chain::RenderPassBegin){
             refuse(out,knownBeginType(type)||knownEndType(type)?
                 (chain==Chain::SubpassEnd&&knownEndType(type)?Reason::UnsupportedExtension:Reason::WrongParent):Reason::UnknownExtension,chain,i,type);
@@ -120,6 +145,7 @@ inline void chainPolicy(const Nodes& nodes,Chain chain,Shape& out) noexcept {
     for(std::uint32_t i=0;i<facts.count;++i){const auto type=facts.types[i];
         if(out.refusal.reason!=Reason::None)break;
         switch(type){
+        case ValveSubpassSrgbType:break; // Deferred until every root is known.
         case VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO:{
             const auto& in=*reinterpret_cast<const VkRenderPassAttachmentBeginInfo*>(nodes.values[i]);
             out.attachmentBegin=true;out.attachmentCount=in.attachmentCount;
@@ -175,12 +201,13 @@ inline void base(const VkRenderPassBeginInfo* info,Shape& out) noexcept {
     if(out.refusal.reason==Reason::None&&!(out.deviceGroup&&out.deviceRenderAreaCount)&&!area(out.renderArea))
         refuse(out,Reason::RenderArea,Chain::RenderPassBegin);
 }
-inline void subpassBegin(const VkSubpassBeginInfo* info,Shape& out) noexcept {
+inline void subpassBegin(const VkSubpassBeginInfo* info,Shape& out,
+                         const frame_pixel_native_driver::Permit* permit=nullptr,PendingPrivate* pending=nullptr) noexcept {
     if(!info){refuse(out,Reason::NullInfo,Chain::SubpassBegin);return;}
     out.chains[static_cast<unsigned>(Chain::SubpassBegin)].rootType=static_cast<std::uint32_t>(info->sType);
     const auto nodes=census(info->pNext,Chain::SubpassBegin,out);
     if(info->sType!=VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO)refuse(out,Reason::Type,Chain::SubpassBegin,UINT32_MAX,static_cast<std::uint32_t>(info->sType));
-    out.contents=info->contents;chainPolicy(nodes,Chain::SubpassBegin,out);
+    out.contents=info->contents;chainPolicy(nodes,Chain::SubpassBegin,out,permit,pending);
 }
 inline void subpassEnd(const VkSubpassEndInfo* info,Shape& out) noexcept {
     if(!info){refuse(out,Reason::NullInfo,Chain::SubpassEnd);return;}
@@ -189,8 +216,22 @@ inline void subpassEnd(const VkSubpassEndInfo* info,Shape& out) noexcept {
     if(info->sType!=VK_STRUCTURE_TYPE_SUBPASS_END_INFO)refuse(out,Reason::Type,Chain::SubpassEnd,UINT32_MAX,static_cast<std::uint32_t>(info->sType));
     chainPolicy(nodes,Chain::SubpassEnd,out);
 }
-inline bool finish(Shape& out) noexcept {
+inline bool finish(Shape& out,const PendingPrivate* pending=nullptr) noexcept {
     if(out.operation!=Operation::End&&out.contents!=VK_SUBPASS_CONTENTS_INLINE)refuse(out,Reason::Contents,out.renderPass2?Chain::SubpassBegin:Chain::RenderPassBegin);
+    if(out.refusal.reason==Reason::None&&pending&&pending->info){
+        // Revocation between header policy and final decoding must also retain
+        // the closed default. The permit itself owns the callback reader scope.
+        if(!pending->permit||!frame_pixel_native_driver::authorizeValveSrgb(*pending->permit,out.operation==Operation::Next))
+            return refuse(out,Reason::UnknownExtension,Chain::SubpassBegin,pending->index,ValveSubpassSrgbType);
+        out.privateProfile=PrivateProfile::ValveSubpassSrgbZeroV1;
+        std::memcpy(&out.privateSrgbMask,static_cast<const std::uint8_t*>(pending->info)+offsetof(ValveSubpassSrgbInfo,srgbMask),sizeof(out.privateSrgbMask));
+        out.privatePayloadObserved=true;
+        // The provider supports a mask; this finite diagnostic profile admits
+        // ONLY the zero value actually constructed by the pinned compositor.
+        // The original Begin/Next call still receives its complete unchanged
+        // private node and retains the driver's sRGB state for the native pass.
+        if(out.privateSrgbMask!=0)refuse(out,Reason::PrivateValue,Chain::SubpassBegin,pending->index,ValveSubpassSrgbType);
+    }
     out.supported=out.refusal.reason==Reason::None;return out.supported;
 }
  } // namespace detail
@@ -206,14 +247,16 @@ inline void headerCensus(std::uint32_t rootType,const void* pNext,Chain chain,Sh
 inline bool begin(const VkRenderPassBeginInfo* in,VkSubpassContents contents,Shape& out) noexcept {
     out={};out.contents=contents;detail::base(in,out);return detail::finish(out);
 }
-inline bool begin2(const VkRenderPassBeginInfo* in,const VkSubpassBeginInfo* subpass,Shape& out) noexcept {
-    out={};out.renderPass2=true;detail::base(in,out);detail::subpassBegin(subpass,out);return detail::finish(out);
+inline bool begin2(const VkRenderPassBeginInfo* in,const VkSubpassBeginInfo* subpass,Shape& out,
+                   const frame_pixel_native_driver::Permit* permit=nullptr) noexcept {
+    out={};out.renderPass2=true;detail::PendingPrivate pending;detail::base(in,out);detail::subpassBegin(subpass,out,permit,&pending);return detail::finish(out,&pending);
 }
 inline bool next(VkSubpassContents contents,Shape& out) noexcept {
     out={};out.operation=Operation::Next;out.contents=contents;return detail::finish(out);
 }
-inline bool next2(const VkSubpassBeginInfo* beginInfo,const VkSubpassEndInfo* endInfo,Shape& out) noexcept {
-    out={};out.operation=Operation::Next;out.renderPass2=true;detail::subpassBegin(beginInfo,out);detail::subpassEnd(endInfo,out);return detail::finish(out);
+inline bool next2(const VkSubpassBeginInfo* beginInfo,const VkSubpassEndInfo* endInfo,Shape& out,
+                  const frame_pixel_native_driver::Permit* permit=nullptr) noexcept {
+    out={};out.operation=Operation::Next;out.renderPass2=true;detail::PendingPrivate pending;detail::subpassBegin(beginInfo,out,permit,&pending);detail::subpassEnd(endInfo,out);return detail::finish(out,&pending);
 }
 inline bool end(Shape& out) noexcept {out={};out.operation=Operation::End;return detail::finish(out);}
 inline bool end2(const VkSubpassEndInfo* endInfo,Shape& out) noexcept {
