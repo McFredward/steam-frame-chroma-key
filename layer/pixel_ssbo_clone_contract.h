@@ -378,6 +378,16 @@ inline bool captureSet0Shape(const VkDescriptorSetLayoutCreateInfo& in,Set0Defin
     }
     if(!found9)return refuse(why,Reason::MissingImage9);
     if(profile.compatibleSet0Mirror()){
+        // The mirror copies only statically attested original descriptors.
+        // Every dynamic binding still participates in bind-time offset/range
+        // rules, even when neither pinned stage reads it. Do not bind an
+        // undefined uncopied dynamic descriptor or infer that it is harmless.
+        for(std::uint32_t i=0;i<in.bindingCount;++i){const auto& binding=in.pBindings[i];
+            if(!binding.descriptorCount || (binding.descriptorType!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+               binding.descriptorType!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC))continue;
+            bool copied=false;for(const auto number:ProbeInterface::MirrorBindings)if(binding.binding==number)copied=true;
+            if(!copied)return refuse(why,Reason::Descriptor,i);
+        }
         for(std::size_t wanted=0;wanted<ProbeInterface::MirrorBindings.size()+1;++wanted){
             const auto number=wanted<ProbeInterface::MirrorBindings.size()?ProbeInterface::MirrorBindings[wanted]:ProbeInterface::MirrorRecordBinding;
             std::uint32_t i=0;for(;i<in.bindingCount&&in.pBindings[i].binding!=number;++i){}if(i==in.bindingCount)return refuse(why,Reason::Descriptor,i);
