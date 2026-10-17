@@ -78,8 +78,12 @@ def directory(path, create=False, private=False):
         raise
 
 
-def read(path, limit=MAX, owned=True):
+def read(path, limit=MAX, owned=True, *, writable_data=False, with_stat=False):
     path = absolute(path)
+    # SteamVR creates this mutable DATA file with mode 0666 on the Frame.
+    # This is never authority to import executable code or relax private state.
+    if writable_data and (not owned or path.name != 'steamvr.vrsettings'):
+        raise SafetyError('permissive data policy is restricted to owned SteamVR settings')
     parent = directory(path.parent)
     try:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent)
@@ -87,7 +91,7 @@ def read(path, limit=MAX, owned=True):
         os.close(parent)
     try:
         before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_mode & 0o022 or not 0 <= before.st_size <= limit or owned and before.st_uid != os.getuid():
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or (not writable_data and before.st_mode & 0o022) or not 0 <= before.st_size <= limit or owned and before.st_uid != os.getuid():
             raise SafetyError('bounded unchanged regular file required: ' + str(path))
         chunks, total = [], 0
         while total <= limit:
@@ -101,7 +105,7 @@ def read(path, limit=MAX, owned=True):
         identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
         if len(raw) != before.st_size or identity(after) != identity(before):
             raise SafetyError('file changed while reading')
-        return raw
+        return (raw, before) if with_stat else raw
     finally:
         os.close(fd)
 
@@ -128,8 +132,10 @@ def load(path):
     return json_bytes(read(path))
 
 
-def put(path, raw, expected=None, mode=0o600):
+def put(path, raw, expected=None, mode=0o600, *, writable_data=False):
     """Atomic replace only a verified exact predecessor; never adopt foreign bytes."""
+    if writable_data and (expected is None or path.name != 'steamvr.vrsettings'):
+        raise SafetyError('settings data replacement requires an exact existing predecessor')
     parent = directory(path.parent, create=True)
     temporary = '.' + path.name + '.' + secrets.token_hex(8)
     try:
@@ -143,19 +149,29 @@ def put(path, raw, expected=None, mode=0o600):
             finally:
                 os.close(fd)
         else:
-            observed = read(path)
+            observed, before = read(path, writable_data=writable_data, with_stat=True)
             if observed != expected:
                 raise SafetyError('foreign change preserved: ' + str(path))
-            identity = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            # Bind the expected bytes to the same original inode. Do not adopt
+            # a different file swapped in between the read and the final stat.
+            fingerprint = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns,
+                                        item.st_ctime_ns, item.st_mode, item.st_uid, item.st_nlink)
+            identity = before
+            if fingerprint(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) != fingerprint(identity):
+                raise SafetyError('file changed before replacement')
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=parent)
             try:
+                if writable_data:
+                    # Preserve the native mode on the NEW temporary inode;
+                    # never chmod SteamVR's existing settings file to hide it.
+                    os.fchmod(fd, stat.S_IMODE(identity.st_mode))
                 with os.fdopen(fd, 'wb', closefd=False) as stream:
                     stream.write(raw)
                     stream.flush()
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            if os.stat(path.name, dir_fd=parent, follow_symlinks=False) != identity:
+            if fingerprint(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) != fingerprint(identity):
                 raise SafetyError('file changed before replacement')
             os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
         os.fsync(parent)
@@ -541,7 +557,7 @@ class Setup:
 
     def _camera_state(self):
         path = self._settings()
-        raw = read(path)  # Never invent/replace a missing settings file.
+        raw = read(path, writable_data=True)  # Mutable Steam DATA; never invent a missing file.
         value = json_bytes(raw)
         section = value.get('camera', {})
         if type(section) is not dict or KEY in section and type(section[KEY]) is not bool:
@@ -586,7 +602,7 @@ class Setup:
         else:
             section.pop(KEY, None)
         mode = stat.S_IMODE(path.stat().st_mode)
-        put(path, encoded(value), raw, mode=mode)
+        put(path, encoded(value), raw, mode=mode, writable_data=True)
         return {'restored': not enable, 'changed': True}
 
     def _restore(self):

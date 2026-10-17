@@ -510,6 +510,114 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(self.install()['reason'], 'installed')
         self.assertEqual(backup.read_bytes(), b'DISABLED BACKUP')
 
+    def test_steam_mode666_roundtrip_preserves_each_baseline_and_mode(self):
+        for baseline in (None, False, True):
+            with self.subTest(baseline=baseline):
+                if self.setup.camera_receipt.exists():
+                    self.setup.camera_receipt.unlink()
+                data = {'unrelated': {'keep': 42}, 'camera': {'other': 'keep'}}
+                if baseline is not None:
+                    data['camera'][s.KEY] = baseline
+                self.settings.write_bytes(s.encoded(data))
+                self.settings.chmod(0o666)
+                self.setup._camera(True)
+                self.assertTrue(s.json_bytes(self.settings.read_bytes())['camera'][s.KEY])
+                self.assertEqual(self.settings.stat().st_mode & 0o777, 0o666)
+                self.assertTrue(self.setup._camera(False)['restored'])
+                self.assertEqual(s.json_bytes(self.settings.read_bytes()), data)
+                self.assertEqual(self.settings.stat().st_mode & 0o777, 0o666)
+                self.assertEqual(self.setup.camera_receipt.stat().st_mode & 0o777, 0o600)
+
+    def test_steam_mode666_complete_prepare_finish_with_registered0755_path(self):
+        registry = self.home / '.config/openvr/openvrpaths.vrpath'
+        os.close(s.directory(registry.parent, create=True))
+        s.put(registry, s.encoded({'config': [str(self.settings.parent)]}))
+        registry.chmod(0o755)
+        self.settings.chmod(0o666)
+        self.install()
+        self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+        self.assertTrue(self.setup.target.exists())
+        self.assertTrue(self.setup.finish()['camera']['restored'])
+        self.assertNotIn(s.KEY, s.json_bytes(self.settings.read_bytes())['camera'])
+        self.assertEqual(self.settings.stat().st_mode & 0o777, 0o666)
+        self.assertEqual(registry.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.unit.native_calls, [])
+
+    def test_mode666_private_artifacts_stay_refused(self):
+        self.install()
+        for path in (self.setup.receipt, self.setup.control, self.setup.package / s.LIBRARY):
+            with self.subTest(path=path.name):
+                raw = path.read_bytes()
+                path.chmod(0o666)
+                with self.assertRaises(s.SafetyError):
+                    s.read(path)
+                with self.assertRaises(s.SafetyError):
+                    s.put(path, b'NOT ALLOWED', raw)
+                with self.assertRaises(s.SafetyError):
+                    s.read(path, writable_data=True)
+                self.assertEqual(path.read_bytes(), raw)
+                path.chmod(0o600)
+
+    def test_mode666_expected_mismatch_and_foreign_camera_edit_preserved(self):
+        self.settings.chmod(0o666)
+        raw = self.settings.read_bytes()
+        with self.assertRaises(s.SafetyError):
+            s.put(self.settings, b'NOT ALLOWED', raw + b'changed', writable_data=True)
+        self.assertEqual(self.settings.read_bytes(), raw)
+        self.setup._camera(True)
+        changed = s.json_bytes(self.settings.read_bytes())
+        changed['camera'][s.KEY] = False  # Original absent; this is a foreign override.
+        self.settings.write_bytes(s.encoded(changed))
+        with self.assertRaises(s.SafetyError):
+            self.setup._camera(False)
+        self.assertEqual(s.json_bytes(self.settings.read_bytes()), changed)
+        self.assertEqual(self.settings.stat().st_mode & 0o777, 0o666)
+
+    def test_mode666_changed_inode_after_read_is_not_adopted(self):
+        self.settings.chmod(0o666)
+        expected = self.settings.read_bytes()
+        foreign = s.encoded({'camera': {'other': 'FOREIGN'}})
+        actual_read = s.read
+        swapped = False
+        def replace_after_read(path, *args, **kwargs):
+            nonlocal swapped
+            result = actual_read(path, *args, **kwargs)
+            if path == self.settings and kwargs.get('with_stat') and not swapped:
+                swapped = True
+                replacement = path.with_name('foreign.vrsettings')
+                replacement.write_bytes(foreign)
+                replacement.chmod(0o666)
+                os.replace(replacement, path)
+            return result
+        s.read = replace_after_read
+        try:
+            with self.assertRaises(s.SafetyError):
+                s.put(self.settings, b'NOT ALLOWED', expected, writable_data=True)
+        finally:
+            s.read = actual_read
+        self.assertTrue(swapped)
+        self.assertEqual(self.settings.read_bytes(), foreign)
+
+    def test_mode666_settings_symlink_hardlink_and_nonboolean_stay_refused(self):
+        raw = self.settings.read_bytes()
+        original = self.settings.with_name('original.vrsettings')
+        self.settings.rename(original)
+        self.settings.symlink_to(original)
+        with self.assertRaises(OSError):
+            self.setup._camera_state()
+        self.settings.unlink()
+        os.link(original, self.settings)
+        with self.assertRaises(s.SafetyError):
+            self.setup._camera_state()
+        self.settings.unlink()
+        original.rename(self.settings)
+        self.settings.write_bytes(s.encoded({'camera': {s.KEY: 1}}))
+        self.settings.chmod(0o666)
+        with self.assertRaises(s.SafetyError):
+            self.setup._camera_state()
+        self.assertNotEqual(self.settings.read_bytes(), raw)
+        self.assertFalse(self.setup.camera_receipt.exists())
+
     def test_cli_no_install_and_no_implicit_restart(self):
         result = subprocess.run([sys.executable, '-B', str(ROOT / 'tools/native_passthrough_setup.py'), 'status', '--home', str(self.home)], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
