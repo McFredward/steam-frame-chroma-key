@@ -16,11 +16,9 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 
 sys.dont_write_bytecode = True
 NAME = 'SteamFrameNativePassthrough'
@@ -32,6 +30,7 @@ DROPIN = '80-steam-frame-native-passthrough.conf'
 LIBRARY = 'libVkLayer_frame_pixel_snapshot.so'
 MAX = 2 * 1024 * 1024
 KEY = 'forceSceneAlphaBlending'
+REVOCATION = b'SFNP_EMERGENCY_OFF/1\n'
 
 
 class SafetyError(ValueError):
@@ -249,6 +248,7 @@ class Setup:
         self.receipt = self.config / 'install.json'
         self.upgrade = self.config / 'upgrade.json'
         self.control = self.config / 'control.json'
+        self.revocation = self.config / 'emergency-off.marker'
         self.camera_receipt = self.config / 'camera-before.json'
         self.inflight = self.config / 'inflight.json'
         self.status_file = self.config / 'status.json'
@@ -312,7 +312,32 @@ class Setup:
         value = load(self.control)
         if set(value) != {'schema', 'enabled'} or value['schema'] != CONTROL or type(value['enabled']) is not bool:
             raise SafetyError('foreign control file preserved')
+        if self._revoked():
+            value['enabled'] = False
         return value
+
+    def _revoked(self):
+        if not exists(self.revocation):
+            return False
+        if read(self.revocation, 64) != REVOCATION:
+            raise SafetyError('foreign emergency marker preserved')
+        return True
+
+    def request_emergency(self):
+        # No long setup/build lock is required to revoke loader discovery. This
+        # marker also makes an in-progress preparation refuse final publication.
+        os.close(directory(self.config, create=True, private=True))
+        if not self._revoked():
+            try:
+                put(self.revocation, REVOCATION)
+            except FileExistsError:
+                self._revoked()
+        if exists(self.receipt):
+            self._state()
+            self._unlink()  # Exact owned link only; no provider/camera call here.
+        return {'reason': 'emergency_off_requested', 'enabled': False,
+                'camera_restore_pending': True, 'automatic_restart': False,
+                'manual_action': 'Future injection is revoked. Stop SteamVR and run disable again to finish any pending camera restoration.'}
 
     def _enabled(self, enabled):
         value = {'schema': CONTROL, 'enabled': enabled}
@@ -401,8 +426,48 @@ class Setup:
             self._control()  # Reinstallation preserves explicit disabled state.
         if self._control()['enabled']:
             self._link()
+            if self._revoked():
+                self._unlink()
         self.system.reload()
         return self._status('installed', enabled=self._control()['enabled'], manual_action='Start SteamVR normally; setup did not restart it.')
+
+    def install_automatic(self):
+        self._collision()
+        engine = self._engine()
+        # Exact repeats reuse the immutable already checked package. They do not
+        # compile again or grow preparation records on every invocation.
+        if exists(self.receipt) and not exists(self.upgrade):
+            try:
+                engine.verify_package(self.package, engine.runtime_files(home=self.home))
+                return self.install(self.package)
+            except Exception:
+                pass  # Changed source/runtime must go through the full cold gate.
+        os.close(directory(self.data, create=True, private=True))
+        attempts = self.data / 'preparation'
+        os.close(directory(attempts, create=True, private=True))
+        staging = attempts / ('attempt-' + secrets.token_hex(16))
+        os.close(directory(staging, create=True, private=True))
+        package = staging / 'package'
+        # The helper retains bounded logs/source/result evidence next to output,
+        # even on failure. An outer temporary context must not erase that proof.
+        engine.prepare(package)
+        result = self.install(package)
+        metadata = load(package / 'package.json')
+        for name, record in metadata['files'].items():
+            remove(package / name, record['sha256'])
+        remove(package / 'package.json', digest(encoded(metadata)))
+        # Only empty directories after exact-file removal qualify for cleanup.
+        for path in sorted(package.rglob('*'), key=lambda p: len(p.parts), reverse=True):
+            if path.is_dir() and not path.is_symlink():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        try:
+            package.rmdir()
+        except OSError:
+            pass
+        return result
 
     def _link(self):
         self._state()
@@ -561,13 +626,21 @@ class Setup:
     def enable(self):
         self._state()
         self._collision()
+        revoked_before = self._revoked()
         self._verify()
         if exists(self.upgrade):
             raise SafetyError('Interrupted upgrade must be completed before enable')
         if exists(self.inflight):
             raise SafetyError('Previous launch still marked inflight; disable first, then enable explicitly')
+        if self._revoked():
+            if not revoked_before:
+                raise SafetyError('Emergency-off arrived during enable; enable again explicitly when ready')
+            remove(self.revocation, digest(REVOCATION))
         self._enabled(True)
         self._link()
+        if self._revoked():
+            self._unlink()
+            return self._status('emergency_off', enabled=False, camera=self._restore())
         return self._status('enabled', enabled=True, manual_action='Start SteamVR normally; no restart was performed.')
 
     def prepare(self):
@@ -609,9 +682,15 @@ class Setup:
             camera = self._camera(True, verified)
             if camera.get('persistence_pending'):
                 raise SafetyError('camera API persistence is pending; ordinary SteamVR launch retained')
-            # The last publication is the only loader-visible opt-in.
+            # The last publication is the only loader-visible opt-in. Emergency
+            # revocation can arrive without waiting for the cold setup lock.
+            if self._revoked():
+                raise SafetyError('Emergency-off revoked this preparation')
             put(self.target, manifest)
             self._link()
+            if self._revoked():
+                self._unpublish(unlink=True)
+                raise SafetyError('Emergency-off revoked final publication')
             return self._status('prepared', enabled=True, capture_id=capture, camera=camera)
         except Exception as error:
             cleanup = None
@@ -692,17 +771,21 @@ def main(argv=None):
     args = parser.parse_args(argv)
     setup = Setup(args.home)
     try:
+        if args.command == 'emergency-off':
+            requested = setup.request_emergency()
+            try:
+                with setup.locked():
+                    result = setup.disable(True)
+            except BlockingIOError:
+                result = requested
+            print(json.dumps(result, sort_keys=True))
+            return 0
         with setup.locked():
             if args.command == 'install':
                 setup._collision()
                 package = args.package
                 if package is None:
-                    engine = setup._engine()
-                    os.close(directory(setup.data, create=True, private=True))
-                    with tempfile.TemporaryDirectory(prefix='.local-prepare-', dir=setup.data) as staging:
-                        package = Path(staging) / 'package'
-                        engine.prepare(package)
-                        result = setup.install(package)
+                    result = setup.install_automatic()
                 else:
                     result = setup.install(absolute(package))
             elif args.command == 'prepare-launch':

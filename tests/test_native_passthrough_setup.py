@@ -399,6 +399,101 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(s.load(self.setup.control)['enabled'])
         self.assertNotIn('MUST NOT IMPORT', result.stderr)
 
+    def test_cross_process_emergency_while_long_build_lock_held(self):
+        self.install()
+        self.setup.prepare()
+        # Clear only the volatile staged session so the production CLI need not
+        # select this test namespace. A real existing owned symlink uses the
+        # exact production target; no /run content is touched by this fixture.
+        self.setup.finish()
+        self.setup.manifest.unlink()
+        receipt = s.load(self.setup.receipt)
+        production_target = Path('/run/user') / str(os.getuid()) / 'steam-frame-native-passthrough/receiver.json'
+        receipt['manifest_link'] = str(production_target)
+        s.put(self.setup.receipt, s.encoded(receipt), s.read(self.setup.receipt))
+        self.setup.manifest.symlink_to(production_target)
+        with self.setup.locked():
+            child = subprocess.run([sys.executable, '-B', str(self.setup.tools / 'native_passthrough_setup.py'), 'emergency-off', '--home', str(self.home)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(child.returncode, 0, child.stderr)
+            result = json.loads(child.stdout)
+            self.assertEqual(result['reason'], 'emergency_off_requested')
+            self.assertTrue(result['camera_restore_pending'])
+            self.assertFalse(self.setup.manifest.is_symlink())
+            self.assertEqual(self.setup.revocation.read_bytes(), s.REVOCATION)
+        # The still-running parent installer must not re-enable/recreate a link.
+        receipt['manifest_link'] = str(self.setup.target)
+        s.put(self.setup.receipt, s.encoded(receipt), s.read(self.setup.receipt))
+        self.assertFalse(self.install()['enabled'])
+        self.assertFalse(self.setup.manifest.is_symlink())
+        self.assertEqual(self.setup.prepare()['reason'], 'disabled')
+        self.setup.enable()
+        self.assertFalse(self.setup.revocation.exists())
+        self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+
+    def test_emergency_during_final_publication_revokes_before_pre_returns(self):
+        self.install()
+        original = s.put
+        def emergency_after_publication(path, raw, *args, **kwargs):
+            result = original(path, raw, *args, **kwargs)
+            if path == self.setup.target:
+                self.setup.request_emergency()
+            return result
+        s.put = emergency_after_publication
+        try:
+            result = self.setup.prepare()
+        finally:
+            s.put = original
+        self.assertEqual(result['reason'], 'stock_fallback')
+        self.assertFalse(self.setup.manifest.is_symlink())
+        self.assertFalse(self.setup.target.exists())
+        self.assertFalse(self.setup._control()['enabled'])
+        self.assertNotIn(s.KEY, s.load(self.settings)['camera'])
+
+    def test_foreign_emergency_marker_not_removed_or_adopted(self):
+        self.install()
+        self.setup.revocation.write_bytes(b'FOREIGN')
+        with self.assertRaises(s.SafetyError):
+            self.setup.request_emergency()
+        self.assertEqual(self.setup.revocation.read_bytes(), b'FOREIGN')
+        self.assertEqual(self.setup.prepare()['reason'], 'stock_fallback')
+        self.assertFalse(self.setup.target.exists())
+
+    def test_automatic_install_reuses_package_and_preserves_failed_preparation_evidence(self):
+        owner = self
+        class Engine:
+            calls = 0
+            fail = False
+            def runtime_files(self, home):
+                return {'openvr': owner.root / 'pinned'}
+            def verify_package(self, package, runtime):
+                return owner.setup.verifier(package, runtime)
+            def prepare(self, package):
+                self.calls += 1
+                evidence = package.parent / 'preparation-result.json'
+                s.put(evidence, s.encoded({'result': 'failure' if self.fail else 'success'}))
+                if self.fail:
+                    raise s.SafetyError('injected local build failure; evidence ' + str(evidence))
+                shutil.copytree(owner.package, package)
+        engine = Engine()
+        self.setup._engine = lambda: engine
+        self.assertEqual(self.setup.install_automatic()['reason'], 'installed')
+        self.assertEqual(engine.calls, 1)
+        attempts = list((self.setup.data / 'preparation').iterdir())
+        self.assertEqual(len(attempts), 1)
+        self.assertTrue((attempts[0] / 'preparation-result.json').exists())
+        self.assertFalse((attempts[0] / 'package').exists())
+        self.setup.disable()
+        self.assertFalse(self.setup.install_automatic()['enabled'])
+        self.assertEqual(engine.calls, 1)
+        self.assertEqual(len(list((self.setup.data / 'preparation').iterdir())), 1)
+        engine.fail = True
+        self.compatible = False
+        with self.assertRaisesRegex(s.SafetyError, 'injected local build failure'):
+            self.setup.install_automatic()
+        failures = [p for p in (self.setup.data / 'preparation').iterdir() if s.load(p / 'preparation-result.json')['result'] == 'failure']
+        self.assertEqual(len(failures), 1)
+        self.assertFalse(self.setup.target.exists())
+
     def test_cli_no_install_and_no_implicit_restart(self):
         result = subprocess.run([sys.executable, '-B', str(ROOT / 'tools/native_passthrough_setup.py'), 'status', '--home', str(self.home)], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
