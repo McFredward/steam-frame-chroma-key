@@ -7,6 +7,7 @@
 #include "../layer/pixel_native_driver_lease.h"
 namespace frame_pixel_native_driver {
 struct LeaseTestAccess {
+    static void advanceEpoch(Lease& lease) noexcept { lease.epoch_.fetch_add(1,std::memory_order_acq_rel); }
     static bool fixture(Lease& lease,const Inputs& inputs) noexcept {
         if(lease.state_.load()!=State::Empty || !inputs.device) return false;
         lease.inputs_=inputs; lease.epoch_.store(1);

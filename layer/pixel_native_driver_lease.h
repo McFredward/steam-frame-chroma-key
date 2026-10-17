@@ -21,7 +21,8 @@ struct Status {
     State state{State::Empty}; Refusal refusal{Refusal::None};
     std::uint64_t epoch{}, device{}, moduleBase{}, inode{}, deviceMajor{}, deviceMinor{};
     std::uint64_t rvas[4]{};
-    std::uint32_t chip{}, routeMask{}, activePermits{};
+    std::uint32_t chip{}, routeMask{}, activePermits{}, observedRoute{UINT32_MAX};
+    char providerPath[256]{};
 };
 namespace detail { struct Preparation; }
 class Lease;
@@ -69,7 +70,8 @@ private:
     std::atomic_flag cold_ = ATOMIC_FLAG_INIT;
     Inputs inputs_{}; std::uint64_t rvas_[4]{};
     std::uint64_t base_{}, inode_{}, devMajor_{}, devMinor_{};
-    std::uint32_t chip_{}, routeMask_{};
+    std::uint32_t chip_{}, routeMask_{}, observedRoute_{UINT32_MAX};
+    char providerPath_[256]{};
     int fd_{-1}; void* module_{};
     bool fail(Refusal) noexcept;
 };

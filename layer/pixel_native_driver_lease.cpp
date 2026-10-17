@@ -69,10 +69,12 @@ bool hashFileRange(int fd,std::uint64_t offset,std::uint64_t n,std::array<std::u
 }
 // Each path component is opened independently. An ordinary symlink (including a
 // substituted parent) is never followed; proc links are used only for maps data.
-int secureOpen(const char* path) noexcept {
+int secureOpen(const char* path,bool protectedDirectories=false) noexcept {
     if(!path || path[0]!='/' || std::strlen(path)>511) return -1;
     int parent=open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
     if(parent<0) return -1;
+    struct stat directory{};
+    if(protectedDirectories && (fstat(parent,&directory)!=0 || directory.st_uid!=0 || (directory.st_mode&0022))) {close(parent);return -1;}
     const char* cursor=path+1;
     while(*cursor) {
         const char* slash=std::strchr(cursor,'/'); const auto count=slash?static_cast<std::size_t>(slash-cursor):std::strlen(cursor);
@@ -80,10 +82,11 @@ int secureOpen(const char* path) noexcept {
         if(!count || count>=sizeof(name)) { close(parent); return -1; }
         std::memcpy(name,cursor,count);
         if(!std::strcmp(name,".") || !std::strcmp(name,"..")) { close(parent); return -1; }
-        const int flags=O_RDONLY|O_CLOEXEC|O_NOFOLLOW|(slash?O_DIRECTORY:0);
+        const int flags=O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK|(slash?O_DIRECTORY:0);
         const int next=openat(parent,name,flags); close(parent); parent=next;
         if(parent<0) return -1;
         if(!slash) return parent;
+        if(protectedDirectories && (fstat(parent,&directory)!=0 || directory.st_uid!=0 || (directory.st_mode&0022))) {close(parent);return -1;}
         cursor=slash+1;
     }
     close(parent); return -1;
@@ -129,32 +132,54 @@ bool sameMaps(const Maps& a,const Maps& b) noexcept {
     }
     return true;
 }
-bool btrfsRootIdentity(int fd,unsigned mapMajor,unsigned mapMinor,const struct stat& st) noexcept {
-    // Linux Btrfs top-level mounts can report an anonymous map superblock dev
-    // distinct from stat's synthetic subvolume dev. Admit only the reviewed /
-    // top-level mount (subvolid=5), same inode, filesystem and root fsid.
-    if(mapMajor!=0 || major(st.st_dev)!=0 || mapMinor==minor(st.st_dev)) return false;
-    struct statfs fileFs{},rootFs{};
-    const int root=open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);if(root<0)return false;
-    const bool fs=fstatfs(fd,&fileFs)==0 && fstatfs(root,&rootFs)==0 &&
-        static_cast<unsigned long>(fileFs.f_type)==0x9123683eul && fileFs.f_type==rootFs.f_type &&
-        std::memcmp(&fileFs.f_fsid,&rootFs.f_fsid,sizeof(fileFs.f_fsid))==0;
-    close(root);if(!fs)return false;
-    std::array<char,65536> text{};std::size_t used=0;if(!readText("/proc/self/mountinfo",text.data(),text.size(),used))return false;
-    bool found=false;char* line=text.data();
+bool exactOption(const char* options,const char* prefix,const char* exact) noexcept {
+    unsigned count=0;bool matches=false;const auto prefixBytes=std::strlen(prefix),exactBytes=std::strlen(exact);
+    const char* token=options;
+    while(*token) {
+        const char* comma=std::strchr(token,',');const auto bytes=comma?static_cast<std::size_t>(comma-token):std::strlen(token);
+        if(bytes>=prefixBytes && !std::memcmp(token,prefix,prefixBytes)){++count;matches=bytes==exactBytes&&!std::memcmp(token,exact,exactBytes);}
+        if(!comma)break;
+        token=comma+1;
+    }
+    return count==1&&matches;
+}
+bool btrfsMountShape(char* text,const char* path,unsigned mapMajor,unsigned mapMinor) noexcept {
+    // Choose the single longest path-prefix mount. A nested bind/subvolume or
+    // duplicate mount must never be justified by the less-specific root row.
+    bool found=false,admitted=false;std::size_t longest=0;char* line=text;
     while(*line) {
         char* end=std::strchr(line,'\n');if(end)*end=0;
         unsigned id=0,parent=0,a=0,b=0;char rootName[256]{},point[256]{};
-        if(std::sscanf(line,"%u %u %u:%u %255s %255s",&id,&parent,&a,&b,rootName,point)==6 && a==mapMajor && b==mapMinor &&
-            !std::strcmp(rootName,"/") && !std::strcmp(point,"/")) {
-            const auto* sep=std::strstr(line," - btrfs ");
-            if(!sep || !std::strstr(sep,"subvolid=5") || !std::strstr(sep,"subvol=/") || found)return false;
-            found=true;
+        if(std::sscanf(line,"%u %u %u:%u %255s %255s",&id,&parent,&a,&b,rootName,point)!=6)return false;
+        if(std::strchr(rootName,'\\')||std::strchr(point,'\\'))return false;
+        const auto len=std::strlen(point),pathLen=std::strlen(path);
+        const bool matches=point[0]=='/' && len<=pathLen && !std::memcmp(point,path,len) && (len==1 || len==pathLen || path[len]=='/');
+        if(matches) {
+            if(found && len==longest)return false;
+            if(!found || len>longest) {
+                const auto* sep=std::strstr(line," - ");char type[32]{},source[256]{},options[2048]{};
+                if(!sep||std::sscanf(sep+3,"%31s %255s %2047s",type,source,options)!=3)return false;
+                found=true;longest=len;
+                admitted=a==mapMajor&&b==mapMinor&&!std::strcmp(rootName,"/")&&!std::strcmp(point,"/")&&
+                    !std::strcmp(type,"btrfs")&&exactOption(options,"subvolid=","subvolid=5")&&exactOption(options,"subvol=","subvol=/");
+            }
         }
         if(!end)break;
         line=end+1;
     }
-    return found;
+    return found&&admitted;
+}
+bool btrfsRootIdentity(int fd,unsigned mapMajor,unsigned mapMinor,const struct stat& st) noexcept {
+    if(mapMajor!=0 || !mapMinor || major(st.st_dev)!=0 || !minor(st.st_dev) || mapMinor==minor(st.st_dev)) return false;
+    struct statfs fileFs{},rootFs{};struct stat rootStat{};
+    const int root=open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);if(root<0)return false;
+    const bool fs=fstat(root,&rootStat)==0 && rootStat.st_ino==256 && rootStat.st_dev==st.st_dev &&
+        fstatfs(fd,&fileFs)==0 && fstatfs(root,&rootFs)==0 &&
+        static_cast<unsigned long>(fileFs.f_type)==0x9123683eul && fileFs.f_type==rootFs.f_type &&
+        std::memcmp(&fileFs.f_fsid,&rootFs.f_fsid,sizeof(fileFs.f_fsid))==0;
+    close(root);if(!fs)return false;
+    std::array<char,65536> text{};std::size_t used=0;if(!readText("/proc/self/mountinfo",text.data(),text.size(),used))return false;
+    return btrfsMountShape(text.data(),DriverPath,mapMajor,mapMinor);
 }
 bool loadMaps(const char* path,int fd,const struct stat& st,Maps& out) noexcept {
     std::array<char,262144> text{};std::size_t used=0;if(!readText("/proc/self/maps",text.data(),text.size(),used))return false;
@@ -173,15 +198,15 @@ bool loadMaps(const char* path,int fd,const struct stat& st,Maps& out) noexcept 
     }
     return out.count>0;
 }
-struct Profile {const char* path;const char* sha;const char* buildId;std::uint64_t bytes;std::uint16_t machine;std::uint64_t rvas[3][2];};
-const Profile NativeProfile{DriverPath,FileSha,BuildId,18850240,EM_AARCH64,{{0xb113e0,0xb11940},{0xb12180,0xb11d60},{0xb18040,0xb185a0}}};
+struct Profile {const char* path;const char* sha;const char* buildId;std::uint64_t bytes;std::uint16_t machine;std::uint32_t owner;bool protectedDirectories;std::uint64_t rvas[3][2];};
+const Profile NativeProfile{DriverPath,FileSha,BuildId,18850240,EM_AARCH64,0,true,{{0xb113e0,0xb11940},{0xb12180,0xb11d60},{0xb18040,0xb185a0}}};
 struct File {
     int fd{-1};struct stat identity{};Elf64_Ehdr eh{};std::array<Elf64_Phdr,MaximumHeaders> ph{};
     std::array<std::array<std::uint8_t,32>,MaximumHeaders> hashes{};
 };
 Refusal verifyFile(const Profile& profile,File& out) noexcept {
-    out.fd=secureOpen(profile.path);if(out.fd<0)return Refusal::FileOpen;
-    if(fstat(out.fd,&out.identity)!=0 || !S_ISREG(out.identity.st_mode) || out.identity.st_uid!=0 ||
+    out.fd=secureOpen(profile.path,profile.protectedDirectories);if(out.fd<0)return Refusal::FileOpen;
+    if(fstat(out.fd,&out.identity)!=0 || !S_ISREG(out.identity.st_mode) || out.identity.st_uid!=profile.owner ||
         (out.identity.st_mode&0022) || out.identity.st_nlink!=1)return Refusal::FileIdentity;
     if(out.identity.st_size<=0 || static_cast<std::uint64_t>(out.identity.st_size)>MaximumFileBytes ||
         static_cast<std::uint64_t>(out.identity.st_size)!=profile.bytes)return Refusal::FileBounds;
@@ -300,6 +325,8 @@ void Lease::revoke() noexcept {
 }
 bool Lease::fail(Refusal r) noexcept {
     auto none=Refusal::None;refusal_.compare_exchange_strong(none,r,std::memory_order_release);
+    // Called only at the terminal cold edge; no metadata is changed afterward.
+    published_.store(true,std::memory_order_release);
     auto preparing=State::Preparing;state_.compare_exchange_strong(preparing,State::Refused,std::memory_order_release);return false;
 }
 bool Lease::releaseCold() noexcept {
@@ -315,7 +342,7 @@ Status Lease::status() const noexcept {
     out.epoch=epoch_.load(std::memory_order_acquire);out.activePermits=readers_.load(std::memory_order_acquire);
     if(published_.load(std::memory_order_acquire)) {
         out.device=reinterpret_cast<std::uintptr_t>(inputs_.device);out.moduleBase=base_;out.inode=inode_;out.deviceMajor=devMajor_;out.deviceMinor=devMinor_;
-        out.chip=chip_;out.routeMask=routeMask_;for(unsigned i=0;i<4;++i)out.rvas[i]=rvas_[i];
+        out.chip=chip_;out.routeMask=routeMask_;out.observedRoute=observedRoute_;std::memcpy(out.providerPath,providerPath_,sizeof(providerPath_));for(unsigned i=0;i<4;++i)out.rvas[i]=rvas_[i];
     }
     return out;
 }
@@ -334,12 +361,18 @@ bool detail::Preparation::run(Lease& lease,const Inputs& input,const Profile& pr
     struct Unlock{Lease& lease;~Unlock(){lease.cold_.clear(std::memory_order_release);}} unlock{lease};
     auto empty=State::Empty;if(!lease.state_.compare_exchange_strong(empty,State::Preparing,std::memory_order_acq_rel))return false;
     if(!input.device || !(input.begin2||input.begin2KHR) || !(input.next2||input.next2KHR))return lease.fail(Refusal::Inputs);
+    lease.inputs_=input;
     Dl_info info{};std::uintptr_t base=0;std::uint64_t rvas[4]{};unsigned mask=0,chip=UINT32_MAX;
     for(unsigned i=0;i<4;++i) {
         const auto p=function(input,i);if(!p)continue;
+        lease.observedRoute_=i;lease.base_=0;lease.providerPath_[0]=0;
         Dl_info current{};
         if(!dladdr(reinterpret_cast<const void*>(p),&current) || !current.dli_fbase || !current.dli_fname)return lease.fail(Refusal::Resolver);
-        if(std::strcmp(current.dli_fname,profile.path))return lease.fail(Refusal::ModulePath);
+        const auto pathBytes=strnlen(current.dli_fname,sizeof(lease.providerPath_));
+        if(pathBytes<sizeof(lease.providerPath_))std::memcpy(lease.providerPath_,current.dli_fname,pathBytes+1);
+        const auto currentBase=reinterpret_cast<std::uintptr_t>(current.dli_fbase),currentAddress=reinterpret_cast<std::uintptr_t>(p);
+        lease.base_=currentBase;if(currentAddress>=currentBase)lease.rvas_[i]=currentAddress-currentBase;
+        if(pathBytes==sizeof(lease.providerPath_) || std::strcmp(current.dli_fname,profile.path))return lease.fail(Refusal::ModulePath);
         const auto module=reinterpret_cast<std::uintptr_t>(current.dli_fbase),address=reinterpret_cast<std::uintptr_t>(p);
         if(address<module || (base&&base!=module))return lease.fail(Refusal::EntryPoint);
         rvas[i]=address-module;base=module;info=current;mask|=1u<<i;
@@ -357,7 +390,7 @@ bool detail::Preparation::run(Lease& lease,const Inputs& input,const Profile& pr
     Loaded loaded{file,before,base};
     const int result=dl_iterate_phdr(Loaded::visit,&loaded);
     if(result!=1 || !loaded.found || loaded.refusal!=Refusal::None)return lease.fail(loaded.refusal);
-    Maps after;struct stat statAfter{},pathAfter{};const int pathFd=secureOpen(profile.path);
+    Maps after;struct stat statAfter{},pathAfter{};const int pathFd=secureOpen(profile.path,profile.protectedDirectories);
     const bool stable=pathFd>=0 && fstat(pathFd,&pathAfter)==0 && fstat(file.fd,&statAfter)==0 &&
         sameStat(file.identity,pathAfter)&&sameStat(file.identity,statAfter)&&loadMaps(profile.path,file.fd,file.identity,after)&&sameMaps(before,after);
     if(pathFd>=0)close(pathFd);
