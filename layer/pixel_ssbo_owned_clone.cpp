@@ -3,14 +3,15 @@
 namespace frame_pixel_ssbo_owned {
 namespace {
 bool limitsPermit(const frame_pixel_ssbo_clone::Recipe& recipe,const VkPhysicalDeviceLimits& limits) noexcept {
-    if(limits.maxBoundDescriptorSets<2 || limits.maxStorageBufferRange<RecordBytes ||
+    const bool mirror=recipe.set0.probeInterface.compatibleSet0Mirror();
+    if(limits.maxBoundDescriptorSets<(mirror?1u:2u) || limits.maxStorageBufferRange<RecordBytes ||
        !limits.maxDescriptorSetStorageBuffers || !limits.maxPerStageDescriptorStorageBuffers)return false;
     for(std::uint32_t i=0;i<recipe.layout.count;++i){const auto& r=recipe.layout.ranges[i];
         if(r.offset>limits.maxPushConstantsSize || r.size>limits.maxPushConstantsSize-r.offset)return false;
     }
     // Conservative cold budget: count all admitted Set0 resources, including
     // unused stage bindings. Refusing a larger envelope cannot alter native work.
-    std::uint32_t storage=1,fragmentStorage=1,fragmentResources=1;
+    std::uint32_t storage=mirror?0u:1u,fragmentStorage=mirror?0u:1u,fragmentResources=mirror?0u:1u;
     for(std::uint32_t i=0;i<recipe.set0.count;++i){const auto& b=recipe.set0.bindings[i];
         const bool stored=b.descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b.descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
         if(stored)storage+=b.descriptorCount;
@@ -92,11 +93,14 @@ Result Clone::prepare(const Preparation& input) noexcept {
     if(!r.set0.view(set0Info))return invalid(Stage::Set0);
     auto result=procs_.CreateDescriptorSetLayout(device_,&set0Info,nullptr,&set0_);
     if(result!=VK_SUCCESS){set0_=VK_NULL_HANDLE;return failure(Stage::Set0,result);}
+    const bool mirror=r.set0.probeInterface.compatibleSet0Mirror();
+    if(!mirror){
     VkDescriptorSetLayoutBinding binding{0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
     VkDescriptorSetLayoutCreateInfo set1Info{};set1Info.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     set1Info.bindingCount=1;set1Info.pBindings=&binding;
     result=procs_.CreateDescriptorSetLayout(device_,&set1Info,nullptr,&set1_);
     if(result!=VK_SUCCESS){set1_=VK_NULL_HANDLE;return failure(Stage::Set1,result);}
+    }
     frame_pixel_ssbo_clone::LayoutView layoutView{};
     if(!r.layoutView(set0_,set1_,layoutView))return invalid(Stage::Layout);
     result=procs_.CreatePipelineLayout(device_,&layoutView.info,nullptr,&layout_);
@@ -164,22 +168,41 @@ Result Clone::prepare(const Preparation& input) noexcept {
         result=procs_.FlushMappedMemoryRanges(device_,1,&range);
         if(result!=VK_SUCCESS)return failure(Stage::Flush,result);
     }
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1};
+    std::array<VkDescriptorPoolSize,11> poolSizes{};std::uint32_t sizeCount=0;
+    if(mirror){
+        std::array<std::uint32_t,11> totals{};
+        for(std::uint32_t i=0;i<r.set0.count;++i){const auto& b=r.set0.bindings[i];
+            if(unsigned(b.descriptorType)>=totals.size())return invalid(Stage::Pool);
+            totals[unsigned(b.descriptorType)]+=b.descriptorCount;}
+        for(unsigned i=0;i<totals.size();++i)if(totals[i])poolSizes[sizeCount++]={VkDescriptorType(i),totals[i]};
+    }else poolSizes[sizeCount++]={VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1};
     VkDescriptorPoolCreateInfo pool{};pool.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets=1;pool.poolSizeCount=1;pool.pPoolSizes=&poolSize;
+    pool.maxSets=1;pool.poolSizeCount=sizeCount;pool.pPoolSizes=poolSizes.data();
     result=procs_.CreateDescriptorPool(device_,&pool,nullptr,&pool_);
     if(result!=VK_SUCCESS){pool_=VK_NULL_HANDLE;return failure(Stage::Pool,result);}
     VkDescriptorSetAllocateInfo allocate{};allocate.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocate.descriptorPool=pool_;allocate.descriptorSetCount=1;allocate.pSetLayouts=&set1_;
+    allocate.descriptorPool=pool_;allocate.descriptorSetCount=1;allocate.pSetLayouts=mirror?&set0_:&set1_;
     result=procs_.AllocateDescriptorSets(device_,&allocate,&set_);
     if(result!=VK_SUCCESS)return failure(Stage::Set,result);
     VkDescriptorBufferInfo record{buffer_,0,RecordBytes};
     VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet=set_;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;write.pBufferInfo=&record;
+    write.dstSet=set_;write.dstBinding=mirror?frame_pixel_ssbo_clone::ProbeInterface::MirrorRecordBinding:0;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;write.pBufferInfo=&record;
     procs_.UpdateDescriptorSets(device_,1,&write,0,nullptr);
     ready_=true;return {};
 }
 
+bool Clone::compatibleSet0Mirror() const noexcept {return ready_&&recipe_.set0.probeInterface.compatibleSet0Mirror();}
+Result Clone::populateMirror(VkDescriptorSet originalSet0) noexcept {
+    if(!compatibleSet0Mirror()||!originalSet0||originalSet0==set_)return {Status::InvalidInput,Stage::Set,VK_SUCCESS};
+    if(mirrorPopulated_)return {Status::AlreadyPrepared,Stage::Set,VK_SUCCESS};
+    std::array<VkCopyDescriptorSet,frame_pixel_ssbo_clone::ProbeInterface::MirrorBindings.size()> copies{};
+    for(unsigned i=0;i<copies.size();++i){auto& copy=copies[i];copy.sType=VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
+        copy.srcSet=originalSet0;copy.srcBinding=frame_pixel_ssbo_clone::ProbeInterface::MirrorBindings[i];
+        copy.dstSet=set_;copy.dstBinding=copy.srcBinding;copy.descriptorCount=1;}
+    // Before first bind only. Once published to a reusable recording this owned
+    // descriptor set is immutable until its explicit retirement/release.
+    mirrorPopulated_=true;procs_.UpdateDescriptorSets(device_,0,nullptr,copies.size(),copies.data());return {};
+}
 void Clone::destroyUnreferenced() noexcept {
     if(!device_)return;
     if(pool_)procs_.DestroyDescriptorPool(device_,pool_,nullptr);
@@ -196,7 +219,7 @@ void Clone::destroyUnreferenced() noexcept {
     device_=VK_NULL_HANDLE;set0_=set1_=VK_NULL_HANDLE;layout_=VK_NULL_HANDLE;renderPass_=VK_NULL_HANDLE;
     vertex_=fragment_=VK_NULL_HANDLE;pipeline_=VK_NULL_HANDLE;pool_=VK_NULL_HANDLE;set_=VK_NULL_HANDLE;
     buffer_=VK_NULL_HANDLE;memory_=VK_NULL_HANDLE;mapped_=nullptr;allocationBytes_=0;
-    ready_=referenced_=coherent_=false;procs_={};recipe_={};
+    ready_=referenced_=coherent_=mirrorPopulated_=false;procs_={};recipe_={};
 }
 Result Clone::release(ReleaseProof proof) noexcept {
     if(referenced_ && !(proof.allRecordingsRetired && proof.deviceQuiescentOrLost))
