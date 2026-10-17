@@ -11,6 +11,38 @@ bounded public diagnostic receipts; it never contacts or changes a device.
 # mask and a misleading global firstRefusal; never invent missing nested data.
 _JOURNAL_REASONS = ("none", "native_creation_failed", "not_initialized", "already_initialized", "device_ineligible", "null_handle", "duplicate_handle", "capacity", "generation_exhausted", "unknown_set", "unknown_layout", "unknown_renderpass", "unknown_shader", "contract", "no_ready", "unknown_object", "stale_pipeline", "unsupported_route")
 MAX_EVENTS = 256
+_NATIVE_DRIVER_PATH = "/usr/lib/libvulkan_freedreno.so"
+_NATIVE_DRIVER_RVAS = {6: (0xb113e0, 0xb11940), 7: (0xb12180, 0xb11d60), 8: (0xb18040, 0xb185a0)}
+
+
+def _native_provider(events, prepared):
+    """Read an already cold-verified receipt; this does not mint runtime permits."""
+    records = [event for event in events if event["event"] == "native_subpass_provider"]
+    if len(records) != 1:
+        return {"ready": False, "reason": "native_provider_missing_or_ambiguous"}
+    provider = records[0]
+    if provider.get("state") != "ready" or provider.get("reason") != "none":
+        return {"ready": False, "reason": "native_provider_refused", "provider": provider}
+    values = ("epoch", "device", "module_base", "inode")
+    if (any(type(provider.get(key)) is not int or not 0 < provider[key] < 1 << 64 for key in values)
+            or len(prepared) != 1 or type(prepared[0].get("native_device")) is not int
+            or prepared[0]["native_device"] != provider["device"]
+            or provider.get("provider_path") != _NATIVE_DRIVER_PATH
+            or type(provider.get("provider_path_bytes")) is not int
+            or provider["provider_path_bytes"] != len(_NATIVE_DRIVER_PATH)
+            or provider.get("provider_path_truncated") is not False
+            or provider.get("native_frame_association_proven") is not False
+            or provider.get("mask_enabled") is not False):
+        return {"ready": False, "reason": "native_provider_identity_invalid", "provider": provider}
+    chip, mask, rvas = provider.get("chip"), provider.get("route_mask"), provider.get("entry_rvas")
+    if (type(chip) is not int or chip not in _NATIVE_DRIVER_RVAS or type(mask) is not int
+            or not 0 <= mask <= 15 or mask & 10 != 10 or type(rvas) is not list or len(rvas) != 4
+            or any(type(value) is not int or not 0 <= value < 1 << 32 for value in rvas)
+            or provider["module_base"] > (1 << 64) - 1 - max(rvas)
+            or any(rvas[index] != (_NATIVE_DRIVER_RVAS[chip][index // 2] if mask & (1 << index) else 0)
+                   for index in range(4))):
+        return {"ready": False, "reason": "native_provider_route_invalid", "provider": provider}
+    return {"ready": True, "reason": "none", "provider": provider}
 
 
 def _definition_context(events):
@@ -77,7 +109,7 @@ def _recipe_observed(events):
 
 
 def assess(status, native_health, events, *, definitions=False, transaction=False,
-           require_profile=False, require_clone=False):
+           require_profile=False, require_clone=False, require_native_provider=False):
     reasons = []
     if not isinstance(status, dict) or not isinstance(native_health, dict):
         return {"ready": False, "reasons": ["invalid_status"]}
@@ -89,7 +121,7 @@ def assess(status, native_health, events, *, definitions=False, transaction=Fals
         definition_context = _definition_context(events)
     except ValueError:
         return {"ready": False, "reasons": ["invalid_definition_context"]}
-    if (transaction and not definitions) or ((require_profile or require_clone) and not transaction):
+    if (transaction and not definitions) or ((require_profile or require_clone or require_native_provider) and not transaction) or type(require_native_provider) is not bool:
         reasons.append("invalid_profile")
     mapping = status.get("active_mappings", {})
     identities = native_health.get("process_identities", {})
@@ -104,6 +136,9 @@ def assess(status, native_health, events, *, definitions=False, transaction=Fals
             or pid not in mapping.get("owned_mapping_pids", [])):
         reasons.append("diagnostic_mapping_not_verified")
     prepared = [event for event in events if event["event"] == "prepared"]
+    provider = _native_provider(events, prepared) if require_native_provider else None
+    if provider is not None and not provider["ready"]:
+        reasons.append(provider["reason"])
     if (len(prepared) != 1 or prepared[0].get("sampler_ready") is not True
             or prepared[0].get("uniform_companion_enabled") is not False
             or prepared[0].get("mask_enabled") is not False):
@@ -144,6 +179,7 @@ def assess(status, native_health, events, *, definitions=False, transaction=Fals
             if require_clone and states[-1].get("ready") is not True:
                 reasons.append("original_output_clone_not_ready")
     return {"ready": not reasons, "reasons": reasons,
+            "native_provider": provider,
             "definition_diagnostics": definition_context,
             "readiness_phase": "capture_admission" if (require_profile or require_clone) else "pre_stream_observation",
             "receiver_pipeline_admitted": _recipe_observed(events) if transaction else False,

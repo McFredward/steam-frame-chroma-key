@@ -143,5 +143,59 @@ class StreamPreflightTests(unittest.TestCase):
         self.assertFalse(gate.assess(self.status, self.health, self.events, transaction=True)["ready"])
 
 
+class NativeProviderPreflightTests(unittest.TestCase):
+    def setUp(self):
+        source = StreamPreflightTests()
+        source.setUp()
+        self.status, self.health, self.events = source.status, source.health, source.events
+        self.events[0]["native_device"] = 42
+        self.provider = {"event": "native_subpass_provider", "state": "ready", "reason": "none", "epoch": 1,
+            "device": 42, "module_base": 4096, "inode": 9, "chip": 7, "route_mask": 15,
+            "entry_rvas": [0xb12180, 0xb12180, 0xb11d60, 0xb11d60],
+            "provider_path": gate._NATIVE_DRIVER_PATH, "provider_path_bytes": len(gate._NATIVE_DRIVER_PATH),
+            "provider_path_truncated": False, "mask_enabled": False, "native_frame_association_proven": False}
+        self.events.append(self.provider)
+
+    def assess(self, **kwargs):
+        return gate.assess(self.status, self.health, self.events, definitions=True, transaction=True,
+                           require_native_provider=True, **kwargs)
+
+    def test_actual_known_khr_provider_can_precede_stream(self):
+        self.assertTrue(self.assess()["ready"])
+        self.assertFalse(self.assess()["passthrough_authorized"])
+        self.provider.update(route_mask=10, entry_rvas=[0, 0xb12180, 0, 0xb11d60])
+        self.assertTrue(self.assess()["ready"])
+
+    def test_missing_refused_or_duplicate_provider_never_requests_stream(self):
+        self.events.pop()
+        self.assertFalse(self.assess()["ready"])
+        self.events.append(self.provider)
+        self.events.append(copy.deepcopy(self.provider))
+        self.assertFalse(self.assess()["ready"])
+        self.events.pop()
+        for reason in ("module_path", "entry_point", "changed", "loaded_code"):
+            self.provider.update(state="refused", reason=reason)
+            self.assertFalse(self.assess()["ready"])
+
+    def test_each_identity_or_route_mutant_refuses(self):
+        for key, value in (("epoch", True), ("device", 43), ("inode", 0), ("module_base", -1),
+                ("module_base", (1 << 64) - 1),
+                ("provider_path", "/other/wrapper.so"), ("provider_path_truncated", True),
+                ("provider_path_bytes", 999), ("chip", 9), ("chip", True), ("route_mask", 5),
+                ("entry_rvas", [0xb12180, 1, 0xb11d60, 2]), ("entry_rvas", [0] * 3),
+                ("mask_enabled", True), ("native_frame_association_proven", True)):
+            with self.subTest(key=key, value=value):
+                previous = self.provider[key]
+                self.provider[key] = value
+                self.assertFalse(self.assess()["ready"])
+                self.provider[key] = previous
+
+    def test_writer_device_must_match_provider(self):
+        self.events[0]["native_device"] = 41
+        self.assertFalse(self.assess()["ready"])
+        self.events[0].pop("native_device")
+        self.assertFalse(self.assess()["ready"])
+
+
 if __name__ == "__main__":
     unittest.main()
