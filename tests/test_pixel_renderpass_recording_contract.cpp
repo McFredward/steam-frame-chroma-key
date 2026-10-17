@@ -302,15 +302,32 @@ void privateValve(){
     require(std::strcmp(r::privateProfileName(r::PrivateProfile::ValveSubpassSrgbZeroV1),"valve_subpass_srgb_zero_v1")==0&&std::strcmp(r::reasonName(r::Reason::PrivateValue),"private_value")==0,"private profile and refusal reporter labels stable");
     require(std::strcmp(r::privateProfileName(static_cast<r::PrivateProfile>(255)),"invalid_private_profile")==0,"invalid profile label bounded");
 }
+void privateEpoch(){
+    const auto inputs=privateInputs();native::Lease lease;require(native::LeaseTestAccess::fixture(lease,inputs),"explicit synthetic epoch fixture initialized");
+    GuardedPrivateHeader guarded;auto begin=beginInfo();auto sub=info<VkSubpassBeginInfo>(VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO);sub.contents=VK_SUBPASS_CONTENTS_INLINE;sub.pNext=guarded.get();r::Shape shape;
+    {
+        auto old=lease.acquire(inputs.device,native::Route::Begin2,inputs.begin2);
+        native::LeaseTestAccess::advanceEpoch(lease);
+        require(lease.status().state==native::State::Ready&&lease.status().epoch==2,"synthetic epoch fault keeps Ready state to isolate generation comparison");
+        require(!r::begin2(&begin,&sub,shape,&old)&&shape.refusal.reason==r::Reason::UnknownExtension&&!shape.privatePayloadObserved,"old epoch alone refuses before inaccessible private payload");
+        auto fresh=lease.acquire(inputs.device,native::Route::Begin2,inputs.begin2);
+        auto node=info<r::detail::ValveSubpassSrgbInfo>(static_cast<VkStructureType>(r::ValveSubpassSrgbType));sub.pNext=&node;
+        require(r::begin2(&begin,&sub,shape,&fresh)&&shape.privatePayloadObserved&&shape.privateSrgbMask==0,"fresh exact-epoch permit still admits observed zero profile");
+        lease.revoke();require(!lease.releaseCold(),"both live epoch scopes prevent early cold release");
+    }
+    require(lease.releaseCold(),"both scoped readers release before epoch fixture cleanup");
+}
 #endif
 }
 int main(int argc,char** argv){static_assert(std::is_trivially_copyable<r::Shape>::value,"owned scalar facts copy independently");
     const bool privateOnly=argc==2&&std::strcmp(argv[1],"--valve-srgb-only")==0;
-    if(!privateOnly){ordinary();attachments();groups();samples();censusAndParents();fullPaths();}
+    const bool epochOnly=argc==2&&std::strcmp(argv[1],"--valve-epoch-only")==0;
+    if(!privateOnly&&!epochOnly){ordinary();attachments();groups();samples();censusAndParents();fullPaths();}
 #ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
-    privateValve();
+    if(!epochOnly)privateValve();
+    if(!privateOnly)privateEpoch();
 #else
-    if(privateOnly){std::cerr<<"private subset requires explicit synthetic lease test target\n";return 2;}
+    if(privateOnly||epochOnly){std::cerr<<"private subset requires explicit synthetic lease test target\n";return 2;}
 #endif
-    std::cout<<"{\"scope\":\""<<(privateOnly?"renderpass-valve-srgb-contract":"renderpass-recording-contract")<<"\",\"checks\":"<<checks<<",\"shape_bytes\":"<<sizeof(r::Shape)<<",\"native_authority\":false}\n";
+    std::cout<<"{\"scope\":\""<<(epochOnly?"renderpass-valve-srgb-epoch":privateOnly?"renderpass-valve-srgb-contract":"renderpass-recording-contract")<<"\",\"checks\":"<<checks<<",\"shape_bytes\":"<<sizeof(r::Shape)<<",\"native_authority\":false}\n";
 }
