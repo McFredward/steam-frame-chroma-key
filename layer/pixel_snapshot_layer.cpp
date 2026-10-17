@@ -52,6 +52,9 @@ namespace {
 #ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
 __attribute__((used)) const char SyntheticPresenterBuildMarker[]="GHVR_SYNTHETIC_PRESENTER_COLD/1";
 __attribute__((used)) const char ScenePresenterBuildMarker[]="GHVR_SCENE_PRESENTER_COLD/1";
+#ifdef FRAME_PIXEL_RELEASE_RECEIVER
+__attribute__((used)) const char ReleaseReceiverBuildMarker[]="SFNP_RELEASE_RECEIVER/1";
+#endif
 namespace presenter=frame_native_presenter_receiver;
 #endif
 using frame_pixel_capture::LiveTracker;
@@ -84,12 +87,21 @@ struct Session {
         if (std::strcmp(base ? base+1 : path, "vrcompositor")) return;
         // Host fixtures may select their own private config. Deployment does
         // not add process/service environment or preload/audit libraries.
+#ifdef FRAME_PIXEL_RELEASE_RECEIVER
+        if(!frame_pixel_io::releaseProcessMatches())return;
+        const auto releasePath=frame_pixel_io::defaultConfigPath();
+        if (!frame_pixel_io::load(releasePath.c_str(),config)) return;
+#else
         const auto* overridePath = std::getenv("GHVR_PIXEL_SNAPSHOT_CONFIG");
         if (!frame_pixel_io::load(overridePath ? overridePath : frame_pixel_io::ConfigPath, config)) return;
+#endif
 #ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
         // Failure is reportable by the cold status writer, but can never admit
         // a replacement. No per-frame config, marker or artifact reads exist.
         presenterSource.prepareCold(config.directoryFd);
+#ifdef FRAME_PIXEL_RELEASE_RECEIVER
+        if(!presenterSource.ready() || presenterSource.profile()!=frame_native_presenter::Profile::SceneContribution)return;
+#endif
 #endif
         // One native process may claim a prepared run. A crash/reboot/restart
         // never re-arms an old capture, even if its temporary manifest remains.

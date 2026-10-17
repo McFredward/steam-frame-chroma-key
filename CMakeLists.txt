@@ -9,6 +9,11 @@ option(FRAME_MASK_BUILD_PIXEL_SNAPSHOT
     "Build an uninstalled one-shot explicit-pattern GPU pixel diagnostic" OFF)
 option(FRAME_PIXEL_SYNTHETIC_PRESENTER
     "Build the uninstalled explicitly opted-in synthetic or real-scene native output replacement" OFF)
+option(FRAME_PIXEL_RELEASE_RECEIVER
+    "Build the explicitly installed Steam Frame Native Passthrough scene receiver" OFF)
+if(FRAME_PIXEL_RELEASE_RECEIVER AND NOT FRAME_PIXEL_SYNTHETIC_PRESENTER)
+    message(FATAL_ERROR "Release receiver requires the scene-capable presenter")
+endif()
 option(FRAME_PIXEL_UNIFORM_COMPANION
     "Require a bounded same-command native uniform companion in the uninstalled diagnostic" OFF)
 option(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
@@ -164,7 +169,7 @@ if(FRAME_MASK_BUILD_RECEIVER_OBSERVER)
 endif()
 
 if(UNIX AND (BUILD_TESTING OR FRAME_MASK_BUILD_TRACE OR FRAME_MASK_BUILD_IMPORT_ENTRY OR FRAME_MASK_BUILD_PIXEL_SNAPSHOT))
-    if(CMAKE_CROSSCOMPILING AND NOT BUILD_TESTING)
+    if((CMAKE_CROSSCOMPILING OR FRAME_PIXEL_RELEASE_RECEIVER) AND NOT BUILD_TESTING)
         # A dispatch layer resolves the next native functions through the loader
         # chain; it needs headers, not a foreign target libvulkan to link against.
         find_path(FRAME_VULKAN_HEADERS vulkan/vulkan.h REQUIRED)
@@ -237,6 +242,9 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
     if(FRAME_PIXEL_SYNTHETIC_PRESENTER)
         target_sources(VkLayer_frame_pixel_snapshot PRIVATE layer/native_presenter_receiver.cpp)
         target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_SYNTHETIC_PRESENTER=1)
+    endif()
+    if(FRAME_PIXEL_RELEASE_RECEIVER)
+        target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_RELEASE_RECEIVER=1)
     endif()
     if(FRAME_PIXEL_SSBO_TRANSACTION)
         target_sources(VkLayer_frame_pixel_snapshot PRIVATE layer/pixel_ssbo_owned_clone.cpp

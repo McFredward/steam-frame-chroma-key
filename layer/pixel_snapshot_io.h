@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <fcntl.h>
 #include <sys/file.h>
@@ -16,6 +17,46 @@
 
 namespace frame_pixel_io {
 constexpr const char* ConfigPath = "/home/steamos/.local/share/GloomhavenVR/SteamLinkMaskProbe/session.conf";
+inline std::string defaultConfigPath() {
+#ifdef FRAME_PIXEL_RELEASE_RECEIVER
+    const char* home=std::getenv("HOME");
+    if(!home || home[0]!='/' || strnlen(home,1025)>900)return {};
+    std::string path(home);
+    if(path.size()>1 && path.back()=='/')path.pop_back();
+    return path+"/.local/share/SteamFrameNativePassthrough/session.conf";
+#else
+    return ConfigPath;
+#endif
+}
+#ifdef FRAME_PIXEL_RELEASE_RECEIVER
+inline bool releaseProcessMatches() noexcept {
+    // Cold negotiation only: pin the actually executing inode, not a pathname
+    // checked before exec. An updated compositor must keep original rendering.
+    constexpr off_t bytes=6026096;
+    constexpr char expected[]="0bb148eda6b5e54e2fbed09d475a43671f5ff6fcb6c2b4f48345b1a9fe8d6f96";
+    const int fd=open("/proc/self/exe",O_RDONLY|O_CLOEXEC);
+    if(fd<0)return false;
+    struct stat before{},after{};
+    bool valid=!fstat(fd,&before) && S_ISREG(before.st_mode) && before.st_size==bytes;
+    frame_receiver::Sha256 hash;std::array<unsigned char,4096> buffer{};
+    off_t used=0;
+    while(valid && used<bytes){
+        const auto want=static_cast<std::size_t>(bytes-used)<buffer.size()?static_cast<std::size_t>(bytes-used):buffer.size();
+        const auto count=read(fd,buffer.data(),want);
+        if(count<0 && errno==EINTR)continue;
+        if(count<=0){valid=false;break;}
+        hash.update(buffer.data(),static_cast<std::size_t>(count));used+=count;
+    }
+    valid=valid && !fstat(fd,&after) && before.st_dev==after.st_dev && before.st_ino==after.st_ino
+        && before.st_size==after.st_size && before.st_mtim.tv_sec==after.st_mtim.tv_sec
+        && before.st_mtim.tv_nsec==after.st_mtim.tv_nsec;
+    close(fd);if(!valid)return false;
+    constexpr char digits[]="0123456789abcdef";const auto digest=hash.finish();
+    for(std::size_t i=0;i<digest.size();++i)
+        if(expected[2*i]!=digits[digest[i]>>4] || expected[2*i+1]!=digits[digest[i]&15])return false;
+    return true;
+}
+#endif
 constexpr const char* ConfigMagic = "GHVR_PIXEL_SNAPSHOT/1\n";
 constexpr const char* ArmMagic = "GHVR_PIXEL_SNAPSHOT_ARM/1\n";
 struct Config {
