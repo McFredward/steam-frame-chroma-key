@@ -262,7 +262,7 @@ private:
     std::uint64_t pendingSubmit_=0,pendingRetirement_=0,drawOrdinal_=0,selectedOrdinal_=0;
     bool configured_=false,recording_=false,armed_=false,reset_=false,inPass_=false;
     const frame_pixel_capture::LiveTracker* adoptedTracker_=nullptr;
-    bool prefixValid_=false,matchingPass_=false,targetPass_=false;
+    bool prefixValid_=false,matchingPass_=false,targetPass_=false,mirrorValidated_=false;
     bool cleanHistory_=true;
     bool selected_=false,scopeEnded_=false,executable_=false,retired_=false;
     bool submitted_=false,pending_=false,complete_=false,quiescent_=false,deviceLost_=false;

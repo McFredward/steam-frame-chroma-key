@@ -613,7 +613,7 @@ void recordingContexts(){
 }
 
 void compatibleMirror(const char* vs,const char* ps,const char* probe){
-    for(unsigned mode=0;mode<8;++mode){Fixture f(false,3,1,vs,ps,probe);f.observeDevice();require(f.transaction.configure(f.clone,f.config()),"configured real owned mirror");
+    for(unsigned mode=0;mode<9;++mode){Fixture f(false,3,1,vs,ps,probe);f.observeDevice();require(f.transaction.configure(f.clone,f.config()),"configured real owned mirror");
         f.driver.command=obj<VkCommandBuffer>(44);f.driver.pool=obj<VkCommandPool>(55);require(f.transaction.adoptRecording(TransactionTestAccess::recording()),"same-callback original recording ticket");f.arm();
         require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE)&&f.transaction.nextSubpass(f.driver.command),"whole original pass reaches actual target subpass1");
         auto ticket=TransactionTestAccess::target(f.source,1,1);TransactionTestAccess::restore(ticket,Id{1,20,777},{16,32,64,128,256});
@@ -624,7 +624,7 @@ void compatibleMirror(const char* vs,const char* ps,const char* probe){
             if(mode==2)TransactionTestAccess::restore(fresh,Id{1,20,777},{16,32,64,128,257});
             if(mode==3)TransactionTestAccess::restore(fresh,Id{1,20,778},{16,32,64,128,256});
             if(mode==6)fresh=TransactionTestAccess::target(Cohort{Id{1,1001,2},f.source.view,f.source.memory,f.source.layout,f.source.extent},1,1);
-            require(f.transaction.targetStateCurrent(fresh)==(mode!=2&&mode!=3&&mode!=6),"post-copy same-callback proof rejects unused-offset drift/layout generation/source changes");}
+            if(mode!=8)require(f.transaction.targetStateCurrent(fresh)==(mode!=2&&mode!=3&&mode!=6),"post-copy same-callback proof rejects unused-offset drift/layout generation/source changes");}
         f.driver.reenter=mode==7;
         const auto result=f.transaction.drawIndexed(f.driver.command,17,2,4,-3,9);const bool replaced=mode==0||mode==7;
         require((result==DrawResult::ReplacedOriginal)==replaced,"no owned command without complete populated immutable mirror and fresh exact target state");

@@ -220,7 +220,7 @@ bool Transaction::beginSucceeded(VkCommandBuffer command,const VkCommandBufferBe
     if(!advance(generation_))return false;
     recording_=true;retired_=false;inPass_=false;scopeEnded_=false;selected_=false;
     current_=VK_NULL_HANDLE;currentSet0_=VK_NULL_HANDLE;setIdentity_={};currentSource_={};selectedSource_={};
-    drawOrdinal_=selectedOrdinal_=0;currentSubpass_=0;prefixValid_=false;matchingPass_=targetPass_=false;cleanHistory_=true;return true;
+    drawOrdinal_=selectedOrdinal_=0;currentSubpass_=0;prefixValid_=mirrorValidated_=false;matchingPass_=targetPass_=false;cleanHistory_=true;return true;
 }
 bool Transaction::adoptRecording(const RecordingTicket& ticket) noexcept {
     Guard guard(*this);if(!guard)return false;
@@ -233,7 +233,7 @@ bool Transaction::adoptRecording(const RecordingTicket& ticket) noexcept {
     generation_=ticket.commandGeneration_;poolGeneration_=ticket.poolGeneration_;
     recording_=true;retired_=false;inPass_=matchingPass_=targetPass_=false;scopeEnded_=selected_=false;currentSubpass_=0;
     current_=VK_NULL_HANDLE;currentSet0_=VK_NULL_HANDLE;setIdentity_={};currentSource_={};selectedSource_={};
-    drawOrdinal_=selectedOrdinal_=0;prefixValid_=false;cleanHistory_=true;return true;
+    drawOrdinal_=selectedOrdinal_=0;prefixValid_=mirrorValidated_=false;cleanHistory_=true;return true;
 }
 bool Transaction::adoptTargetState(const TargetTicket& ticket) noexcept {
     Guard guard(*this);if(!guard)return false;
@@ -246,6 +246,7 @@ bool Transaction::adoptTargetState(const TargetTicket& ticket) noexcept {
        !valid(ticket.set0_,ticket.device_) || !valid(ticket.source_.image,ticket.device_) ||
        !valid(ticket.source_.view,ticket.device_) || !valid(ticket.source_.memory,ticket.device_) ||
        ticket.source_.layout!=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || !same(ticket.source_,ticket.source_))return refuse(Reason::Identity);
+    mirrorValidated_=false;
     if(clone_->compatibleSet0Mirror()){
         std::uint32_t expected=0;for(unsigned i=0;i<set0_.count;++i)if(set0_.bindings[i].descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || set0_.bindings[i].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)expected+=set0_.bindings[i].descriptorCount;
         // Core restore identity and Journal creation identity have distinct
@@ -260,14 +261,14 @@ bool Transaction::adoptTargetState(const TargetTicket& ticket) noexcept {
 bool Transaction::targetStateCurrent(const TargetTicket& ticket) noexcept {
     Guard guard(*this);if(!guard)return false;
     ContextScope context(*this,ticket.command_,{},Operation::TargetTicket);
-    if(!configured_||!clone_->compatibleSet0Mirror()||!active(ticket.command_)||selected_||!prefixValid_||
+    if(!configured_||!clone_->compatibleSet0Mirror()||!clone_->mirrorPopulated()||!active(ticket.command_)||selected_||!prefixValid_||
        !inPass_||!matchingPass_||current_!=original_||!adoptedTracker_||ticket.tracker_!=adoptedTracker_||ticket.device_!=frame_pixel_ssbo_clone::handle(device_)||
        ticket.commandGeneration_!=generation_||ticket.pool_!=pool_||ticket.poolGeneration_!=poolGeneration_||
        ticket.ordinal_!=drawOrdinal_+1||ticket.subpass_!=currentSubpass_||ticket.subpass_!=targetSubpass_||
        !same(ticket.pipeline_,provenance_[5])||!same(ticket.layout_,provenance_[1])||!same(ticket.set0_,setIdentity_)||
        !same(ticket.source_,currentSource_)||!same(ticket.restoreLayout_,restoreLayout_)||ticket.restoreCount_!=restoreCount_)return refuse(Reason::Prefix);
     for(unsigned i=0;i<restoreCount_;++i)if(ticket.restoreOffsets_[i]!=restoreOffsets_[i])return refuse(Reason::Prefix);
-    return true;
+    mirrorValidated_=true;return true;
 }
 bool Transaction::arm(VkCommandBuffer command) noexcept {
     Guard guard(*this);if(!guard)return false;
@@ -360,7 +361,7 @@ DrawResult Transaction::replace(VkCommandBuffer command,std::uint32_t vertices,s
     if(!same(currentSource_,currentSource_)){refuse(Reason::Source);return DrawResult::ForwardOriginal;}
     if(!clone_->ready() || !clone_->referenced()){refuse(Reason::InvalidConfiguration);return DrawResult::ForwardOriginal;}
     const bool mirror=clone_->compatibleSet0Mirror();
-    if(mirror && (!clone_->mirrorPopulated()||!valid(restoreLayout_,frame_pixel_ssbo_clone::handle(device_))||!clone_->markMirrorBound())){refuse(Reason::Prefix);return DrawResult::ForwardOriginal;}
+    if(mirror && (!mirrorValidated_||!clone_->mirrorPopulated()||!valid(restoreLayout_,frame_pixel_ssbo_clone::handle(device_))||!clone_->markMirrorBound())){refuse(Reason::Prefix);return DrawResult::ForwardOriginal;}
     selected_=true;selectedOrdinal_=drawOrdinal_;selectedSource_=currentSource_;
     const auto set=mirror?clone_->mirrorSet():clone_->set1();
     config_.dispatch.sets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,clone_->layout(),mirror?0u:1u,1,&set,mirror?restoreCount_:0,mirror&&restoreCount_?restoreOffsets_.data():nullptr);
