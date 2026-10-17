@@ -88,7 +88,10 @@ is now connected by an explicitly opt-in
 Its default build is off; no new receiver is installed on the Frame. The
 [prepared visible trial](docs/research/synthetic-presenter-visible-trial-20261017.md)
 requires separate approval for output replacement and temporary native camera
-blending. Actual streamed passthrough and real-game coverage remain unproved.
+blending. The [first visible synthetic trial](docs/research/native-synthetic-visible-run-20261017.md)
+now confirms native streamed camera blending, intermediate transparency and menu
+recovery. Motion still lags; real-game coverage is not connected. The Frame is
+fully restored after the manually agreed test.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
