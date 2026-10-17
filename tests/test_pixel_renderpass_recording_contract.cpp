@@ -3,6 +3,12 @@
 #include <cstring>
 #include <iostream>
 #include <type_traits>
+#include <utility>
+#ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
+#include "pixel_native_driver_lease_fixture.h"
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace r=frame_pixel_renderpass_recording;
 namespace {
@@ -179,5 +185,132 @@ void fullPaths(){
     require(std::strcmp(r::reasonName(r::Reason::WrongParent),"wrong_parent")==0&&std::strcmp(r::chainName(r::Chain::SubpassEnd),"subpass_end")==0,"stable reporter labels");
     require(std::strcmp(r::reasonName(static_cast<r::Reason>(255)),"invalid_recording_reason")==0&&std::strcmp(r::chainName(r::Chain::Count),"invalid_chain")==0,"finite fallback labels");
 }
+#ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
+namespace native=frame_pixel_native_driver;
+VKAPI_ATTR void VKAPI_CALL fakeBegin(){}
+VKAPI_ATTR void VKAPI_CALL fakeBeginKHR(){}
+VKAPI_ATTR void VKAPI_CALL fakeNext(){}
+VKAPI_ATTR void VKAPI_CALL fakeNextKHR(){}
+VKAPI_ATTR void VKAPI_CALL fakeOther(){}
+native::Inputs privateInputs(){return {handle<VkDevice>(701),&fakeBegin,&fakeBeginKHR,&fakeNext,&fakeNextKHR};}
+PFN_vkVoidFunction entrypoint(const native::Inputs& in,native::Route route){
+    switch(route){case native::Route::Begin2:return in.begin2;case native::Route::Begin2KHR:return in.begin2KHR;
+        case native::Route::Next2:return in.next2;case native::Route::Next2KHR:return in.next2KHR;}return nullptr;
 }
-int main(){static_assert(std::is_trivially_copyable<r::Shape>::value,"owned scalar facts copy independently");ordinary();attachments();groups();samples();censusAndParents();fullPaths();std::cout<<"{\"scope\":\"renderpass-recording-contract\",\"checks\":"<<checks<<",\"shape_bytes\":"<<sizeof(r::Shape)<<",\"native_authority\":false}\n";}
+// A valid 16-byte pNext prefix ending exactly at a protected page. Any private
+// payload access, including an accidentally permitted memcpy, faults normally
+// as well as under ASan. This fixture owns no native provider authority.
+class GuardedPrivateHeader {
+    void* mapping_=MAP_FAILED;std::size_t page_=0;VkBaseInStructure* header_=nullptr;
+public:
+    GuardedPrivateHeader(){
+        const auto size=::sysconf(_SC_PAGESIZE);require(size>0,"guarded fixture has page size");page_=static_cast<std::size_t>(size);
+        mapping_=::mmap(nullptr,2*page_,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        require(mapping_!=MAP_FAILED,"guarded fixture allocates owned pages");
+        require(::mprotect(static_cast<std::uint8_t*>(mapping_)+page_,page_,PROT_NONE)==0,"private payload page is inaccessible");
+        header_=reinterpret_cast<VkBaseInStructure*>(static_cast<std::uint8_t*>(mapping_)+page_-sizeof(VkBaseInStructure));
+        *header_=info<VkBaseInStructure>(static_cast<VkStructureType>(r::ValveSubpassSrgbType));
+    }
+    ~GuardedPrivateHeader(){if(mapping_!=MAP_FAILED)::munmap(mapping_,2*page_);}
+    GuardedPrivateHeader(const GuardedPrivateHeader&)=delete;
+    VkBaseInStructure* get(){return header_;}
+};
+void privateValve(){
+    static_assert(sizeof(VkBaseInStructure)==16&&r::detail::ValveSrgbLP64,"private profile is exact LP64 only");
+    static_assert(!std::is_copy_constructible<native::Permit>::value,"callback capability is opaque and move-only");
+    r::Shape shape;auto begin=beginInfo();auto sub=info<VkSubpassBeginInfo>(VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO);
+    sub.contents=VK_SUBPASS_CONTENTS_INLINE;auto end=info<VkSubpassEndInfo>(VK_STRUCTURE_TYPE_SUBPASS_END_INFO);
+    auto node=info<r::detail::ValveSubpassSrgbInfo>(static_cast<VkStructureType>(r::ValveSubpassSrgbType));sub.pNext=&node;
+    GuardedPrivateHeader guarded;sub.pNext=guarded.get();
+    require(!r::begin2(&begin,&sub,shape)&&shape.refusal.reason==r::Reason::UnknownExtension&&!shape.privatePayloadObserved,"default public decoder refuses private header before inaccessible payload");
+    native::Permit empty;
+    require(!r::begin2(&begin,&sub,shape,&empty)&&shape.refusal.type==r::ValveSubpassSrgbType&&!shape.privatePayloadObserved,"unleased callback never reads private payload");
+    const auto inputs=privateInputs();
+    for(const auto route:{native::Route::Begin2,native::Route::Begin2KHR,native::Route::Next2,native::Route::Next2KHR}){
+        native::Lease lease;require(native::LeaseTestAccess::fixture(lease,inputs),"explicit synthetic lease fixture initialized");
+        {
+            auto permit=lease.acquire(inputs.device,route,entrypoint(inputs,route));const bool next=route==native::Route::Next2||route==native::Route::Next2KHR;
+            sub.pNext=&node;node.srgbMask=0;const auto savedNode=node;const auto savedSub=sub;
+            require(next?r::next2(&sub,&end,shape,&permit):r::begin2(&begin,&sub,shape,&permit),"known source-backed zero mask admitted for exact synthetic Core/KHR callback route");
+            require(shape.privateProfile==r::PrivateProfile::ValveSubpassSrgbZeroV1&&shape.privatePayloadObserved&&shape.privateSrgbMask==0,"admitted private profile and actual zero value retained as owned scalars");
+            require(chain(shape,r::Chain::SubpassBegin).count==1&&chain(shape,r::Chain::SubpassBegin).types[0]==r::ValveSubpassSrgbType,"private header remains in complete bounded census");
+            require(std::memcmp(&node,&savedNode,sizeof(node))==0&&std::memcmp(&sub,&savedSub,sizeof(sub))==0,"source private node and original subpass pointers never rewritten");
+            sub.pNext=nullptr;
+            require((next?r::next2(&sub,&end,shape,&permit):r::begin2(&begin,&sub,shape,&permit))&&!shape.privatePayloadObserved&&shape.privateProfile==r::PrivateProfile::None,"ordinary call resets all prior private facts despite a live scoped permit");
+            sub.pNext=guarded.get();
+            require(!(next?r::begin2(&begin,&sub,shape,&permit):r::next2(&sub,&end,shape,&permit))&&shape.refusal.reason==r::Reason::UnknownExtension&&!shape.privatePayloadObserved,"Begin capability cannot authorize Next or vice versa before inaccessible payload");
+            sub.pNext=&node;
+            for(const auto value:{1u,128u,UINT32_MAX}){
+                node.srgbMask=value;
+                require(!(next?r::next2(&sub,&end,shape,&permit):r::begin2(&begin,&sub,shape,&permit))&&shape.refusal.reason==r::Reason::PrivateValue,"finite observed-producer profile refuses every tested nonzero mask");
+                require(shape.privatePayloadObserved&&shape.privateSrgbMask==value&&shape.refusal.type==r::ValveSubpassSrgbType&&shape.refusal.index==0&&shape.refusal.chain==r::Chain::SubpassBegin,"nonzero refusal retains exact value and causal private header");
+            }
+            node.srgbMask=0;sub.pNext=guarded.get();
+            auto unknown=info<VkBaseInStructure>(static_cast<VkStructureType>(0x6ffffffe));guarded.get()->pNext=&unknown;
+            require(!(next?r::next2(&sub,&end,shape,&permit):r::begin2(&begin,&sub,shape,&permit))&&shape.refusal.reason==r::Reason::UnknownExtension&&shape.refusal.index==1&&!shape.privatePayloadObserved,"later unknown header refuses before preceding inaccessible private payload");
+            require(chain(shape,r::Chain::SubpassBegin).count==2,"later unknown header census is complete");
+            auto duplicate=info<VkBaseInStructure>(static_cast<VkStructureType>(r::ValveSubpassSrgbType));guarded.get()->pNext=&duplicate;
+            require(!(next?r::next2(&sub,&end,shape,&permit):r::begin2(&begin,&sub,shape,&permit))&&shape.refusal.reason==r::Reason::DuplicateType&&!shape.privatePayloadObserved,"duplicate private nodes refuse before either payload");
+            guarded.get()->pNext=guarded.get();
+            require(!(next?r::next2(&sub,&end,shape,&permit):r::begin2(&begin,&sub,shape,&permit))&&shape.refusal.reason==r::Reason::ChainCycle&&!shape.privatePayloadObserved,"private self-cycle refuses before inaccessible payload");
+            std::array<VkBaseInStructure,r::MaxChain-1> tail{};
+            for(unsigned i=0;i<tail.size();++i){tail[i].sType=static_cast<VkStructureType>(100+i);tail[i].pNext=i+1<tail.size()?&tail[i+1]:poison<VkBaseInStructure>();}
+            guarded.get()->pNext=tail.data();
+            require(!(next?r::next2(&sub,&end,shape,&permit):r::begin2(&begin,&sub,shape,&permit))&&shape.refusal.reason==r::Reason::ChainBounds&&!shape.privatePayloadObserved,"private prefix with overflowing census refuses before payload or overflow pointer");
+            require(chain(shape,r::Chain::SubpassBegin).count==r::MaxChain&&chain(shape,r::Chain::SubpassBegin).termination==r::Termination::Bounds,"full overflow chain evidence retained");
+            guarded.get()->pNext=nullptr;sub.contents=VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS;
+            require(!(next?r::next2(&sub,&end,shape,&permit):r::begin2(&begin,&sub,shape,&permit))&&shape.refusal.reason==r::Reason::Contents&&!shape.privatePayloadObserved,"non-inline operation refuses before inaccessible private payload");
+            sub.contents=VK_SUBPASS_CONTENTS_INLINE;
+            if(next){end.pNext=&unknown;
+                require(!r::next2(&sub,&end,shape,&permit)&&shape.refusal.chain==r::Chain::SubpassEnd&&!shape.privatePayloadObserved,"unknown later End root prevents earlier private payload read");
+                end.pNext=guarded.get();sub.pNext=nullptr;
+                require(!r::next2(&sub,&end,shape,&permit)&&shape.refusal.chain==r::Chain::SubpassEnd&&!shape.privatePayloadObserved,"private node at End parent never reads payload or gains admission");end.pNext=nullptr;
+            }else{
+                sub.pNext=guarded.get();
+                require(!r::begin2(nullptr,&sub,shape,&permit)&&shape.refusal.reason==r::Reason::NullInfo&&!shape.privatePayloadObserved,"invalid earlier Begin root prevents private payload read");
+                begin.pNext=guarded.get();sub.pNext=nullptr;
+                require(!r::begin2(&begin,&sub,shape,&permit)&&shape.refusal.chain==r::Chain::RenderPassBegin&&!shape.privatePayloadObserved,"private node at RenderPassBegin parent stays refused");begin.pNext=nullptr;
+            }
+        }
+        lease.revoke();require(lease.releaseCold(),"synthetic callback reader released before explicit lease cleanup");
+    }
+    sub.pNext=guarded.get();
+    {
+        native::Lease lease;require(native::LeaseTestAccess::fixture(lease,inputs),"synthetic negative-context fixture initialized");
+        {
+            auto wrongDevice=lease.acquire(handle<VkDevice>(702),native::Route::Begin2,inputs.begin2);
+            require(!r::begin2(&begin,&sub,shape,&wrongDevice)&&shape.refusal.reason==r::Reason::UnknownExtension&&!shape.privatePayloadObserved,"wrong actual device cannot authorize private payload");
+            auto wrongEntry=lease.acquire(inputs.device,native::Route::Begin2,&fakeOther);
+            require(!r::begin2(&begin,&sub,shape,&wrongEntry)&&!shape.privatePayloadObserved,"different saved NEXT entrypoint cannot authorize private payload");
+            auto nullEntry=lease.acquire(inputs.device,native::Route::Begin2,nullptr);
+            require(!r::begin2(&begin,&sub,shape,&nullEntry)&&!shape.privatePayloadObserved,"null saved NEXT entrypoint cannot authorize private payload");
+            auto invalidRoute=lease.acquire(inputs.device,static_cast<native::Route>(255),inputs.begin2);
+            require(!r::begin2(&begin,&sub,shape,&invalidRoute)&&!shape.privatePayloadObserved,"invalid recording route cannot authorize private payload");
+            auto original=lease.acquire(inputs.device,native::Route::Begin2,inputs.begin2);auto moved=std::move(original);
+            require(!r::begin2(&begin,&sub,shape,&original)&&!shape.privatePayloadObserved,"moved-from permit never authorizes payload");
+            sub.pNext=&node;require(r::begin2(&begin,&sub,shape,&moved),"moved permit retains exact synthetic callback scope");sub.pNext=guarded.get();
+            lease.revoke();
+            require(!r::begin2(&begin,&sub,shape,&moved)&&shape.refusal.reason==r::Reason::UnknownExtension&&!shape.privatePayloadObserved,"revoked epoch refuses before inaccessible private payload");
+            require(!lease.releaseCold(),"active scoped permit prevents cold release");
+        }
+        require(lease.releaseCold(),"quiescent revoked synthetic lease releases explicitly");
+    }
+    end.pNext=guarded.get();
+    require(!r::end2(&end,shape)&&shape.refusal.reason==r::Reason::UnknownExtension&&!shape.privatePayloadObserved,"End2 has no private capability route");end.pNext=nullptr;
+    begin.pNext=guarded.get();require(!r::begin(&begin,VK_SUBPASS_CONTENTS_INLINE,shape)&&!shape.privatePayloadObserved,"legacy Begin has no private capability route");begin.pNext=nullptr;
+    sub.pNext=&node;require(!r::begin2(&begin,&sub,shape)&&!shape.privatePayloadObserved,"earlier capability never changes later public default");
+    require(std::strcmp(r::privateProfileName(r::PrivateProfile::ValveSubpassSrgbZeroV1),"valve_subpass_srgb_zero_v1")==0&&std::strcmp(r::reasonName(r::Reason::PrivateValue),"private_value")==0,"private profile and refusal reporter labels stable");
+    require(std::strcmp(r::privateProfileName(static_cast<r::PrivateProfile>(255)),"invalid_private_profile")==0,"invalid profile label bounded");
+}
+#endif
+}
+int main(int argc,char** argv){static_assert(std::is_trivially_copyable<r::Shape>::value,"owned scalar facts copy independently");
+    const bool privateOnly=argc==2&&std::strcmp(argv[1],"--valve-srgb-only")==0;
+    if(!privateOnly){ordinary();attachments();groups();samples();censusAndParents();fullPaths();}
+#ifdef FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST
+    privateValve();
+#else
+    if(privateOnly){std::cerr<<"private subset requires explicit synthetic lease test target\n";return 2;}
+#endif
+    std::cout<<"{\"scope\":\""<<(privateOnly?"renderpass-valve-srgb-contract":"renderpass-recording-contract")<<"\",\"checks\":"<<checks<<",\"shape_bytes\":"<<sizeof(r::Shape)<<",\"native_authority\":false}\n";
+}
