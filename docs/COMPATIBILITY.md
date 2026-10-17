@@ -1,0 +1,105 @@
+# Compatibility and current limits
+
+Steam Frame Native Passthrough currently targets one combination: a supported
+PC game integration, ordinary Steam Link PC VR streaming, and a Steam Frame
+runtime accepted by the local compatibility checks. It is not a universal
+transparency switch for any streamed game.
+
+## Supported combination
+
+| Component | Current scope |
+|---|---|
+| Headset | Steam Frame; the native receiver runs on the headset. |
+| Transport | Steam Link PC VR through SteamVR, with the ordinary PC sender. No sender patch or second camera video stream. |
+| Game | Gloomhaven Digital with a GloomhavenVR build containing the native Steam Link integration. Unmodified clients do not supply the format. |
+| PC graphics path | The visible game test used Windows/D3D11, Unity's built-in renderer, MultiPass, Gamma colour space and an SDR alpha-capable source. |
+| Frame software | Exact compositor shader, descriptor/state and driver-provider checks must pass. An OS/SteamVR version label alone is insufficient. |
+| Other games/transports | Not supported by the current game integration. ALVR, Virtual Desktop and other headsets are not established by these tests. |
+
+The receiver is distinct from GloomhavenVR's **Steam Frame standalone**
+passthrough. It processes a PC VR stream; it does not install or configure the
+standalone game.
+
+## What has actually been shown
+
+On 2026-10-17 the maintainer confirmed real GloomhavenVR gameplay composited over
+the Frame's native passthrough camera, using ModBuild686. Application logs record
+both 4040×4040 MultiPass/MSAA8 eyes. Earlier visible tests also showed fractional
+transparency and restoration of the ordinary picture through the game menu.
+
+Those headset tests used an explicitly staged, temporary receiver for one
+compositor process. They do **not** establish a newly tested persistent
+installation, every future SteamVR update, every game material or a measured
+end-to-end latency. The persistent installer has a separate software-validation
+scope. See the dated [real-game result](research/real-game-visible-run-20261017.md)
+for the retained observation and its limits.
+
+## Picture and performance limits
+
+- The source must supply RGB contribution and independent opacity for the same
+  current eye. A texture with an alpha channel is not enough on its own.
+- Fractional opacity is supported. Arbitrary refractive glass, effects that sample
+  a different background and all transparent shader families are not certified.
+- Some window edges and smaller hand boundaries are soft. The current opacity
+  field is 1024² versus 2048² scene colour; filtering, video encoding and original
+  UI shadows can each contribute. Correcting this must preserve genuine partial
+  transparency.
+- Motion latency and the cost of extra image packing/sampling remain relevant.
+  Host GPU measurements are not a Frame performance guarantee. There is no extra
+  previous-eye/pair queue in the GloomhavenVR source helper, but the ordinary
+  rendering, video, reprojection and display pipeline still has latency.
+- HDR, Linear colour space and unsupported stereo/source shapes keep the
+  ordinary image instead of guessing coverage. The game reports why it refused
+  the scene source.
+
+The format guard recognizes the current packed picture. It is not authentication
+or a guarantee that a copied/frozen image is fresh. Opening the menu or turning
+the source off takes effect when a new ordinary image reaches the receiver;
+already transmitted or frozen images cannot be recalled.
+
+## Persistence, updates and recovery
+
+The installer owns files below `~/.local/share/SteamFrameNativePassthrough`,
+`~/.config/SteamFrameNativePassthrough`, its user-service activation and temporary
+per-user runtime state. It does not replace Valve binaries, flash the OS or write
+the system partition/bootloader. It does not automatically restart SteamVR.
+
+Before each activation it verifies the **Frame-side files** against the installed
+package. A changed/unknown fingerprint prevents loading the receiver and restores
+the owned camera setting. Temporary activation expires with the service process
+or a reboot; the installed package remains available for inspection. Keeping it
+installed does not mean that a new SteamVR build has been admitted. A failed or
+incomplete previous launch latches activation off until you inspect `status`,
+resolve the cause and explicitly use `enable`.
+
+A **PC-side** SteamVR/Steam Link update can change the video layout or codec while
+all Frame-side files remain identical. Pre-start file checks cannot detect every
+such change. Native pipeline and current-image format guards retain the original
+shader when their contracts do not match, but an actively packed game source can
+then look like an atlas rather than an ordinary game view. There is no receiver
+handshake that automatically turns off the PC source. Disable **Steam Link native
+passthrough** in the game, restart the game if the ordinary image does not return,
+and wait for the required compatibility update. Do the same while the receiver
+is otherwise disabled or unavailable. This is conservative fallback, not a
+guarantee of an invisible recovery from every update.
+
+Stopping activation affects future processes. Running modified pipelines remain
+owned by that SteamVR process until it exits. Installing while it is running
+stages activation for the next normal launch. A loaded library cannot be replaced
+by an update; stop SteamVR manually before updating the checkout and running
+`install` again. An exact repeat preserves a manually disabled state instead of
+silently re-enabling it.
+
+Follow a disable/recovery operation with a **manual** SteamVR restart.
+`emergency-off` does not need a working SteamVR camera API to remove activation;
+camera-setting restoration can be separately pending and is reported by `status`.
+For full removal, stop SteamVR and run `uninstall` before starting it again. An
+uninstall issued while live can retain a disabled stop helper and camera receipt;
+repeat it after SteamVR has stopped to finalize removal. A removed filename is
+never treated as proof that an old library has unloaded.
+
+Earlier development attempts did cause recoverable black/blue screens and Steam
+startup failures. Checks and rollback are designed around that history. User-scope
+files and strict refusal reduce risk; they are not proof that every future runtime
+failure is impossible. Keep the project folder and a way to reach Desktop Mode
+or SSH until the installation works for your configuration.

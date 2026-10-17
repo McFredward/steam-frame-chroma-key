@@ -1,0 +1,427 @@
+# Steam Frame passthrough: explicit-mask development fork
+
+This fork is adding **real per-eye opacity masks** for PC streaming. Scene colors
+will remain independent of transparency, and the passthrough camera remains on
+the headset.
+
+**Real GloomhavenVR game imagery has now been visibly blended with the Frame's
+native camera over an unchanged PC Steam Link sender.** The maintainer confirmed
+the Build686 test on 2026-10-17; paired application logs show both 4040×4040
+MultiPass/MSAA8 eyes using the scene-contribution profile. Menu-video opacity
+and some boundary rendering still need corrections. This is a development
+checkpoint, not a general-purpose or permanently installed release.
+
+The current explicit-mask receiver is a manually approved, one-compositor-process
+installation. A SteamVR restart does not re-arm it, and its separately saved
+camera override needs explicit restoration. The original `install.sh` below
+installs the original chroma-key implementation, **not** this new receiver.
+See [the real-game result and limitations](docs/research/real-game-visible-run-20261017.md).
+The default build remains inactive. The following checkpoints are historical.
+
+The explicit-mask producer, atlas decoder, source/lifetime guards and deployment
+experiments are new work in this fork. The upstream chroma-key implementation,
+its investigation of the native compositor/camera setting and its public OpenVR
+settings helper remain credited to
+[spyjacob's original project](https://github.com/spyjacob/steam-frame-chroma-key).
+Its original [MIT license](LICENSE) and history are retained.
+
+Development branch: [`dev`](https://github.com/McFredward/steam-frame-chroma-key/tree/dev).
+See [mask implementation and tests](docs/MASK-TRANSPORT.md) and
+[remaining Steam Link integration](docs/MASK-BRIDGE-INVESTIGATION.md).
+
+The GloomhavenVR source pattern has now been visually confirmed in both eyes,
+including manual menu restoration. The next [decoded-image snapshot experiment](docs/PIXEL-SNAPSHOT-PREPARATION-20261015.md)
+uses a reversible public-Vulkan diagnostic. Its [first approved Frame attempt](docs/PIXEL-SNAPSHOT-ATTEMPT-20261015.md)
+loaded normally but refused acquisition before arming. The original runtime was
+restored. The [second attempt](docs/PIXEL-TRACKER-CONCURRENCY-20261015.md)
+identified an internal metadata lock refusal before arming; the original runtime
+was restored again. The targeted repair now also permits the
+[first complete native pixel snapshot](docs/PIXEL-SNAPSHOT-CAPTURE-20261015.md).
+The exact image and metadata are secured, and the diagnostic was fully removed.
+That raw-copy representation did not recover the source payload; native
+frame/eye/UV association remained open.
+The [same-image sampler comparison](docs/PIXEL-SAMPLER-PREPARATION-20261016.md)
+checks the raw-copy interpretation against native converted-view sampling.
+Its [first device attempt](docs/PIXEL-SAMPLER-ATTEMPT-20261016.md) reached normal
+startup but refused cold admission before a stream or image acquisition. The
+original Frame runtime was completely restored. A follow-up adds exact refusal
+reasons and uses actual query history instead of blanket rejection of an enabled
+idle feature. Its [successful native paired capture](docs/PIXEL-SAMPLER-CAPTURE-20261016.md)
+now recovers all six original static source headers and measured fractional
+coverage codes through native GPU sampling. The diagnostic was fully removed.
+Native spatial/temporal association and live alpha composition remain open;
+this does not enable streamed passthrough.
+The [next receiver-parameter proof](docs/NATIVE-UNIFORM-PROOF-PLAN-20261016.md)
+adds an optional, uninstalled final-draw uniform companion with bounded copies,
+an offline reader and strict resource guards. It remains off by default. A new
+native capture requires a reviewed package and fresh agreement; this does not
+authorize a replacement shader or establish the remaining spatial/video mapping.
+The [completed final-draw capture](docs/NATIVE-UNIFORM-CAPTURE-20261016.md)
+now includes GPU-copied native uniform bytes alongside both pixel paths. The
+bounded offline lookup reference is independently checked against the original
+fragment shader. Physical eye, source-ray registration and live alpha remain
+unproven; the temporary diagnostic is removed and the original Frame UI is
+confirmed usable.
+The next [changing registration source](docs/APP-REGISTRATION-SOURCE-20261016.md)
+is integrated in GloomhavenVR677. Real local Unity/Vulkan tests preserve its
+per-eye codes and headers exactly; a separate strict reader accepts the new
+profile without weakening the earlier static gates. The
+[actual changing-source recovery](docs/CHANGING-SOURCE-REGISTRATION-20261016.md)
+now identifies one encoded stereo pair against independently supplied PC logs.
+The next [inert fragment observation](docs/NATIVE-FRAGMENT-SSA-PROBE-20261016.md)
+exports original shader values only in an owned offscreen GPU fixture. Native
+temporal association, application-ray registration and actual game-alpha
+composition remain unproven; no live replacement shader is activated.
+The subsequent [dual-panel reconstruction](docs/ATLAS-RECONSTRUCTION-20261016.md)
+checks separate color/coverage reads with explicit diagnostic transforms and
+the actual original fragment on two host Vulkan drivers. It remains offline;
+it does not calibrate a live stream or enable passthrough.
+The [packed-coordinate prototype](docs/PACKED-ATLAS-REGISTRATION-20261016.md)
+then removes the CPU uniform join using the original fragment's own coordinates.
+An independent [game-coverage fixture](docs/GAME-COVERAGE-PROTOTYPE-20261016.md)
+tests explicit alpha rules for four owned Unity shader families. Both remain inert.
+The [bounded canvas locator](docs/PACKED-ATLAS-REGISTRATION-20261016.md#actual-current-pixel-locator)
+now derives capture-specific candidates from current pixels without historical
+fit inputs; the [SSBO observer](docs/NATIVE-FRAGMENT-SSBO-PROBE-20261016.md)
+checks original-invocation values with one owned color attachment. Neither is a
+native receiver installation or a live presenter.
+
+The [successful original-invocation capture](docs/research/native-invocation-capture-20261017.md)
+now records actual fragment values together with the selected native image.
+The temporary diagnostic is removed and the Frame is restored. The
+[direct current-R1 registrar](docs/research/native-r1-registration-20261017.md)
+validates that saved image without a fitted map, while the
+[single-output candidate](docs/research/native-r1-presenter-20261017.md) is checked
+on owned host GPU resources. Neither component is installed as a presenter;
+actual streaming passthrough and real game coverage remain unimplemented.
+The new [synthetic format guard](docs/research/native-guarded-presenter-20261017.md)
+also passes same-recorded-command ON/OFF/ON and partial-alpha composition on owned
+GPUs, with its additional cost measured separately. The
+[creation-scoped primitive](docs/research/native-presenter-creation-20261017.md)
+is now connected by an explicitly opt-in
+[cold receiver prototype](docs/research/native-presenter-receiver-20261017.md).
+Its default build is off; no new receiver is installed on the Frame. The
+[prepared visible trial](docs/research/synthetic-presenter-visible-trial-20261017.md)
+requires separate approval for output replacement and temporary native camera
+blending. The [first visible synthetic trial](docs/research/native-synthetic-visible-run-20261017.md)
+now confirms native streamed camera blending, intermediate transparency and menu
+recovery. Motion still lags; real-game coverage is not connected. The Frame is
+fully restored after the manually agreed test.
+
+The next [same-eye depth experiment](docs/research/same-eye-depth-coverage-20261017.md)
+preserves original RGB while reconstructing opaque/cutout coverage from existing
+scene depth, including admitted MSAA and stencil cases. A separate
+[subgroup experiment](docs/research/native-subgroup-presenter-20261017.md)
+preserves the complete format guard but shows only a small host improvement and
+a more expensive OFF path; it is not a production lag fix. The maintainer has
+requested removal of the synthetic player-facing setting from GloomhavenVR.
+These internal fixtures do not introduce a new test-pattern mode in the mod.
+
+The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
+existing Frame diagnostics without installing anything or starting another VR
+client. The [PC source collector](docs/PC-MASK-SOURCE.md) inspects the installed
+Steam Link driver separately. Neither tool enables masks or changes SteamVR.
+
+The supplied PC driver now has a concrete
+[encoder/transmitter dataflow](docs/PC-DRIVER-20261011.md), and the native shader
+inspection identifies a [conditional full-eye UV route](docs/FRAME-UV-BINDING-20261011.md).
+A separate [bounded passive pipeline diagnostic](docs/PASSIVE-PIPELINE-TRACE.md)
+has verified 39 complete recorded/submitted stage pairings on the inspected Frame
+build. The later [compact-journal native capture](docs/FRAME-COMPACT-JOURNAL-RUN-20261011.md)
+retains 703,494 resource observations without loss and 32 complete CPU resource
+snapshots. Neither capture establishes GPU-consumed eye values or source-video
+identity. The next adapters must join [native receiver selection and resource import](docs/FRAME-NEXT-ADAPTER.md)
+with [actual Windows composition and transmitter keys](docs/PC-NEXT-ADAPTER.md).
+An [opt-in receiver observer](docs/RECEIVER-OBSERVER-IMPLEMENTATION.md) is now built
+and tested offline to inspect bounded, protected selection metadata. Its first
+[native startup attempt](docs/FRAME-RECEIVER-LAUNCH-20261012.md) established that
+the receiver starts under the Steam client service; the original SteamVR-only
+activation could not reach it. The [approved Steam-client attempt](docs/FRAME-RECEIVER-STEAM-RUN-20261012.md)
+loaded the observer in the receiver, but a Btrfs file-identity guard refused
+arming. The [later successful receiver capture](docs/FRAME-RECEIVER-CAPTURE-20261012.md)
+now provides 32 valid protected selections without loss. Exact PC source-frame,
+compositor resource/eye and GPU association remain incomplete.
+After a [SteamOS update](docs/FRAME-RECEIVER-UPDATE-20261012.md), the receiver
+observer was revalidated against the current native binary before any new
+deployment; unknown or stale builds remain refused.
+The [compositor import diagnostic preparation](docs/COMPOSITOR-IMPORT-PREPARATION.md)
+now has bounded offline state, exact entry-layout checks and a read-only kernel
+socket-pair helper. Its production/native-lifetime integration is still pending;
+these components do not enable streamed passthrough.
+An [authentic client connection capture](docs/CLIENT-CONNECT-CAPTURE-20261012.md)
+now confirms normal headset startup and a successful native receiver connection
+call. Continuous descriptor lifetime and exact resource/video association remain
+separate, incomplete steps; the temporary diagnostic was fully removed afterward.
+The [register-only resource census](docs/CLIENT-RESOURCE-CENSUS.md) has now
+[captured all six native import/reference boundaries](docs/CLIENT-RESOURCE-CAPTURE-20261012.md).
+It establishes that the actual resource thread needs its own safe stack
+registration. The bounded kernel peer lookup refused its FD scan limit;
+connection lifetime and resource/video association remain incomplete. The
+diagnostic was fully removed and original Frame state verified afterward.
+An [explicit cold decoder-thread adapter](docs/CLIENT-RESOURCE-THREAD-PREPARATION.md)
+has now [prepared the real decoder thread](docs/CLIENT-RESOURCE-THREAD-CAPTURE-20261012.md):
+all six captured resource boundaries had current-thread stack ownership. The
+corrected external lookup also observed the current receiver/compositor kernel
+peer pair. A later ownership check safely ended acquisition; neither this
+finite observation nor the later peer snapshot establishes continuous lifetime,
+resource/video or GPU association. The temporary diagnostic was fully removed.
+These diagnostics change no rendered pixels and do not enable genuine-mask
+passthrough.
+The [bounded raw import adapter](docs/CLIENT-RESOURCE-RAW-PREPARATION.md)
+is built and reviewed offline, with actual final ARM read/write/cancellation
+checks and the complete 56-check local host gate. Its
+[actual Frame capture](docs/CLIENT-RESOURCE-RAW-CAPTURE-20261013.md) now records
+one complete matching request/reply and following receiver reference, using
+393 additional private metadata bytes. The temporary diagnostic was fully
+removed. Compositor resource, source video/eye/UV and GPU association remain
+unproven; streamed genuine-mask passthrough is not enabled.
+The next [raw compositor components](docs/COMPOSITOR-RESOURCE-RAW-PREPARATION.md)
+now reuse the native decoder and public Vulkan result types with bounded
+copy admission. Their software checks pass; production bootstrap, the owning
+resource-journal bridge and actual compositor capture are still pending.
+
+The original upstream chroma-key implementation and instructions below remain
+available as a separate path. They do not enable the new explicit-mask path.
+
+---
+
+## Original chroma-key passthrough
+
+Mixed reality on the Steam Frame over Valve's normal PC streaming, with no ALVR and no Virtual Desktop.
+
+Paint your SteamVR game's background a solid colour (for example pure green) and the Steam Frame
+replaces that colour with its own passthrough camera. Valve's native streaming (vrlink, hardware decode) is unchanged.
+No second video stream is added, the camera image never leaves the headset, and the cost is about 0.3 ms of GPU time
+with no extra frame of latency.
+
+![The Chroma Key panel in the SteamVR dashboard, captured on a Steam Frame](docs/headset_panel.png)
+
+What you get:
+
+- **In-headset panel** in the SteamVR dashboard: keying ON/OFF, key colour presets and hue bar, Similarity, Edge
+  softness and Spill sliders.
+- **Desktop background switch** (*Key colour* / *Mountains*): with no game running, it makes the PC SteamVR home
+  backdrop the key colour, so you see your room around the SteamVR desktop view. Switch back to the default
+  mountains with one click.
+- **PC control panel** (optional): eyedropper to sample the background colour straight off your monitor, a colour
+  picker and the same sliders.
+- Everything is user-scope. Nothing under `/usr` or `/opt` is modified, and `uninstall.sh` rolls it all back.
+
+> **Warning**
+> This is an unofficial hack that hooks SteamVR's compositor through internal, undocumented details. It was built and
+> tested on **SteamOS holo 0.4.5 (build 20261007)** with the SteamVR version shipped on the headset at that time.
+> A SteamVR update can break it. When that happens the shader generator refuses to run rather than produce a broken
+> shader, and the layer falls back to the stock shader. See [Fragility](#fragility). Use at your own risk.
+
+---
+
+## Requirements
+
+- A Steam Frame streaming from a Windows PC with SteamVR.
+- **Developer Mode** on the headset, for SSH access.
+- On the PC: an SSH client (built into Windows 10/11) and, for the optional PC tools, **Python 3** from
+  [python.org](https://www.python.org/) (includes tkinter).
+
+The headset already ships with the build tools this needs: `g++`, `glslc`, `spirv-tools`, `python3`, `freetype2`
+and `git`.
+
+## Install
+
+### 1. Enable Developer Mode and SSH on the headset
+
+1. On the Frame: **Steam Settings → System → Enable Developer Mode**.
+2. In the left menu, scroll down to the **Developer** section, then scroll toward the bottom of that page and click
+   **Set User Password**.
+3. Find the headset's IP address in its Wi-Fi settings.
+
+The username is `steamos`. Check that it works from the PC:
+
+```powershell
+ssh steamos@<headset-ip>
+```
+
+If SSH stops working after a reboot, check the Frame's current IP first. With
+the default device name and working local hostname discovery, you can also use
+`ssh steamos@frame.local` so an IP change does not break the connection.
+Keep Developer Mode enabled. In the Frame's desktop terminal, this command
+starts SSH immediately and enables it for future boots:
+
+```bash
+sudo systemctl enable --now sshd.service
+```
+
+After a reboot, `systemctl is-enabled sshd.service` should report `enabled` and
+`systemctl is-active sshd.service` should report `active`. These are the native
+service controls; no separate SSH startup script is required.
+See [Valve's developer setup](https://partner.steamgames.com/doc/steamhardware/steamframe/setup)
+and [systemd's service controls](https://github.com/systemd/systemd/blob/main/man/systemctl.xml).
+
+### 2. Set up a `frame` SSH alias with a key (on the PC)
+
+The PC tools reach the headset through an SSH alias named `frame`, using key login so they never prompt for a
+password. In PowerShell:
+
+```powershell
+ssh-keygen -t ed25519 -f $HOME\.ssh\id_ed25519_frame -N '""'
+type $HOME\.ssh\id_ed25519_frame.pub | ssh steamos@<headset-ip> "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Add this to `%USERPROFILE%\.ssh\config` (create the file if it doesn't exist):
+
+```
+Host frame
+    HostName <headset-ip>
+    User steamos
+    IdentityFile ~/.ssh/id_ed25519_frame
+    IdentitiesOnly yes
+    ServerAliveInterval 15
+```
+
+Now `ssh frame` should log in with no password prompt. If you only plan to use the in-headset panel, you can skip
+this step and SSH in however you like.
+
+### 3. Build and install on the headset
+
+SSH into the headset (`ssh frame`) and run the following. The repo **must be cloned to `~/mr-chroma`**, because the
+panel and PC tools call scripts at that path.
+
+```bash
+git clone https://github.com/spyjacob/steam-frame-chroma-key.git ~/mr-chroma
+cd ~/mr-chroma
+
+./build.sh && ./install.sh                                     # build the Vulkan layer + helper, install user-scope
+touch ~/.config/mrchroma/enable-compositor                     # opt the compositor in to the layer
+~/.local/share/mrchroma/mrctl set-bool camera forceSceneAlphaBlending 1
+systemctl --user restart steamvr                               # SteamVR restarts and loads the layer (~15 s)
+```
+
+Wait for SteamVR to come back (put the headset on so it wakes up), reconnect the PC stream if it dropped, then:
+
+```bash
+./mrkey.sh chroma 0 1 0 0.32 0.12 0.5      # key pure green: R G B similarity softness spill
+toggle/install_toggle.sh                   # in-headset dashboard panel (recommended)
+```
+
+Your settings persist across SteamVR restarts and reboots.
+
+### 4. PC tools (optional)
+
+From a copy of this repo on the PC:
+
+- **Desktop background sync.** This makes the panel's *Desktop background* switch work. It runs hidden at login:
+
+  ```powershell
+  python pc\mrchroma_pcsync.pyw --install      # adds a Startup-folder shortcut and starts it now
+  ```
+
+  It uses the `frame` alias by default. To use a different host, set the `MRCHROMA_HOST` environment variable.
+- **PC control panel** with the eyedropper: double-click `pc\mrchroma_panel.pyw`.
+
+## Using it
+
+1. In your game, make the background a solid colour, such as pure green `(0, 255, 0)`, using an
+   unlit skybox, scene background or large plane.
+2. Stream to the Frame as usual through SteamVR (normal **OpenVR** mode, not Virtual Desktop).
+3. Open the SteamVR dashboard and click the **Chroma Key** icon in the bottom bar.
+   - **ON/OFF** toggles keying.
+   - Pick a **key colour** preset or drag the **hue** bar to match your background.
+   - **Similarity** sets how far from the key colour still counts as background. Raise it if patches of
+     background remain, and lower it if parts of your subject disappear.
+   - **Edge softness** sets the width of the fade at edges.
+   - **Spill removal** removes the coloured fringe the key colour leaves on edges.
+   - **Desktop background**: *Key colour* shows passthrough around the SteamVR desktop view when no game is running,
+     and *Mountains* restores the normal SteamVR home. This needs the PC sync helper. The panel shows *PC in sync*,
+     *waiting for PC* or *PC helper not responding*.
+
+   Colour and slider changes apply when you release the trigger.
+
+From a shell on the headset you can do the same things:
+
+```bash
+~/mr-chroma/mrtoggle.sh on|off|toggle|status       # keying on/off, keeps the last colour/settings
+~/mr-chroma/mrkey.sh chroma R G B sim soft spill   # set colour + params (0..1 values)
+~/mr-chroma/mrkey.sh rect                          # debug: key a fixed rectangle in the middle of each eye
+~/mr-chroma/mrtoggle.sh bg on|off|toggle|status    # PC desktop background: key colour / mountains
+```
+
+## Uninstall
+
+On the headset:
+
+```bash
+cd ~/mr-chroma
+./uninstall.sh            # turns the blending setting back off, removes the layer + panel
+systemctl --user restart steamvr
+```
+
+`./uninstall.sh --purge` also deletes the config and the settings backup. A copy of your original
+`steamvr.vrsettings` is kept in `~/.local/share/mrchroma/backup/`.
+
+On the PC: `python pc\mrchroma_pcsync.pyw --uninstall` removes the helper and restores the default SteamVR background.
+
+**Emergency off switch** (if SteamVR misbehaves): delete `~/.local/share/vulkan/implicit_layer.d/mrchroma.json` or
+`~/.config/mrchroma/enable-compositor`, then restart SteamVR. There is also a crash guard: if the compositor starts 3
+times within 120 s with the layer loaded, the layer stops loading and writes
+`~/.local/share/mrchroma/compositor-guard-tripped`. Delete that file to re-arm it.
+
+---
+
+## How it works
+
+1. `vrlink` (the streaming client on the headset) does **no rendering**. It hardware-decodes the stream into NV12
+   dma-buf images (1152×4608, packed/foveated) and passes them to `vrcompositor`. vrlink never has an RGBA frame, so
+   the key can't be done there.
+2. `vrcompositor` converts YCbCr→RGB and reprojects/distorts the stream in
+   **`distort_ps_achromatic_se2.spv`**, writing `vec4(rgb, 1.0)` into each eye buffer.
+3. When the hidden setting `camera/forceSceneAlphaBlending` is true, the compositor draws the passthrough camera
+   every frame, blended `src = ONE_MINUS_DST_ALPHA, dst = ONE`. The camera shows through wherever the scene's alpha
+   is below 1.
+4. This project adds a user-scope **Vulkan layer**. Inside vrcompositor only, it swaps that one shader module in
+   memory for a patched SPIR-V. The patched shader computes alpha from a CbCr-distance chroma key, with smoothstep
+   edge softness and spill suppression, and writes premultiplied `(rgb·a, a)`.
+
+The patched shader is generated **on your headset** from your SteamVR install's own shader, so no Valve files are
+redistributed here. Dashboards and overlays are drawn afterwards with normal alpha, so they stay opaque. Stereo,
+tracking and reprojection are the compositor's own.
+
+### Components
+
+| Path | What |
+|---|---|
+| `layer/mrchroma_layer.cpp`, `layer/compositor_hooks.inc` | The Vulkan layer. It loads only into `vrcompositor` (opt-in flag file) and `vrlink` (log only). Every other process gets "Skipping layer" from the loader. |
+| `tools/gen_key_spv.py` | Patches the compositor shader disassembly into a rect-test or chroma-key variant, then assembles and validates it. |
+| `mrkey.sh` | `off` / `rect` / `chroma R G B threshold softness spill`. Regenerates the shader and hot-reloads compositor shaders (`vrcmd --reload-shaders`). |
+| `mrtoggle.sh` | `on` / `off` / `toggle` / `status`, plus `bg ...`. Re-enables the last generated shader without regenerating it. |
+| `tools/mrctl.cpp` | OpenVR helper: get/set settings, measure frame timing (`mrctl timing 8`). |
+| `toggle/` | The SteamVR dashboard overlay. It is software-rendered with FreeType via `SetOverlayRaw` and autolaunched through a user app manifest (`mrchroma.toggle`). `mrtoggle_overlay --render out.ppm` renders the layout without SteamVR. |
+| `pc/mrchroma_pcsync.pyw`, `pc/vrsettings_win.py` | PC helper that keeps the PC SteamVR home background in step with the headset. It writes through SteamVR's public settings API (`IVRSettings` in `openvr_api.dll`), applies changes live and idles while SteamVR is closed. Log: `%LOCALAPPDATA%\mrchroma\pcsync.log`. |
+| `pc/mrchroma_panel.pyw` | PC control panel (tkinter): eyedropper, colour picker, sliders, all over `ssh frame`. |
+| `install.sh` / `uninstall.sh` | User-scope install and full rollback. |
+
+### Why the desktop-background helper exists
+
+When you stream from the PC with no game running, the **PC's** SteamVR draws its own background (sky, mountains,
+floor, ground circles, base stations) into the video. The headset only receives finished pixels, so there is nothing
+to key. The helper sets the PC's `steamvr/background` to the key colour and hides `showFloor`, `showGridCircles` and
+`drawTrackingReferences`. For *Mountains* it removes those keys so the defaults come back. Games aren't affected
+because they draw their own background.
+
+### Measured (PC streaming, 90 Hz)
+
+| Mode | Refresh | Compositor GPU p50 / p95 | Dropped / 8 s |
+|---|---|---|---|
+| Off | 90.0 Hz | 2.88–2.94 / 3.31–3.33 ms | 0–1 |
+| Chroma | 90.0 Hz | 3.17–3.33 / 3.33–3.48 ms | 0 |
+
+## Fragility
+
+The patcher anchors on `OpStore %504 %994` and a few IDs in this exact SteamVR build's shader. After a SteamVR update,
+`gen_key_spv.py` refuses to generate a shader ("unexpected shader layout") instead of producing a broken one. If the
+compositor rejects a patched module, the layer falls back to the original shader. The shader filename and the
+`forceSceneAlphaBlending` setting are internal SteamVR details that Valve can change at any time. Porting to a new
+SteamVR build means re-deriving those anchors from the new `distort_ps_achromatic_se2.spv` disassembly. Issues and
+PRs are welcome.
+
+## Disclaimer
+
+Not affiliated with or endorsed by Valve. Steam, SteamVR and Steam Frame are trademarks of Valve Corporation.
