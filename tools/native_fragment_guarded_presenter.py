@@ -100,6 +100,8 @@ def transform(original, profile, enabled=True, descriptor_count=1):
               "original_fallback_store_value": 994, "guard_branch_before_panels": True,
               "source_mip_contract": "owned single mip; equal min/mag filter; level0 only",
               "guard_samples_explicit_lod0": 12 if enabled else 0,
+              "first_cell_mismatch_guard_samples": 1 if enabled else 0,
+              "first_cell_mismatch_skips_remaining_samples": True,
               "additional_panel_samples_explicit_lod0": 4 if enabled else 0,
               "original_samples_unchanged": True, "guard_ssa": {}}
     if not enabled:
@@ -162,38 +164,51 @@ def transform(original, profile, enabled=True, descriptor_count=1):
             result = emit(target, 167, 96, result, value)
         return result
     geometry_valid = conjunction(geometry, checks)
-    signature_header, panel_header, invalid_geometry, invalid_signature, signature_merge, final_merge = [fresh() for _ in range(6)]
+    (signature_header, remaining_header, panel_header, invalid_geometry, invalid_first_signature,
+     invalid_signature, signature_merge, first_signature_merge, final_merge) = [fresh() for _ in range(9)]
     geometry += [make(247, final_merge, 0), make(250, geometry_valid, signature_header, invalid_geometry)]
-    signature, windows, cells = [], [], []
+    first_signature, signature, windows, cells = [], [], [], []
     # Both operands are values from the original first B9/B25 descriptor loads.
     # They dominate this splice; no descriptor load/access chain is added.
-    sampled_image = emit(signature, 86, 297, 599, 600)
+    sampled_image = emit(first_signature, 86, 297, 599, 600)
     width, height = p["canvas"]
     guard = p["guard"]
+    remaining_sampled_image = None
     for index, code in enumerate(guard["codes"]):
+        target = first_signature if index == 0 else signature
+        if index == 1:
+            # OpSampledImage results may only be consumed in their own block.
+            # Recombine the same original image/sampler values, never reload.
+            remaining_sampled_image = emit(signature, 86, 297, 599, 600)
         center = [guard["origin"][axis] + guard["stride"][axis] * index + guard["size"][axis] / 2
                   for axis in (0, 1)]
         normalized = [center[0] / width, center[1] / height]
-        xy = [emit(signature, 129, 8, lo, emit(signature, 133, 8, size, constant(position)))
+        xy = [emit(target, 129, 8, lo, emit(target, 133, 8, size, constant(position)))
               for lo, size, position in zip(minimum, span, normalized)]
-        coordinate = emit(signature, 80, 39, *xy)
-        sample = emit(signature, 88, 9, sampled_image, coordinate, 2, zero)
-        g = emit(signature, 81, 8, sample, 1)
+        coordinate = emit(target, 80, 39, *xy)
+        sample = emit(target, 88, 9, sampled_image if index == 0 else remaining_sampled_image, coordinate, 2, zero)
+        g = emit(target, 81, 8, sample, 1)
         low = constant((code - guard["code_tolerance"]) / 255.)
         high = constant((code + guard["code_tolerance"]) / 255.)
-        lower, upper = emit(signature, 190, 96, g, low), emit(signature, 188, 96, g, high)
+        lower, upper = emit(target, 190, 96, g, low), emit(target, 188, 96, g, high)
         windows.extend((lower, upper))
         cells.append({"index": index, "code": code, "center_canvas": center,
                       "center_normalized": normalized, "coordinate": coordinate,
                       "sample": sample, "g": g, "low": low, "high": high,
                       "lower": lower, "upper": upper})
-    signature_valid = conjunction(signature, windows)
+    first_valid = conjunction(first_signature, windows[:2])
+    first_signature += [make(247, first_signature_merge, 0),
+                        make(250, first_valid, remaining_header, invalid_first_signature)]
+    signature_valid = emit(signature, 167, 96, first_valid, conjunction(signature, windows[2:]))
     signature += [make(247, signature_merge, 0), make(250, signature_valid, panel_header, invalid_signature)]
     # Exact original SSA994 on both invalid routes, not a recomputed decoder or
     # a select that evaluates retargeted reads before deciding which to keep.
-    guarded = geometry + [make(248, signature_header)] + signature + [make(248, panel_header)]
+    guarded = geometry + [make(248, signature_header)] + first_signature
+    guarded += [make(248, remaining_header)] + signature + [make(248, panel_header)]
     guarded += panel + [make(249, signature_merge), make(248, invalid_signature), make(62, 504, 994),
-                        make(249, signature_merge), make(248, signature_merge), make(249, final_merge),
+                        make(249, signature_merge), make(248, signature_merge), make(249, first_signature_merge),
+                        make(248, invalid_first_signature), make(62, 504, 994), make(249, first_signature_merge),
+                        make(248, first_signature_merge), make(249, final_merge),
                         make(248, invalid_geometry), make(62, 504, 994), make(249, final_merge),
                         make(248, final_merge), make(253), make(56)]
     result = instructions[:splice] + guarded
@@ -208,10 +223,14 @@ def transform(original, profile, enabled=True, descriptor_count=1):
     binary = pack_module(header, result)
     record.update(output_sha256=presenter.atlas.probe.digest(binary), output_bytes=len(binary), candidate_marker=MARKER,
                   guard_ssa={"geometry_valid": geometry_valid, "signature_valid": signature_valid,
-                             "signature_header": signature_header, "panel_header": panel_header,
+                             "first_signature_valid": first_valid,
+                             "signature_header": signature_header, "remaining_header": remaining_header,
+                             "panel_header": panel_header, "invalid_first_signature": invalid_first_signature,
                              "invalid_geometry": invalid_geometry, "invalid_signature": invalid_signature,
-                             "signature_merge": signature_merge, "final_merge": final_merge,
-                             "sampled_image": sampled_image, "zero": zero, "cells": cells},
+                             "signature_merge": signature_merge, "first_signature_merge": first_signature_merge,
+                             "final_merge": final_merge,
+                             "sampled_image": sampled_image, "remaining_sampled_image": remaining_sampled_image,
+                             "zero": zero, "cells": cells},
                   guard_original_image_value=599, guard_original_sampler_value=600,
                   original_function_prefix_unchanged=True)
     return binary, record
