@@ -82,6 +82,9 @@ private:
     VkPhysicalDeviceProperties properties_{};VkPhysicalDeviceMemoryProperties memory_{};
     std::mutex cold_;
     frame_pixel_ssbo_profile::Artifact artifact_{};
+    // Cold exact-stage pins only. Neither callback order nor a same-size
+    // unrelated module can authorize the compatible one-set profile.
+    frame_pixel_ssbo_clone::ShaderDefinition originalVertex_{},originalFragment_{};
     frame_pixel_ssbo_owned::Clone clone_;
     tx::Transaction transaction_;
     tx::SourceReadbackMetadata source_{};

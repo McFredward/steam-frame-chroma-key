@@ -152,6 +152,9 @@ public:
     bool beginSucceeded(VkCommandBuffer,const VkCommandBufferBeginInfo&,VkResult) noexcept;
     bool adoptRecording(const RecordingTicket&) noexcept;
     bool adoptTargetState(const TargetTicket&) noexcept;
+    // Revalidate the freshly minted same-callback original state after the
+    // descriptor copy, before any owned command can disturb native state.
+    bool targetStateCurrent(const TargetTicket&) noexcept;
     bool arm(VkCommandBuffer) noexcept;
     bool beginRenderPass(VkCommandBuffer,VkRenderPass,VkSubpassContents) noexcept;
     void pipelineBound(VkCommandBuffer,VkPipeline) noexcept;
@@ -162,8 +165,9 @@ public:
     void sourceBound(VkCommandBuffer,const Cohort&) noexcept;
     // Invoke instead of forwarding one original direct vkCmdDraw. Forward the
     // native draw exactly once ONLY when ForwardOriginal is returned. On success
-    // the only replacement commands are Set1/probe bind, exact original draw,
-    // and the IMMEDIATE original-pipeline restore. Never duplicate that draw.
+    // mirror mode binds compatible Set0/probe, exact original draw, IMMEDIATE
+    // original pipeline restore, then exact native Set0+offset restore. The
+    // legacy extra Set1 route is an offline control only. Never duplicate draw.
     DrawResult draw(VkCommandBuffer,std::uint32_t vertices,std::uint32_t instances,
                     std::uint32_t firstVertex,std::uint32_t firstInstance) noexcept;
     DrawResult drawIndexed(VkCommandBuffer,std::uint32_t indices,std::uint32_t instances,
@@ -251,7 +255,9 @@ private:
     VkPipelineLayout originalLayout_=VK_NULL_HANDLE; VkRenderPass pass_=VK_NULL_HANDLE;
     std::uint32_t targetSubpass_=0,subpassCount_=0,currentSubpass_=0;
     VkDescriptorSet currentSet0_=VK_NULL_HANDLE;
-    Cohort currentSource_{},selectedSource_{};Id setIdentity_{};SubmitObservation submitObservation_{};
+    Cohort currentSource_{},selectedSource_{};Id setIdentity_{},restoreLayout_{};
+    std::array<std::uint32_t,frame_pixel_ssbo_clone::MaxBindings> restoreOffsets_{};
+    std::uint32_t restoreCount_=0;SubmitObservation submitObservation_{};
     std::uint64_t epoch_=0,generation_=0,poolGeneration_=0,serial_=0,submitNonce_=0,retireNonce_=0;
     std::uint64_t pendingSubmit_=0,pendingRetirement_=0,drawOrdinal_=0,selectedOrdinal_=0;
     bool configured_=false,recording_=false,armed_=false,reset_=false,inPass_=false;

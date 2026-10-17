@@ -1125,7 +1125,8 @@ public:
             if(setLayout->bindings[i].count!=1||result.count>=result.offsets.size())return false;
             result.offsets[result.count++]=command->sets[0].offsets[i];
         }
-        if(lostState())return false;out=result;return true;
+        if(lostState())return false;
+        out=result;return true;
     }
     // Original creation-time prefix identity for the optional SSBO observer.
     // A later equal raw layout handle is not the prefix baked into a pipeline.

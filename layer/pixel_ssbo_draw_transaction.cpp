@@ -246,8 +246,28 @@ bool Transaction::adoptTargetState(const TargetTicket& ticket) noexcept {
        !valid(ticket.set0_,ticket.device_) || !valid(ticket.source_.image,ticket.device_) ||
        !valid(ticket.source_.view,ticket.device_) || !valid(ticket.source_.memory,ticket.device_) ||
        ticket.source_.layout!=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || !same(ticket.source_,ticket.source_))return refuse(Reason::Identity);
+    if(clone_->compatibleSet0Mirror()){
+        std::uint32_t expected=0;for(unsigned i=0;i<set0_.count;++i)if(set0_.bindings[i].descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || set0_.bindings[i].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)expected+=set0_.bindings[i].descriptorCount;
+        // Core restore identity and Journal creation identity have distinct
+        // generation namespaces. The opaque producer proves Core association;
+        // only the actual device/raw layout value is common to both domains.
+        if(!valid(ticket.restoreLayout_,ticket.device_)||ticket.restoreLayout_.value!=provenance_[1].value||ticket.restoreCount_!=expected||expected>restoreOffsets_.size())return refuse(Reason::Prefix);
+        restoreLayout_=ticket.restoreLayout_;restoreCount_=ticket.restoreCount_;restoreOffsets_=ticket.restoreOffsets_;
+    }
     current_=original_;currentSet0_=handle<VkDescriptorSet>(ticket.set0_.value);setIdentity_=ticket.set0_;
     currentSource_=ticket.source_;prefixValid_=true;return true;
+}
+bool Transaction::targetStateCurrent(const TargetTicket& ticket) noexcept {
+    Guard guard(*this);if(!guard)return false;
+    ContextScope context(*this,ticket.command_,{},Operation::TargetTicket);
+    if(!configured_||!clone_->compatibleSet0Mirror()||!active(ticket.command_)||selected_||!prefixValid_||
+       !adoptedTracker_||ticket.tracker_!=adoptedTracker_||ticket.device_!=frame_pixel_ssbo_clone::handle(device_)||
+       ticket.commandGeneration_!=generation_||ticket.pool_!=pool_||ticket.poolGeneration_!=poolGeneration_||
+       ticket.ordinal_!=drawOrdinal_+1||ticket.subpass_!=currentSubpass_||ticket.subpass_!=targetSubpass_||
+       !same(ticket.pipeline_,provenance_[5])||!same(ticket.layout_,provenance_[1])||!same(ticket.set0_,setIdentity_)||
+       !same(ticket.source_,currentSource_)||!same(ticket.restoreLayout_,restoreLayout_)||ticket.restoreCount_!=restoreCount_)return refuse(Reason::Prefix);
+    for(unsigned i=0;i<restoreCount_;++i)if(ticket.restoreOffsets_[i]!=restoreOffsets_[i])return refuse(Reason::Prefix);
+    return true;
 }
 bool Transaction::arm(VkCommandBuffer command) noexcept {
     Guard guard(*this);if(!guard)return false;
@@ -278,7 +298,7 @@ bool Transaction::beginRenderPass(VkCommandBuffer command,VkRenderPass pass,VkSu
     inPass_=true;
     if(!armed_){cleanHistory_=false;return false;}
     if(!reset_)return refuse(Reason::MissingReset);
-    if(selected_ || scopeEnded_)return refuse(Reason::Scope);
+    if((selected_ || scopeEnded_)&&!clone_->compatibleSet0Mirror())return refuse(Reason::Scope);
     if(contents!=VK_SUBPASS_CONTENTS_INLINE)return refuse(Reason::Secondary);
     currentSubpass_=0;targetPass_=pass==pass_;
     matchingPass_=targetPass_ && currentSubpass_==targetSubpass_;
@@ -326,27 +346,31 @@ DrawResult Transaction::replace(VkCommandBuffer command,std::uint32_t vertices,s
     ContextScope context(*this,command,{},indexed?Operation::CmdDrawIndexed:Operation::CmdDraw);
     if(!active(command))return DrawResult::ForwardOriginal;
     if(!advance(drawOrdinal_))return DrawResult::ForwardOriginal;
-    if(selected_){refuse(Reason::LaterDraw);return DrawResult::ForwardOriginal;}
+    if(selected_){if(!clone_->compatibleSet0Mirror())refuse(Reason::LaterDraw);return DrawResult::ForwardOriginal;}
     if(!armed_)return DrawResult::ForwardOriginal;
     if(!reset_){refuse(Reason::MissingReset);return DrawResult::ForwardOriginal;}
     if(!inPass_){refuse(Reason::Scope);return DrawResult::ForwardOriginal;}
     // Preceding ordinary unrelated native draws are preserved, including the
     // real receiver target at ordinal 4. Only the exact target profile is
-    // replaced; ANY subsequent draw invalidates publication.
+    // replaced. The compatible mirror restores native state before any suffix;
+    // the legacy Set1 control still refuses subsequent draws.
     if(current_!=original_ || !matchingPass_)return DrawResult::ForwardOriginal;
     if(!vertices || !instances){refuse(Reason::EmptyDraw);return DrawResult::ForwardOriginal;}
     if(!currentSet0_ || !prefixValid_){refuse(Reason::Prefix);return DrawResult::ForwardOriginal;}
     if(!same(currentSource_,currentSource_)){refuse(Reason::Source);return DrawResult::ForwardOriginal;}
     if(!clone_->ready() || !clone_->referenced()){refuse(Reason::InvalidConfiguration);return DrawResult::ForwardOriginal;}
+    const bool mirror=clone_->compatibleSet0Mirror();
+    if(mirror && (!clone_->mirrorPopulated()||!valid(restoreLayout_,frame_pixel_ssbo_clone::handle(device_))||!clone_->markMirrorBound())){refuse(Reason::Prefix);return DrawResult::ForwardOriginal;}
     selected_=true;selectedOrdinal_=drawOrdinal_;selectedSource_=currentSource_;
-    const auto set=clone_->set1();
-    config_.dispatch.sets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,clone_->layout(),1,1,&set,0,nullptr);
+    const auto set=mirror?clone_->mirrorSet():clone_->set1();
+    config_.dispatch.sets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,clone_->layout(),mirror?0u:1u,1,&set,mirror?restoreCount_:0,mirror&&restoreCount_?restoreOffsets_.data():nullptr);
     config_.dispatch.pipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,clone_->pipeline());
     if(indexed)config_.dispatch.drawIndexed(command,vertices,instances,firstVertex,vertexOffset,firstInstance);
     else config_.dispatch.draw(command,vertices,instances,firstVertex,firstInstance);
     // MUST be the next command even if a downstream callback reveals reentry or
     // poisons publication. Restoring is cleanup, never conditional authorization.
     config_.dispatch.pipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,original_);
+    if(mirror)config_.dispatch.sets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,handle<VkPipelineLayout>(restoreLayout_.value),0,1,&currentSet0_,restoreCount_,restoreCount_?restoreOffsets_.data():nullptr);
     return DrawResult::ReplacedOriginal;
 }
 void Transaction::endRenderPass(VkCommandBuffer command) noexcept {
@@ -357,7 +381,7 @@ void Transaction::endRenderPass(VkCommandBuffer command) noexcept {
     if(!inPass_){refuse(Reason::Scope);return;}
     if(targetPass_ && currentSubpass_+1!=subpassCount_){refuse(Reason::Subpass);return;}
     inPass_=false;matchingPass_=targetPass_=false;
-    if(selected_){
+    if(selected_&&!scopeEnded_){
         scopeEnded_=true;
         if(!clone_->ready()){refuse(Reason::InvalidConfiguration);return;}
         VkBufferMemoryBarrier host{};host.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -382,7 +406,7 @@ void Transaction::unknown(VkCommandBuffer command,Reason why,const CommandContex
 }
 void Transaction::laterDraw(VkCommandBuffer command) noexcept {
     Guard guard(*this);if(!guard || !matches(command) || retired_)return;
-    if(advance(drawOrdinal_) && selected_)refuse(Reason::LaterDraw);
+    if(advance(drawOrdinal_) && selected_&&!clone_->compatibleSet0Mirror())refuse(Reason::LaterDraw);
 }
 bool Transaction::nextSubpass(VkCommandBuffer c,VkSubpassContents contents) noexcept {
     Guard guard(*this);if(!guard)return false;

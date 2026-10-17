@@ -41,11 +41,13 @@ void Bridge::queueRetrieved(std::uint32_t family,std::uint32_t index,VkQueue q,b
     if(!ordinary||!transaction_.queueRetrieved(device_,family,index,q)){refuse(Refusal::Queue);return;}queueKnown_.store(true,std::memory_order_release);
 }
 void Bridge::shaderCreated(const VkShaderModuleCreateInfo& ci,frame_pixel_ssbo_journal::Journal& journal) noexcept {
-    if(ci.codeSize!=6620)return;
+    if(ci.codeSize!=6620&&ci.codeSize!=9460)return;
     try{std::lock_guard<std::mutex> lock(cold_);if(profile_.load(std::memory_order_acquire))return;
-        clone::ShaderDefinition original;clone::Refusal why;
-        if(!clone::captureShader(ci,clone::ShaderRole::Fragment,original,why))return; // An unrelated same-sized shader is not the target.
-        if(!frame_pixel_ssbo_profile::transform(original,frame_pixel_ssbo_profile::Election::Sparse32,artifact_,why)||!journal.authorizeProbeInterface(artifact_.profile)){refuse(Refusal::Shader);return;}
+        clone::ShaderDefinition original;clone::Refusal why;const bool vertex=ci.codeSize==9460;
+        if(!clone::captureShader(ci,vertex?clone::ShaderRole::Vertex:clone::ShaderRole::Fragment,original,why))return; // An unrelated same-sized shader is not the target.
+        (vertex?originalVertex_:originalFragment_)=original;
+        if(!originalVertex_.complete||!originalFragment_.complete)return;
+        if(!frame_pixel_ssbo_profile::transformMirror(originalVertex_,originalFragment_,artifact_,why)||!journal.authorizeProbeInterface(artifact_.profile)){refuse(Refusal::Shader);return;}
         profile_.store(true,std::memory_order_release);
     }catch(...){refuse(Refusal::Shader);}
 }
@@ -127,6 +129,9 @@ void Bridge::forget(VkCommandBuffer c,VkCommandPool p) noexcept {
 }
 void Bridge::begin(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,VkCommandBuffer c,bool armed) noexcept {
     if(!armed||!usable()||adopted_.load(std::memory_order_acquire)||clone::handle(c)!=learnedCommand_.load(std::memory_order_acquire))return;
+    // An extra Set1 cannot preserve arbitrary native suffix descriptor state.
+    // Legacy profiles remain offline controls and never arm the receiver.
+    if(!clone_.compatibleSet0Mirror()){refuse(Refusal::Shader);return;}
     tx::Transaction::RecordingTicket ticket;
     if(!tracker.ssboRecordingTicket(tag,c,ticket)||!transaction_.adoptRecording(ticket)||
        clone::handle(transaction_.pool())!=learnedPool_.load(std::memory_order_relaxed)||transaction_.poolGeneration()!=learnedPoolGeneration_.load(std::memory_order_relaxed)||
@@ -150,10 +155,20 @@ bool Bridge::draw(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,Vk
     transaction_.observe(c,observation); // evidence survives refusal; no ticket is minted by this observation
     tx::Transaction::TargetTicket ticket;
     const auto descriptorEpoch=descriptorEpoch_.load(std::memory_order_acquire),resourceEpoch=resourceEpoch_.load(std::memory_order_acquire);
-    if(usable()&&tracker.ssboTargetTicket(tag,c,*clone_.preparedRecipe(),ticket)){
+    if(usable()&&!replaced_.load(std::memory_order_acquire)&&tracker.ssboTargetTicket(tag,c,*clone_.preparedRecipe(),ticket)){
         if(!transaction_.adoptTargetState(ticket))refuse(Refusal::Target);
         else {selectedSet_.store(clone::handle(transaction_.descriptorSet()),std::memory_order_relaxed);targetBound_.store(true,std::memory_order_release);
-            if(descriptorEpoch!=descriptorEpoch_.load(std::memory_order_acquire))refuse(Refusal::DescriptorMutation);}
+            if(descriptorEpoch!=descriptorEpoch_.load(std::memory_order_acquire))refuse(Refusal::DescriptorMutation);
+            if(usable()){
+                const auto copied=clone_.populateMirror(transaction_.descriptorSet());
+                if(copied.status!=frame_pixel_ssbo_owned::Status::Ok)refuse(Refusal::Target);
+                // The copy is CPU Vulkan work before any owned bind. A nested
+                // callback/mutation cannot silently change what will be restored.
+                tx::Transaction::TargetTicket current;
+                if(descriptorEpoch!=descriptorEpoch_.load(std::memory_order_acquire)||resourceEpoch!=resourceEpoch_.load(std::memory_order_acquire))refuse(Refusal::DescriptorMutation);
+                if(usable()&&(!tracker.ssboTargetTicket(tag,c,*clone_.preparedRecipe(),current)||!transaction_.targetStateCurrent(current)))refuse(Refusal::Target);
+            }
+        }
     }
     if(!usable()){observation.detailReason=reason_.load(std::memory_order_acquire);transaction_.unknownRoute(c,observation);return false;}
     const auto result=indexed?transaction_.drawIndexed(c,n,instances,first,offset,firstInstance):transaction_.draw(c,n,instances,first,firstInstance);
