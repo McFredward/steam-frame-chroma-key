@@ -64,7 +64,7 @@ struct Native {
     std::uint64_t nextOriginal=0x600,nextCandidate=0x800;
     unsigned deviceCalls=0,deviceDestroys=0,shaderCalls=0,ownedShaderCalls=0,ownedShaderDestroys=0,nativePipelineCalls=0,ownedPipelineCalls=0,originalDestroys=0,ownedDestroys=0,corePass=0,khrPass=0;
     VkResult nativeResult=VK_SUCCESS,ownedShaderResult=VK_SUCCESS,ownedPipelineResult=VK_SUCCESS;
-    bool partialOwned=false,reuseOriginal=false,testNested=false;unsigned nestedChecks=0;
+    bool partialOwned=false,reuseOriginal=false,testNested=false,failDuringOwned=false;unsigned nestedChecks=0;
     const VkGraphicsPipelineCreateInfo* expected=nullptr;std::uint32_t expectedCount=0;
     frame_pixel_ssbo_journal::PipelineToken oldToken{};frame_pixel_ssbo_journal::Event reused{};
     std::vector<VkPipeline> originals,candidates;std::vector<VkShaderModule> ownedShaders;
@@ -116,6 +116,7 @@ VKAPI_ATTR VkResult VKAPI_CALL createPipelines(VkDevice device,VkPipelineCache c
         const auto result=r::complete(device,cache,VK_API_VERSION_1_1,VK_SUCCESS,a,allocator,unchanged,ready->recipe,session().presenterSource,calls,{deviceFor(device),retirePresenterOriginal});
         require(!result.replaced&&result.reason==frame_native_presenter::Reason::Dispatch&&handle(unchanged)==active->oldToken.value,"nested optional replacement cannot borrow outer TLS retirement scope");++active->nestedChecks;}
 
+    if(active->failDuringOwned)deviceFor(device)->definitionBoundary.invalidate();
     *output=(active->ownedPipelineResult==VK_SUCCESS||active->partialOwned)?object<VkPipeline>(active->nextCandidate++):VK_NULL_HANDLE;if(*output)active->candidates.push_back(*output);return active->ownedPipelineResult;}
 VKAPI_ATTR void VKAPI_CALL destroyPipeline(VkDevice device,VkPipeline pipeline,const VkAllocationCallbacks* allocator){exact(device,allocator);
     if(std::find(active->originals.begin(),active->originals.end(),pipeline)!=active->originals.end()){
@@ -206,6 +207,16 @@ void privateHooks(const char* vertexPath,const char* fragmentPath,const char* ca
 } // namespace receiver_test
 int main(int argc,char** argv){using namespace receiver_test;
     if(argc==2&&!std::strcmp(argv[1],"--presenter-status-json")){std::cout<<status();return 0;}
+    if(argc==5&&!std::strcmp(argv[1],"--retirement-race")){
+        startupBoundary();const auto vs=loadWords(argv[2]),ps=loadWords(argv[3]),candidate=loadWords(argv[4]);
+        Directory source;source.marker();source.file("synthetic-presenter.spv",candidate.data(),candidate.size()*4);
+        require(session().presenterSource.prepareCold(source.fd),"race control seals the actual pinned candidate");
+        Native d;d.definitions(vs,ps);d.failDuringOwned=true;auto output=d.create();
+        require(output==d.candidates&&d.originalDestroys==1,"in-flight observer failure cannot skip original retirement");
+        require(deviceFor(d.device)->definitionBoundary.failed()&&session().presenterCounters.snapshot().definitionHistoryFailed,"failed history stays closed after mandatory retirement");
+        const auto later=d.create();require(later.back()==d.originals.back()&&d.ownedPipelineCalls==1,"failed history admits no later replacement");
+        std::cout<<"{\"scope\":\"cold-presenter-retirement-race\",\"checks\":"<<checks<<",\"headset_result\":false}\n";return 0;
+    }
     if(argc==5&&!std::strcmp(argv[1],"--receiver-delta")){startupBoundary();deltaHooks(argv[2],argv[3],argv[4]);std::cout<<"{\"scope\":\"cold-presenter-receiver-delta\",\"checks\":"<<checks<<",\"headset_result\":false}\n";return 0;}
     require(argc==1||argc==4,"optional private VS PS guarded candidate paths");startupBoundary();publicFiles();publicHooks();if(argc==4)privateHooks(argv[1],argv[2],argv[3]);std::cout<<"{\"scope\":\"cold-presenter-receiver-public\",\"checks\":"<<checks<<",\"native_provider_verified\":false}\n";
 }

@@ -1305,7 +1305,12 @@ void retirePresenterOriginal(void* owner,VkDevice device,VkPipeline pipeline) no
     // Retire at destroy ENTRY. The downstream call may allow immediate raw
     // handle reuse on another thread; never retire that later generation.
     // This mode allocates no LiveTracker and registers no diagnostic pipeline.
-    observeDefinitions(d,[&](auto& definitions){definitions.destroyPipeline(pipeline);});
+    // A different cold callback can invalidate observation while the optional
+    // driver creation is in flight. Sticky refusal must not skip retirement
+    // of the still-unexposed original before downstream handle reuse.
+    try{if(!d->definitions.destroyPipeline(pipeline))d->definitionBoundary.invalidate();}
+    catch(...){d->definitionBoundary.invalidate();}
+    if(d->definitionBoundary.failed())session().presenterCounters.historyFailed();
 }
 #endif
 VKAPI_ATTR VkResult VKAPI_CALL traceCreateGraphicsPipelines(VkDevice device,VkPipelineCache cache,std::uint32_t count,const VkGraphicsPipelineCreateInfo* info,const VkAllocationCallbacks* alloc,VkPipeline* out) {

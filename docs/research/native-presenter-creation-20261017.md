@@ -1,7 +1,8 @@
 # Inert completion-scoped presenter creation
 
-`layer/native_presenter_pipeline.h` is an unhooked cold primitive, not an installed
-receiver or permission to change a native pipeline. The frozen private fragment
+`layer/native_presenter_pipeline.h` is a cold primitive. The separate opt-in receiver now calls it during
+actual native creation; neither the header nor its tests grant installation or
+permission to change a Frame pipeline. The frozen private fragment
 is18416 bytes, SHA256
 `0aaf356d3789473cd32ff0d60cf5971bc1473813241657877db5c147bb1d4364`.
 Its generated body and original Valve inputs stay private. Cold preparation owns
@@ -65,12 +66,17 @@ are retained with their bounded repairs. No unrelated existing suite was replaye
 
 An independent read-only review found the format, AlphaToOne/Coverage and static
 color-write gaps in the first primitive; these were fixed before the final checks.
-It also identified the negotiated-version gate, now explicit. The primitive is
-still not called by any receiver. A future hook must track the **actual returned
-replacement** honestly, retire any original journal identity before native destroy,
-and never label a replacement handle as a proven original pipeline. Partial batch
-success, unknown definitions, startup health and reversible operator staging also
-remain explicit integration work. No Frame change or alpha-consumer proof follows
+It also identified the negotiated-version gate, now explicit. The optional
+[receiver integration](native-presenter-receiver-20261017.md) now tracks the
+**actual returned replacement** honestly, retires the original journal identity
+before native destroy, and never labels replacement handles as stock originals.
+A later review reproduced a narrow race: sticky observer failure during native
+candidate creation could skip the old retirement callback. Mandatory retirement
+now runs despite that failed observation history and preserves the sticky refusal
+for all later admissions. Its focused causal mutant fails at the exact old-
+generation check; the repaired actual-hook control passes72 assertions. Partial
+batch success and unknown definitions retain the original native result. Startup
+health and reversible operator staging still need actual approved device use. No Frame change or alpha-consumer proof follows
 from these tests.
 
 Separate [guard GPU evidence](../../tests/native-fragment-guarded-presenter-gpu/README.md)

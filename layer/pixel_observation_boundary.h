@@ -13,6 +13,9 @@ public:
         catch(...) { failed_.store(true,std::memory_order_release); }
     }
     bool failed() const noexcept{return failed_.load(std::memory_order_acquire);}
+    // Required cleanup may still run after observation is disabled. Its own
+    // failure must close the history without throwing across a native C ABI.
+    void invalidate() noexcept{failed_.store(true,std::memory_order_release);}
 private:
     std::atomic<bool> failed_{false};
 };

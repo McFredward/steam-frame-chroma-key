@@ -83,7 +83,12 @@ The new [synthetic format guard](docs/research/native-guarded-presenter-20261017
 also passes same-recorded-command ON/OFF/ON and partial-alpha composition on owned
 GPUs, with its additional cost measured separately. The
 [creation-scoped primitive](docs/research/native-presenter-creation-20261017.md)
-prepares a simpler native integration but is not hooked or installed.
+is now connected by an explicitly opt-in
+[cold receiver prototype](docs/research/native-presenter-receiver-20261017.md).
+Its default build is off; no new receiver is installed on the Frame. The
+[prepared visible trial](docs/research/synthetic-presenter-visible-trial-20261017.md)
+requires separate approval for output replacement and temporary native camera
+blending. Actual streamed passthrough and real-game coverage remain unproved.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
