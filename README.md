@@ -13,16 +13,21 @@ partially transparent objects can blend with your real room too.
 **[Install via SSH](docs/INSTALL.md#from-a-pc-over-ssh)** ·
 [Compatibility](docs/COMPATIBILITY.md)
 
-## Supported now
+## Supported games
 
-| Requirement | Supported |
+| Game | Required mod |
 |---|---|
-| Game/mod | [GloomhavenVR](https://github.com/McFredward/GloomhavenVR), with **Steam Link native passthrough** integration |
-| Setup | Steam Frame streaming from a Windows PC through Steam Link |
-| SteamVR on the Frame | **2.18.2 — build 1791331621** |
+| Gloomhaven Digital | [GloomhavenVR](https://github.com/McFredward/GloomhavenVR), with **Steam Link native passthrough** integration |
 
 Other games need their own integration. Installing this patch alone does not
 add mixed reality to an unmodified game.
+
+## Requirements
+
+| Requirement | Supported |
+|---|---|
+| Setup | Steam Frame streaming from a Windows PC through Steam Link |
+| SteamVR on the Frame | **2.18.2 — build 1791331621** |
 
 **Experimental:** real GloomhavenVR gameplay has been confirmed; some edges and
 motion still need improvement. See [known limits and update support](docs/COMPATIBILITY.md).
