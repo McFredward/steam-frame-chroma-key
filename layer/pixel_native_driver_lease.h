@@ -19,7 +19,7 @@ struct Inputs {
 };
 struct Status {
     State state{State::Empty}; Refusal refusal{Refusal::None};
-    std::uint64_t epoch{}, device{}, moduleBase{}, inode{}, deviceMajor{}, deviceMinor{};
+    std::uint64_t epoch{}, device{}, moduleBase{}, inode{}, deviceMajor{}, deviceMinor{}, acquireMisses{};
     std::uint64_t rvas[4]{};
     std::uint32_t chip{}, routeMask{}, activePermits{}, observedRoute{UINT32_MAX};
     char providerPath[256]{};
@@ -67,6 +67,7 @@ private:
     std::atomic<std::uint64_t> epoch_{0};
     std::atomic<bool> published_{false};
     mutable std::atomic<std::uint32_t> readers_{0};
+    mutable std::atomic<std::uint64_t> acquireMisses_{0};
     std::atomic_flag cold_ = ATOMIC_FLAG_INIT;
     Inputs inputs_{}; std::uint64_t rvas_[4]{};
     std::uint64_t base_{}, inode_{}, devMajor_{}, devMinor_{};

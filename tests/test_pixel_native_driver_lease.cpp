@@ -56,6 +56,9 @@ void mountControls() {
     check(!valid(mutate("btrfs","ext4")),"non Btrfs refused");
     check(!valid(mutate("/ / ro","/other / ro")),"wrong mount root refused");
 }
+const char* changedPath=nullptr;
+void mutateBeforeStable(Lease&) noexcept { if(changedPath)chmod(changedPath,0744); }
+void revokeBeforeReady(Lease& lease) noexcept { lease.revoke(); }
 void ownedDso(const char* path) {
     void* original=dlopen(path,RTLD_NOW|RTLD_LOCAL);check(original!=nullptr,"owned fixture loads");
     auto begin=reinterpret_cast<PFN_vkVoidFunction>(dlsym(original,"lease_fixture_begin"));auto next=reinterpret_cast<PFN_vkVoidFunction>(dlsym(original,"lease_fixture_next"));auto wrapper=reinterpret_cast<PFN_vkVoidFunction>(dlsym(original,"lease_fixture_wrapper"));
@@ -72,7 +75,7 @@ void ownedDso(const char* path) {
     lease.revoke();check(lease.releaseCold(),"owned module explicit release");
     // All negatives run through the same cold entry and preserve refusal.
     original=dlopen(path,RTLD_NOW|RTLD_LOCAL);check(original!=nullptr,"fixture reload");
-    auto reject=[&](Inputs in,Profile p,Refusal expected,const char* label){Lease bad;check(!detail::Preparation::run(bad,in,p),label);check(bad.status().refusal==expected,"precise owned refusal");bad.revoke();check(bad.releaseCold(),"refused resource cleanup");};
+    auto reject=[&](Inputs in,Profile p,Refusal expected,const char* label){Lease bad;check(!detail::Preparation::run(bad,in,p),label);check(bad.status().refusal==expected,"precise owned refusal");if(expected==Refusal::EntryPoint)check(bad.status().observedRoute<4&&bad.status().moduleBase&&bad.status().providerPath[0],"refused provider provenance retained");bad.revoke();check(bad.releaseCold(),"refused resource cleanup");};
     Inputs changed=input;changed.begin2=wrapper;reject(changed,profile,Refusal::EntryPoint,"wrapper entry refused");
     changed=input;changed.next2=nullptr;changed.next2KHR=nullptr;reject(changed,profile,Refusal::Inputs,"missing next refused");
     changed=input;changed.device=nullptr;reject(changed,profile,Refusal::Inputs,"missing device refused");
@@ -84,9 +87,12 @@ void ownedDso(const char* path) {
     // Actual file metadata change is observed independently of its content hash.
     File observed;check(verifyFile(profile,observed)==Refusal::None,"observe owned file stable");struct stat prior=observed.identity;check(chmod(path,0744)==0,"mutate file mode");struct stat after{};check(fstat(observed.fd,&after)==0&&!sameStat(prior,after),"changed identity rejected");check(chmod(path,0755)==0,"restore mode");close(observed.fd);
     std::string link=std::string(path)+".link";unlink(link.c_str());check(symlink(path,link.c_str())==0,"make symlink negative");check(secureOpen(link.c_str())<0,"final symlink refused");unlink(link.c_str());
-    check(secureOpen("/tmp/../etc/passwd")<0,"dot traversal refused");check(secureOpen("relative")<0,"relative path refused");
+    check(secureOpen("/tmp/../etc/passwd")<0,"dot traversal refused");check(secureOpen("relative")<0,"relative path refused");check(secureOpen(path,true)<0,"world-writable temporary parent refused by production path policy");
+    std::string fifo=std::string(path)+".fifo";unlink(fifo.c_str());check(mkfifo(fifo.c_str(),0600)==0,"owned FIFO negative");Profile fifoProfile=profile;fifoProfile.path=fifo.c_str();File fifoFile;check(verifyFile(fifoProfile,fifoFile)==Refusal::FileIdentity,"FIFO refused without blocking");close(fifoFile.fd);unlink(fifo.c_str());
     // Full cold run raced with close, while cold status is read concurrently.
-    for(unsigned round=0;round<8;++round){Lease raced;bool ready=false;std::thread worker([&]{ready=detail::Preparation::run(raced,input,profile);});while(raced.status().state==State::Empty)std::this_thread::yield();raced.revoke();for(unsigned j=0;j<128;++j){const auto status=raced.status();check(status.state!=State::Ready,"revocation cannot resurrect publication");}worker.join();check(!ready&&raced.status().state==State::Revoked,"prepare loses to revoke");check(raced.releaseCold(),"raced cold resources reaped");}
+    for(unsigned round=0;round<8;++round){Lease raced;bool ready=false;std::thread worker([&]{ready=detail::Preparation::run(raced,input,profile);});while(raced.status().state==State::Empty)std::this_thread::yield();raced.revoke();for(unsigned j=0;j<128;++j){const auto status=raced.status();check(status.state!=State::Ready,"revocation cannot resurrect publication");}worker.join();(void)ready;check(raced.status().state==State::Revoked,"no publication revival after revoke");check(raced.releaseCold(),"raced cold resources reaped");}
+    Lease revoked;testBeforeReady=revokeBeforeReady;check(!detail::Preparation::run(revoked,input,profile),"deterministic revoke immediately before Ready");testBeforeReady=nullptr;check(revoked.status().state==State::Revoked&&revoked.status().refusal==Refusal::Closed,"closed preparation cannot republish");check(revoked.releaseCold(),"deterministic revocation cleanup");
+    changedPath=path;testBeforeStable=mutateBeforeStable;Lease changing;check(!detail::Preparation::run(changing,input,profile),"actual file identity change in full cold verifier refused");testBeforeStable=nullptr;changedPath=nullptr;check(changing.status().refusal==Refusal::Changed,"full verifier changed cause");check(chmod(path,0755)==0,"restore changed fixture mode");changing.revoke();check(changing.releaseCold(),"changing file cleanup");
     // Loaded byte mismatch is checked against the already hashed file. No write
     // is made to an external/native module: only this owned fixture's RX page.
     File file;check(verifyFile(profile,file)==Refusal::None,"owned file for RX mutant");Maps maps;check(loadMaps(path,file.fd,file.identity,maps),"owned map identity");

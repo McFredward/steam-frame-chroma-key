@@ -24,6 +24,11 @@ constexpr char FileSha[]="dfed0652b592b263a400ba0a64fbdd421870a938abed4d447a9aaf
 constexpr char BuildId[]="b7e5995d0b202f06e81cd5a0f809ec1b744a0cb8";
 constexpr std::uint64_t EntryRvas[3][2]={{0xb113e0,0xb11940},{0xb12180,0xb11d60},{0xb18040,0xb185a0}};
 std::atomic<std::uint64_t> nextEpoch{1};
+#if defined(FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST)
+// Cold-only deterministic adversarial hooks; absent from the runtime library.
+void (*testBeforeStable)(Lease&) noexcept=nullptr;
+void (*testBeforeReady)(Lease&) noexcept=nullptr;
+#endif
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free,"Callback readers require lock-free atomics");
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free,"Callback epoch requires lock-free atomics");
 unsigned routeIndex(Route r) noexcept { return static_cast<unsigned>(r); }
@@ -310,8 +315,11 @@ Permit Lease::acquire(VkDevice device,Route route,PFN_vkVoidFunction saved) cons
     if(i>=4 || !device || !saved || state_.load(std::memory_order_acquire)!=State::Ready)return {};
     const auto generation=epoch_.load(std::memory_order_acquire);
     // Saturating increment avoids a theoretical wrap becoming false quiescence.
-    auto readers=readers_.load(std::memory_order_relaxed);
-    if(readers==UINT32_MAX || !readers_.compare_exchange_strong(readers,readers+1,std::memory_order_acquire))return {};
+    auto readers=readers_.load(std::memory_order_relaxed);bool acquired=false;
+    for(unsigned attempt=0;attempt<8 && readers!=UINT32_MAX;++attempt) {
+        if(readers_.compare_exchange_strong(readers,readers+1,std::memory_order_acquire)){acquired=true;break;}
+    }
+    if(!acquired){acquireMisses_.fetch_add(1,std::memory_order_relaxed);return {};}
     if(state_.load(std::memory_order_acquire)!=State::Ready || !generation || epoch_.load(std::memory_order_acquire)!=generation ||
        inputs_.device!=device || function(inputs_,i)!=saved || !(routeMask_&(1u<<i))) {
         readers_.fetch_sub(1,std::memory_order_release);return {};
@@ -339,7 +347,7 @@ bool Lease::releaseCold() noexcept {
 }
 Status Lease::status() const noexcept {
     Status out;out.state=state_.load(std::memory_order_acquire);out.refusal=refusal_.load(std::memory_order_acquire);
-    out.epoch=epoch_.load(std::memory_order_acquire);out.activePermits=readers_.load(std::memory_order_acquire);
+    out.epoch=epoch_.load(std::memory_order_acquire);out.activePermits=readers_.load(std::memory_order_acquire);out.acquireMisses=acquireMisses_.load(std::memory_order_relaxed);
     if(published_.load(std::memory_order_acquire)) {
         out.device=reinterpret_cast<std::uintptr_t>(inputs_.device);out.moduleBase=base_;out.inode=inode_;out.deviceMajor=devMajor_;out.deviceMinor=devMinor_;
         out.chip=chip_;out.routeMask=routeMask_;out.observedRoute=observedRoute_;std::memcpy(out.providerPath,providerPath_,sizeof(providerPath_));for(unsigned i=0;i<4;++i)out.rvas[i]=rvas_[i];
@@ -390,6 +398,9 @@ bool detail::Preparation::run(Lease& lease,const Inputs& input,const Profile& pr
     Loaded loaded{file,before,base};
     const int result=dl_iterate_phdr(Loaded::visit,&loaded);
     if(result!=1 || !loaded.found || loaded.refusal!=Refusal::None)return lease.fail(loaded.refusal);
+    #if defined(FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST)
+    if(testBeforeStable)testBeforeStable(lease);
+#endif
     Maps after;struct stat statAfter{},pathAfter{};const int pathFd=secureOpen(profile.path,profile.protectedDirectories);
     const bool stable=pathFd>=0 && fstat(pathFd,&pathAfter)==0 && fstat(file.fd,&statAfter)==0 &&
         sameStat(file.identity,pathAfter)&&sameStat(file.identity,statAfter)&&loadMaps(profile.path,file.fd,file.identity,after)&&sameMaps(before,after);
@@ -399,6 +410,9 @@ bool detail::Preparation::run(Lease& lease,const Inputs& input,const Profile& pr
     lease.inputs_=input;lease.base_=base;lease.inode_=file.identity.st_ino;lease.devMajor_=major(file.identity.st_dev);lease.devMinor_=minor(file.identity.st_dev);
     lease.chip_=chip+6;lease.routeMask_=mask;for(unsigned i=0;i<4;++i)lease.rvas_[i]=rvas[i];
     lease.epoch_.store(generation,std::memory_order_release);lease.published_.store(true,std::memory_order_release);
+    #if defined(FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST)
+    if(testBeforeReady)testBeforeReady(lease);
+#endif
     auto preparing=State::Preparing;
     if(!lease.state_.compare_exchange_strong(preparing,State::Ready,std::memory_order_release))return lease.fail(Refusal::Closed);
     return true;
