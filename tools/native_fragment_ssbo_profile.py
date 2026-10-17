@@ -20,6 +20,11 @@ ssa, require = ssbo.ssa, ssbo.require
 PROFILE = "EXACT_ORIGINAL_CONSTANT_ZERO_B9_COUNT1_SSBO_PIXEL_0_0_SET1_V1"
 FIRST_COVERED_PROFILE = "EXACT_ORIGINAL_CONSTANT_ZERO_B9_COUNT1_SSBO_FIRST_COVERED_SET1_V1"
 SPARSE32_PROFILE = "EXACT_ORIGINAL_CONSTANT_ZERO_B9_COUNT1_SSBO_FIRST_ELIGIBLE_GRID32_SET1_V1"
+MIRROR_PROFILE = "EXACT_BOTH_STAGES_UNUSED_BINDING8_COUNT1_SSBO_FIRST_ELIGIBLE_GRID32_SET0_MIRROR_V1"
+VERTEX_BYTES = 9460
+VERTEX_SHA256 = "94abc0c24124e8b4a301e7f1df5a4c8c0e8b0eb50e4c6ea78f3521370a6897c5"
+MIRROR_BINDINGS = (0, 2, 3, 4, 6, 9, 25)
+MIRROR_RECORD_BINDING = 8
 # A finite instrumentation grammar, not a change to ssa.ALLOWED. These extra
 # opcodes are required by this exact SSBO transformer and are not original code.
 SSBO_ALLOWED = ssa.ALLOWED | {29, 109, 167, 184, 190, 230}
@@ -178,6 +183,74 @@ def transform(original, first_covered=False, election=None):
     return specialize(original, canonical_ssbo(original, election=mode), election=mode)
 
 
+def descriptor_census(data):
+    """Independent finite metadata walk; never broadens the executable parser.
+
+    Complete decorated-variable sets are checked only AFTER exact stage pins by
+    transform_mirror. This helper alone creates no checked profile/authority.
+    """
+    require(type(data) is bytes and 20 <= len(data) <= ssa.MAX_BYTES and len(data)%4 == 0,
+            "bounded descriptor metadata module required")
+    words = struct.unpack("<%dI" % (len(data)//4), data)
+    require(words[0] == 0x07230203 and words[4] == 0 and 0 < words[3] < 65536,
+            "ordinary bounded SPIR-V descriptor metadata header required")
+    decorations, variables, at = {}, {}, 5
+    while at < len(words):
+        count, op = words[at] >> 16, words[at] & 65535
+        require(0 < count <= len(words)-at, "complete bounded descriptor metadata instruction")
+        operands = words[at+1:at+count]
+        require(op not in (73, 74, 75, 332), "indirect/group descriptor decorations are not attested")
+        if op == 71 and len(operands) >= 2 and operands[1] in (33, 34):
+            require(len(operands) == 3 and operands[0] < words[3], "literal descriptor decoration required")
+            target = decorations.setdefault(operands[0], {})
+            require(operands[1] not in target, "duplicate descriptor decoration")
+            target[operands[1]] = operands[2]
+        if op == 59:
+            require(len(operands) >= 3 and operands[1] not in variables, "unique descriptor variable definition")
+            variables[operands[1]] = operands[2]
+        at += count
+    result = []
+    for target, values in decorations.items():
+        require(set(values) == {33, 34} and target in variables, "complete literal decorated variable required")
+        result.append((values[34], values[33], variables[target]))
+    require(len(result) == len(set(result)), "unique native descriptor bindings required")
+    return tuple(sorted(result))
+
+
+def mirror_original_interfaces(vertex, fragment):
+    require(len(vertex) == VERTEX_BYTES and ssbo.probe.digest(vertex) == VERTEX_SHA256,
+            "exact original vertex mirror pin required")
+    original_interface(fragment)
+    vs = descriptor_census(vertex); ps = descriptor_census(fragment)
+    require(vs == ((0, 0, 2), (0, 2, 2), (0, 3, 2)) and
+            ps == ((0, 4, 2), (0, 6, 2), (0, 9, 0), (0, 25, 0)),
+            "complete pinned original descriptor census required; binding8 collision refused")
+    require(all(binding != MIRROR_RECORD_BINDING for _, binding, _ in (*vs, *ps)),
+            "original stages must not statically declare the mirror record binding")
+    return vs, ps
+
+
+def transform_mirror(vertex, fragment):
+    """Exact original one-set interface, separate from all legacy Set1 modes."""
+    vs, ps = mirror_original_interfaces(vertex, fragment)
+    legacy, record = transform(fragment, election="sparse32")
+    header, instructions = parse_ssbo_module(legacy)
+    old = {ssa.Instruction(71, (1014, 34, 1)): ssa.Instruction(71, (1014, 34, 0)),
+           ssa.Instruction(71, (1014, 33, 0)): ssa.Instruction(71, (1014, 33, MIRROR_RECORD_BINDING))}
+    require(all(instructions.count(item) == 1 for item in old), "exact owned SSBO descriptor decorations required")
+    changed = [old.get(item, item) for item in instructions]
+    words = list(header)+[word for item in changed for word in item.words()]
+    binary = struct.pack("<%dI" % len(words), *words)
+    record.update(profile=MIRROR_PROFILE, original_vertex_sha256=VERTEX_SHA256,
+        original_vertex_bytes=len(vertex), original_vertex_descriptors=vs, original_fragment_descriptors=ps,
+        record_descriptor_set=0, record_descriptor_binding=MIRROR_RECORD_BINDING,
+        required_original_copy_bindings=list(MIRROR_BINDINGS), compatible_original_set0_mirror=True,
+        additional_set1=False, original_binding8_unused=True, native_descriptor_set_written=False,
+        output_sha256=ssbo.probe.digest(binary), output_bytes=len(binary),
+        instrumentation="original-invocation 128-byte owned Set0 binding8 SSBO; unchanged original one-set layout")
+    return binary, record
+
+
 def cpp_template_data(original):
     """Owned additions and scalar patch offsets only; no original instructions."""
     original_interface(original)
@@ -211,12 +284,21 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("original", "output", "record"): parser.add_argument("--"+name, type=Path, required=True)
     parser.add_argument("--first-covered", action="store_true")
+    parser.add_argument("--mirror-set0", action="store_true")
+    parser.add_argument("--vertex", type=Path)
     parser.add_argument("--election", choices=("pixel0", "first-covered", "sparse32"))
     args = parser.parse_args(argv)
     try:
         require(args.output.absolute() != args.record.absolute(), "distinct private output paths required")
         require(not any(path.exists() or path.is_symlink() for path in (args.output, args.record)), "exclusive output paths required")
-        binary, record = transform(ssbo.recovery.read_owned(args.original, ssa.MAX_BYTES), args.first_covered, args.election)
+        original = ssbo.recovery.read_owned(args.original, ssa.MAX_BYTES)
+        if args.mirror_set0:
+            require(args.vertex is not None and not args.first_covered and args.election is None,
+                    "mirror requires both original stages and its distinct fixed sparse32 mode")
+            binary, record = transform_mirror(ssbo.recovery.read_owned(args.vertex, ssa.MAX_BYTES), original)
+        else:
+            require(args.vertex is None, "vertex input is exclusive to the checked mirror mode")
+            binary, record = transform(original, args.first_covered, args.election)
         with tempfile.TemporaryDirectory(prefix="owned-count1-ssbo-") as temporary:
             path = Path(temporary)/"probe.spv"; path.write_bytes(binary)
             result = subprocess.run(["spirv-val", "--target-env", "vulkan1.1", str(path)],

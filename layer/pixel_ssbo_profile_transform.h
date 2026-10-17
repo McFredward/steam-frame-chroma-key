@@ -304,6 +304,28 @@ inline bool transform(const frame_pixel_ssbo_clone::ShaderDefinition& original,E
        out.profile.firstCoveredInvocation()!=firstCovered || out.profile.sparseGrid32()!=sparse){out={};return clone::refuse(why,clone::Reason::ShaderPin);}
     return true;
 }
+// Original ONE-SET mirror variant. The only byte changes from the canonical
+// sparse Set1 artifact are our two generated descriptor annotations; original
+// output and executable accesses remain byte-identical. Both native stages are
+// pinned and exhaustively descriptor-attested by the distinct profile factory.
+inline bool transformMirror(const frame_pixel_ssbo_clone::ShaderDefinition& vertex,
+                            const frame_pixel_ssbo_clone::ShaderDefinition& fragment,
+                            Artifact& out,frame_pixel_ssbo_clone::Refusal& why) noexcept {
+    namespace clone=frame_pixel_ssbo_clone;out={};why={};
+    if(!vertex.complete || !fragment.complete)return clone::refuse(why,clone::Reason::ShaderProfile);
+    Artifact legacy;if(!transform(fragment,Election::Sparse32,legacy,why))return false;
+    unsigned sets=0,bindings=0;
+    for(std::size_t at=5;at<legacy.bytes/4;){const auto count=legacy.words[at]>>16,op=legacy.words[at]&65535u;
+        if(!count||count>legacy.bytes/4-at)return clone::refuse(why,clone::Reason::ShaderProfile);
+        if(op==71&&count==4&&legacy.words[at+1]==1014){
+            if(legacy.words[at+2]==34&&legacy.words[at+3]==1){legacy.words[at+3]=0;++sets;}
+            else if(legacy.words[at+2]==33&&legacy.words[at+3]==0){legacy.words[at+3]=clone::ProbeInterface::MirrorRecordBinding;++bindings;}
+        }at+=count;
+    }
+    if(sets!=1||bindings!=1||!clone::ProbeInterface::set0Mirror(vertex.words.data(),vertex.bytes,fragment.words.data(),fragment.bytes,
+            legacy.words.data(),legacy.bytes,legacy.profile,why))return false;
+    out=legacy;return true;
+}
 // Preserve the two original canonical artifacts and their existing call sites.
 inline bool transform(const frame_pixel_ssbo_clone::ShaderDefinition& original,bool firstCovered,
                       Artifact& out,frame_pixel_ssbo_clone::Refusal& why) noexcept {

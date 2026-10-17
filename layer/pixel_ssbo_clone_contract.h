@@ -69,7 +69,16 @@ public:
     constexpr ProbeInterface() noexcept=default;
     bool specializedCount1() const noexcept{return kind_!=0;}
     bool firstCoveredInvocation() const noexcept{return kind_==2;}
-    bool sparseGrid32() const noexcept{return kind_==3;}
+    bool sparseGrid32() const noexcept{return kind_==3 || kind_==4;}
+    bool compatibleSet0Mirror() const noexcept{return kind_==4;}
+    std::uint32_t recordSet() const noexcept{return compatibleSet0Mirror()?0u:1u;}
+    std::uint32_t recordBinding() const noexcept{return compatibleSet0Mirror()?MirrorRecordBinding:0u;}
+    inline static constexpr std::array<std::uint32_t,7> MirrorBindings{{0,2,3,4,6,9,25}};
+    static constexpr std::uint32_t MirrorRecordBinding=8;
+    static constexpr std::size_t MirrorSparse32Bytes=9888;
+    static constexpr const char* MirrorSparse32Sha256="ec8eaf5e1f0db2f4454320a5b613291e818d9f77b9c6219c683c1211e66333e1";
+    static constexpr const char* OriginalVertexSha256="94abc0c24124e8b4a301e7f1df5a4c8c0e8b0eb50e4c6ea78f3521370a6897c5";
+    static constexpr const char* OriginalFragmentSha256="f28dd5d22a570cbee64057da03d0418b80aee88a8eeed988b2f776e8d9a513f2";
     bool sameProfile(ProbeInterface other) const noexcept{return kind_==other.kind_;}
     static constexpr std::size_t Count1Bytes=9864;
     static constexpr const char* Count1Sha256="6d666c261114f93436e48c1f52793fe18afbce9552e07b53d4212654c4560020";
@@ -89,11 +98,59 @@ public:
         else return refuse(why,Reason::ShaderPin);
         return true;
     }
+    // A mirror profile cannot be minted from an artifact hash or caller flag
+    // alone. Both exact native stage byte streams must independently prove the
+    // complete descriptor interface, including absence of binding8. No original
+    // instructions or binaries are distributed in this contract.
+    static bool set0Mirror(const std::uint32_t* vertex,std::size_t vertexBytes,
+                          const std::uint32_t* fragment,std::size_t fragmentBytes,
+                          const std::uint32_t* probe,std::size_t probeBytes,
+                          ProbeInterface& out,Refusal& why) noexcept {
+        out={};why={};
+        if(!pinned(vertex,vertexBytes,9460,OriginalVertexSha256)||
+           !pinned(fragment,fragmentBytes,6620,OriginalFragmentSha256)||
+           !pinned(probe,probeBytes,MirrorSparse32Bytes,MirrorSparse32Sha256))return refuse(why,Reason::ShaderPin);
+        const NativeDescriptor vs[]={{75,2,2},{83,0,2},{142,3,2}};
+        const NativeDescriptor ps[]={{89,4,2},{106,6,2},{289,9,0},{295,25,0}};
+        if(!descriptors(vertex,vertexBytes,vs,3)||!descriptors(fragment,fragmentBytes,ps,4))return refuse(why,Reason::ShaderProfile);
+        out.kind_=4;return true;
+    }
     bool matches(const std::uint32_t* words,std::size_t bytes) const noexcept {
         if(!kind_)return true; // Historical array3 artifact transport contract.
+        if(compatibleSet0Mirror())return pinned(words,bytes,MirrorSparse32Bytes,MirrorSparse32Sha256);
         ProbeInterface verified;Refusal why;return count1(words,bytes,verified,why) && verified.kind_==kind_;
     }
 private:
+    struct NativeDescriptor {std::uint32_t id,binding,storage;};
+    static bool pinned(const std::uint32_t* words,std::size_t bytes,std::size_t expected,const char* pin) noexcept {
+        if(!words || bytes!=expected)return false;
+        frame_receiver::Sha256 hash;hash.update(words,bytes);return digestMatches(hash.finish(),pin);
+    }
+    // Separate bounded metadata walk. It never widens an executable grammar or
+    // interprets another shader merely because its header looks plausible.
+    static bool descriptors(const std::uint32_t* words,std::size_t bytes,const NativeDescriptor* expected,std::size_t entries) noexcept {
+        if(words[0]!=0x07230203u || words[4] || !words[3] || words[3]>=65536 || entries>4)return false;
+        std::array<unsigned,4> sets{},bindings{},variables{};
+        for(std::size_t at=5;at<bytes/4;){
+            const auto count=words[at]>>16,op=words[at]&65535u;if(!count||count>bytes/4-at)return false;
+            if(op==73||op==74||op==75||op==332)return false; // no grouped/indirect descriptor annotations
+            if(op==71&&count>=3&&(words[at+2]==33||words[at+2]==34)){
+                if(count!=4)return false;
+                std::size_t i=0;for(;i<entries&&expected[i].id!=words[at+1];++i){}if(i==entries)return false;
+                if(words[at+2]==33){if(++bindings[i]!=1||words[at+3]!=expected[i].binding||words[at+3]==MirrorRecordBinding)return false;}
+                else if(++sets[i]!=1||words[at+3])return false;
+            }
+            if(op==59){
+                if(count<4)return false;
+                std::size_t i=0;for(;i<entries&&expected[i].id!=words[at+2];++i){}
+                if(i<entries){if(++variables[i]!=1||words[at+3]!=expected[i].storage)return false;}
+                else if(words[at+3]==0||words[at+3]==2)return false;
+            }
+            at+=count;
+        }
+        for(std::size_t i=0;i<entries;++i)if(sets[i]!=1||bindings[i]!=1||variables[i]!=1)return false;
+        return true;
+    }
     std::uint8_t kind_=0;
 };
 template<class T> std::uint64_t handle(T value) noexcept {
@@ -319,6 +376,16 @@ inline bool captureSet0Shape(const VkDescriptorSetLayoutCreateInfo& in,Set0Defin
         out.bindings[i]=binding; // Immutable pointers were rejected, never retained.
     }
     if(!found9)return refuse(why,Reason::MissingImage9);
+    if(profile.compatibleSet0Mirror()){
+        for(std::size_t wanted=0;wanted<ProbeInterface::MirrorBindings.size()+1;++wanted){
+            const auto number=wanted<ProbeInterface::MirrorBindings.size()?ProbeInterface::MirrorBindings[wanted]:ProbeInterface::MirrorRecordBinding;
+            std::uint32_t i=0;for(;i<in.bindingCount&&in.pBindings[i].binding!=number;++i){}if(i==in.bindingCount)return refuse(why,Reason::Descriptor,i);
+            const auto& binding=in.pBindings[i];const auto stage=wanted<3?VK_SHADER_STAGE_VERTEX_BIT:VK_SHADER_STAGE_FRAGMENT_BIT;
+            const bool type=wanted<5?(binding.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER||binding.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC):
+                wanted==5?binding.descriptorType==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:wanted==6?binding.descriptorType==VK_DESCRIPTOR_TYPE_SAMPLER:binding.descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            if(!type||binding.descriptorCount!=1||!(binding.stageFlags&stage))return refuse(why,Reason::Descriptor,i);
+        }
+    }
     out.count=in.bindingCount;out.probeInterface=profile;out.complete=!pending;out.pendingCount1=pending;return true;
 }
 } // namespace detail
@@ -556,9 +623,10 @@ struct Recipe {
     std::array<Identity,6> provenance{}; // Scalar diagnostic history, never build handles.
     bool definitionComplete=false,nativeCompatibilityProven=false,nativeLifetimeProven=false,runtimeActivationAuthorized=false;
     bool layoutView(VkDescriptorSetLayout ownedSet0,VkDescriptorSetLayout ownedSet1,LayoutView& out) const noexcept {
-        out={};if(!definitionComplete || !ownedSet0 || !ownedSet1)return false;
-        out.sets={ownedSet0,ownedSet1};out.info.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        out.info.setLayoutCount=2;out.info.pSetLayouts=out.sets.data();out.info.pushConstantRangeCount=layout.count;
+        out={};const bool mirror=set0.probeInterface.compatibleSet0Mirror();
+        if(!definitionComplete || !ownedSet0 || (!mirror&&!ownedSet1))return false;
+        out.sets={ownedSet0,mirror?VK_NULL_HANDLE:ownedSet1};out.info.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        out.info.setLayoutCount=mirror?1u:2u;out.info.pSetLayouts=out.sets.data();out.info.pushConstantRangeCount=layout.count;
         out.info.pPushConstantRanges=layout.count?layout.ranges.data():nullptr;return true;
     }
 };
