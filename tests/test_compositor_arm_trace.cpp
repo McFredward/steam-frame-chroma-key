@@ -47,6 +47,61 @@ void wait_replayed(Capture& c) {
     }
     require(false);
 }
+void wait_optional_output_drained(EventRing& events,Core& core,
+                                  std::atomic<bool>* waiting=nullptr) {
+    // Test-side pacing only. A fixed sleep cannot guarantee that a scheduled
+    // background writer has consumed a finite batch. Render hooks never wait.
+    for(unsigned i=0;i<2000;++i) {
+        if(events.empty() || !core.enabled())return;
+        if(waiting)waiting->store(true,std::memory_order_release);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::fprintf(stderr,"optional output did not drain: emitted=%llu dropped=%llu enabled=%u\n",
+        static_cast<unsigned long long>(events.emitted()),
+        static_cast<unsigned long long>(events.dropped()),unsigned(core.enabled()));
+    require(false);
+}
+void delayed_optional_consumer_pacing() {
+    const std::uint32_t code=0x07230203;
+    {
+        // Reproduce the old failure mechanism without scheduler or wall-clock
+        // assumptions: all 2200 calls run while the consumer is paused. Waiting
+        // after that finite burst cannot turn rejected events into accepted ones.
+        EventRing events;Core core(events,true);
+        for(unsigned i=0;i<2200;++i)core.shaderCreated(1,10,&code,sizeof(code));
+        require(events.emitted()==EventCapacity && events.dropped()==2200-EventCapacity);
+        Event event;while(events.pop(event)){}
+        require(events.empty() && !events.finished() && core.enabled());
+    }
+    EventRing events;Core core(events,true);
+    std::atomic<bool> releaseConsumer{false},waiting{false},producerDone{false};
+    unsigned consumed=0;
+    std::thread consumer([&]{
+        while(!releaseConsumer.load(std::memory_order_acquire))std::this_thread::yield();
+        Event event;
+        while(core.enabled() || !events.empty()) {
+            if(events.pop(event))++consumed;
+            else std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    });
+    std::thread producer([&]{
+        for(unsigned i=0;i<2200 && core.enabled();++i) {
+            core.shaderCreated(1,10,&code,sizeof(code));
+            if(i%16==15)wait_optional_output_drained(events,core,&waiting);
+        }
+        producerDone.store(true,std::memory_order_release);
+    });
+    for(unsigned i=0;i<1000 && !waiting.load(std::memory_order_acquire);++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(waiting.load(std::memory_order_acquire));
+    // The consumer is still explicitly paused, so this proves the producer
+    // waits for progress instead of relying on how long a sleep took.
+    require(!producerDone.load(std::memory_order_acquire) && events.emitted()==16 && !events.dropped());
+    releaseConsumer.store(true,std::memory_order_release);
+    producer.join();consumer.join();
+    require(producerDone.load(std::memory_order_acquire) && events.finished() && !core.enabled());
+    require(consumed==EventLimit && events.empty() && !events.dropped());
+}
 void footer_capacity(Capture& c) {
     // Formatting bounds only: deliberately impossible maximum counters are
     // not native observations or admission evidence.
@@ -65,7 +120,9 @@ void footer_capacity(Capture& c) {
                      &d.candidateView,&d.candidateImage,&d.candidateMemory,&d.descriptorConversion})*id={UINT64_MAX,UINT64_MAX};
         for(auto* chain:{&d.descriptorViewChain,&d.descriptorImageChain}) {
             chain->count=UINT32_MAX;chain->errorFlags=UINT32_MAX;
-            for(auto& type:chain->types)type=static_cast<VkStructureType>(UINT32_MAX);
+            // Keep the ten-digit formatter bound without an out-of-range C++
+            // enum load, which UBSan correctly rejects even in synthetic data.
+            for(auto& type:chain->types)type=VK_STRUCTURE_TYPE_MAX_ENUM;
         }
     }
     char buffer[FooterReserve];std::size_t used=0;
@@ -83,6 +140,7 @@ int main(int argc,char** argv) {
     const bool armed_run=mode!="unarmed",deadline_run=mode=="deadline";
     const bool byte_cap=mode=="byte-cap",event_cap=mode=="event-cap",failed_writer=mode=="failed-writer";
     const bool public_run=mode=="public-draw";
+    if(event_cap)delayed_optional_consumer_pacing();
     char pattern[]="/tmp/frame-raw-arm-trace-XXXXXX";const auto directory=mkdtemp(pattern);require(directory);
     const std::string root(directory),journal=root+"/journal.jsonl",marker=root+"/capture-arm.marker";
     auto& c=capture();c.bindingsEnabled=true;c.core.enable(true);c.importProcessAdmitted=true;c.importJournalOpen=true;
@@ -168,11 +226,17 @@ int main(int argc,char** argv) {
                     c.core.pipelineDestroyed(1,12);
                     c.core.pipelineCreated(1,12,11,stages.data(),stages.size(),true,true);
                 }
-                // No render-side waiting is introduced: this fixture waits only
-                // to avoid manufacturing producer-ring contention/capacity loss.
-                if(i%16==15)std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                // These batches emit at most 48 records into the 256-slot ring.
+                // A real consumer acknowledgement prevents fixture-induced loss
+                // even when another parallel CI test deschedules the writer.
+                if(i%16==15)wait_optional_output_drained(c.events,c.core);
             }
             for(unsigned i=0;i<2000 && c.core.enabled();++i)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if(c.core.enabled() || !c.lifecycleReady())
+                std::fprintf(stderr,"optional cap state: emitted=%llu dropped=%llu enabled=%u lifecycle=%u writer=%u\n",
+                    static_cast<unsigned long long>(c.events.emitted()),
+                    static_cast<unsigned long long>(c.events.dropped()),unsigned(c.core.enabled()),
+                    unsigned(c.lifecycleReady()),c.importWriterReady.load());
             require(!c.core.enabled() && c.lifecycleReady());
             require(c.events.finished()==event_cap && !c.events.dropped());
         }
