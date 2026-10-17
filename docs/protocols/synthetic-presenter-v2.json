@@ -1,0 +1,60 @@
+{
+  "schema": "frame-synthetic-presenter-profile-v1",
+  "profile": "dense-asymmetric-registration-presenter-v2",
+  "profile_revision": 2,
+  "canvas": [
+    688,
+    548
+  ],
+  "color": [
+    16,
+    244,
+    320,
+    192
+  ],
+  "coverage": [
+    352,
+    244,
+    320,
+    192
+  ],
+  "rgb_convention": "straight",
+  "coverage_convention": "linear",
+  "sample_component": "native-G",
+  "guard": {
+    "cells": 12,
+    "size": [
+      32,
+      32
+    ],
+    "origin": [
+      16,
+      464
+    ],
+    "stride": [
+      52,
+      0
+    ],
+    "code_tolerance": 2,
+    "signature_preimage": "GVR-SP1;profile=dense-asymmetric-registration-presenter-v2;revision=2;canvas=688x548;color=16,244,320,192;coverage=352,244,320,192;rgb=straight;coverage=linear;component=native-G;guard=12,32,16,464,52;tol=2/255",
+    "signature_sha256": "6f999b336f525cdb66e379bd3038c50fc9d1237f534a66323ab0215b503ed586",
+    "codes": [
+      111,
+      153,
+      155,
+      51,
+      111,
+      82,
+      92,
+      219,
+      102,
+      227,
+      121,
+      189
+    ]
+  },
+  "scope": "SYNTHETIC_FORMAT_RECOGNITION_ONLY",
+  "authenticates_body": false,
+  "proves_liveness": false,
+  "passthrough_authorized": false
+}
