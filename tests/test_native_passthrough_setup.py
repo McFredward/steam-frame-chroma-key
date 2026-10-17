@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Real temp-filesystem installer controls; fake runtime/unit manager, no device."""
+import contextlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('owned_setup', ROOT / 'tools/native_passthrough_setup.py')
+s = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(s)
+
+
+class System:
+    def __init__(self):
+        self.live = False
+        self.reloads = 0
+        self.native_calls = []
+        self.settings = None
+        self.persist = True
+
+    def reload(self):
+        self.reloads += 1
+        return True
+
+    def running(self):
+        return self.live
+
+    @contextlib.contextmanager
+    def camera(self, package, metadata, runtime):
+        self.native_calls.append('open-pinned')
+        owner = self
+        class Api:
+            def write(self, value):
+                owner.native_calls.append(('set', value))
+                if owner.persist:
+                    data = s.load(owner.settings)
+                    data.setdefault('camera', {})[s.KEY] = value
+                    s.put(owner.settings, s.encoded(data), s.read(owner.settings))
+            def remove_override(self):
+                owner.native_calls.append('remove-key')
+                if owner.persist:
+                    data = s.load(owner.settings)
+                    data.setdefault('camera', {}).pop(s.KEY, None)
+                    s.put(owner.settings, s.encoded(data), s.read(owner.settings))
+        yield Api()
+
+
+class SetupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='sfnp-setup-owned-')
+        self.root = Path(self.temp.name)
+        self.home = self.root / 'home'
+        self.home.mkdir(mode=0o700)
+        self.runtime = self.root / 'runtime'
+        self.runtime.mkdir(mode=0o700)
+        self.package = self.root / 'input'
+        self.package.mkdir(mode=0o700)
+        artifacts = {s.LIBRARY: b'OWNED-LIBRARY-NOT-A-NATIVE-PROOF', 'scene-presenter.spv': b'OWNED-SPV',
+                     'tools/prepare_native_release.py': b'# owned fake verifier, never executed\n',
+                     'tools/steamvr_camera_alpha.py': b'# owned fake camera, never executed\n',
+                     'tools/pixel_snapshot_session.py': b'# owned fixture\n', 'pc/vrsettings_win.py': b'# fixture\n',
+                     'compatibility.json': s.encoded({'runtime_files': {'openvr': {'sha256': '0' * 64}}})}
+        self.metadata = {'schema': 'sfnp-native-package-v1', 'files': {n: {'bytes': len(b), 'sha256': s.digest(b)} for n, b in artifacts.items()}}
+        for name, raw in {**artifacts, 'package.json': s.encoded(self.metadata)}.items():
+            (self.package / name).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            s.put(self.package / name, raw)
+        self.unit = System()
+        self.compatible = True
+        self.checks = 0
+        def verify(package, runtime):
+            self.checks += 1
+            if not self.compatible:
+                raise s.SafetyError('unsupported runtime fingerprint: explicit owned fixture')
+            manifest = s.load(package / 'package.json')
+            for name, record in manifest['files'].items():
+                raw = s.read(package / name)
+                if s.digest(raw) != record['sha256']:
+                    raise s.SafetyError('artifact hash mismatch')
+            return manifest
+        self.setup = s.Setup(self.home, system=self.unit, verifier=verify, runtime_factory=lambda: {'openvr': self.root / 'pinned'}, runtime_dir=self.runtime)
+        self.settings = self.home / '.local/share/Steam/config/steamvr.vrsettings'
+        os.close(s.directory(self.settings.parent, create=True))
+        self.unit.settings = self.settings
+        s.put(self.settings, s.encoded({'unrelated': {'keep': 42}, 'camera': {'other': 'keep'}}))
+        os.close(s.directory(self.setup.config, create=True, private=True))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def install(self):
+        return self.setup.install(self.package)
+
+    def test_repeat_install_preserves_disabled_and_other_dropin(self):
+        foreign = self.setup.dropin.with_name('10-other.conf')
+        os.close(s.directory(foreign.parent, create=True))
+        foreign.write_text('[Service]\nEnvironment=OTHER=1\n')
+        self.install()
+        self.assertTrue(self.setup.manifest.is_symlink())
+        self.assertEqual(os.readlink(self.setup.manifest), str(self.setup.target))
+        self.assertFalse(self.setup.manifest.exists())
+        self.setup.disable()
+        self.install()
+        self.assertFalse(self.setup.status()['enabled'])
+        self.assertIn('OTHER=1', foreign.read_text())
+        unit = self.setup.dropin.read_text()
+        for key in ('RuntimeDirectory=steam-frame-native-passthrough', 'RuntimeDirectoryMode=0700', 'RuntimeDirectoryPreserve=no', 'ExecStartPre=-/usr/bin/python3', 'ExecStopPost=-/usr/bin/python3'):
+            self.assertIn(key, unit)
+        self.assertNotIn('Restart=', unit)
+        self.assertNotIn('ExecStart=\n', unit)
+
+    def test_launch_then_normal_stop_then_fresh_launch(self):
+        self.install()
+        self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+        launch = s.load(self.setup.inflight)
+        self.assertTrue(self.setup.target.exists())
+        self.assertEqual(self.setup.session.read_bytes(), b'GHVR_PIXEL_SNAPSHOT/1\n' + launch['capture_id'].encode() + b'\n' + launch['directory'].encode() + b'\n')
+        run = Path(launch['directory'])
+        self.assertEqual(run.parent, self.runtime / 'runs')
+        self.assertEqual(run.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((run / 'scene-presenter.enable').read_bytes(), b'GHVR_SCENE_PRESENTER/1\n')
+        self.assertTrue(s.load(self.settings)['camera'][s.KEY])
+        self.assertEqual(self.setup.finish()['reason'], 'stopped')
+        self.assertFalse(self.setup.target.exists())
+        self.assertTrue(self.setup.manifest.is_symlink())
+        self.assertNotIn(s.KEY, s.load(self.settings)['camera'])
+        self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+        self.assertNotEqual(s.load(self.setup.inflight)['capture_id'], launch['capture_id'])
+
+    def test_runtime_update_retains_install_but_removes_injection(self):
+        self.install()
+        self.compatible = False
+        result = self.setup.prepare()
+        self.assertEqual(result['reason'], 'stock_fallback')
+        self.assertIn('unsupported runtime', result['reason_detail'])
+        self.assertFalse(self.setup.target.exists())
+        self.assertFalse(self.setup.inflight.exists())
+        self.assertTrue(self.setup.status()['installed'])
+        self.assertFalse(self.setup.status()['compatible'])
+        self.assertEqual(self.unit.native_calls, [])
+
+    def test_powerloss_dangling_link_and_persistent_crash_latch(self):
+        self.install()
+        self.setup.prepare()
+        shutil.rmtree(self.runtime)  # Models RuntimeDirectory teardown/reboot, not production removal.
+        self.assertFalse(self.setup.manifest.exists())
+        self.assertTrue(self.setup.manifest.is_symlink())
+        self.runtime.mkdir(mode=0o700)
+        result = self.setup.prepare()
+        self.assertEqual(result['reason'], 'unclean_previous_launch')
+        self.assertFalse(self.setup.status()['enabled'])
+        self.setup.finish()
+        self.assertEqual(self.setup.prepare()['reason'], 'disabled')
+        self.setup.enable()
+        self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+
+    def test_abnormal_stop_requires_explicit_enable(self):
+        self.install()
+        self.setup.prepare()
+        self.assertEqual(self.setup.finish('signal')['reason'], 'abnormal_stop_disabled')
+        self.assertFalse(self.setup.status()['enabled'])
+        self.assertEqual(self.setup.prepare()['reason'], 'disabled')
+        self.setup.enable()
+        self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+
+    def test_each_camera_baseline_and_unrelated_fields(self):
+        for baseline in (None, False, True):
+            with self.subTest(baseline=baseline):
+                # A new receipt is required per original baseline, never overwrite one.
+                if self.setup.camera_receipt.exists():
+                    self.setup.camera_receipt.unlink()
+                data = s.load(self.settings)
+                if baseline is None:
+                    data['camera'].pop(s.KEY, None)
+                else:
+                    data['camera'][s.KEY] = baseline
+                s.put(self.settings, s.encoded(data), s.read(self.settings))
+                self.setup._camera(True)
+                before = s.load(self.setup.camera_receipt)
+                self.assertEqual(before['previous'], {'present': baseline is not None, 'value': baseline})
+                self.assertEqual(self.setup._camera(False)['restored'], True)
+                after = s.load(self.settings)
+                self.assertEqual(after['camera'].get(s.KEY), baseline)
+                self.assertEqual(after['camera']['other'], 'keep')
+                self.assertEqual(after['unrelated'], {'keep': 42})
+
+    def test_camera_receipt_precedes_write(self):
+        original = s.put
+        writes = []
+        def observed(path, raw, *args, **kwargs):
+            if path == self.settings:
+                self.assertTrue(self.setup.camera_receipt.exists())
+                self.assertTrue(s.load(self.setup.camera_receipt)['write_intent'])
+            writes.append(path)
+            return original(path, raw, *args, **kwargs)
+        s.put = observed
+        try:
+            self.setup._camera(True)
+        finally:
+            s.put = original
+        self.assertLess(writes.index(self.setup.camera_receipt), writes.index(self.settings))
+
+    def test_changed_camera_value_preserved_without_api(self):
+        self.install()
+        self.setup.prepare()
+        data = s.load(self.settings)
+        data['camera'][s.KEY] = False  # Original absent; false is a foreign explicit edit.
+        s.put(self.settings, s.encoded(data), s.read(self.settings))
+        result = self.setup.disable(True)
+        self.assertFalse(result['camera']['restored'])
+        self.assertFalse(self.setup.target.exists())
+        self.assertFalse(self.setup.manifest.is_symlink())
+        self.assertFalse(s.load(self.settings)['camera'][s.KEY])
+        self.assertEqual(self.unit.native_calls, [])
+
+    def test_original_true_no_write_does_not_adopt_foreign_false(self):
+        data = s.load(self.settings)
+        data['camera'][s.KEY] = True
+        s.put(self.settings, s.encoded(data), s.read(self.settings))
+        self.setup._camera(True)
+        data['camera'][s.KEY] = False
+        s.put(self.settings, s.encoded(data), s.read(self.settings))
+        with self.assertRaises(s.SafetyError):
+            self.setup._camera(False)
+        self.assertFalse(s.load(self.settings)['camera'][s.KEY])
+
+    def test_live_restore_pending_retains_stop_helper(self):
+        self.install()
+        self.setup.prepare()
+        self.unit.live = True
+        self.unit.persist = False
+        result = self.setup.uninstall()
+        self.assertEqual(result['reason'], 'uninstall_pending')
+        self.assertFalse(result['camera']['restored'])
+        self.assertTrue(result['camera']['persistence_pending'])
+        self.assertTrue(self.setup.dropin.exists())
+        self.assertFalse(self.setup.target.exists())
+        self.assertIn('remove-key', self.unit.native_calls)
+        self.unit.live = False
+        result = self.setup.uninstall()
+        self.assertEqual(result['reason'], 'uninstalled')
+        self.assertEqual(self.setup.uninstall()['reason'], 'not_installed')
+        self.assertNotIn(s.KEY, s.load(self.settings)['camera'])
+
+    def test_unknown_live_provider_never_called_emergency_still_revokes(self):
+        self.install()
+        self.setup.prepare()
+        self.unit.live = True
+        self.compatible = False
+        result = self.setup.disable(True)
+        self.assertFalse(result['camera']['restored'])
+        self.assertFalse(self.setup.manifest.is_symlink())
+        self.assertFalse(self.setup.target.exists())
+        self.assertEqual(self.unit.native_calls, [])
+        self.assertFalse(self.setup.status()['enabled'])
+
+    def test_foreign_dropin_install_uninstall_preserve(self):
+        os.close(s.directory(self.setup.dropin.parent, create=True))
+        self.setup.dropin.write_text('foreign')
+        with self.assertRaises(s.SafetyError):
+            self.install()
+        self.assertEqual(self.setup.dropin.read_text(), 'foreign')
+        self.setup.dropin.unlink()
+        self.install()
+        self.setup.dropin.write_text('later foreign')
+        with self.assertRaises(s.SafetyError):
+            self.setup.uninstall()
+        self.assertEqual(self.setup.dropin.read_text(), 'later foreign')
+
+    def test_legacy_collision_before_any_install_write(self):
+        old = self.home / '.local/share/GloomhavenVR/SteamLinkMaskProbe/session.conf'
+        os.close(s.directory(old.parent, create=True))
+        old.write_text('old experiment')
+        with self.assertRaisesRegex(s.SafetyError, 'original operator/receipt'):
+            self.install()
+        self.assertFalse(self.setup.receipt.exists())
+        self.assertEqual(old.read_text(), 'old experiment')
+
+    def test_missing_settings_keeps_stock_and_no_synthetic_baseline(self):
+        self.install()
+        self.settings.unlink()
+        result = self.setup.prepare()
+        self.assertEqual(result['reason'], 'stock_fallback')
+        self.assertFalse(self.setup.target.exists())
+        self.assertFalse(self.setup.camera_receipt.exists())
+
+    def test_foreign_manifest_preserved_on_disable_but_owned_target_revoked(self):
+        self.install()
+        self.setup.prepare()
+        self.setup.manifest.unlink()
+        self.setup.manifest.write_text('FOREIGN MANIFEST')
+        with self.assertRaises(s.SafetyError):
+            self.setup.disable(True)
+        self.assertEqual(self.setup.manifest.read_text(), 'FOREIGN MANIFEST')
+        self.assertFalse(self.setup.target.exists())
+
+    def test_bounded_history_and_owned_runs(self):
+        self.install()
+        captures = []
+        for _ in range(6):
+            self.assertEqual(self.setup.prepare()['reason'], 'prepared')
+            captures.append(s.load(self.setup.inflight)['capture_id'])
+            self.setup.finish()
+        self.assertEqual(len(set(captures)), 6)
+        self.assertEqual(len(s.load(self.setup.history)['launches']), 3)
+        self.assertLessEqual(len(list(self.setup.runs.iterdir())), 3)
+
+    def test_changed_package_or_nonprivate_runtime_refuses_before_publication(self):
+        self.install()
+        (self.setup.package / s.LIBRARY).write_bytes(b'changed')
+        self.assertEqual(self.setup.prepare()['reason'], 'stock_fallback')
+        self.assertFalse(self.setup.target.exists())
+        self.assertFalse(self.setup.camera_receipt.exists())
+
+    def test_no_runtime_directory_no_injection(self):
+        self.install()
+        self.runtime.rmdir()
+        self.assertEqual(self.setup.prepare()['reason'], 'stock_fallback')
+        self.assertFalse(self.setup.target.exists())
+        self.assertFalse(self.setup.camera_receipt.exists())
+
+    def test_stopped_package_upgrade_and_repeat_preserve_preference(self):
+        self.install()
+        self.setup.disable()
+        new = b'OWNED UPDATED LIBRARY'
+        (self.package / s.LIBRARY).write_bytes(new)
+        self.metadata['files'][s.LIBRARY] = {'bytes': len(new), 'sha256': s.digest(new)}
+        s.put(self.package / 'package.json', s.encoded(self.metadata), s.read(self.package / 'package.json'))
+        self.assertEqual(self.install()['reason'], 'installed')
+        self.assertFalse(self.setup.status()['enabled'])
+        self.assertEqual((self.setup.package / s.LIBRARY).read_bytes(), new)
+        self.assertFalse(self.setup.upgrade.exists())
+        self.assertEqual(self.install()['reason'], 'installed')
+
+    def test_live_update_refused_and_interrupted_upgrade_resumes_without_injection(self):
+        self.install()
+        new = b'OWNED NEW VERSION'
+        (self.package / s.LIBRARY).write_bytes(new)
+        self.metadata['files'][s.LIBRARY] = {'bytes': len(new), 'sha256': s.digest(new)}
+        s.put(self.package / 'package.json', s.encoded(self.metadata), s.read(self.package / 'package.json'))
+        self.unit.live = True
+        with self.assertRaisesRegex(s.SafetyError, 'Stop SteamVR'):
+            self.install()
+        self.unit.live = False
+        original = s.put
+        def interrupt(path, raw, *args, **kwargs):
+            if path == self.setup.package / s.LIBRARY:
+                raise OSError('injected interruption before version write')
+            return original(path, raw, *args, **kwargs)
+        s.put = interrupt
+        try:
+            with self.assertRaises(OSError):
+                self.install()
+        finally:
+            s.put = original
+        self.assertTrue(self.setup.upgrade.exists())
+        self.assertEqual(self.setup.prepare()['reason'], 'interrupted_upgrade')
+        self.assertFalse(self.setup.target.exists())
+        self.assertEqual(self.install()['reason'], 'installed')
+        self.assertFalse(self.setup.upgrade.exists())
+        self.assertEqual((self.setup.package / s.LIBRARY).read_bytes(), new)
+
+    def test_foreign_runtime_permissions_and_nonboolean_camera_refuse(self):
+        self.install()
+        self.runtime.chmod(0o775)
+        self.assertEqual(self.setup.prepare()['reason'], 'stock_fallback')
+        self.assertFalse(self.setup.target.exists())
+        self.assertFalse(self.setup.camera_receipt.exists())
+        self.runtime.chmod(0o700)
+        data = s.load(self.settings)
+        data['camera'][s.KEY] = 1
+        s.put(self.settings, s.encoded(data), s.read(self.settings))
+        self.assertEqual(self.setup.prepare()['reason'], 'stock_fallback')
+        self.assertEqual(s.load(self.settings)['camera'][s.KEY], 1)
+        self.assertFalse(self.setup.target.exists())
+
+    def test_installed_entrypoint_emergency_off_does_not_import_verifier(self):
+        self.install()
+        self.setup.prepare()
+        (self.setup.package / 'tools/prepare_native_release.py').write_text('raise Exception("MUST NOT IMPORT")')
+        # Real installed CLI, no fake runtime verifier. The temporary injected
+        # runtime namespace cannot be selected by a production CLI, so only the
+        # dangling-link baseline can be used here; camera is already restored.
+        self.setup.finish()
+        self.setup.manifest.unlink()
+        receipt = s.load(self.setup.receipt)
+        receipt['manifest_link'] = str(Path('/run/user') / str(os.getuid()) / 'steam-frame-native-passthrough/receiver.json')
+        s.put(self.setup.receipt, s.encoded(receipt), s.read(self.setup.receipt))
+        script = self.setup.tools / 'native_passthrough_setup.py'
+        result = subprocess.run([sys.executable, '-B', str(script), 'emergency-off', '--home', str(self.home)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['reason'], 'emergency_off')
+        self.assertFalse(s.load(self.setup.control)['enabled'])
+        self.assertNotIn('MUST NOT IMPORT', result.stderr)
+
+    def test_cli_no_install_and_no_implicit_restart(self):
+        result = subprocess.run([sys.executable, '-B', str(ROOT / 'tools/native_passthrough_setup.py'), 'status', '--home', str(self.home)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)['installed'])
+        source = (ROOT / 'tools/native_passthrough_setup.py').read_text()
+        self.assertNotIn("'restart'", source)
+        self.assertNotIn("'sudo'", source)
+
+    def test_guarded_filesystem_permissions_and_symlinks(self):
+        self.install()
+        self.assertEqual(self.setup.config.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.setup.receipt.stat().st_mode & 0o777, 0o600)
+        self.setup.control.unlink()
+        self.setup.control.symlink_to(self.settings)
+        with self.assertRaises(OSError):
+            self.setup.enable()
+        self.assertNotIn(s.KEY, s.load(self.settings)['camera'])
+
+
+if __name__ == '__main__':
+    unittest.main()
