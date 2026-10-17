@@ -62,6 +62,7 @@ private:
     std::atomic<State> state_{State::Empty};
     std::atomic<Refusal> refusal_{Refusal::None};
     std::atomic<std::uint64_t> epoch_{0};
+    std::atomic<bool> published_{false};
     mutable std::atomic<std::uint32_t> readers_{0};
     std::atomic_flag cold_ = ATOMIC_FLAG_INIT;
     Inputs inputs_{}; std::uint64_t rvas_[4]{};
