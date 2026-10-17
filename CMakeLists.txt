@@ -217,7 +217,8 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
         message(FATAL_ERROR "The receiver pixel snapshot targets Linux Vulkan")
     endif()
     add_library(VkLayer_frame_pixel_snapshot SHARED
-        layer/pixel_snapshot_layer.cpp layer/pixel_readback.cpp layer/pixel_sampler_probe.cpp)
+        layer/pixel_snapshot_layer.cpp layer/pixel_readback.cpp layer/pixel_sampler_probe.cpp
+        layer/pixel_native_driver_lease.cpp)
     if(FRAME_PIXEL_UNIFORM_COMPANION)
         target_sources(VkLayer_frame_pixel_snapshot PRIVATE layer/pixel_uniform_copy.cpp)
         target_compile_definitions(VkLayer_frame_pixel_snapshot PRIVATE FRAME_PIXEL_UNIFORM_COMPANION=1)
@@ -237,7 +238,7 @@ if(FRAME_MASK_BUILD_PIXEL_SNAPSHOT)
         -Wl,--no-undefined "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/layer/pixel_snapshot_exports.map")
     set_property(TARGET VkLayer_frame_pixel_snapshot APPEND PROPERTY LINK_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/layer/pixel_snapshot_exports.map)
-    target_link_libraries(VkLayer_frame_pixel_snapshot PRIVATE Threads::Threads)
+    target_link_libraries(VkLayer_frame_pixel_snapshot PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     set(FRAME_PIXEL_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}VkLayer_frame_pixel_snapshot${CMAKE_SHARED_LIBRARY_SUFFIX}")
     configure_file(layer/VkLayer_frame_pixel_snapshot.json.in
         ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_frame_pixel_snapshot.json @ONLY)
@@ -256,9 +257,12 @@ if(BUILD_TESTING AND UNIX)
     target_include_directories(test_pixel_graphics_admission PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_graphics_admission PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME pixel_graphics_admission COMMAND test_pixel_graphics_admission)
-    add_executable(test_pixel_renderpass_recording_contract tests/test_pixel_renderpass_recording_contract.cpp)
+    add_executable(test_pixel_renderpass_recording_contract tests/test_pixel_renderpass_recording_contract.cpp
+        layer/pixel_native_driver_lease.cpp)
     target_include_directories(test_pixel_renderpass_recording_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_renderpass_recording_contract PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_compile_definitions(test_pixel_renderpass_recording_contract PRIVATE FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST=1)
+    target_link_libraries(test_pixel_renderpass_recording_contract PRIVATE ${CMAKE_DL_LIBS})
     add_test(NAME pixel_renderpass_recording_contract COMMAND test_pixel_renderpass_recording_contract)
     add_executable(test_pixel_observation_boundary tests/test_pixel_observation_boundary.cpp)
     target_compile_options(test_pixel_observation_boundary PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -305,12 +309,13 @@ if(BUILD_TESTING AND UNIX)
     target_link_libraries(test_pixel_ssbo_receiver_bridge PRIVATE Threads::Threads)
     add_test(NAME pixel_ssbo_receiver_bridge COMMAND test_pixel_ssbo_receiver_bridge)
     add_executable(test_pixel_snapshot_rp2_hooks tests/test_pixel_snapshot_rp2_hooks.cpp
+        layer/pixel_native_driver_lease.cpp
         layer/pixel_ssbo_receiver_bridge.cpp layer/pixel_ssbo_draw_transaction.cpp layer/pixel_ssbo_owned_clone.cpp
         layer/pixel_readback.cpp layer/pixel_sampler_probe.cpp)
     target_include_directories(test_pixel_snapshot_rp2_hooks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
-    target_compile_definitions(test_pixel_snapshot_rp2_hooks PRIVATE FRAME_PIXEL_SSBO_TRANSACTION=1 FRAME_PIXEL_SSBO_DEFINITION_JOURNAL=1)
+    target_compile_definitions(test_pixel_snapshot_rp2_hooks PRIVATE FRAME_PIXEL_SSBO_TRANSACTION=1 FRAME_PIXEL_SSBO_DEFINITION_JOURNAL=1 FRAME_PIXEL_NATIVE_DRIVER_LEASE_TEST=1)
     target_compile_options(test_pixel_snapshot_rp2_hooks PRIVATE -Wall -Wextra -Wpedantic -Werror)
-    target_link_libraries(test_pixel_snapshot_rp2_hooks PRIVATE Threads::Threads)
+    target_link_libraries(test_pixel_snapshot_rp2_hooks PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     add_test(NAME pixel_snapshot_rp2_hooks COMMAND test_pixel_snapshot_rp2_hooks)
     add_test(NAME pixel_snapshot_recording_hooks COMMAND test_pixel_snapshot_rp2_hooks --recording-public)
     # The native companion is an explicit, uninstalled diagnostic build option.
