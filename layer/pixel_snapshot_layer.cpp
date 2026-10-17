@@ -1,8 +1,8 @@
-// Temporary explicit-pattern carriage diagnostic using public Vulkan calls
-// and one owned raw P010 copy. The optional SSBO observer changes only a
-// manually armed selected draw, preserves original color, then restores the
-// original pipeline. No executable detour, private memory read, PC sender
-// modification or passthrough presentation is enabled.
+// Default mode is an explicit-pattern carriage diagnostic with an owned P010
+// copy and an optional manually armed, color-preserving SSBO observer.
+// FRAME_PIXEL_SYNTHETIC_PRESENTER instead opts into cold creation-scoped guarded
+// fragment replacement, without draw hooks, readbacks or camera configuration.
+// Neither mode modifies the PC sender or reads private native process memory.
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 #include "pixel_capture_tracker.h"

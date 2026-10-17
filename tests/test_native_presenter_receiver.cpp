@@ -21,7 +21,7 @@ struct Directory {
     std::string read(const char* name){const int in=openat(fd,name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);require(in>=0,"read owned receipt");char data[2048]{};const auto count=::read(in,data,sizeof(data));close(in);require(count>0&&count<static_cast<ssize_t>(sizeof(data)),"bounded status receipt");return {data,static_cast<std::size_t>(count)};}
 };
 std::string status(bool maximum=false){Directory d;r::Source source;r::Snapshot s;s.observedDevice=17;s.observedApi=VK_API_VERSION_1_1;s.activeDevices=1;
-    if(maximum){s.revision=s.pipelineAttempts=s.pipelineReplacements=s.observedDevice=UINT64_MAX;s.observedApi=s.activeDevices=UINT32_MAX;s.primitiveReason=frame_native_presenter::Reason::UnexpectedHandle;s.definitionHistoryFailed=true;s.graphicsGate=frame_native_presenter::GraphicsGate::Multisample;s.attachmentFormat=static_cast<VkFormat>(UINT32_MAX);s.unsupportedDynamic=static_cast<VkDynamicState>(UINT32_MAX);}
+    if(maximum){s.revision=s.pipelineAttempts=s.pipelineReplacements=s.observedDevice=UINT64_MAX;s.observedApi=s.activeDevices=UINT32_MAX;s.primitiveReason=frame_native_presenter::Reason::UnexpectedHandle;s.definitionHistoryFailed=true;s.graphicsGate=frame_native_presenter::GraphicsGate::Multisample;s.attachmentFormat=VK_FORMAT_MAX_ENUM;s.unsupportedDynamic=VK_DYNAMIC_STATE_MAX_ENUM;}
     require(r::writeStatusCold(d.fd,Capture,source,s,maximum?32:1,maximum),"actual producer writes bounded JSON");return d.read(r::StatusFile);}
 void publicFiles(){
     {Directory d;r::Source s;require(!s.prepareCold(-1)&&s.reason()==r::SourceReason::Directory,"invalid directory refused");}
@@ -29,14 +29,14 @@ void publicFiles(){
     {Directory d;r::Source s;require(!s.prepareCold(d.fd)&&s.reason()==r::SourceReason::Marker,"missing explicit opt-in stays off");d.marker();require(!s.prepareCold(d.fd)&&s.reason()==r::SourceReason::Marker,"failed preparation cannot resurrect");}
     for(unsigned variant=0;variant<6;++variant){Directory d;d.marker();
         if(variant==0)d.file("synthetic-presenter.enable","GHVR_SYNTHETIC_PRESENTER/2\n",25);
-        if(variant==1)fchmodat(d.fd,"synthetic-presenter.enable",0644,0);
+        if(variant==1)require(!fchmodat(d.fd,"synthetic-presenter.enable",0644,0),"fixture marker permission mutation succeeds");
         if(variant==2){require(!renameat(d.fd,"synthetic-presenter.enable",d.fd,"elsewhere"),"move marker");require(!symlinkat("elsewhere",d.fd,"synthetic-presenter.enable"),"symlink marker");}
         if(variant==3)require(!linkat(d.fd,"synthetic-presenter.enable",d.fd,"second",0),"hardlinked marker");
         if(variant==4){unlinkat(d.fd,"synthetic-presenter.enable",0);require(!mkfifoat(d.fd,"synthetic-presenter.enable",0600),"FIFO marker");}
         if(variant==5)d.file("synthetic-presenter.enable",r::EnableMagic,std::strlen(r::EnableMagic)-1);
         r::Source s;require(!s.prepareCold(d.fd)&&s.reason()==r::SourceReason::Marker,"noncanonical marker safely refused");}
     for(unsigned variant=0;variant<5;++variant){Directory d;d.marker();std::array<unsigned char,frame_native_presenter::GuardedFragmentBytes> bad{};d.file("synthetic-presenter.spv",bad.data(),bad.size());
-        if(variant==1)fchmodat(d.fd,"synthetic-presenter.spv",0644,0);
+        if(variant==1)require(!fchmodat(d.fd,"synthetic-presenter.spv",0644,0),"fixture artifact permission mutation succeeds");
         if(variant==2)require(!linkat(d.fd,"synthetic-presenter.spv",d.fd,"second",0),"hardlinked artifact");
         if(variant==3){require(!renameat(d.fd,"synthetic-presenter.spv",d.fd,"elsewhere"),"move artifact");require(!symlinkat("elsewhere",d.fd,"synthetic-presenter.spv"),"artifact symlink");}
         if(variant==4)d.file("synthetic-presenter.spv",bad.data(),4);
@@ -179,7 +179,7 @@ void deltaHooks(const char* vertexPath,const char* fragmentPath,const char* cand
     {Native d;{std::lock_guard<std::mutex> lock(session().presenterWriterMutex);if(session().presenterWriter.joinable())session().presenterWriter.join();}
         struct stat file{};require(fstatat(d.directory.fd,r::StatusFile,&file,AT_SYMLINK_NOFOLLOW)&&errno==ENOENT,"new device lifetime cannot restart exhausted process-wide status budget");}
     require(session().presenterStatusUpdates==r::MaximumStatusUpdates,"status update budget persists across final device destruction");
-    const auto receipt=status(true);require(receipt.find("\"graphics_gate\":\"multisample\"")!=std::string::npos&&receipt.find("\"attachment_format\":4294967295")!=std::string::npos&&receipt.find("\"unsupported_dynamic\":4294967295")!=std::string::npos,"actual maximal diagnostic fields stay inside 1KiB producer envelope");
+    const auto receipt=status(true);require(receipt.find("\"graphics_gate\":\"multisample\"")!=std::string::npos&&receipt.find("\"attachment_format\":2147483647")!=std::string::npos&&receipt.find("\"unsupported_dynamic\":2147483647")!=std::string::npos,"actual maximal diagnostic fields stay inside 1KiB producer envelope");
 }
 void privateHooks(const char* vertexPath,const char* fragmentPath,const char* candidatePath){const auto vs=loadWords(vertexPath),ps=loadWords(fragmentPath),candidate=loadWords(candidatePath);
     Directory source;source.marker();source.file("synthetic-presenter.spv",candidate.data(),candidate.size()*4);require(session().presenterSource.prepareCold(source.fd),"real pinned guarded artifact cold-prepared");
