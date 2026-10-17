@@ -71,6 +71,12 @@ fit inputs; the [SSBO observer](docs/NATIVE-FRAGMENT-SSBO-PROBE-20261016.md)
 checks original-invocation values with one owned color attachment. Neither is a
 native receiver installation or a live presenter.
 
+The [successful original-invocation capture](docs/research/native-invocation-capture-20261017.md)
+now records actual fragment values together with the selected native image.
+The temporary diagnostic is removed and the Frame is restored. A direct current-R1
+registration and single-output reconstruction are the next offline steps;
+actual streaming passthrough and real game coverage remain unimplemented.
+
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR
 client. The [PC source collector](docs/PC-MASK-SOURCE.md) inspects the installed
