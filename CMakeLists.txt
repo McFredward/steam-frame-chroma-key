@@ -248,6 +248,8 @@ if(BUILD_TESTING AND UNIX)
     add_library(pixel_native_driver_lease_fixture SHARED tests/native-driver-lease/fixture.cpp)
     target_compile_options(pixel_native_driver_lease_fixture PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_link_options(pixel_native_driver_lease_fixture PRIVATE -Wl,--build-id=sha1)
+    add_custom_command(TARGET pixel_native_driver_lease_fixture POST_BUILD
+        COMMAND chmod 0755 $<TARGET_FILE:pixel_native_driver_lease_fixture>)
     add_executable(test_pixel_native_driver_lease tests/test_pixel_native_driver_lease.cpp)
     target_include_directories(test_pixel_native_driver_lease PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${Vulkan_INCLUDE_DIRS})
     target_compile_options(test_pixel_native_driver_lease PRIVATE -Wall -Wextra -Wpedantic -Werror)
