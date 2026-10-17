@@ -14,6 +14,17 @@ constexpr std::size_t MaximumArtifactBytes=64u*1024u;
 // is recorded separately and does not turn this primitive into a runtime hook.
 constexpr const char* GuardedFragmentSha256="0aaf356d3789473cd32ff0d60cf5971bc1473813241657877db5c147bb1d4364";
 constexpr std::size_t GuardedFragmentBytes=18416;
+// Real image contribution is a distinct protocol: RGB already includes surface
+// opacity and additive emission. It must never enter the straight-RGB decoder.
+constexpr const char* SceneFragmentSha256="57ce6fdaa983765fe12800002a1f3c53be50291586e16a13d5fbcc0bced49cb3";
+constexpr std::size_t SceneFragmentBytes=19224;
+enum class Profile : std::uint8_t { Synthetic, SceneContribution };
+inline const char* fragmentSha256(Profile profile) noexcept {
+    return profile == Profile::SceneContribution ? SceneFragmentSha256 : GuardedFragmentSha256;
+}
+inline std::size_t fragmentBytes(Profile profile) noexcept {
+    return profile == Profile::SceneContribution ? SceneFragmentBytes : GuardedFragmentBytes;
+}
 
 enum class Reason : std::uint8_t {
     None,Artifact,ApiVersion,Original,Identity,Interface,Graphics,Dispatch,NativeCreation,
@@ -36,13 +47,14 @@ struct Result {
 // belongs here; the Valve original and generated body must not be distributed.
 class Fragment {
 public:
-    bool prepare(const std::uint32_t* words,std::size_t bytes) noexcept {
+    bool prepare(const std::uint32_t* words,std::size_t bytes,Profile profile=Profile::Synthetic) noexcept {
         bytes_=0;
-        if(!words||!GuardedFragmentBytes||bytes!=GuardedFragmentBytes||bytes>MaximumArtifactBytes||bytes%4)
+        if((profile!=Profile::Synthetic&&profile!=Profile::SceneContribution)||
+           !words||bytes!=fragmentBytes(profile)||bytes>MaximumArtifactBytes||bytes%4)
             return false;
         std::memcpy(words_.data(),words,bytes);
         frame_receiver::Sha256 hash;hash.update(words_.data(),bytes);
-        if(!definitions::digestMatches(hash.finish(),GuardedFragmentSha256))return false;
+        if(!definitions::digestMatches(hash.finish(),fragmentSha256(profile)))return false;
         bytes_=bytes;return true;
     }
     bool ready() const noexcept{return bytes_!=0;}

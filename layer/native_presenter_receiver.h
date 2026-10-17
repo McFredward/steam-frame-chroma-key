@@ -7,6 +7,8 @@ namespace frame_native_presenter_receiver {
 namespace native = frame_native_presenter;
 constexpr const char* EnableMagic = "GHVR_SYNTHETIC_PRESENTER/1\n";
 constexpr const char* StatusFile = "synthetic-presenter-status.json";
+constexpr const char* SceneEnableMagic = "GHVR_SCENE_PRESENTER/1\n";
+constexpr const char* SceneStatusFile = "scene-presenter-status.json";
 constexpr unsigned MaximumStatusUpdates = 32;
 enum class SourceReason : std::uint8_t { Disabled, Directory, Marker, Module, Pin, Ready };
 const char* sourceReasonName(SourceReason) noexcept;
@@ -21,10 +23,15 @@ public:
     bool ready() const noexcept { return reason_ == SourceReason::Ready; }
     SourceReason reason() const noexcept { return reason_; }
     const native::Fragment& fragment() const noexcept { return fragment_; }
+    native::Profile profile() const noexcept { return profile_; }
+    const char* statusFile() const noexcept {
+        return profile_ == native::Profile::SceneContribution ? SceneStatusFile : StatusFile;
+    }
 private:
     bool attempted_ = false;
     SourceReason reason_ = SourceReason::Disabled;
     native::Fragment fragment_;
+    native::Profile profile_ = native::Profile::Synthetic;
 };
 
 struct Retirement {

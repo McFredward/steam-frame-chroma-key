@@ -51,6 +51,7 @@
 namespace {
 #ifdef FRAME_PIXEL_SYNTHETIC_PRESENTER
 __attribute__((used)) const char SyntheticPresenterBuildMarker[]="GHVR_SYNTHETIC_PRESENTER_COLD/1";
+__attribute__((used)) const char ScenePresenterBuildMarker[]="GHVR_SCENE_PRESENTER_COLD/1";
 namespace presenter=frame_native_presenter_receiver;
 #endif
 using frame_pixel_capture::LiveTracker;

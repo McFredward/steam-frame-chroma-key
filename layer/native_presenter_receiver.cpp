@@ -94,14 +94,26 @@ bool Source::prepareCold(int directory) noexcept {
     if (attempted_) return ready();
     attempted_ = true;
     if (!directoryOwned(directory)) { reason_ = SourceReason::Directory; return false; }
+    struct stat scene{}, synthetic{};
+    const bool hasScene = !fstatat(directory, "scene-presenter.enable", &scene, AT_SYMLINK_NOFOLLOW);
+    const bool sceneError = !hasScene && errno != ENOENT;
+    const bool hasSynthetic = !fstatat(directory, "synthetic-presenter.enable", &synthetic, AT_SYMLINK_NOFOLLOW);
+    if (sceneError || (!hasSynthetic && errno != ENOENT) || (hasScene && hasSynthetic)) {
+        reason_ = SourceReason::Marker; return false;
+    }
+    profile_ = hasScene ? native::Profile::SceneContribution : native::Profile::Synthetic;
+    const char* magic = hasScene ? SceneEnableMagic : EnableMagic;
+    const char* name = hasScene ? "scene-presenter.enable" : "synthetic-presenter.enable";
     char marker[sizeof("GHVR_SYNTHETIC_PRESENTER/1\n") - 1]{};
-    if (!readOwned(directory, "synthetic-presenter.enable", marker, sizeof(marker)) ||
-        std::memcmp(marker, EnableMagic, sizeof(marker))) { reason_ = SourceReason::Marker; return false; }
-    std::array<std::uint32_t, native::GuardedFragmentBytes / 4> words{};
-    if (!readOwned(directory, "synthetic-presenter.spv", words.data(), sizeof(words))) {
+    const auto markerBytes = std::strlen(magic);
+    if (!readOwned(directory, name, marker, markerBytes) ||
+        std::memcmp(marker, magic, markerBytes)) { reason_ = SourceReason::Marker; return false; }
+    std::array<std::uint32_t, native::MaximumArtifactBytes / 4> words{};
+    const auto bytes = native::fragmentBytes(profile_);
+    if (!readOwned(directory, hasScene ? "scene-presenter.spv" : "synthetic-presenter.spv", words.data(), bytes)) {
         reason_ = SourceReason::Module; return false;
     }
-    if (!fragment_.prepare(words.data(), sizeof(words))) { reason_ = SourceReason::Pin; return false; }
+    if (!fragment_.prepare(words.data(), bytes, profile_)) { reason_ = SourceReason::Pin; return false; }
     reason_ = SourceReason::Ready;
     return true;
 }
@@ -152,28 +164,32 @@ bool writeStatusCold(int directory, const char* capture, const Source& source, c
     if (!directoryOwned(directory) || !capture || strnlen(capture, 33) != 32 || !update || update > MaximumStatusUpdates)
         return false;
     for (unsigned i = 0; i < 32; ++i) if (!((capture[i] >= '0' && capture[i] <= '9') || (capture[i] >= 'a' && capture[i] <= 'f'))) return false;
-    if (!ownedExistingOrAbsent(directory, StatusFile)) return false;
+    const bool scene = source.profile() == native::Profile::SceneContribution;
+    const char* finalName = source.statusFile();
+    if (!ownedExistingOrAbsent(directory, finalName)) return false;
     char text[1024]{};
     const auto count = std::snprintf(text, sizeof(text),
-        "{\"schema\":\"frame-synthetic-presenter-receiver-v1\",\"mode\":\"synthetic_format_guarded_presenter\","
+        "{\"schema\":\"%s\",\"mode\":\"%s\","
         "\"capture_id\":\"%s\",\"source_ready\":%s,\"source_reason\":\"%s\",\"candidate_sha256\":\"%s\",\"candidate_bytes\":%zu,"
         "\"observed_device\":%llu,\"observed_api\":%u,\"active_devices\":%u,\"pipeline_attempts\":%llu,\"pipeline_replacements\":%llu,"
         "\"last_primitive_reason\":\"%s\",\"graphics_gate\":\"%s\",\"attachment_format\":%u,\"unsupported_dynamic\":%u,"
         "\"definition_history_failed\":%s,\"revision\":%llu,\"updates\":%u,\"budget_exhausted\":%s,"
         "\"diagnostic_atomics_not_source_cohort\":true,\"native_frame_association_proven\":false,\"passthrough_authorized\":false}\n",
-        capture, source.ready() ? "true" : "false", sourceReasonName(source.reason()), native::GuardedFragmentSha256,
-        native::GuardedFragmentBytes, static_cast<unsigned long long>(s.observedDevice), s.observedApi, s.activeDevices,
+        scene ? "frame-scene-presenter-receiver-v1" : "frame-synthetic-presenter-receiver-v1",
+        scene ? "scene_contribution_guarded_presenter" : "synthetic_format_guarded_presenter",
+        capture, source.ready() ? "true" : "false", sourceReasonName(source.reason()), native::fragmentSha256(source.profile()),
+        native::fragmentBytes(source.profile()), static_cast<unsigned long long>(s.observedDevice), s.observedApi, s.activeDevices,
         static_cast<unsigned long long>(s.pipelineAttempts), static_cast<unsigned long long>(s.pipelineReplacements),
         primitiveReasonName(s.primitiveReason), graphicsGateName(s.graphicsGate), unsigned(s.attachmentFormat), unsigned(s.unsupportedDynamic),
         s.definitionHistoryFailed ? "true" : "false",
         static_cast<unsigned long long>(s.revision), update, exhausted ? "true" : "false");
     if (count <= 0 || static_cast<std::size_t>(count) >= sizeof(text)) return false;
-    constexpr const char* temporary = "synthetic-presenter-status.tmp";
+    const char* temporary = scene ? "scene-presenter-status.tmp" : "synthetic-presenter-status.tmp";
     const int fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return false;
     const bool written = !fchmod(fd, 0600) && frame_pixel_io::writeAll(fd, text, static_cast<std::size_t>(count));
     struct stat owned{}; const bool known = !fstat(fd, &owned); close(fd);
-    if (written && known && !renameat(directory, temporary, directory, StatusFile)) return true;
+    if (written && known && !renameat(directory, temporary, directory, finalName)) return true;
     struct stat currentFile{};
     if (known && !fstatat(directory, temporary, &currentFile, AT_SYMLINK_NOFOLLOW) &&
         currentFile.st_dev == owned.st_dev && currentFile.st_ino == owned.st_ino) unlinkat(directory, temporary, 0);

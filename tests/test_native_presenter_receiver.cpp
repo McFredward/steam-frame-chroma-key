@@ -17,7 +17,7 @@ struct Directory {
     Directory(){char name[]="/tmp/ghvr-presenter-fixture-XXXXXX";const auto* made=mkdtemp(name);require(made,"owned temporary directory");path=made;fd=open(path.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC);require(fd>=0,"private directory descriptor");}
     ~Directory(){if(fd>=0){auto* stream=fdopendir(dup(fd));if(stream){while(auto* entry=readdir(stream))if(std::strcmp(entry->d_name,".")&&std::strcmp(entry->d_name,".."))unlinkat(fd,entry->d_name,0);closedir(stream);}close(fd);}rmdir(path.c_str());}
     void file(const char* name,const void* data,std::size_t size,mode_t mode=0600){unlinkat(fd,name,0);const int out=openat(fd,name,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,mode);require(out>=0,"create owned fixture file");require(!fchmod(out,mode)&&frame_pixel_io::writeAll(out,data,size),"write exact owned bytes");close(out);}
-    void marker(){file("synthetic-presenter.enable",r::EnableMagic,std::strlen(r::EnableMagic));}
+    void marker(bool scene=false){const auto* magic=scene?r::SceneEnableMagic:r::EnableMagic;file(scene?"scene-presenter.enable":"synthetic-presenter.enable",magic,std::strlen(magic));}
     std::string read(const char* name){const int in=openat(fd,name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);require(in>=0,"read owned receipt");char data[2048]{};const auto count=::read(in,data,sizeof(data));close(in);require(count>0&&count<static_cast<ssize_t>(sizeof(data)),"bounded status receipt");return {data,static_cast<std::size_t>(count)};}
 };
 std::string status(bool maximum=false){Directory d;r::Source source;r::Snapshot s;s.observedDevice=17;s.observedApi=VK_API_VERSION_1_1;s.activeDevices=1;
@@ -41,6 +41,17 @@ void publicFiles(){
         if(variant==3){require(!renameat(d.fd,"synthetic-presenter.spv",d.fd,"elsewhere"),"move artifact");require(!symlinkat("elsewhere",d.fd,"synthetic-presenter.spv"),"artifact symlink");}
         if(variant==4)d.file("synthetic-presenter.spv",bad.data(),4);
         r::Source s;require(!s.prepareCold(d.fd)&&s.reason()==(variant==0?r::SourceReason::Pin:r::SourceReason::Module),"noncanonical artifact refused before use");}
+    for(unsigned variant=0;variant<7;++variant){Directory d;d.marker(true);
+        std::array<unsigned char,frame_native_presenter::SceneFragmentBytes> bad{};
+        d.file("scene-presenter.spv",bad.data(),bad.size());
+        if(variant==1)d.marker();
+        if(variant==2)d.file("scene-presenter.enable",r::EnableMagic,std::strlen(r::EnableMagic));
+        if(variant==3)require(!fchmodat(d.fd,"scene-presenter.enable",0644,0),"scene opt-in permission mutation");
+        if(variant==4){unlinkat(d.fd,"scene-presenter.enable",0);require(!symlinkat("scene-presenter.spv",d.fd,"scene-presenter.enable"),"scene opt-in symlink");}
+        if(variant==5)d.file("scene-presenter.spv",bad.data(),4);
+        if(variant==6)require(!linkat(d.fd,"scene-presenter.spv",d.fd,"second",0),"scene artifact hardlink");
+        r::Source s;require(!s.prepareCold(d.fd)&&s.reason()==(variant==0?r::SourceReason::Pin:variant>=5?r::SourceReason::Module:r::SourceReason::Marker),"distinct scene profile rejects ambiguous, foreign, malformed or unpinned input");
+    }
     auto text=status();require(text.find("\"source_reason\":\"disabled\"")!=std::string::npos&&text.find("\"diagnostic_atomics_not_source_cohort\":true")!=std::string::npos&&text.find("\"passthrough_authorized\":false")!=std::string::npos,"status keeps diagnostic and authority boundaries");
     require(status(true).size()<1024,"maximum width status fits envelope");
     {Directory d;r::Source s;r::Snapshot snap;require(!r::writeStatusCold(d.fd,"short",s,snap,1,false)&&!r::writeStatusCold(d.fd,Capture,s,snap,0,false)&&!r::writeStatusCold(d.fd,Capture,s,snap,33,false),"invalid status identity/budget refused");
@@ -102,7 +113,7 @@ VKAPI_ATTR VkResult VKAPI_CALL createPass(VkDevice device,const VkRenderPassCrea
 VKAPI_ATTR VkResult VKAPI_CALL createPass2(VkDevice device,const VkRenderPassCreateInfo2*,const VkAllocationCallbacks* allocator,VkRenderPass* output){exact(device,allocator);++active->corePass;*output=object<VkRenderPass>(0x32);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL createPass2KHR(VkDevice device,const VkRenderPassCreateInfo2*,const VkAllocationCallbacks* allocator,VkRenderPass* output){exact(device,allocator);++active->khrPass;*output=object<VkRenderPass>(0x33);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL createShader(VkDevice device,const VkShaderModuleCreateInfo* ci,const VkAllocationCallbacks* allocator,VkShaderModule* output){exact(device,allocator);++active->shaderCalls;
-    if(ci->codeSize==frame_native_presenter::GuardedFragmentBytes){++active->ownedShaderCalls;*output=object<VkShaderModule>(0x900+active->ownedShaderCalls);active->ownedShaders.push_back(*output);return active->ownedShaderResult;}
+    if(ci->codeSize==frame_native_presenter::GuardedFragmentBytes||ci->codeSize==frame_native_presenter::SceneFragmentBytes){++active->ownedShaderCalls;*output=object<VkShaderModule>(0x900+active->ownedShaderCalls);active->ownedShaders.push_back(*output);return active->ownedShaderResult;}
     *output=object<VkShaderModule>(active->shaderCalls==1?0x40:0x50);return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL destroyShader(VkDevice device,VkShaderModule shader,const VkAllocationCallbacks* allocator){exact(device,allocator);require(std::find(active->ownedShaders.begin(),active->ownedShaders.end(),shader)!=active->ownedShaders.end(),"only successfully owned candidate shader destroyed");++active->ownedShaderDestroys;}
 VKAPI_ATTR void VKAPI_CALL destroyPipeline(VkDevice,VkPipeline,const VkAllocationCallbacks*);
@@ -182,9 +193,13 @@ void deltaHooks(const char* vertexPath,const char* fragmentPath,const char* cand
     require(session().presenterStatusUpdates==r::MaximumStatusUpdates,"status update budget persists across final device destruction");
     const auto receipt=status(true);require(receipt.find("\"graphics_gate\":\"multisample\"")!=std::string::npos&&receipt.find("\"attachment_format\":2147483647")!=std::string::npos&&receipt.find("\"unsupported_dynamic\":2147483647")!=std::string::npos,"actual maximal diagnostic fields stay inside 1KiB producer envelope");
 }
-void privateHooks(const char* vertexPath,const char* fragmentPath,const char* candidatePath){const auto vs=loadWords(vertexPath),ps=loadWords(fragmentPath),candidate=loadWords(candidatePath);
-    Directory source;source.marker();source.file("synthetic-presenter.spv",candidate.data(),candidate.size()*4);require(session().presenterSource.prepareCold(source.fd),"real pinned guarded artifact cold-prepared");
-    unlinkat(source.fd,"synthetic-presenter.enable",0);require(session().presenterSource.ready(),"cold artifact remains immutable after enable removal; not a live pipeline switch");
+void privateHooks(const char* vertexPath,const char* fragmentPath,const char* candidatePath,bool scene=false){const auto vs=loadWords(vertexPath),ps=loadWords(fragmentPath),candidate=loadWords(candidatePath);
+    if(scene){frame_native_presenter::Fragment wrong;require(!wrong.prepare(candidate.data(),candidate.size()*4),"contribution code cannot use the synthetic protocol");}
+    Directory source;source.marker(scene);source.file(scene?"scene-presenter.spv":"synthetic-presenter.spv",candidate.data(),candidate.size()*4);require(session().presenterSource.prepareCold(source.fd),"real pinned guarded artifact cold-prepared");
+    require(session().presenterSource.profile()==(scene?frame_native_presenter::Profile::SceneContribution:frame_native_presenter::Profile::Synthetic),"exact selected protocol retained");
+    if(scene){r::Snapshot snap;require(r::writeStatusCold(source.fd,Capture,session().presenterSource,snap,1,false),"scene profile status emitted cold");
+        const auto receipt=source.read(r::SceneStatusFile);require(receipt.find("frame-scene-presenter-receiver-v1")!=std::string::npos&&receipt.find(frame_native_presenter::SceneFragmentSha256)!=std::string::npos,"scene status cannot claim legacy protocol or digest");}
+    unlinkat(source.fd,scene?"scene-presenter.enable":"synthetic-presenter.enable",0);require(session().presenterSource.ready(),"cold artifact remains immutable after enable removal; not a live pipeline switch");
     {Native d(true);d.definitions(vs,ps);require(deviceFor(d.device)->presenterInterfaceAuthorized.load(),"original PS attests pending count1 layout before pipeline creation");d.reuseOriginal=true;const auto before=session().presenterCounters.snapshot();auto output=d.create(2);
         require(d.nativePipelineCalls==1&&d.ownedPipelineCalls==2&&d.originalDestroys==2&&d.ownedShaderCalls==2&&d.ownedShaderDestroys==2&&output==d.candidates,"all matched views replaced from same original batch immediately");
         const auto after=session().presenterCounters.snapshot();require(after.pipelineReplacements==before.pipelineReplacements+2,"replacement diagnostics count all views");
@@ -206,10 +221,12 @@ void privateHooks(const char* vertexPath,const char* fragmentPath,const char* ca
 
 } // namespace receiver_test
 int main(int argc,char** argv){using namespace receiver_test;
+    if(argc==5&&!std::strcmp(argv[1],"--scene-receiver")){startupBoundary();publicFiles();publicHooks();privateHooks(argv[2],argv[3],argv[4],true);std::cout<<"{\"scope\":\"cold-scene-presenter-receiver\",\"checks\":"<<checks<<",\"headset_result\":false}\n";return 0;}
     if(argc==2&&!std::strcmp(argv[1],"--presenter-status-json")){std::cout<<status();return 0;}
-    if(argc==5&&!std::strcmp(argv[1],"--retirement-race")){
+    if(argc==5&&(!std::strcmp(argv[1],"--retirement-race")||!std::strcmp(argv[1],"--scene-retirement-race"))){
+        const bool scene=!std::strcmp(argv[1],"--scene-retirement-race");
         startupBoundary();const auto vs=loadWords(argv[2]),ps=loadWords(argv[3]),candidate=loadWords(argv[4]);
-        Directory source;source.marker();source.file("synthetic-presenter.spv",candidate.data(),candidate.size()*4);
+        Directory source;source.marker(scene);source.file(scene?"scene-presenter.spv":"synthetic-presenter.spv",candidate.data(),candidate.size()*4);
         require(session().presenterSource.prepareCold(source.fd),"race control seals the actual pinned candidate");
         Native d;d.definitions(vs,ps);d.failDuringOwned=true;auto output=d.create();
         require(output==d.candidates&&d.originalDestroys==1,"in-flight observer failure cannot skip original retirement");

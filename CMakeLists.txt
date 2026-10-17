@@ -8,7 +8,7 @@ option(FRAME_MASK_BUILD_TRACE "Build the opt-in passive compositor diagnostic la
 option(FRAME_MASK_BUILD_PIXEL_SNAPSHOT
     "Build an uninstalled one-shot explicit-pattern GPU pixel diagnostic" OFF)
 option(FRAME_PIXEL_SYNTHETIC_PRESENTER
-    "Build the uninstalled explicitly opted-in synthetic-v2 output replacement" OFF)
+    "Build the uninstalled explicitly opted-in synthetic or real-scene native output replacement" OFF)
 option(FRAME_PIXEL_UNIFORM_COMPANION
     "Require a bounded same-command native uniform companion in the uninstalled diagnostic" OFF)
 option(FRAME_PIXEL_SSBO_DEFINITION_JOURNAL
@@ -473,8 +473,12 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_guarded_presenter.py)
         add_test(NAME native_fragment_subgroup_presenter COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_subgroup_presenter.py)
+        add_test(NAME native_fragment_scene_presenter COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_scene_presenter.py)
         add_test(NAME synthetic_presenter_session COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_synthetic_presenter_session.py)
+        add_test(NAME scene_presenter_session COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scene_presenter_session.py)
         add_test(NAME steamvr_camera_alpha COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_steamvr_camera_alpha.py)
         add_test(NAME pixel_uniform_metadata_bridge COMMAND ${Python3_EXECUTABLE} -B
