@@ -16,11 +16,17 @@ constexpr std::size_t MaxChain=16,MaxAttachments=8,MaxLocationEntries=32;
 // not name it yet. Header-only recognition refuses its memory-write/query
 // semantics; no private declaration or payload interpretation is introduced.
 constexpr std::uint32_t PerformanceCountersBeginType=1000605004;
+// Valve's exact Mesa abc426bb62351045a9dcf7fa0a113e6dd810c303 declares
+// vksubpass_begin_info_valve in tu_cmd_buffer.cc. This number alone grants no
+// admission: its private LP64 payload requires an independently checked device
+// and actual operation-specific NEXT entrypoint capability before any read.
+constexpr std::uint32_t ValveSubpassSrgbType=1000109099;
 enum class Reason : std::uint8_t {None,NullInfo,Type,Contents,UnknownExtension,UnsupportedExtension,
-    WrongParent,DuplicateType,ChainCycle,ChainBounds,ArrayBounds,NullArray,DeviceMask,RenderArea,Identity};
+    WrongParent,DuplicateType,ChainCycle,ChainBounds,ArrayBounds,NullArray,DeviceMask,RenderArea,Identity,PrivateValue};
 enum class Chain : std::uint8_t {RenderPassBegin,SubpassBegin,SubpassEnd,Count};
 enum class Termination : std::uint8_t {Complete,Cycle,Bounds};
 enum class Operation : std::uint8_t {Begin,Next,End};
+enum class PrivateProfile : std::uint8_t {None,ValveSubpassSrgbZeroV1};
 struct Refusal {Reason reason=Reason::None;std::uint32_t type=UINT32_MAX,index=UINT32_MAX;Chain chain=Chain::RenderPassBegin;};
 struct Census {std::uint32_t rootType=UINT32_MAX;std::array<std::uint32_t,MaxChain> types{};std::uint32_t count=0;Termination termination=Termination::Complete;};
 struct Shape {
@@ -34,6 +40,8 @@ struct Shape {
     std::uint32_t deviceMask=0,deviceRenderAreaCount=0;VkRect2D deviceRenderArea{};
     std::uint32_t initialLocationCount=0,postLocationCount=0;
     std::array<std::uint32_t,MaxLocationEntries> initialAttachmentIndices{},postSubpassIndices{};
+    PrivateProfile privateProfile=PrivateProfile::None;
+    bool privatePayloadObserved=false;std::uint32_t privateSrgbMask=0;
 };
 inline const char* reasonName(Reason r) noexcept {
     switch(r){
@@ -42,7 +50,7 @@ inline const char* reasonName(Reason r) noexcept {
     N(UnknownExtension,"unknown_extension") N(UnsupportedExtension,"unsupported_extension")
     N(WrongParent,"wrong_parent") N(DuplicateType,"duplicate_type") N(ChainCycle,"chain_cycle")
     N(ChainBounds,"chain_bounds") N(ArrayBounds,"array_bounds") N(NullArray,"null_array")
-    N(DeviceMask,"device_mask") N(RenderArea,"render_area") N(Identity,"identity")
+    N(DeviceMask,"device_mask") N(RenderArea,"render_area") N(Identity,"identity") N(PrivateValue,"private_value")
 #undef N
     }return "invalid_recording_reason";
 }
