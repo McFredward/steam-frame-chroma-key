@@ -55,6 +55,7 @@ struct TransactionTestAccess {
         t.device_=1;t.command_=owned_fixture::object<VkCommandBuffer>(44);t.pool_=owned_fixture::object<VkCommandPool>(55);
         t.commandGeneration_=generation;t.poolGeneration_=poolGeneration;t.family_=7;return t;
     }
+    static void restore(Transaction::TargetTicket& t,Id layout,std::initializer_list<std::uint32_t> values){t.restoreLayout_=layout;t.restoreCount_=unsigned(values.size());std::copy(values.begin(),values.end(),t.restoreOffsets_.begin());}
     static Transaction::TargetTicket target(const Cohort& source,std::uint64_t ordinal=1,std::uint32_t subpass=0){
         Transaction::TargetTicket t;t.tracker_=reinterpret_cast<const frame_pixel_capture::LiveTracker*>(std::uintptr_t(0x111));
         t.device_=1;t.command_=owned_fixture::object<VkCommandBuffer>(44);t.pool_=owned_fixture::object<VkCommandPool>(55);
@@ -76,6 +77,7 @@ struct Recorder {
     std::set<std::uint64_t> fences;
     unsigned fenceCreates=0,fenceDestroys=0,fenceResets=0,markerSubmits=0,invalidates=0,polls=0;
     VkResult createResult=VK_SUCCESS,resetResult=VK_SUCCESS,markerResult=VK_SUCCESS,status=VK_NOT_READY,invalidateResult=VK_SUCCESS;
+    bool mirror=false;std::array<std::uint32_t,5> expectedOffsets{{16,32,64,128,256}};
     bool reenter=false,block=false,entered=false,continueCall=false;
     std::mutex mutex;std::condition_variable condition;
     Transaction* transaction=nullptr;
@@ -109,7 +111,10 @@ VKAPI_ATTR void VKAPI_CALL bindPipeline(VkCommandBuffer cb,VkPipelineBindPoint p
 }
 VKAPI_ATTR void VKAPI_CALL bindSets(VkCommandBuffer cb,VkPipelineBindPoint point,VkPipelineLayout layout,std::uint32_t first,
     std::uint32_t count,const VkDescriptorSet* sets,std::uint32_t dynamic,const std::uint32_t* offsets){
-    require(cb==recorder->command && point==VK_PIPELINE_BIND_POINT_GRAPHICS && layout!=recorder->layout && first==1 && count==1 &&
+    if(recorder->mirror){require(cb==recorder->command&&point==VK_PIPELINE_BIND_POINT_GRAPHICS&&!first&&count==1&&sets&&dynamic==5&&offsets,"mirror and restore touch only Set0 with full original dynamic list");
+        require(std::equal(recorder->expectedOffsets.begin(),recorder->expectedOffsets.end(),offsets),"all dynamic offsets restored including unused bindings1/5/7");
+        require(layout==recorder->layout?sets[0]==obj<VkDescriptorSet>(70):sets[0]==obj<VkDescriptorSet>(900),"owned mirror never substitutes original restore set");
+    }else require(cb==recorder->command && point==VK_PIPELINE_BIND_POINT_GRAPHICS && layout!=recorder->layout && first==1 && count==1 &&
         sets && sets[0]==recorder->set1 && !dynamic && !offsets,"ONLY owned compatible Set1, native Set0/push/dynamic state not rebound");
     recorder->add(Recorder::Op::Sets,frame_pixel_ssbo_clone::handle(sets[0]));
 }
@@ -123,6 +128,7 @@ VKAPI_ATTR void VKAPI_CALL draw(VkCommandBuffer cb,std::uint32_t v,std::uint32_t
 VKAPI_ATTR void VKAPI_CALL drawIndexed(VkCommandBuffer cb,std::uint32_t n,std::uint32_t i,std::uint32_t first,std::int32_t offset,std::uint32_t instance){
     require(cb==recorder->command,"one exact original indexed draw command");
     recorder->add(Recorder::Op::DrawIndexed,0,{n,i,first,static_cast<std::uint32_t>(offset),instance});
+    if(recorder->reenter)recorder->transaction->unknownRoute(cb);
 }
 VKAPI_ATTR VkResult VKAPI_CALL createFence(VkDevice device,const VkFenceCreateInfo* ci,const VkAllocationCallbacks* allocator,VkFence* result){
     require(device==recorder->device && ci->sType==VK_STRUCTURE_TYPE_FENCE_CREATE_INFO && !ci->pNext && !ci->flags && !allocator,"cold unsignaled owned fence");
@@ -165,9 +171,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL multipleProc(VkDevice device,const char
 struct Fixture {
     owned_fixture::Driver ownerDriver;Recorder driver;Transaction transaction;
     owned_fixture::Fixture captured;frame_pixel_ssbo_owned::Clone clone;
-    VkDescriptorSet set0=obj<VkDescriptorSet>(70);Cohort source{};
+    VkDescriptorSet set0=obj<VkDescriptorSet>(70);Cohort source{};std::vector<std::uint32_t> mirrorWords;
     static owned_fixture::Driver* activate(owned_fixture::Driver& d){owned_fixture::driver=&d;return &d;}
-    Fixture(bool noncoherent=false,std::uint32_t subpasses=1,std::uint32_t selected=0):ownerDriver(),driver(),transaction(),captured((activate(ownerDriver),owned_fixture::Fixture{})){
+    Fixture(bool noncoherent=false,std::uint32_t subpasses=1,std::uint32_t selected=0,const char* vs=nullptr,const char* ps=nullptr,const char* probe=nullptr):ownerDriver(),driver(),transaction(),captured((activate(ownerDriver),owned_fixture::Fixture{})){
         ownerDriver.noncoherent=noncoherent;
         if(noncoherent)captured.p.memory.memoryTypes[0].propertyFlags=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         for(unsigned i=0;i<captured.recipe.provenance.size();++i)captured.recipe.provenance[i]={1,(i+1)*10,1};
@@ -175,6 +181,15 @@ struct Fixture {
             captured.recipe.renderPass.subpassCount=subpasses;
             for(unsigned i=1;i<subpasses;++i)*captured.recipe.renderPass.subpass(i)=*captured.recipe.renderPass.subpass(0);
             captured.recipe.graphics.info.subpass=selected;expectedSubpassCount=subpasses;captured.p.downstream=multipleProc;
+        }
+        if(vs){namespace c=frame_pixel_ssbo_clone;ownerDriver.mirror=true;ownerDriver.mirrorSource=set0;driver.mirror=true;
+            const auto vertex=owned_fixture::readShader(vs),fragment=owned_fixture::readShader(ps);mirrorWords=owned_fixture::readShader(probe);c::Refusal why;c::ProbeInterface profile;
+            require(c::ProbeInterface::set0Mirror(vertex.data(),vertex.size()*4,fragment.data(),fragment.size()*4,mirrorWords.data(),mirrorWords.size()*4,profile,why),"private mirror requires both exact original source stages");
+            std::copy(vertex.begin(),vertex.end(),captured.recipe.vertex.words.begin());std::copy(fragment.begin(),fragment.end(),captured.recipe.fragment.words.begin());
+            std::array<VkDescriptorSetLayoutBinding,29> bindings{};for(unsigned i=0;i<29;++i)bindings[i]={i,i<8?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:i==8?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i<25?VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_ALL,nullptr};
+            for(unsigned i:{0u,1u,2u,5u,7u})bindings[i].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            VkDescriptorSetLayoutCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;ci.bindingCount=bindings.size();ci.pBindings=bindings.data();require(c::captureSet0(ci,captured.recipe.set0,why,profile),"mirror retains every original descriptor including unused dynamic slots");
+            captured.p.fragment=mirrorWords.data();captured.p.fragmentBytes=mirrorWords.size()*4;ownerDriver.expectedFragmentBytes=unsigned(captured.p.fragmentBytes);frame_receiver::Sha256 hash;hash.update(captured.p.fragment,captured.p.fragmentBytes);captured.p.fragmentSha256=hash.finish();
         }
         require(clone.prepare(captured.p).status==frame_pixel_ssbo_owned::Status::Ok,"reuse existing real owned-clone finite creation fixture");
         recorder=&driver;driver.transaction=&transaction;driver.probe=clone.pipeline();driver.record=clone.recordBuffer();driver.set1=clone.set1();
@@ -597,6 +612,32 @@ void recordingContexts(){
     for(unsigned i=0;i<=static_cast<unsigned>(RecordingPhase::Retired);++i)require(std::strcmp(phaseName(static_cast<RecordingPhase>(i)),"InvalidPhase"),"every finite phase has a diagnostic name");
 }
 
+void compatibleMirror(const char* vs,const char* ps,const char* probe){
+    for(unsigned mode=0;mode<8;++mode){Fixture f(false,3,1,vs,ps,probe);f.observeDevice();require(f.transaction.configure(f.clone,f.config()),"configured real owned mirror");
+        f.driver.command=obj<VkCommandBuffer>(44);f.driver.pool=obj<VkCommandPool>(55);require(f.transaction.adoptRecording(TransactionTestAccess::recording()),"same-callback original recording ticket");f.arm();
+        require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE)&&f.transaction.nextSubpass(f.driver.command),"whole original pass reaches actual target subpass1");
+        auto ticket=TransactionTestAccess::target(f.source,1,1);TransactionTestAccess::restore(ticket,Id{1,20,777},{16,32,64,128,256});
+        if(mode==4)TransactionTestAccess::restore(ticket,Id{1,999,777},{16,32,64,128,256});
+        if(mode==5)TransactionTestAccess::restore(ticket,Id{1,20,777},{16,32,64,128});
+        const bool adopted=f.transaction.adoptTargetState(ticket);require(adopted==(mode!=4&&mode!=5),"opaque restore uses Core identity and exact full original dynamic count");
+        if(adopted&&mode!=1){require(f.clone.populateMirror(f.set0).status==frame_pixel_ssbo_owned::Status::Ok,"copy before first descriptor bind after buffer-reset lease");auto fresh=ticket;
+            if(mode==2)TransactionTestAccess::restore(fresh,Id{1,20,777},{16,32,64,128,257});
+            if(mode==3)TransactionTestAccess::restore(fresh,Id{1,20,778},{16,32,64,128,256});
+            if(mode==6)fresh=TransactionTestAccess::target(Cohort{Id{1,1001,2},f.source.view,f.source.memory,f.source.layout,f.source.extent},1,1);
+            require(f.transaction.targetStateCurrent(fresh)==(mode!=2&&mode!=3&&mode!=6),"post-copy same-callback proof rejects unused-offset drift/layout generation/source changes");}
+        f.driver.reenter=mode==7;
+        const auto result=f.transaction.drawIndexed(f.driver.command,17,2,4,-3,9);const bool replaced=mode==0||mode==7;
+        require((result==DrawResult::ReplacedOriginal)==replaced,"no owned command without complete populated immutable mirror and fresh exact target state");
+        if(replaced){const auto& c=f.driver.commands;require(c.size()==8&&c[3].op==Recorder::Op::Sets&&c[3].object==900&&c[4].op==Recorder::Op::Pipeline&&c[5].op==Recorder::Op::DrawIndexed&&c[5].args==std::array<std::uint32_t,5>{17,2,4,std::uint32_t(-3),9},"one mirror/probe and exact unchanged original indexed draw");
+            require(c[6].op==Recorder::Op::Pipeline&&c[6].object==60&&c[7].op==Recorder::Op::Sets&&c[7].object==70,"immediate original pipeline then unconditional full native Set0 restoration even after reentry");}
+        if(mode==0){require(f.transaction.draw(f.driver.command,3,1,0,0)==DrawResult::ForwardOriginal&&f.transaction.refusal()==Reason::None,"later same-target original draw is untouched after descriptor-equivalent restoration");
+            require(f.transaction.nextSubpass(f.driver.command),"later original inline subpass allowed");require(f.transaction.drawIndexed(f.driver.command,6,1,0,0,0)==DrawResult::ForwardOriginal,"later-subpass original draw untouched");f.transaction.endRenderPass(f.driver.command);const auto ended=f.driver.commands.size();
+            require(f.transaction.beginRenderPass(f.driver.command,obj<VkRenderPass>(999),VK_SUBPASS_CONTENTS_INLINE)==false&&f.transaction.refusal()==Reason::None,"unrelated later whole native pass retains no target authority");require(f.transaction.draw(f.driver.command,3,1,0,0)==DrawResult::ForwardOriginal,"later pass native draw not substituted");f.transaction.endRenderPass(f.driver.command);
+            require(f.driver.commands.size()==ended&&f.ownerDriver.copies==1,"one selected observer, one copy, one reset and one HOST barrier for full reusable recording");f.transaction.endCommand(f.driver.command,VK_SUCCESS);f.driver.status=VK_SUCCESS;f.submitOriginal();RecordView view;require(!f.transaction.publish(f.readback(),view),"mirror cohort cannot publish before exact generation retirement");f.retire();require(f.transaction.publish(f.readback(),view)&&view.execution==1,"same final owned fence and source cohort required for mirror publication");}
+        f.release();
+    }
+}
+
 void reentryAndConcurrency(){
     for(bool threaded:{false,true}){
         Fixture f;f.initialize();f.arm();require(f.transaction.beginRenderPass(f.driver.command,f.driver.pass,VK_SUBPASS_CONTENTS_INLINE),"test pass");f.prefix();
@@ -612,6 +653,7 @@ void reentryAndConcurrency(){
 }
 }
 int main(int argc,char** argv){
+    if(argc==5&&!std::strcmp(argv[1],"mirror")){compatibleMirror(argv[2],argv[3],argv[4]);std::cout<<"compatible mirror transaction checks="<<checks<<" owner="<<owned_fixture::checks<<'\n';return 0;}
     if(argc==2 && !std::strcmp(argv[1],"contexts")){recordingContexts();std::cout<<"recording context checks="<<checks<<'\n';return 0;}
     if(argc==2 && !std::strcmp(argv[1],"subpasses")){multipleSubpassRecordings();std::cout<<"subpass transaction checks="<<checks<<'\n';return 0;}
     if(argc==2 && !std::strcmp(argv[1],"priorities")){originalQueuePriorities();std::cout<<"queue priority checks="<<checks<<'\n';return 0;}

@@ -23,10 +23,11 @@ namespace journal_fixture {
 #include "layer/pixel_snapshot_layer.cpp"
 
 namespace {
-enum class HookEvent {Begin,Next,End,NativeIndexed,OwnedIndexed,OriginalPipeline,OwnedPipeline,HostBarrier,DescriptorSets,DynamicState,OriginalSubmit,MarkerSubmit,Unknown};
+enum class HookEvent {Begin,Next,End,NativeIndexed,OwnedIndexed,OriginalPipeline,OwnedPipeline,HostBarrier,DescriptorSets,DynamicState,OriginalSubmit,MarkerSubmit,Unknown,MirrorSets,RestoreSets};
 struct HookCalls {
     unsigned creates=0,begins=0,nexts=0,ends=0,nativeIndexed=0,ownedIndexed=0,commandBegins=0,commandEnds=0,idles=0,destroys=0;
     std::array<unsigned,4> coreRoute{},khrRoute{};
+    unsigned mirrorBinds=0,restoreBinds=0;
     unsigned sets=0,dynamics=0,submits=0,markers=0,unknowns=0;
     std::array<unsigned,unsigned(frame_pixel_ssbo_transaction::Operation::Count)> unknownCalls{};
     VkResult createResult=VK_SUCCESS;
@@ -42,7 +43,11 @@ unsigned ownedResets=0,ownedFences=0,availableRP2Routes=3;
 unsigned ownedPassCount=1,ownedTargetSubpass=0,ownedLegacyPasses=0,ownedPasses2=0,ownedPasses2Core=0,ownedPasses2KHR=0;
 void emulateShader(){const std::array<std::uint32_t,4> header{{1,0x5353424f,1,32}};std::memcpy(owned_fixture::driver->mapped.data(),header.data(),16);}
 VKAPI_ATTR void VKAPI_CALL hookFill(VkCommandBuffer,VkBuffer,VkDeviceSize,VkDeviceSize,std::uint32_t){++ownedResets;}
-VKAPI_ATTR void VKAPI_CALL hookSets(VkCommandBuffer,VkPipelineBindPoint,VkPipelineLayout,std::uint32_t,std::uint32_t,const VkDescriptorSet*,std::uint32_t,const std::uint32_t*){}
+VKAPI_ATTR void VKAPI_CALL hookSets(VkCommandBuffer c,VkPipelineBindPoint point,VkPipelineLayout layout,std::uint32_t first,std::uint32_t count,const VkDescriptorSet* sets,std::uint32_t dynamic,const std::uint32_t* offsets){
+    require(c==hookCalls.command&&point==VK_PIPELINE_BIND_POINT_GRAPHICS&&!first&&count==1&&sets&&dynamic==1&&offsets&&offsets[0]==hookCalls.dynamicOffset,"mirror exact Set0 with complete native dynamic offsets");
+    if(layout==pl){require(sets[0]==ds,"unconditional native Set0 restoration uses exact original layout/set");++hookCalls.restoreBinds;hookCalls.events.push_back(HookEvent::RestoreSets);}
+    else {require(sets[0]==h<VkDescriptorSet>(900),"only immutable privately owned mirror bound");++hookCalls.mirrorBinds;hookCalls.events.push_back(HookEvent::MirrorSets);}
+}
 VKAPI_ATTR void VKAPI_CALL hookDraw(VkCommandBuffer,std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t){emulateShader();}
 VKAPI_ATTR VkResult VKAPI_CALL hookFence(VkDevice,const VkFenceCreateInfo*,const VkAllocationCallbacks*,VkFence* out){++ownedFences;*out=h<VkFence>(9000);return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL hookDestroyFence(VkDevice,VkFence,const VkAllocationCallbacks*){--ownedFences;}
@@ -55,7 +60,7 @@ VKAPI_ATTR VkResult VKAPI_CALL hookSubmit(VkQueue queue,std::uint32_t count,cons
 VKAPI_ATTR VkResult VKAPI_CALL hookInvalidate(VkDevice,std::uint32_t,const VkMappedMemoryRange*){return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL hookSetLayout(VkDevice d,const VkDescriptorSetLayoutCreateInfo* ci,const VkAllocationCallbacks* a,VkDescriptorSetLayout* out){
     owned_fixture::common(d,a);const bool first=!owned_fixture::driver->set0;
-    require(first?ci->bindingCount==6:ci->bindingCount==1,"full original six-binding prefix and own storage Set1");
+    require(first&&ci->bindingCount==8,"full compatible original eight-binding mirror with no extra set");
     const auto result=owned_fixture::driver->create(first?frame_pixel_ssbo_owned::Stage::Set0:frame_pixel_ssbo_owned::Stage::Set1,out);
     if(result==VK_SUCCESS)(first?owned_fixture::driver->set0:owned_fixture::driver->set1)=*out;
     return result;
@@ -234,16 +239,16 @@ struct HookFixture {
     VkSubpassDescription2 subpass=info<VkSubpassDescription2>(VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2);
     std::array<VkSubpassDescription2,3> allSubpasses{};
     VkRenderPassCreateInfo2 pass=info<VkRenderPassCreateInfo2>(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);
-    std::array<VkDescriptorSetLayoutBinding,6> setDefinitions{};
+    std::array<VkDescriptorSetLayoutBinding,8> setDefinitions{};
     float priority=1;VkDeviceQueueCreateInfo queue=info<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
     HookFixture(unsigned subpasses=1,unsigned selected=0,unsigned routes=3){
         hookCalls={};ownedResets=ownedFences=0;availableRP2Routes=routes;hookCalls.command=command;hookCalls.dispatchDevice=dispatchDevice;hookCalls.queue=queueHandle;hookCalls.dynamicOffset=native->dynamicOffset;owned_fixture::driver=&driver;
-        driver.expectedCount=1;driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
+        driver.expectedCount=1;driver.mirror=true;driver.mirrorBindings=8;driver.mirrorSource=ds;driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::MirrorSparse32Bytes;
         ownedPassCount=subpasses;ownedTargetSubpass=selected;ownedLegacyPasses=ownedPasses2=ownedPasses2Core=ownedPasses2KHR=0;
         shape.nativeSet=sl;shape.graphics.layout=pl;shape.graphics.renderPass=h<VkRenderPass>(30);shape.stages[0].module=vs;shape.stages[1].module=fs;shape.push={VK_SHADER_STAGE_VERTEX_BIT,0,16};
         shape.graphics.subpass=selected;
         for(unsigned i=0;i<5;++i)setDefinitions[i]={frame_pixel_uniform::UniformBindings[i],i==1?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr};
-        setDefinitions.back()={9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};shape.set.bindingCount=6;shape.set.pBindings=setDefinitions.data();
+        setDefinitions[5]={8,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};setDefinitions[6]={9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};setDefinitions[7]={25,VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};shape.set.bindingCount=8;shape.set.pBindings=setDefinitions.data();
         queue.queueCount=1;queue.queueFamilyIndex=3;queue.pQueuePriorities=&priority;shape.device.queueCreateInfoCount=1;shape.device.pQueueCreateInfos=&queue;
         auto deviceContext=std::make_unique<Device>();context=deviceContext.get();context->native=h<VkDevice>(1);context->id=device;context->gdpa=hookGdpa;
         loadRenderPass2Dispatch(*context,dispatchDevice);
@@ -294,9 +299,9 @@ struct HookFixture {
         require(context->definitions.createSet(sl,shape.set,VK_SUCCESS)&&context->definitions.createLayout(pl,shape.layout,VK_SUCCESS),"same original cold Set0/push definitions");
         shape.graphics.renderPass=createPass(khr);require(context->definitions.inspectStats().live[3]==1,"actual exported Create2 records complete original pass");
         require(native->tracker.destroyPipeline(device,pipeline)&&native->tracker.destroyShader(device,vs)&&native->tracker.destroyShader(device,fs),"retire synthetic shader seed before private originals");
-        require(native->tracker.observe([&](auto& core){core.destroyPipelineLayout(device,pl);core.createPipelineLayout(device,pl,shape.layout);}),"same Core layout generation follows original definition");
-        const auto vertex=journal_fixture::readShader(vertexPath),fragment=journal_fixture::readShader(fragmentPath);
-        auto module=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);module.codeSize=fragment.size()*4;module.pCode=fragment.data();context->bridge.shaderCreated(module,context->definitions);
+        require(native->tracker.observe([&](auto& core){core.destroyPipelineLayout(device,pl);core.freeSets(device,dp,1,&ds);core.freeSets(device,dp,1,&ds2);core.destroySetLayout(device,sl);core.createSetLayout(device,sl,shape.set);core.createPipelineLayout(device,pl,shape.layout);auto a=info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);a.descriptorPool=dp;a.descriptorSetCount=1;a.pSetLayouts=&sl;core.allocateSets(device,a,&ds);core.allocateSets(device,a,&ds2);auto sampler=info<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);core.createSampler(device,h<VkSampler>(1600),sampler);VkDescriptorImageInfo im{};im.sampler=h<VkSampler>(1600);auto w=info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);w.dstSet=ds;w.dstBinding=25;w.descriptorCount=1;w.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLER;w.pImageInfo=&im;core.updateSets(device,1,&w,0,nullptr);}),"same Core layout generation follows original definition");
+        const auto vertex=journal_fixture::readShader(vertexPath),fragment=journal_fixture::readShader(fragmentPath);native->write(ds);native->writeUniforms(ds);
+        auto module=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);module.codeSize=fragment.size()*4;module.pCode=fragment.data();context->bridge.shaderCreated(module,context->definitions);module.codeSize=vertex.size()*4;module.pCode=vertex.data();context->bridge.shaderCreated(module,context->definitions);
         module.codeSize=vertex.size()*4;module.pCode=vertex.data();require(context->definitions.createShader(vs,module,VK_SUCCESS)&&native->tracker.createShader(device,vs,module),"private original vertex observed, no test pin bypass");
         module.codeSize=fragment.size()*4;module.pCode=fragment.data();require(context->definitions.createShader(fs,module,VK_SUCCESS)&&native->tracker.createShader(device,fs,module),"private original fragment observed, no test pin bypass");
         frame_pixel_ssbo_journal::Event event;
@@ -606,7 +611,7 @@ void multipleSubpassHooks(const char* vertex,const char* fragment,unsigned count
         require(state.replaced&&state.refusal==frame_pixel_ssbo_receiver::Refusal::None&&!state.transaction,"actual exported legacy/Core2/KHR reaches exact configured nonzero-subpass transaction");
         require(hookCalls.ownedIndexed==1&&!hookCalls.nativeIndexed,"nonzero-subpass original indexed draw never duplicated");
         const auto draw=std::find(events.begin(),events.end(),HookEvent::OwnedIndexed);
-        require(draw!=events.end()&&draw+1!=events.end()&&*(draw+1)==HookEvent::OriginalPipeline,"immediate original pipeline restoration survives actual Next2 route");
+        require(draw!=events.end()&&draw+1!=events.end()&&*(draw+1)==HookEvent::OriginalPipeline&&draw+2!=events.end()&&*(draw+2)==HookEvent::RestoreSets,"immediate original pipeline and exact Set0 restoration survives actual Next2 route");
         require(events.size()>=2&&events[events.size()-2]==HookEvent::End&&events.back()==HookEvent::HostBarrier,"HOST/source work follows final whole-pass original End only");
     }else{
         require(state.refusal==frame_pixel_ssbo_receiver::Refusal::UnknownRoute&&!hookCalls.ownedIndexed&&hookCalls.nativeIndexed==1,"unknown Next2 child extension refuses only observer and preserves one original draw");

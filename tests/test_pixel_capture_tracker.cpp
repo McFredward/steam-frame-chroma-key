@@ -77,6 +77,7 @@ struct TransactionTestAccess {
     }
     static bool empty(const Transaction::TargetTicket& t) { return !t.tracker_ && !t.device_ && !t.ordinal_; }
     static std::uint32_t subpass(const Transaction::TargetTicket& t) { return t.subpass_; }
+    static bool restore(const Transaction::TargetTicket& t){return t.restoreLayout_.value==20&&t.restoreLayout_.generation&&t.restoreLayout_.generation!=t.layout_.generation&&t.restoreCount_==4&&std::equal(t.restoreOffsets_.begin(),t.restoreOffsets_.begin()+4,std::array<std::uint32_t,4>{{16,256,64,128}}.begin());}
 };
 }
 #endif
@@ -1142,6 +1143,20 @@ void ssboSubpassTickets() {
     require(mismatch->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE)&&mismatch->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"current original scope independently reaches subpass1");mismatch->tracker.draw(device,cb);
     require(!mismatch->tracker.ssboTargetTicket(device,cb,recipe,ticket),"matching current/recipe index cannot erase the pipeline's actual created-subpass identity");
 }
+void ssboRestoreOffsets(){
+    using Access=frame_pixel_ssbo_transaction::TransactionTestAccess;using Ticket=frame_pixel_ssbo_transaction::Transaction::TargetTicket;
+    auto f=uniformFixture();require(f->tracker.destroyPipeline(device,pipeline),"retire prior pipeline before full original dynamic layout");
+    std::array<VkDescriptorSetLayoutBinding,11> definitions{};const std::array<unsigned,11> order{{25,9,8,7,6,5,4,3,2,1,0}};
+    for(unsigned i=0;i<order.size();++i){const auto n=order[i];definitions[i]={n,n==25?VK_DESCRIPTOR_TYPE_SAMPLER:n==9?VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:n==8?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:(n==1||n==2||n==5||n==7)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr};}
+    require(f->tracker.observe([&](auto& core){core.destroyPipelineLayout(device,pl);core.freeSets(device,dp,1,&ds);core.freeSets(device,dp,1,&ds2);core.destroySetLayout(device,sl);auto set=info<VkDescriptorSetLayoutCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);set.bindingCount=definitions.size();set.pBindings=definitions.data();core.createSetLayout(device,sl,set);auto layout=info<VkPipelineLayoutCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);layout.setLayoutCount=1;layout.pSetLayouts=&sl;core.createPipelineLayout(device,pl,layout);auto alloc=info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);alloc.descriptorPool=dp;alloc.descriptorSetCount=1;alloc.pSetLayouts=&sl;core.allocateSets(device,alloc,&ds);auto sampler=info<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);core.createSampler(device,h<VkSampler>(1500),sampler);VkDescriptorImageInfo im{};im.sampler=h<VkSampler>(1500);auto write=info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);write.dstSet=ds;write.dstBinding=25;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLER;write.pImageInfo=&im;core.updateSets(device,1,&write,0,nullptr);}),"observe complete original layout with unsorted declarations and unused dynamic descriptors");
+    f->write(ds);f->writeUniforms(ds);f->makePipeline(pipeline,pl,"PS_DISTORT");
+    frame_pixel_ssbo_clone::Recipe recipe;recipe.definitionComplete=true;const std::array<unsigned,6> handles{{10,20,2000,100,101,110}};for(unsigned i=0;i<6;++i)recipe.provenance[i]={1,handles[i],900+i};
+    require(f->tracker.ssboDeviceCreated(device,h<VkDevice>(1))&&f->tracker.ssboPipelineCreated(device,pipeline,recipe.provenance[5]),"separate Journal creation and Core original-layout generations associated");
+    std::array<std::uint32_t,4> offsets{{16,256,64,128}};require(f->tracker.bindPipeline(device,cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline)&&f->tracker.observe([&](auto& core){core.bindSets(device,cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pl,0,1,&ds,offsets.size(),offsets.data());}),"original full dynamic offset array observed");
+    require(f->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE)&&f->tracker.draw(device,cb),"actual target draw consumes original source prefix");Ticket ticket;
+    require(f->tracker.ssboTargetTicket(device,cb,recipe,ticket)&&Access::restore(ticket),"private restore ticket retains all sorted original offsets including unused1/5/7 without equating Journal/Core generation");
+    require(f->tracker.observe([&](auto& core){const auto previous=core.snapshot(device,cb,pl);frame_bindings::Set0RestoreSnapshot state;require(core.set0Restore(previous,state)&&state.count==4&&state.offsets[3]==128,"bounded readout agrees with complete original bind");++offsets[3];core.bindSets(device,cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pl,0,1,&ds,offsets.size(),offsets.data());require(!core.set0Restore(previous,state)&&!state.count,"old binding revision cannot authorize restoring changed unused dynamic offset");}),"same callback readout uses exact full Core revision");
+}
 void ssboNativeTickets() {
     using Transaction = frame_pixel_ssbo_transaction::Transaction;
     using Access = frame_pixel_ssbo_transaction::TransactionTestAccess;
@@ -1252,6 +1267,9 @@ void ssboNativeTickets() {
 }
 
 int main(int argc, char** argv) {
+#ifdef FRAME_PIXEL_SSBO_TRANSACTION
+    if(argc==2&&!std::strcmp(argv[1],"ssbo-restore")){ssboRestoreOffsets();std::cout<<"SSBO restore checks="<<checks<<'\n';return 0;}
+#endif
 #ifdef FRAME_PIXEL_SSBO_TRANSACTION
     if (argc == 2 && !std::strcmp(argv[1], "ssbo-subpasses")) {
         ssboSubpassTickets();std::cout << "pixel SSBO subpass tickets: " << checks << " checks passed\n";return 0;

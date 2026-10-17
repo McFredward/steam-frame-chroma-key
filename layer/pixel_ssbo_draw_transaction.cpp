@@ -261,7 +261,7 @@ bool Transaction::targetStateCurrent(const TargetTicket& ticket) noexcept {
     Guard guard(*this);if(!guard)return false;
     ContextScope context(*this,ticket.command_,{},Operation::TargetTicket);
     if(!configured_||!clone_->compatibleSet0Mirror()||!active(ticket.command_)||selected_||!prefixValid_||
-       !adoptedTracker_||ticket.tracker_!=adoptedTracker_||ticket.device_!=frame_pixel_ssbo_clone::handle(device_)||
+       !inPass_||!matchingPass_||current_!=original_||!adoptedTracker_||ticket.tracker_!=adoptedTracker_||ticket.device_!=frame_pixel_ssbo_clone::handle(device_)||
        ticket.commandGeneration_!=generation_||ticket.pool_!=pool_||ticket.poolGeneration_!=poolGeneration_||
        ticket.ordinal_!=drawOrdinal_+1||ticket.subpass_!=currentSubpass_||ticket.subpass_!=targetSubpass_||
        !same(ticket.pipeline_,provenance_[5])||!same(ticket.layout_,provenance_[1])||!same(ticket.set0_,setIdentity_)||

@@ -28,9 +28,10 @@ namespace journal_fixture {
 namespace {
 using Bridge=frame_pixel_ssbo_receiver::Bridge;
 namespace tx=frame_pixel_ssbo_transaction;
-unsigned expectedPrefixBindings=6;
+unsigned expectedPrefixBindings=8;
 unsigned expectedSubpassCount=1;
-Bridge* failHistoryOnCreate=nullptr;
+Bridge* failHistoryOnCreate=nullptr;Bridge* copyingBridge=nullptr;Fixture* copyingFixture=nullptr;unsigned copyMutation=0;
+void mutationDuringCopy(){if(copyMutation==12)copyingBridge->descriptorMutation(ds);if(copyMutation==13){++copyingFixture->dynamicOffset;copyingFixture->bind();}if(copyMutation==14)copyingBridge->resourceRetiring(tx::Resource::Image,frame_bindings::handle(image));}
 struct Calls {unsigned resets=0,draws=0,indexed=0,markers=0,fences=0,hostBarriers=0;bool signaled=true;} calls;
 VKAPI_ATTR void VKAPI_CALL mockBarrier(VkCommandBuffer,VkPipelineStageFlags,VkPipelineStageFlags destination,VkDependencyFlags,
     std::uint32_t,const VkMemoryBarrier*,std::uint32_t,const VkBufferMemoryBarrier*,std::uint32_t,const VkImageMemoryBarrier*){if(destination==VK_PIPELINE_STAGE_HOST_BIT)++calls.hostBarriers;}
@@ -85,8 +86,8 @@ void historyGuards(){
     require(earlier.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::Device,"history failure never overwrites an earlier permanent refusal");
 }
 void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned mode,unsigned subpasses=1){
-    calls={};failHistoryOnCreate=nullptr;expectedPrefixBindings=6;expectedSubpassCount=subpasses;owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;
-    driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
+    calls={};failHistoryOnCreate=nullptr;expectedPrefixBindings=8;expectedSubpassCount=subpasses;owned_fixture::Driver driver;owned_fixture::driver=&driver;driver.expectedCount=1;driver.mirror=true;driver.mirrorBindings=expectedPrefixBindings;driver.mirrorSource=ds;
+    driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::MirrorSparse32Bytes;
     owned_fixture::Fixture limits;
     auto native=std::make_unique<Fixture>(true,0,VK_COMMAND_BUFFER_LEVEL_PRIMARY,0,true);
     Bridge b;frame_pixel_ssbo_journal::Journal journal{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
@@ -94,9 +95,9 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     std::array<VkSubpassDescription,3> originalSubpasses{};
     if(subpasses>1){require(subpasses<=originalSubpasses.size(),"bounded multi-subpass callback fixture");for(unsigned i=0;i<subpasses;++i)originalSubpasses[i]=shape.sub;shape.pass.subpassCount=subpasses;shape.pass.pSubpasses=originalSubpasses.data();shape.graphics.subpass=1;}
     shape.stages[0].module=vs;shape.stages[1].module=fs;shape.push={VK_SHADER_STAGE_VERTEX_BIT,0,16};
-    std::array<VkDescriptorSetLayoutBinding,6> definitions{};
+    std::array<VkDescriptorSetLayoutBinding,8> definitions{};
     for(unsigned i=0;i<5;++i)definitions[i]={frame_pixel_uniform::UniformBindings[i],i==1?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_ALL,nullptr};
-    definitions.back()={9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};shape.set.bindingCount=6;shape.set.pBindings=definitions.data();
+    definitions[5]={8,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};definitions[6]={9,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};definitions[7]={25,VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};shape.set.bindingCount=8;shape.set.pBindings=definitions.data();
     float priority=1;auto q=info<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);q.queueCount=1;q.queueFamilyIndex=3;q.pQueuePriorities=&priority;
     shape.device.queueCreateInfoCount=1;shape.device.pQueueCreateInfos=&q;
     VkPhysicalDeviceProperties properties{};properties.limits=limits.p.limits;
@@ -104,10 +105,13 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     require(native->tracker.ssboDeviceCreated(device,h<VkDevice>(1)),"production tracker observes actual mock device identity");
     shape.initialize(journal);shape.definitions(journal);
     require(native->tracker.destroyPipeline(device,pipeline)&&native->tracker.destroyShader(device,vs)&&native->tracker.destroyShader(device,fs),"retire synthetic setup target before real original definitions");
-    require(native->tracker.observe([&](auto& core){core.destroyPipelineLayout(device,pl);core.createPipelineLayout(device,pl,shape.layout);}),"both observers consume identical original push-range/layout input");
+    require(native->tracker.observe([&](auto& core){core.destroyPipelineLayout(device,pl);core.freeSets(device,dp,1,&ds);core.freeSets(device,dp,1,&ds2);core.destroySetLayout(device,sl);core.createSetLayout(device,sl,shape.set);core.createPipelineLayout(device,pl,shape.layout);auto a=info<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);a.descriptorPool=dp;a.descriptorSetCount=1;a.pSetLayouts=&sl;core.allocateSets(device,a,&ds);core.allocateSets(device,a,&ds2);}),"both observers consume identical original push-range/layout input");
     const auto vertex=journal_fixture::readShader(vertexPath),fragment=journal_fixture::readShader(fragmentPath);
+    native->write(ds);native->writeUniforms(ds);
+    require(native->tracker.observe([&](auto& core){auto sampler=info<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);core.createSampler(device,h<VkSampler>(1600),sampler);VkDescriptorImageInfo image{};image.sampler=h<VkSampler>(1600);auto w=info<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);w.dstSet=ds;w.dstBinding=25;w.descriptorCount=1;w.descriptorType=VK_DESCRIPTOR_TYPE_SAMPLER;w.pImageInfo=&image;core.updateSets(device,1,&w,0,nullptr);}),"required original sampler is defined for mirror copy");
     auto module=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);module.codeSize=fragment.size()*4;module.pCode=fragment.data();
-    b.shaderCreated(module,journal);require(b.snapshot().profile,"actual private original PS pins sparse32 canonical count1 artifact");
+    b.shaderCreated(module,journal);require(!b.snapshot().profile,"one original stage alone cannot authorize compatible mirror");
+    module.codeSize=vertex.size()*4;module.pCode=vertex.data();b.shaderCreated(module,journal);require(b.snapshot().profile,"both actual original stages pin compatible mirror");
     module.codeSize=vertex.size()*4;module.pCode=vertex.data();require(journal.createShader(vs,module,VK_SUCCESS)&&native->tracker.createShader(device,vs,module),"same original private VS callback to both observers");
     module.codeSize=fragment.size()*4;module.pCode=fragment.data();require(journal.createShader(fs,module,VK_SUCCESS)&&native->tracker.createShader(device,fs,module),"same original private PS callback to both observers");
     frame_pixel_ssbo_journal::Event event;require(journal.createPipeline(pipeline,shape.graphics,VK_SUCCESS,&event)&&native->tracker.createPipeline(device,pipeline,shape.graphics),"production cold recipe assembled from retained actual private shader definitions");
@@ -185,7 +189,12 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
         const auto retirement=b.beforeRetirement(tx::Retirement::ResetCommand,cb);b.afterRetirement(retirement,VK_SUCCESS);require(!b.tracks(cb),"failed history still retires exact adopted command generation");
         require(b.release(VK_SUCCESS) && driver.live.empty() && !calls.fences,"adopted history loss does not loosen retirement or leak owned resources");return;
     }
-    require(b.draw(native->tracker,device,cb,6,1,0,0,-3,true)&&calls.indexed==1&&!calls.draws,"one exact indexed target replaced once with original args, never duplicated");
+    if(mode>=12){copyingBridge=&b;copyingFixture=native.get();copyMutation=mode;driver.copyCallback=mutationDuringCopy;}
+    const bool replaced=b.draw(native->tracker,device,cb,6,1,0,0,-3,true);
+    driver.copyCallback=nullptr;copyingBridge=nullptr;copyingFixture=nullptr;
+    if(mode>=12){require(!replaced&&!calls.indexed&&!calls.draws&&driver.copies==1&&b.snapshot().refusal!=frame_pixel_ssbo_receiver::Refusal::None,"descriptor/resource epoch or original offset drift during copy refuses BEFORE every owned bind/draw");const auto retired=b.beforeRetirement(tx::Retirement::ResetCommand,cb);b.afterRetirement(retired,VK_SUCCESS);require(b.release(VK_SUCCESS)&&driver.live.empty(),"copy-time refusal preserves buffer lease retirement and releases immutable mirror");return;}
+    require(replaced&&calls.indexed==1&&!calls.draws,"one exact indexed target replaced once with original args, never duplicated");
+    if(mode==11){native->tracker.draw(device,cb);require(!b.draw(native->tracker,device,cb,6,1,0,0,-3,true)&&calls.indexed==1&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None&&!b.snapshot().transaction,"later selected native indexed draw forwards once without second target adoption/copy/substitution");}
     require(native->tracker.observe([&](auto& core){auto pool=info<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);pool.maxSets=1;core.createPool(device,h<VkDescriptorPool>(999),pool);}),"observe independent unrelated original descriptor pool");
     b.descriptorPoolRetiring(native->tracker,device,h<VkDescriptorPool>(999));b.descriptorMutation(uiDs);b.resourceRetiring(tx::Resource::Image,999);
     require(b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None&&!b.snapshot().transaction,"unrelated descriptor pools, sets and image destruction preserve selected generation");
@@ -195,8 +204,9 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
     require(!calls.hostBarriers,"no readback barrier before full original renderpass End");
     if(subpasses==3){require(native->tracker.nextSubpass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"original final empty subpass after selected draw");b.nextPass(cb,VK_SUBPASS_CONTENTS_INLINE);require(!calls.hostBarriers,"Next never inserts HOST/copy work inside original multi-subpass renderpass");}
     Candidate candidate;require(native->tracker.endRenderPass(device,cb,candidate),"matching source candidate from production tracker");b.endPass(cb);
-    if(mode<3)require(calls.hostBarriers==1,"whole original End emits one outside-pass HOST barrier");
+    if(mode<3||mode==11)require(calls.hostBarriers==1,"whole original End emits one outside-pass HOST barrier");
     if(mode!=1)b.copyRecorded(candidate);
+    if(mode==11){require(native->tracker.beginRenderPass(device,cb,VK_SUBPASS_CONTENTS_INLINE),"later native whole pass opens");b.beginPass(cb,h<VkRenderPass>(99),VK_SUBPASS_CONTENTS_INLINE);native->tracker.draw(device,cb);require(!b.draw(native->tracker,device,cb,3,1,0,0,0,false),"later native whole-pass draw untouched");Candidate ignored;native->tracker.endRenderPass(device,cb,ignored);b.endPass(cb);require(calls.hostBarriers==1&&driver.copies==1,"later original pass neither copies mirror nor emits extra HOST barrier");}
     b.endCommand(cb,VK_SUCCESS);
     auto submit=info<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);submit.commandBufferCount=1;submit.pCommandBuffers=&cb;
     for(unsigned i=0;i<(mode?1u:2u);++i){const auto ticket=b.beforeSubmit(h<VkQueue>(2),1,&submit);b.afterSubmit(ticket,h<VkQueue>(2),1,&submit,VK_SUCCESS);}
@@ -210,13 +220,13 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
         b.definitionObservationFailed();const auto markers=calls.markers;
         require(!b.publish(source,record) && !record.record && !record.bytes && b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::DefinitionHistory,"retired otherwise-complete record cannot publish after missing definition history");
         b.definitionObservationFailed();require(!b.publish(source,record) && calls.markers==markers,"repeated late history failure neither publishes bytes nor submits work");
-    }else if(mode==0){
-        require(b.publish(source,record)&&record.execution==2,"independently counted final raw-copy replay matches original-invocation SSBO execution");
+    }else if(mode==0||mode==11){
+        require(b.publish(source,record)&&record.execution==(mode==0?2u:1u),"independently counted final raw-copy replay matches original-invocation SSBO execution");
         require(native->tracker.beginCommand(device,cb,native->beginInfo,true),"replacement generation legitimately reuses native raw handle");
         b.pipeline(cb,pipeline);b.descriptorMutation(ds);b.resourceRetiring(tx::Resource::Image,frame_bindings::handle(image));
         b.definitionRetiring(frame_pixel_ssbo_journal::ObjectKind::Pipeline,frame_bindings::handle(pipeline));
         const auto later=b.beforeSubmit(h<VkQueue>(2),1,&submit);b.afterSubmit(later,h<VkQueue>(2),1,&submit,VK_SUCCESS);
-        require(b.publish(source,record)&&record.execution==2&&b.snapshot().sourceExecutions==2,"replacement generation/descriptor updates never alter old immutable record");
+        require(b.publish(source,record)&&record.execution==(mode==0?2u:1u)&&b.snapshot().sourceExecutions==(mode==0?2u:1u),"replacement generation/descriptor updates never alter old immutable record");
     }else if(mode==1){
         require(!b.publish(source,record)&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::CopyCohort,"missing raw-copy cohort never publishes or strands accepted private submit nonce");
     }else if(mode==3){
@@ -235,7 +245,7 @@ void privateCallbacks(const char* vertexPath,const char* fragmentPath,unsigned m
 // creation metadata does not establish their simultaneous native lifetimes.
 void privateVariantSelection(const char* vertexPath,const char* fragmentPath,unsigned selected,bool stale){
     calls={};expectedPrefixBindings=29;expectedSubpassCount=1;owned_fixture::Driver driver;owned_fixture::driver=&driver;
-    driver.expectedCount=1;driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::Sparse32Bytes;
+    driver.expectedCount=1;driver.mirror=true;driver.mirrorBindings=expectedPrefixBindings;driver.mirrorSource=ds;driver.expectedFragmentBytes=frame_pixel_ssbo_clone::ProbeInterface::MirrorSparse32Bytes;
     owned_fixture::Fixture limits;auto native=std::make_unique<Fixture>(true,0,VK_COMMAND_BUFFER_LEVEL_PRIMARY,0,true);
     Bridge b;frame_pixel_ssbo_journal::Journal journal{1,{},frame_pixel_ssbo_journal::PendingCount1::RetainFacts};
     journal_fixture::Fixture shape;
@@ -250,7 +260,7 @@ void privateVariantSelection(const char* vertexPath,const char* fragmentPath,uns
     require(native->tracker.destroyPipeline(device,pipeline)&&native->tracker.destroyShader(device,vs)&&native->tracker.destroyShader(device,fs),"retire only synthetic seed target before actual private definitions");
     require(native->tracker.observe([&](auto& core){core.destroyPipelineLayout(device,pl);core.destroySetLayout(device,sl);core.freeSets(device,dp,1,&ds);auto pool=info<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);pool.maxSets=16;core.createPool(device,h<VkDescriptorPool>(100000),pool);auto sampler=info<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);core.createSampler(device,h<VkSampler>(100001),sampler);}),"prepare independent actual-prefix mock descriptor pool and sampler");
     const auto vertex=journal_fixture::readShader(vertexPath),fragment=journal_fixture::readShader(fragmentPath);
-    auto module=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);module.codeSize=fragment.size()*4;module.pCode=fragment.data();b.shaderCreated(module,journal);
+    auto module=info<VkShaderModuleCreateInfo>(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);module.codeSize=fragment.size()*4;module.pCode=fragment.data();b.shaderCreated(module,journal);module.codeSize=vertex.size()*4;module.pCode=vertex.data();b.shaderCreated(module,journal);
     std::array<VkDescriptorSet,6> sets{};std::array<VkPipelineLayout,6> layouts{};std::array<VkPipeline,6> pipelines{};std::array<VkRenderPass,6> passes{};
     std::array<frame_pixel_ssbo_clone::Identity,6> identities{};
     for(unsigned i=0;i<6;++i){
@@ -278,7 +288,7 @@ void privateVariantSelection(const char* vertexPath,const char* fragmentPath,uns
     const auto fifth=candidate(cb,4),sixth=candidate(other,5);const auto chosen=selected==4?fifth:sixth;const auto ignored=selected==4?sixth:fifth;
     b.learn(chosen);b.learn(ignored);
     if(stale){require(journal.destroyPipeline(pipelines[selected])&&native->tracker.destroyPipeline(device,pipelines[selected]),"selected original generation actually retired before cold lookup");require(journal.createPipeline(pipelines[selected],shape.graphics,VK_SUCCESS),"same numeric pipeline may be reused for another generation");b.tick(journal);require(b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::Selection&&!driver.calls,"stale actual selected generation has no first-ready or reused-handle fallback");require(b.release(VK_SUCCESS)&&driver.live.empty(),"stale selection allocated no Vulkan objects");return;}
-    b.tick(journal);require(b.snapshot().ready&&b.snapshot().selectedPipeline.value==identities[selected].value&&calls.fences==1,"cold clone selects actual fifth/sixth pipeline independently of creation/report order");
+    driver.mirrorSource=sets[selected];b.tick(journal);require(b.snapshot().ready&&b.snapshot().selectedPipeline.value==identities[selected].value&&calls.fences==1,"cold clone selects actual fifth/sixth pipeline independently of creation/report order");
     if(selected==4){const auto before=b.beforeRetirement(tx::Retirement::ResetPool,VK_NULL_HANDLE,pool);require(native->tracker.resetCommandPool(device,pool),"actual successful pool reset between scalar selection and next Begin");b.afterRetirement(before,VK_SUCCESS);require(b.snapshot().ready&&b.snapshot().refusal==frame_pixel_ssbo_receiver::Refusal::None,"legitimate pre-adoption pool reset preserves exact selected object generation");}
     require(native->tracker.beginCommand(device,ignored.command,native->beginInfo,true),"other live candidate begins a later recording");b.begin(native->tracker,device,ignored.command,true);require(!calls.resets,"other concurrently valid pipeline command cannot adopt selected clone");
     require(native->tracker.beginCommand(device,chosen.command,native->beginInfo,true),"selected exact command begins its next real generation");b.begin(native->tracker,device,chosen.command,true);require(calls.resets==1,"only selected command next Begin records one GPU reset");bind(chosen.command,selected);b.pipeline(chosen.command,pipelines[selected]);require(native->tracker.beginRenderPass(device,chosen.command,VK_SUBPASS_CONTENTS_INLINE),"chosen original render pass starts");b.beginPass(chosen.command,passes[selected],VK_SUBPASS_CONTENTS_INLINE);native->tracker.draw(device,chosen.command);require(b.draw(native->tracker,device,chosen.command,6,1,0,0,0,true),"selected exact variant indexed draw receives original-output observer");
@@ -288,6 +298,7 @@ void privateVariantSelection(const char* vertexPath,const char* fragmentPath,uns
 }
 }
 int main(int argc,char** argv){
+    if(argc==4&&!std::strcmp(argv[1],"--mirror-only")){for(unsigned mode:{0u,11u,12u,13u,14u})privateCallbacks(argv[2],argv[3],mode);std::cout<<"mirror bridge checks="<<checks.load()<<" owner="<<owned_fixture::checks<<'\n';return 0;}
     if(argc==4&&std::strcmp(argv[1],"--contexts-only")==0){privateCallbacks(argv[2],argv[3],10);std::cout<<"{\"scope\":\"recording provenance subset; fake dispatch and private original shader definitions only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     if(argc==4&&std::strcmp(argv[1],"--subpasses-only")==0){privateCallbacks(argv[2],argv[3],0,2);privateCallbacks(argv[2],argv[3],0,3);std::cout<<"{\"scope\":\"private multi-subpass callback subset, fake dispatch only\",\"checks\":"<<checks.load()<<",\"native_authority\":false}\n";return 0;}
     if(argc==4&&std::strcmp(argv[1],"--history-only")==0){historyGuards();for(unsigned mode=5;mode<=9;++mode)privateCallbacks(argv[2],argv[3],mode);std::cout<<"{\"scope\":\"definition-history-cancellation-subset,fake-dispatch\",\"checks\":"<<checks.load()<<",\"native_authority\":false,\"actual_r2_cause\":false}\n";return 0;}

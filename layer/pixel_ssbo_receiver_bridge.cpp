@@ -167,6 +167,7 @@ bool Bridge::draw(frame_pixel_capture::LiveTracker& tracker,std::uint64_t tag,Vk
                 tx::Transaction::TargetTicket current;
                 if(descriptorEpoch!=descriptorEpoch_.load(std::memory_order_acquire)||resourceEpoch!=resourceEpoch_.load(std::memory_order_acquire))refuse(Refusal::DescriptorMutation);
                 if(usable()&&(!tracker.ssboTargetTicket(tag,c,*clone_.preparedRecipe(),current)||!transaction_.targetStateCurrent(current)))refuse(Refusal::Target);
+                if(descriptorEpoch!=descriptorEpoch_.load(std::memory_order_acquire)||resourceEpoch!=resourceEpoch_.load(std::memory_order_acquire))refuse(Refusal::DescriptorMutation);
             }
         }
     }

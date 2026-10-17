@@ -17,7 +17,8 @@ struct Driver {
     unsigned calls=0,failAt=0,destroys=0,flushes=0,updates=0;
     bool noncoherent=false,partialPipeline=false,missing=false,wrongRequirements=false;
     bool refuseMemoryType=false,oversize=false,missingPass2=false,aliasPass2=false,missingKhr2=false;
-    bool mappedLive=false,mirror=false;unsigned copies=0;
+    bool mappedLive=false,mirror=false;unsigned copies=0,mirrorBindings=29;
+    VkDescriptorSet mirrorSource=object<VkDescriptorSet>(901);void(*copyCallback)()=nullptr;
     unsigned expectedCount=3,expectedFragmentBytes=20,expectedSubpasses=1,expectedSubpass=UINT32_MAX,pass2Calls=0,corePass2Calls=0,khrPass2Calls=0,corePassLookups=0,khrPassLookups=0;
     std::uint64_t next=100;
     std::set<std::uint64_t> live;
@@ -43,7 +44,7 @@ void common(VkDevice d,const VkAllocationCallbacks* a){demand(d==driver->device 
 VKAPI_ATTR VkResult VKAPI_CALL createSet(VkDevice d,const VkDescriptorSetLayoutCreateInfo* ci,const VkAllocationCallbacks* a,VkDescriptorSetLayout* out){
     common(d,a);demand(ci && ci->sType==VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO && !ci->pNext && !ci->flags,"ordinary owned set layout");
     const bool first=!driver->set0;
-    if(first){if(driver->mirror)demand(ci->bindingCount==29 && ci->pBindings[8].binding==8 && ci->pBindings[8].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,"mirror uses complete identical original29 layout");
+    if(first){if(driver->mirror)demand(ci->bindingCount==driver->mirrorBindings,"mirror uses complete identical original29 layout");
         else demand(ci->bindingCount==3 && ci->pBindings[2].binding==9 && ci->pBindings[2].descriptorCount==driver->expectedCount,"original Set0 descriptor count retained without native expansion");}
     else demand(ci->bindingCount==1 && ci->pBindings[0].binding==0 && ci->pBindings[0].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,"owned Set1 record binding");
     auto result=driver->create(first?Stage::Set0:Stage::Set1,out);
@@ -114,7 +115,7 @@ VKAPI_ATTR VkResult VKAPI_CALL flush(VkDevice d,std::uint32_t count,const VkMapp
 }
 VKAPI_ATTR VkResult VKAPI_CALL createPool(VkDevice d,const VkDescriptorPoolCreateInfo* ci,const VkAllocationCallbacks* a,VkDescriptorPool* out){
     common(d,a);demand(ci->maxSets==1,"one owned descriptor set");
-    if(driver->mirror){unsigned total=0;for(unsigned i=0;i<ci->poolSizeCount;++i)total+=ci->pPoolSizes[i].descriptorCount;demand(total==29,"mirror pool budgets full original layout including undefined unused entries");}
+    if(driver->mirror){unsigned total=0;for(unsigned i=0;i<ci->poolSizeCount;++i)total+=ci->pPoolSizes[i].descriptorCount;demand(total==driver->mirrorBindings,"mirror pool budgets full original layout including undefined unused entries");}
     else demand(ci->poolSizeCount==1 && ci->pPoolSizes[0].descriptorCount==1,"one owned storage descriptor");
     auto result=driver->create(Stage::Pool,out);if(result==VK_SUCCESS)driver->pool=*out;return result;
 }
@@ -126,8 +127,8 @@ VKAPI_ATTR VkResult VKAPI_CALL allocateSet(VkDevice d,const VkDescriptorSetAlloc
 VKAPI_ATTR void VKAPI_CALL update(VkDevice d,std::uint32_t count,const VkWriteDescriptorSet* writes,std::uint32_t copyCount,const VkCopyDescriptorSet* copies){
     demand(d==driver->device,"descriptor updates use exact owned device");
     if(copyCount){demand(driver->mirror && !count && !writes && copyCount==7 && copies && !driver->copies,"immutable mirror copied once before recording bind");
-        for(unsigned i=0;i<copyCount;++i){const auto& c=copies[i];demand(c.sType==VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET && !c.pNext && c.srcSet==object<VkDescriptorSet>(901) && c.dstSet==object<VkDescriptorSet>(900) && c.srcBinding==frame_pixel_ssbo_clone::ProbeInterface::MirrorBindings[i] && c.dstBinding==c.srcBinding && !c.srcArrayElement && !c.dstArrayElement && c.descriptorCount==1,"only statically attested original descriptors copied into owned set, never native writes");}
-        ++driver->copies;return;
+        for(unsigned i=0;i<copyCount;++i){const auto& c=copies[i];demand(c.sType==VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET && !c.pNext && c.srcSet==driver->mirrorSource && c.dstSet==object<VkDescriptorSet>(900) && c.srcBinding==frame_pixel_ssbo_clone::ProbeInterface::MirrorBindings[i] && c.dstBinding==c.srcBinding && !c.srcArrayElement && !c.dstArrayElement && c.descriptorCount==1,"only statically attested original descriptors copied into owned set, never native writes");}
+        ++driver->copies;if(driver->copyCallback)driver->copyCallback();return;
     }
     demand(count==1 && writes && writes->dstSet==object<VkDescriptorSet>(900) && writes->dstBinding==(driver->mirror?8u:0u) && writes->descriptorCount==1 && writes->pBufferInfo->buffer==driver->buffer && writes->pBufferInfo->range==128 && !writes->pBufferInfo->offset,"write exact own128B descriptor at profile binding, no native updates");++driver->updates;
 }
