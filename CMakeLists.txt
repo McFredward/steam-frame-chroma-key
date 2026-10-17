@@ -471,6 +471,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_r1_presenter.py)
         add_test(NAME native_fragment_guarded_presenter COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_guarded_presenter.py)
+        add_test(NAME native_fragment_subgroup_presenter COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_fragment_subgroup_presenter.py)
         add_test(NAME synthetic_presenter_session COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_synthetic_presenter_session.py)
         add_test(NAME steamvr_camera_alpha COMMAND ${Python3_EXECUTABLE} -B

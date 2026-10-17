@@ -4,11 +4,11 @@ This fork is adding **real per-eye opacity masks** for PC streaming. Scene color
 will remain independent of transparency, and the passthrough camera remains on
 the headset.
 
-The first development checkpoint contains the bounded mask transport, an
-explicit-mask shader generator, actual Vulkan rendering tests, and a Frame
-diagnostics collector. **The Steam Link frame/texture adapter is not implemented
-yet; this is not an installable genuine-mask passthrough feature.** The legacy
-layer refuses mask shaders until that adapter can bind them correctly.
+The receiver has now visibly blended a synthetic GloomhavenVR source with the
+Frame's native camera over an unchanged PC Steam Link sender. **Real game-scene
+coverage and the final mod integration are still in development; this is not a
+finished installable passthrough feature.** The default build remains inactive.
+The following checkpoints retain their historical scopes.
 
 Development branch: [`dev`](https://github.com/McFredward/steam-frame-chroma-key/tree/dev).
 See [mask implementation and tests](docs/MASK-TRANSPORT.md) and
@@ -92,6 +92,15 @@ blending. The [first visible synthetic trial](docs/research/native-synthetic-vis
 now confirms native streamed camera blending, intermediate transparency and menu
 recovery. Motion still lags; real-game coverage is not connected. The Frame is
 fully restored after the manually agreed test.
+
+The next [same-eye depth experiment](docs/research/same-eye-depth-coverage-20261017.md)
+preserves original RGB while reconstructing opaque/cutout coverage from existing
+scene depth, including admitted MSAA and stencil cases. A separate
+[subgroup experiment](docs/research/native-subgroup-presenter-20261017.md)
+preserves the complete format guard but shows only a small host improvement and
+a more expensive OFF path; it is not a production lag fix. The maintainer has
+requested removal of the synthetic player-facing setting from GloomhavenVR.
+These internal fixtures do not introduce a new test-pattern mode in the mod.
 
 The [read-only live inspection](docs/LIVE-BRIDGE-INSPECTION.md) reads bounded
 existing Frame diagnostics without installing anything or starting another VR

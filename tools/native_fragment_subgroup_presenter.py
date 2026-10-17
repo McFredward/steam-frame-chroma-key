@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline exact-format guard with a source-local subgroup fast path.
 
-Requires Fragment BASIC/BALLOT and subgroup-uniform-control-flow, not merely
+Requires Fragment BASIC/BALLOT/SHUFFLE and subgroup-uniform-control-flow, not merely
 Vulkan 1.1. No runtime hook, device capability grant, frame cache or activation
 is provided. Helper invocations and unequal R1 use the complete old guard.
 """
